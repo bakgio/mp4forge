@@ -8,6 +8,9 @@ use crate::FourCc;
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
 
 /// Stateful MP4 writer that can backfill container sizes after payload bytes are written.
+///
+/// This wrapper is designed for rewrite-style flows that need to stream payload bytes, nest
+/// container boxes, and then patch final sizes back into previously written headers.
 pub struct Writer<W> {
     writer: W,
     box_stack: Vec<BoxInfo>,
@@ -43,11 +46,16 @@ where
     W: Write + Seek,
 {
     /// Starts a new box using `box_type` and an empty small-header placeholder.
+    ///
+    /// The final size is written later by [`Writer::end_box`].
     pub fn start_box_type(&mut self, box_type: FourCc) -> Result<BoxInfo, WriterError> {
         self.start_box(BoxInfo::new(box_type, SMALL_HEADER_SIZE))
     }
 
     /// Writes `info` as the next box header and pushes it onto the open-box stack.
+    ///
+    /// Callers typically pass either a small-header placeholder or a header copied from an
+    /// existing box when preserving layout details.
     pub fn start_box(&mut self, info: BoxInfo) -> Result<BoxInfo, WriterError> {
         let written = info.write(&mut self.writer)?;
         self.box_stack.push(written);
@@ -55,6 +63,8 @@ where
     }
 
     /// Rewrites the most recently opened box header with its final size.
+    ///
+    /// The returned [`BoxInfo`] reflects the finalized on-disk size after the rewrite completes.
     pub fn end_box(&mut self) -> Result<BoxInfo, WriterError> {
         let Some(started) = self.box_stack.pop() else {
             return Err(WriterError::NoOpenBox);
@@ -133,21 +143,35 @@ where
 /// Errors raised while writing or copying MP4 boxes.
 #[derive(Debug)]
 pub enum WriterError {
+    /// An I/O operation failed while reading, seeking, or writing.
     Io(io::Error),
+    /// Box header metadata was invalid or could not be encoded.
     Header(HeaderError),
+    /// [`Writer::end_box`] was called with no corresponding open box.
     NoOpenBox,
+    /// The current writer position moved before the recorded start offset of the open box.
     InvalidBoxSpan {
+        /// Concrete box type being closed.
         box_type: FourCc,
+        /// Recorded start offset of the open box.
         offset: u64,
+        /// Current writer position observed during close.
         end: u64,
     },
+    /// Re-encoding the finalized header changed its encoded width.
     HeaderSizeChanged {
+        /// Concrete box type being closed.
         box_type: FourCc,
+        /// Header width used when the box was opened.
         original_header_size: u64,
+        /// Header width produced by the finalized size.
         rewritten_header_size: u64,
     },
+    /// A raw-copy operation ended before all requested bytes were copied.
     IncompleteCopy {
+        /// Number of bytes that should have been copied.
         expected_size: u64,
+        /// Number of bytes that were actually copied.
         actual_size: u64,
     },
 }
