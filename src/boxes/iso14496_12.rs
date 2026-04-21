@@ -1504,7 +1504,7 @@ impl FieldValueWrite for Mvhd {
                         "value must contain exactly 9 elements",
                     ));
                 }
-                for (slot, value) in self.matrix.iter_mut().zip(values.into_iter()) {
+                for (slot, value) in self.matrix.iter_mut().zip(values) {
                     *slot = i32_from_signed(field_name, value)?;
                 }
                 Ok(())
@@ -1516,7 +1516,7 @@ impl FieldValueWrite for Mvhd {
                         "value must contain exactly 6 elements",
                     ));
                 }
-                for (slot, value) in self.pre_defined.iter_mut().zip(values.into_iter()) {
+                for (slot, value) in self.pre_defined.iter_mut().zip(values) {
                     *slot = i32_from_signed(field_name, value)?;
                 }
                 Ok(())
@@ -1934,7 +1934,7 @@ impl FieldValueWrite for Tkhd {
                         "value must contain exactly 9 elements",
                     ));
                 }
-                for (slot, value) in self.matrix.iter_mut().zip(values.into_iter()) {
+                for (slot, value) in self.matrix.iter_mut().zip(values) {
                     *slot = i32_from_signed(field_name, value)?;
                 }
                 Ok(())

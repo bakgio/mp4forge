@@ -436,8 +436,11 @@ pub fn max_sample_bitrate(samples: &[SampleInfo], timescale: u32, window_time_de
             }
         }
 
-        if duration != 0 {
-            let bitrate = 8 * size * u64::from(timescale) / duration;
+        if let Some(bitrate) = size
+            .checked_mul(8)
+            .and_then(|bits| bits.checked_mul(u64::from(timescale)))
+            .and_then(|scaled_bits| scaled_bits.checked_div(duration))
+        {
             max_bitrate = max_bitrate.max(bitrate);
         }
 

@@ -10,7 +10,7 @@ repository = "https://github.com/bakgio/mp4forge"
 readme = "README.md"
 keywords = ["mp4", "isobmff", "parser", "video", "cli"]
 categories = ["command-line-utilities", "multimedia::video", "parser-implementations"]
-exclude = ["tests/*", "fuzz/*"]
+exclude = [".github/**", "fuzz/**", "tests/**"]
 
 [package.metadata.docs.rs]
 all-features = true
