@@ -93,3 +93,69 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
         run: cargo audit
+
+  check-version:
+    name: Check for new version
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      new_release: ${{ steps.tag.outputs.new_release }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        id: tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "new_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, msrv, docs, audit, check-version]
+    if: github.event_name == 'push' && needs.check-version.outputs.new_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Extract changelog
+        id: changelog
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          TITLE=$(awk "/^# ${VERSION//./\\.} /{print; exit}" CHANGELOG.md)
+          TITLE="${TITLE#\# }"
+          BODY=$(awk "/^# ${VERSION//./\\.} /{found=1; next} /^# /{if(found) exit} found{print}" CHANGELOG.md)
+          echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: ${{ steps.changelog.outputs.title }}
+          body: ${{ steps.changelog.outputs.body }}
