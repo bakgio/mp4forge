@@ -1,4 +1,4 @@
-//! Low-level MP4 and ISOBMFF toolkit.
+//! MP4 and ISOBMFF toolkit with low-level building blocks and thin ergonomic helpers.
 
 /// Bit-level reader and writer helpers used by the codec layer.
 pub mod bitio;
@@ -8,7 +8,7 @@ pub mod boxes;
 pub mod cli;
 /// Descriptor-driven binary codec primitives.
 pub mod codec;
-/// Path-based box extraction helpers built on the structure walker.
+/// Path-based box extraction helpers, including typed convenience reads.
 pub mod extract;
 /// Four-character box identifier support.
 pub mod fourcc;
@@ -16,6 +16,8 @@ pub mod fourcc;
 pub mod header;
 /// File-summary helpers built on the extraction and box layers.
 pub mod probe;
+/// Path-based typed payload rewrite helpers built on the writer layer.
+pub mod rewrite;
 /// Stable field-order string rendering for descriptor-backed boxes.
 pub mod stringify;
 /// Depth-first structure walking with path tracking and lazy payload access.

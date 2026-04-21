@@ -1,12 +1,14 @@
 use std::io::Cursor;
 
 use mp4forge::boxes::AnyTypeBox;
-use mp4forge::boxes::iso14496_12::{Ftyp, Meta, Moov, Trak, Udta};
+use mp4forge::boxes::iso14496_12::{Ftyp, Meta, Moov, Tkhd, Trak, Udta};
 use mp4forge::boxes::metadata::{
     DATA_TYPE_STRING_UTF8, Data, Ilst, Key, Keys, NumberedMetadataItem,
 };
 use mp4forge::codec::{CodecBox, marshal};
-use mp4forge::extract::{ExtractError, extract_box, extract_box_with_payload, extract_boxes};
+use mp4forge::extract::{
+    ExtractError, extract_box, extract_box_as, extract_box_with_payload, extract_boxes,
+};
 use mp4forge::stringify::stringify;
 use mp4forge::walk::BoxPath;
 use mp4forge::{BoxInfo, FourCc};
@@ -120,6 +122,117 @@ fn extract_box_with_payload_uses_walked_lookup_context() {
     assert_eq!(numbered.item_name, fourcc("data"));
     assert_eq!(numbered.data.data_type, DATA_TYPE_STRING_UTF8);
     assert_eq!(numbered.data.data, b"1.0.0");
+}
+
+#[test]
+fn extract_box_as_returns_typed_payloads() {
+    let mut tkhd_a = Tkhd::default();
+    tkhd_a.track_id = 1;
+    let mut tkhd_b = Tkhd::default();
+    tkhd_b.track_id = 2;
+    let trak_a = encode_supported_box(&Trak, &encode_supported_box(&tkhd_a, &[]));
+    let trak_b = encode_supported_box(&Trak, &encode_supported_box(&tkhd_b, &[]));
+    let moov = encode_supported_box(&Moov, &[trak_a, trak_b].concat());
+
+    let extracted = extract_box_as::<_, Tkhd>(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
+    )
+    .unwrap();
+
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(
+        extracted
+            .iter()
+            .map(|tkhd| tkhd.track_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn extract_box_as_uses_walked_lookup_context() {
+    let qt = fourcc("qt  ");
+    let ftyp = Ftyp {
+        major_brand: qt,
+        minor_version: 0x0200,
+        compatible_brands: vec![qt],
+    };
+    let mut keys = Keys::default();
+    keys.entry_count = 1;
+    keys.entries = vec![Key {
+        key_size: 9,
+        key_namespace: fourcc("mdta"),
+        key_value: vec![b'x'],
+    }];
+
+    let mut numbered = NumberedMetadataItem::default();
+    numbered.set_box_type(FourCc::from_u32(1));
+    numbered.item_name = fourcc("data");
+    numbered.data = Data {
+        data_type: DATA_TYPE_STRING_UTF8,
+        data_lang: 0,
+        data: b"1.0.0".to_vec(),
+    };
+
+    let keys_box = encode_supported_box(&keys, &[]);
+    let numbered_box = encode_supported_box(&numbered, &[]);
+    let ilst_box = encode_supported_box(&Ilst, &numbered_box);
+    let meta_box = encode_supported_box(&Meta::default(), &[keys_box, ilst_box].concat());
+    let moov_box = encode_supported_box(&Moov, &meta_box);
+    let file = [encode_supported_box(&ftyp, &[]), moov_box].concat();
+
+    let extracted = extract_box_as::<_, NumberedMetadataItem>(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("meta"),
+            fourcc("ilst"),
+            FourCc::from_u32(1),
+        ]),
+    )
+    .unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].item_name, fourcc("data"));
+    assert_eq!(extracted[0].data.data, b"1.0.0");
+}
+
+#[test]
+fn extract_box_as_reports_payload_type_context() {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = 7;
+    let trak = encode_supported_box(&Trak, &encode_supported_box(&tkhd, &[]));
+    let moov = encode_supported_box(&Moov, &trak);
+
+    let error = extract_box_as::<_, Meta>(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractError::UnexpectedPayloadType {
+            ref path,
+            box_type,
+            offset,
+            expected_type
+        } if path.as_slice() == [fourcc("moov"), fourcc("trak"), fourcc("tkhd")]
+            && box_type == fourcc("tkhd")
+            && offset == 16
+            && expected_type == std::any::type_name::<Meta>()
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "unexpected decoded payload type at moov/trak/tkhd (type=tkhd, offset=16): expected {}",
+            std::any::type_name::<Meta>()
+        )
+    );
 }
 
 #[test]

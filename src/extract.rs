@@ -1,5 +1,9 @@
 //! Path-based box extraction helpers built on the structure walker.
+//!
+//! This module keeps the existing low-level extraction surface available while also exposing thin
+//! typed helpers for callers that already know the payload type they expect at a given path.
 
+use std::any::type_name;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Seek};
@@ -7,7 +11,7 @@ use std::io::{self, Read, Seek};
 use crate::BoxInfo;
 use crate::FourCc;
 use crate::boxes::{BoxRegistry, default_registry};
-use crate::codec::{CodecError, DynCodecBox, unmarshal_any_with_context};
+use crate::codec::{CodecBox, CodecError, DynCodecBox, unmarshal_any_with_context};
 use crate::header::HeaderError;
 use crate::walk::{
     BoxPath, PathMatch, WalkControl, WalkError, WalkHandle, walk_structure_from_box_with_registry,
@@ -15,6 +19,10 @@ use crate::walk::{
 };
 
 /// Header metadata paired with a decoded runtime box payload.
+///
+/// Use this when the caller needs both the matched [`BoxInfo`] and direct access to the decoded
+/// runtime-erased payload. Callers that already know the concrete payload type can usually prefer
+/// [`extract_box_as`] or [`extract_boxes_as`] to avoid manual downcasts.
 pub struct ExtractedBox {
     /// Header metadata captured during the structure walk.
     pub info: BoxInfo,
@@ -22,7 +30,10 @@ pub struct ExtractedBox {
     pub payload: Box<dyn DynCodecBox>,
 }
 
-/// Extracts every box that matches `path`.
+/// Extracts every box that matches `path` and returns the matching header metadata.
+///
+/// When `parent` is present, `path` is evaluated relative to that box. Returns an empty vector
+/// when no boxes match.
 pub fn extract_box<R>(
     reader: &mut R,
     parent: Option<&BoxInfo>,
@@ -35,7 +46,10 @@ where
     extract_boxes(reader, parent, &paths)
 }
 
-/// Extracts every box that matches any path in `paths`.
+/// Extracts every box that matches any path in `paths` and returns the matching header metadata.
+///
+/// When `parent` is present, every path is evaluated relative to that box. Returns an empty vector
+/// when no boxes match.
 pub fn extract_boxes<R>(
     reader: &mut R,
     parent: Option<&BoxInfo>,
@@ -49,6 +63,9 @@ where
 }
 
 /// Extracts every box that matches `path` and decodes the payloads.
+///
+/// When `parent` is present, `path` is evaluated relative to that box. Each match is returned as
+/// an [`ExtractedBox`] so callers can inspect both the header metadata and decoded payload.
 pub fn extract_box_with_payload<R>(
     reader: &mut R,
     parent: Option<&BoxInfo>,
@@ -62,6 +79,8 @@ where
 }
 
 /// Extracts every box that matches any path in `paths` and decodes the payloads.
+///
+/// When `parent` is present, every path is evaluated relative to that box.
 pub fn extract_boxes_with_payload<R>(
     reader: &mut R,
     parent: Option<&BoxInfo>,
@@ -74,13 +93,138 @@ where
     extract_boxes_with_payload_with_registry(reader, parent, paths, &registry)
 }
 
-/// Extracts every box that matches any path in `paths` using `registry`.
+/// Extracts every box that matches `path`, decodes the payloads, and clones them as `T`.
+///
+/// This is the smallest high-level extraction helper for common read flows that already know the
+/// concrete payload type they expect. It keeps the existing low-level extraction layer intact
+/// while removing the repeated downcast boilerplate from call sites.
+///
+/// When `parent` is present, `path` is evaluated relative to that box.
+pub fn extract_box_as<R, T>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<T>, ExtractError>
+where
+    R: Read + Seek,
+    T: CodecBox + Clone + 'static,
+{
+    let paths = [path];
+    extract_boxes_as(reader, parent, &paths)
+}
+
+/// Extracts every box that matches any path in `paths`, decodes the payloads, and clones them as
+/// `T`.
+///
+/// Every matched box must decode to `T`, otherwise [`ExtractError::UnexpectedPayloadType`] is
+/// returned with the matched path and offset for diagnostics. Returns an empty vector when no
+/// boxes match.
+pub fn extract_boxes_as<R, T>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<T>, ExtractError>
+where
+    R: Read + Seek,
+    T: CodecBox + Clone + 'static,
+{
+    let registry = default_registry();
+    extract_boxes_as_with_registry(reader, parent, paths, &registry)
+}
+
+/// Extracts every box that matches any path in `paths` using `registry` and returns the matching
+/// header metadata.
+///
+/// Use this when custom or context-sensitive box registrations must participate in the extraction.
 pub fn extract_boxes_with_registry<R>(
     reader: &mut R,
     parent: Option<&BoxInfo>,
     paths: &[BoxPath],
     registry: &BoxRegistry,
 ) -> Result<Vec<BoxInfo>, ExtractError>
+where
+    R: Read + Seek,
+{
+    Ok(collect_matches(reader, parent, paths, registry)?
+        .into_iter()
+        .map(|matched| matched.info)
+        .collect())
+}
+
+/// Extracts every box that matches any path in `paths`, then decodes the payloads with `registry`.
+///
+/// Use this when custom or context-sensitive box registrations must participate in payload decode.
+pub fn extract_boxes_with_payload_with_registry<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<ExtractedBox>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let matched_boxes = collect_matches(reader, parent, paths, registry)?;
+    let mut matches = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        let payload = decode_payload(reader, &matched, registry)?;
+        matches.push(ExtractedBox {
+            info: matched.info,
+            payload,
+        });
+    }
+
+    Ok(matches)
+}
+
+/// Extracts every box that matches any path in `paths`, decodes the payloads with `registry`, and
+/// clones them as `T`.
+///
+/// Use this when the active registry may include custom box registrations and all matched boxes are
+/// expected to share the same concrete payload type.
+pub fn extract_boxes_as_with_registry<R, T>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<T>, ExtractError>
+where
+    R: Read + Seek,
+    T: CodecBox + Clone + 'static,
+{
+    let matched_boxes = collect_matches(reader, parent, paths, registry)?;
+    let mut payloads = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        let payload = decode_payload(reader, &matched, registry)?;
+        let typed = payload
+            .as_ref()
+            .as_any()
+            .downcast_ref::<T>()
+            .cloned()
+            .ok_or_else(|| ExtractError::UnexpectedPayloadType {
+                path: matched.path.clone(),
+                box_type: matched.info.box_type(),
+                offset: matched.info.offset(),
+                expected_type: type_name::<T>(),
+            })?;
+        payloads.push(typed);
+    }
+
+    Ok(payloads)
+}
+
+struct MatchedBox {
+    info: BoxInfo,
+    path: BoxPath,
+}
+
+fn collect_matches<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<MatchedBox>, ExtractError>
 where
     R: Read + Seek,
 {
@@ -106,7 +250,10 @@ where
             exact_match,
         } = match_paths(paths, &relative_path);
         if exact_match {
-            matches.push(*handle.info());
+            matches.push(MatchedBox {
+                info: *handle.info(),
+                path: relative_path.clone(),
+            });
         }
 
         Ok(if forward_match {
@@ -125,33 +272,31 @@ where
     Ok(matches)
 }
 
-/// Extracts every box that matches any path in `paths`, then decodes the payloads with `registry`.
-pub fn extract_boxes_with_payload_with_registry<R>(
+fn decode_payload<R>(
     reader: &mut R,
-    parent: Option<&BoxInfo>,
-    paths: &[BoxPath],
+    matched: &MatchedBox,
     registry: &BoxRegistry,
-) -> Result<Vec<ExtractedBox>, ExtractError>
+) -> Result<Box<dyn DynCodecBox>, ExtractError>
 where
     R: Read + Seek,
 {
-    let infos = extract_boxes_with_registry(reader, parent, paths, registry)?;
-    let mut matches = Vec::with_capacity(infos.len());
-
-    for info in infos {
-        info.seek_to_payload(reader)?;
-        let (payload, _) = unmarshal_any_with_context(
-            reader,
-            info.payload_size()?,
-            info.box_type(),
-            registry,
-            info.lookup_context(),
-            None,
-        )?;
-        matches.push(ExtractedBox { info, payload });
-    }
-
-    Ok(matches)
+    matched.info.seek_to_payload(reader)?;
+    let payload_size = matched.info.payload_size()?;
+    let (payload, _) = unmarshal_any_with_context(
+        reader,
+        payload_size,
+        matched.info.box_type(),
+        registry,
+        matched.info.lookup_context(),
+        None,
+    )
+    .map_err(|source| ExtractError::PayloadDecode {
+        path: matched.path.clone(),
+        box_type: matched.info.box_type(),
+        offset: matched.info.offset(),
+        source,
+    })?;
+    Ok(payload)
 }
 
 fn validate_paths(paths: &[BoxPath]) -> Result<(), ExtractError> {
@@ -176,11 +321,38 @@ fn match_paths(paths: &[BoxPath], current: &BoxPath) -> PathMatch {
 /// Errors raised while extracting path-matched boxes.
 #[derive(Debug)]
 pub enum ExtractError {
+    /// An I/O operation failed while reading or seeking.
     Io(io::Error),
+    /// Box header metadata was invalid or truncated.
     Header(HeaderError),
+    /// Payload decode failed before a more specific matched-box context was available.
     Codec(CodecError),
+    /// Structure walking failed before a specific extraction match could be reported.
     Walk(WalkError),
+    /// One of the requested paths was empty.
     EmptyPath,
+    /// A matched payload failed to decode with contextual path metadata.
+    PayloadDecode {
+        /// Matched path that was being decoded when the failure happened.
+        path: BoxPath,
+        /// Concrete box type at that matched path.
+        box_type: FourCc,
+        /// File offset of the matched box header.
+        offset: u64,
+        /// Underlying decode failure.
+        source: CodecError,
+    },
+    /// A matched payload decoded successfully but did not match the requested concrete type.
+    UnexpectedPayloadType {
+        /// Matched path whose payload downcast failed.
+        path: BoxPath,
+        /// Concrete box type at that matched path.
+        box_type: FourCc,
+        /// File offset of the matched box header.
+        offset: u64,
+        /// Fully qualified Rust type name requested by the caller.
+        expected_type: &'static str,
+    },
 }
 
 impl fmt::Display for ExtractError {
@@ -191,6 +363,24 @@ impl fmt::Display for ExtractError {
             Self::Codec(error) => error.fmt(f),
             Self::Walk(error) => error.fmt(f),
             Self::EmptyPath => f.write_str("box path must not be empty"),
+            Self::PayloadDecode {
+                path,
+                box_type,
+                offset,
+                source,
+            } => write!(
+                f,
+                "failed to decode payload at {path} (type={box_type}, offset={offset}): {source}"
+            ),
+            Self::UnexpectedPayloadType {
+                path,
+                box_type,
+                offset,
+                expected_type,
+            } => write!(
+                f,
+                "unexpected decoded payload type at {path} (type={box_type}, offset={offset}): expected {expected_type}"
+            ),
         }
     }
 }
@@ -202,7 +392,8 @@ impl Error for ExtractError {
             Self::Header(error) => Some(error),
             Self::Codec(error) => Some(error),
             Self::Walk(error) => Some(error),
-            Self::EmptyPath => None,
+            Self::PayloadDecode { source, .. } => Some(source),
+            Self::EmptyPath | Self::UnexpectedPayloadType { .. } => None,
         }
     }
 }

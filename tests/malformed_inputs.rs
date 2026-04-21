@@ -90,8 +90,15 @@ fn extract_box_with_payload_rejects_truncated_supported_payloads() {
 
     assert!(matches!(
         error,
-        ExtractError::Codec(CodecError::Io(ref io_error))
-            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+        ExtractError::PayloadDecode {
+            path,
+            box_type,
+            offset: 0,
+            source: CodecError::Io(ref io_error)
+        }
+            if path.as_slice() == [fourcc("mvhd")]
+                && box_type == fourcc("mvhd")
+                && io_error.kind() == std::io::ErrorKind::UnexpectedEof
     ));
 }
 

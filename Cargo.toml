@@ -1,11 +1,11 @@
 [package]
 name = "mp4forge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["bakgio"]
 license = "MIT OR Apache-2.0"
-description = "Rust library and CLI for inspecting, extracting, and rewriting MP4 box structures"
+description = "Rust library and CLI for inspecting, probing, extracting, and rewriting MP4 box structures"
 repository = "https://github.com/bakgio/mp4forge"
 readme = "README.md"
 keywords = ["mp4", "isobmff", "parser", "video", "cli"]

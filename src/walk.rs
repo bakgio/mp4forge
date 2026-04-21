@@ -26,6 +26,9 @@ pub enum WalkControl {
 }
 
 /// Ordered sequence of box identifiers from the root to the current box.
+///
+/// Path comparisons used by the extraction and rewrite helpers honor [`FourCc::ANY`] as a
+/// wildcard segment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoxPath(Vec<FourCc>);
 
@@ -86,6 +89,23 @@ impl Deref for BoxPath {
 
     fn deref(&self) -> &Self::Target {
         self.as_slice()
+    }
+}
+
+impl fmt::Display for BoxPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return f.write_str("<root>");
+        }
+
+        for (index, box_type) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str("/")?;
+            }
+            write!(f, "{box_type}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -409,14 +429,22 @@ where
 /// Errors raised while walking a box tree.
 #[derive(Debug)]
 pub enum WalkError {
+    /// An I/O operation failed while reading or seeking.
     Io(io::Error),
+    /// Box header metadata was invalid or truncated.
     Header(HeaderError),
+    /// Payload decode failed while the walker was inspecting or expanding a box.
     Codec(CodecError),
+    /// A child box declared a size larger than the remaining bytes in its parent container.
     TooLargeBoxSize {
+        /// Concrete box type whose declared size exceeded the available bytes.
         box_type: FourCc,
+        /// Declared child box size.
         size: u64,
+        /// Remaining bytes available in the parent container.
         available_size: u64,
     },
+    /// A non-QuickTime container ended before all advertised child bytes were consumed.
     UnexpectedEof,
 }
 
