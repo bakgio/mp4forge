@@ -1,0 +1,43 @@
+{
+  "MajorBrand": "isom",
+  "MinorVersion": 512,
+  "CompatibleBrands": [
+    "isom",
+    "iso2",
+    "avc1",
+    "mp41"
+  ],
+  "FastStart": false,
+  "Timescale": 1000,
+  "Duration": 1024,
+  "DurationSeconds": 1.024,
+  "Tracks": [
+    {
+      "TrackID": 1,
+      "Timescale": 10240,
+      "Duration": 10240,
+      "DurationSeconds": 1,
+      "Codec": "avc1.64000C",
+      "Encrypted": false,
+      "Width": 320,
+      "Height": 180,
+      "SampleNum": 10,
+      "ChunkNum": 9,
+      "IDRFrameNum": 1,
+      "Bitrate": 40336,
+      "MaxBitrate": 40336
+  },
+    {
+      "TrackID": 2,
+      "Timescale": 44100,
+      "Duration": 45124,
+      "DurationSeconds": 1.02322,
+      "Codec": "mp4a.40.2",
+      "Encrypted": false,
+      "SampleNum": 44,
+      "ChunkNum": 9,
+      "Bitrate": 10570,
+      "MaxBitrate": 10632
+  }
+  ]
+}

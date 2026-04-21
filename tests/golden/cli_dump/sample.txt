@@ -1,0 +1,57 @@
+[ftyp] Size=32 MajorBrand="isom" MinorVersion=512 CompatibleBrands=[{CompatibleBrand="isom"}, {CompatibleBrand="iso2"}, {CompatibleBrand="avc1"}, {CompatibleBrand="mp41"}]
+[free] Size=8 Data=[...] (use "-full free" to show all)
+[mdat] Size=6402 Data=[...] (use "-full mdat" to show all)
+[moov] Size=1836
+  [mvhd] Size=108 ... (use "-full mvhd" to show all)
+  [trak] Size=743
+    [tkhd] Size=92 ... (use "-full tkhd" to show all)
+    [edts] Size=36
+      [elst] Size=28 Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=2048 MediaRateInteger=1}]
+    [mdia] Size=607
+      [mdhd] Size=32 Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=10240 DurationV0=10240 Language="eng" PreDefined=0
+      [hdlr] Size=44 Version=0 Flags=0x000000 PreDefined=0 HandlerType="vide" Name="VideoHandle"
+      [minf] Size=523
+        [vmhd] Size=20 Version=0 Flags=0x000001 Graphicsmode=0 Opcolor=[0, 0, 0]
+        [dinf] Size=36
+          [dref] Size=28 Version=0 Flags=0x000000 EntryCount=1
+            [url ] Size=12 Version=0 Flags=0x000001
+        [stbl] Size=459
+          [stsd] Size=167 Version=0 Flags=0x000000 EntryCount=1
+            [avc1] Size=151 ... (use "-full avc1" to show all)
+              [avcC] Size=49 ... (use "-full avcC" to show all)
+              [pasp] Size=16 HSpacing=1 VSpacing=1
+          [stts] Size=24 Version=0 Flags=0x000000 EntryCount=1 Entries=[{SampleCount=10 SampleDelta=1024}]
+          [stss] Size=20 Version=0 Flags=0x000000 EntryCount=1 SampleNumber=[1]
+          [ctts] Size=88 ... (use "-full ctts" to show all)
+          [stsc] Size=40 ... (use "-full stsc" to show all)
+          [stsz] Size=60 Version=0 Flags=0x000000 SampleSize=0 SampleCount=10 EntrySize=[3679, 86, 545, 180, 69, 60, 182, 22, 204, 15]
+          [stco] Size=52 Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[48, 3836, 4527, 4864, 5043, 5227, 5560, 5702, 6038]
+  [trak] Size=844
+    [tkhd] Size=92 ... (use "-full tkhd" to show all)
+    [edts] Size=36
+      [elst] Size=28 Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=1024 MediaRateInteger=1}]
+    [mdia] Size=708
+      [mdhd] Size=32 Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=44100 DurationV0=45124 Language="eng" PreDefined=0
+      [hdlr] Size=44 Version=0 Flags=0x000000 PreDefined=0 HandlerType="soun" Name="SoundHandle"
+      [minf] Size=624
+        [smhd] Size=16 Version=0 Flags=0x000000 Balance=0
+        [dinf] Size=36
+          [dref] Size=28 Version=0 Flags=0x000000 EntryCount=1
+            [url ] Size=12 Version=0 Flags=0x000001
+        [stbl] Size=564
+          [stsd] Size=106 Version=0 Flags=0x000000 EntryCount=1
+            [mp4a] Size=90 DataReferenceIndex=1 EntryVersion=0 ChannelCount=2 SampleSize=16 PreDefined=0 SampleRate=44100
+              [esds] Size=54 ... (use "-full esds" to show all)
+          [stts] Size=48 ... (use "-full stts" to show all)
+          [stsc] Size=100 ... (use "-full stsc" to show all)
+          [stsz] Size=196 ... (use "-full stsz" to show all)
+          [stco] Size=52 Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[3813, 4381, 4707, 4933, 5103, 5409, 5582, 5906, 6053]
+          [sgpd] Size=26 Version=1 Flags=0x000000 GroupingType="roll" DefaultLength=2 EntryCount=1 RollDistances=[-1]
+          [sbgp] Size=28 Version=0 Flags=0x000000 GroupingType=1919904876 EntryCount=1 Entries=[{SampleCount=44 GroupDescriptionIndex=1}]
+  [udta] Size=133
+    [meta] Size=90 Version=0 Flags=0x000000
+      [hdlr] Size=33 Version=0 Flags=0x000000 PreDefined=0 HandlerType="mdir" Name=""
+      [ilst] Size=45
+        [(c)too] Size=37
+          [data] Size=29 DataType=UTF8 DataLang=0 EncodingTool="Lavf58.29.100"
+    [loci] (unsupported box type) Size=35 Data=[...] (use "-full loci" to show all)

@@ -1,0 +1,49 @@
+[package]
+name = "mp4forge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mp4forge = { path = ".." }
+
+[[bin]]
+name = "read_box_structure"
+path = "fuzz_targets/read_box_structure.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_box_headers"
+path = "fuzz_targets/parse_box_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_codec_boxes"
+path = "fuzz_targets/roundtrip_codec_boxes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_paths"
+path = "fuzz_targets/extract_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_backfill"
+path = "fuzz_targets/writer_backfill.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

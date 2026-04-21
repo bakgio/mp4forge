@@ -1,0 +1,132 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in mp4forge
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill out the sections below so we can reproduce the issue and fix it without guessing.
+
+  - type: input
+    id: mp4forge-version
+    attributes:
+      label: mp4forge Version
+      description: Which version are you using?
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust Version
+      description: Output of `rustc --version`, if applicable.
+      placeholder: "rustc 1.88.0 (6b00bc388 2025-06-23)"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: install-path
+    attributes:
+      label: Installation Method
+      description: How are you running mp4forge?
+      options:
+        - cargo install mp4forge
+        - cargo install --path .
+        - cargo run from a local checkout
+        - Used as a library dependency
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected Surface
+      description: Which part of the project is affected?
+      multiple: true
+      options:
+        - Library API
+        - CLI command
+        - MP4 parsing / decoding
+        - MP4 writing / rewriting
+        - Probe / dump output
+        - Packaging / installation
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Which platform(s) does this occur on?
+      multiple: true
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: command-or-api
+    attributes:
+      label: Command or API
+      description: Which CLI command or library API is involved?
+      placeholder: "mp4forge probe sample.mp4 / mp4forge::probe::probe"
+    validations:
+      required: false
+
+  - type: textarea
+    id: happened
+    attributes:
+      label: What Happened?
+      description: Describe the bug. Include any error messages, panics, or incorrect output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      description: Provide a minimal command sequence, Rust snippet, or reproduction steps.
+      placeholder: |
+        cargo run --bin mp4forge -- probe sample.mp4
+    validations:
+      required: true
+
+  - type: textarea
+    id: sample-file
+    attributes:
+      label: Sample MP4 or Media Context
+      description: If the issue depends on a specific file, describe it here or attach a minimal sample.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Include stack traces, screenshots, hexdumps, or anything else that helps narrow the issue.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched the existing issues before opening this report
+          required: true

@@ -1,0 +1,57 @@
+[ftyp] Offset=0 Size=32 MajorBrand="isom" MinorVersion=512 CompatibleBrands=[{CompatibleBrand="isom"}, {CompatibleBrand="iso2"}, {CompatibleBrand="avc1"}, {CompatibleBrand="mp41"}]
+[free] Offset=32 Size=8 Data=[...] (use "-full free" to show all)
+[mdat] Offset=40 Size=6402 Data=[...] (use "-full mdat" to show all)
+[moov] Offset=6442 Size=1836
+  [mvhd] Offset=6450 Size=108 ... (use "-full mvhd" to show all)
+  [trak] Offset=6558 Size=743
+    [tkhd] Offset=6566 Size=92 ... (use "-full tkhd" to show all)
+    [edts] Offset=6658 Size=36
+      [elst] Offset=6666 Size=28 Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=2048 MediaRateInteger=1}]
+    [mdia] Offset=6694 Size=607
+      [mdhd] Offset=6702 Size=32 Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=10240 DurationV0=10240 Language="eng" PreDefined=0
+      [hdlr] Offset=6734 Size=44 Version=0 Flags=0x000000 PreDefined=0 HandlerType="vide" Name="VideoHandle"
+      [minf] Offset=6778 Size=523
+        [vmhd] Offset=6786 Size=20 Version=0 Flags=0x000001 Graphicsmode=0 Opcolor=[0, 0, 0]
+        [dinf] Offset=6806 Size=36
+          [dref] Offset=6814 Size=28 Version=0 Flags=0x000000 EntryCount=1
+            [url ] Offset=6830 Size=12 Version=0 Flags=0x000001
+        [stbl] Offset=6842 Size=459
+          [stsd] Offset=6850 Size=167 Version=0 Flags=0x000000 EntryCount=1
+            [avc1] Offset=6866 Size=151 ... (use "-full avc1" to show all)
+              [avcC] Offset=6952 Size=49 ... (use "-full avcC" to show all)
+              [pasp] Offset=7001 Size=16 HSpacing=1 VSpacing=1
+          [stts] Offset=7017 Size=24 Version=0 Flags=0x000000 EntryCount=1 Entries=[{SampleCount=10 SampleDelta=1024}]
+          [stss] Offset=7041 Size=20 Version=0 Flags=0x000000 EntryCount=1 SampleNumber=[1]
+          [ctts] Offset=7061 Size=88 ... (use "-full ctts" to show all)
+          [stsc] Offset=7149 Size=40 ... (use "-full stsc" to show all)
+          [stsz] Offset=7189 Size=60 Version=0 Flags=0x000000 SampleSize=0 SampleCount=10 EntrySize=[3679, 86, 545, 180, 69, 60, 182, 22, 204, 15]
+          [stco] Offset=7249 Size=52 Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[48, 3836, 4527, 4864, 5043, 5227, 5560, 5702, 6038]
+  [trak] Offset=7301 Size=844
+    [tkhd] Offset=7309 Size=92 ... (use "-full tkhd" to show all)
+    [edts] Offset=7401 Size=36
+      [elst] Offset=7409 Size=28 Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=1024 MediaRateInteger=1}]
+    [mdia] Offset=7437 Size=708
+      [mdhd] Offset=7445 Size=32 Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=44100 DurationV0=45124 Language="eng" PreDefined=0
+      [hdlr] Offset=7477 Size=44 Version=0 Flags=0x000000 PreDefined=0 HandlerType="soun" Name="SoundHandle"
+      [minf] Offset=7521 Size=624
+        [smhd] Offset=7529 Size=16 Version=0 Flags=0x000000 Balance=0
+        [dinf] Offset=7545 Size=36
+          [dref] Offset=7553 Size=28 Version=0 Flags=0x000000 EntryCount=1
+            [url ] Offset=7569 Size=12 Version=0 Flags=0x000001
+        [stbl] Offset=7581 Size=564
+          [stsd] Offset=7589 Size=106 Version=0 Flags=0x000000 EntryCount=1
+            [mp4a] Offset=7605 Size=90 DataReferenceIndex=1 EntryVersion=0 ChannelCount=2 SampleSize=16 PreDefined=0 SampleRate=44100
+              [esds] Offset=7641 Size=54 ... (use "-full esds" to show all)
+          [stts] Offset=7695 Size=48 ... (use "-full stts" to show all)
+          [stsc] Offset=7743 Size=100 ... (use "-full stsc" to show all)
+          [stsz] Offset=7843 Size=196 ... (use "-full stsz" to show all)
+          [stco] Offset=8039 Size=52 Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[3813, 4381, 4707, 4933, 5103, 5409, 5582, 5906, 6053]
+          [sgpd] Offset=8091 Size=26 Version=1 Flags=0x000000 GroupingType="roll" DefaultLength=2 EntryCount=1 RollDistances=[-1]
+          [sbgp] Offset=8117 Size=28 Version=0 Flags=0x000000 GroupingType=1919904876 EntryCount=1 Entries=[{SampleCount=44 GroupDescriptionIndex=1}]
+  [udta] Offset=8145 Size=133
+    [meta] Offset=8153 Size=90 Version=0 Flags=0x000000
+      [hdlr] Offset=8165 Size=33 Version=0 Flags=0x000000 PreDefined=0 HandlerType="mdir" Name=""
+      [ilst] Offset=8198 Size=45
+        [(c)too] Offset=8206 Size=37
+          [data] Offset=8214 Size=29 DataType=UTF8 DataLang=0 EncodingTool="Lavf58.29.100"
+    [loci] (unsupported box type) Offset=8243 Size=35 Data=[...] (use "-full loci" to show all)
