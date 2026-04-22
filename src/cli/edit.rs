@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::FourCc;
 use crate::boxes::iso14496_12::{Ftyp, Tfdt};
@@ -13,7 +13,10 @@ use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
 use crate::codec::{
     CodecError, DynCodecBox, ImmutableBox, marshal_dyn, unmarshal, unmarshal_any_with_context,
 };
+use crate::extract::{ExtractError, extract_boxes_as};
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
+use crate::rewrite::{RewriteError, rewrite_boxes_as};
+use crate::walk::{BoxPath, WalkError};
 use crate::writer::{Writer, WriterError};
 
 const FTYP: FourCc = FourCc::from_bytes(*b"ftyp");
@@ -37,7 +40,7 @@ where
 {
     match run_inner(args) {
         Ok(()) => 0,
-        Err(EditError::UsageRequested) => {
+        Err(EditCliError::UsageRequested) => {
             let _ = write_usage(stderr);
             1
         }
@@ -62,6 +65,10 @@ where
     writeln!(
         writer,
         "  -base_media_decode_time <value>    Replace tfdt base media decode times"
+    )?;
+    writeln!(
+        writer,
+        "  -path <box/path>                   Limit supported typed rewrites to parsed slash-delimited box paths"
     )?;
     writeln!(
         writer,
@@ -95,34 +102,61 @@ where
     Ok(())
 }
 
-fn run_inner(args: &[String]) -> Result<(), EditError> {
-    let (options, input_path, output_path) = parse_args(args)?;
-    let mut input = File::open(input_path)?;
-    let output = File::create(output_path)?;
-    edit_reader(&mut input, output, &options)
+fn run_inner(args: &[String]) -> Result<(), EditCliError> {
+    let parsed = parse_args(args)?;
+    let mut input = File::open(parsed.input_path)?;
+    let output = File::create(parsed.output_path)?;
+    if parsed.paths.is_empty() {
+        return edit_reader(&mut input, output, &parsed.options).map_err(EditCliError::Edit);
+    }
+
+    edit_reader_scoped_paths(&mut input, output, &parsed.options, &parsed.paths)
 }
 
-fn parse_args(args: &[String]) -> Result<(EditOptions, &str, &str), EditError> {
+#[derive(Debug)]
+struct ParsedEditArgs<'a> {
+    options: EditOptions,
+    paths: Vec<BoxPath>,
+    input_path: &'a str,
+    output_path: &'a str,
+}
+
+fn parse_args(args: &[String]) -> Result<ParsedEditArgs<'_>, EditCliError> {
     let mut options = EditOptions::default();
+    let mut paths = Vec::new();
     let mut positional = Vec::new();
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
             "-base_media_decode_time" | "--base_media_decode_time" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err(EditError::InvalidArgument(
+                    return Err(EditCliError::InvalidArgument(
                         "missing value for -base_media_decode_time".to_string(),
                     ));
                 };
                 let value = value.parse::<u64>().map_err(|_| {
-                    EditError::InvalidArgument(format!("invalid base media decode time: {value}"))
+                    EditCliError::InvalidArgument(format!(
+                        "invalid base media decode time: {value}"
+                    ))
                 })?;
                 options.base_media_decode_time = Some(value);
                 index += 2;
             }
+            "-path" | "--path" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(EditCliError::InvalidArgument(
+                        "missing value for -path".to_string(),
+                    ));
+                };
+                let path = BoxPath::parse(value).map_err(|error| {
+                    EditCliError::InvalidArgument(format!("invalid box path: {error}"))
+                })?;
+                paths.push(path);
+                index += 2;
+            }
             "-drop" | "--drop" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err(EditError::InvalidArgument(
+                    return Err(EditCliError::InvalidArgument(
                         "missing value for -drop".to_string(),
                     ));
                 };
@@ -130,16 +164,16 @@ fn parse_args(args: &[String]) -> Result<(EditOptions, &str, &str), EditError> {
                     options
                         .drop_boxes
                         .insert(FourCc::try_from(name).map_err(|_| {
-                            EditError::InvalidArgument(format!(
+                            EditCliError::InvalidArgument(format!(
                                 "box types passed to -drop must be 4 bytes: {name}"
                             ))
                         })?);
                 }
                 index += 2;
             }
-            "-h" | "--help" => return Err(EditError::UsageRequested),
+            "-h" | "--help" => return Err(EditCliError::UsageRequested),
             value if value.starts_with('-') => {
-                return Err(EditError::InvalidArgument(format!(
+                return Err(EditCliError::InvalidArgument(format!(
                     "unknown edit option: {value}"
                 )));
             }
@@ -151,10 +185,177 @@ fn parse_args(args: &[String]) -> Result<(EditOptions, &str, &str), EditError> {
     }
 
     if positional.len() != 2 {
-        return Err(EditError::UsageRequested);
+        return Err(EditCliError::UsageRequested);
     }
 
-    Ok((options, positional[0], positional[1]))
+    if !paths.is_empty() && options.base_media_decode_time.is_none() {
+        return Err(EditCliError::InvalidArgument(
+            "edit -path currently supports only -base_media_decode_time rewrites".to_string(),
+        ));
+    }
+
+    Ok(ParsedEditArgs {
+        options,
+        paths,
+        input_path: positional[0],
+        output_path: positional[1],
+    })
+}
+
+fn edit_reader_scoped_paths<R, W>(
+    reader: &mut R,
+    writer: W,
+    options: &EditOptions,
+    paths: &[BoxPath],
+) -> Result<(), EditCliError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+{
+    let Some(base_media_decode_time) = options.base_media_decode_time else {
+        return Err(EditCliError::InvalidArgument(
+            "edit -path currently supports only -base_media_decode_time rewrites".to_string(),
+        ));
+    };
+
+    let matched_tfdt =
+        extract_boxes_as::<_, Tfdt>(reader, None, paths).map_err(map_scoped_extract_error)?;
+    if base_media_decode_time > u64::from(u32::MAX)
+        && matched_tfdt.iter().any(|tfdt| tfdt.version() == 0)
+    {
+        return Err(EditCliError::Edit(EditError::NumericOverflow {
+            field_name: "base media decode time",
+        }));
+    }
+
+    reader.seek(SeekFrom::Start(0))?;
+    let mut scoped_output = Cursor::new(Vec::new());
+    rewrite_boxes_as::<_, _, Tfdt, _>(reader, &mut scoped_output, paths, |tfdt| {
+        if tfdt.version() == 0 {
+            tfdt.base_media_decode_time_v0 = base_media_decode_time as u32;
+        } else {
+            tfdt.base_media_decode_time_v1 = base_media_decode_time;
+        }
+    })
+    .map_err(map_scoped_rewrite_error)?;
+
+    let scoped_bytes = scoped_output.into_inner();
+    let follow_up_options = EditOptions {
+        base_media_decode_time: None,
+        drop_boxes: options.drop_boxes.clone(),
+    };
+    if follow_up_options.is_noop() {
+        let mut writer = writer;
+        writer.write_all(&scoped_bytes)?;
+        return Ok(());
+    }
+
+    let mut scoped_reader = Cursor::new(scoped_bytes);
+    edit_reader(&mut scoped_reader, writer, &follow_up_options).map_err(EditCliError::Edit)
+}
+
+fn map_scoped_extract_error(error: ExtractError) -> EditCliError {
+    match error {
+        ExtractError::Io(error) => EditCliError::Edit(EditError::Io(error)),
+        ExtractError::Header(error) => EditCliError::Edit(EditError::Header(error)),
+        ExtractError::Codec(error) => EditCliError::Edit(EditError::Codec(error)),
+        ExtractError::Walk(error) => EditCliError::Edit(map_walk_error(error)),
+        ExtractError::EmptyPath => {
+            EditCliError::InvalidArgument("box path must not be empty".to_string())
+        }
+        ExtractError::PayloadDecode { source, .. } => EditCliError::Edit(EditError::Codec(source)),
+        ExtractError::UnexpectedPayloadType {
+            path,
+            box_type,
+            offset,
+            ..
+        } => EditCliError::InvalidArgument(format!(
+            "path-based -base_media_decode_time rewrites require tfdt boxes: matched {path} (type={box_type}, offset={offset})"
+        )),
+    }
+}
+
+fn map_scoped_rewrite_error(error: RewriteError) -> EditCliError {
+    match error {
+        RewriteError::Io(error) => EditCliError::Edit(EditError::Io(error)),
+        RewriteError::Header(error) => EditCliError::Edit(EditError::Header(error)),
+        RewriteError::Codec(error) => EditCliError::Edit(EditError::Codec(error)),
+        RewriteError::Writer(error) => EditCliError::Edit(EditError::Writer(error)),
+        RewriteError::EmptyPath => {
+            EditCliError::InvalidArgument("box path must not be empty".to_string())
+        }
+        RewriteError::PayloadDecode { source, .. } | RewriteError::PayloadEncode { source, .. } => {
+            EditCliError::Edit(EditError::Codec(source))
+        }
+        RewriteError::UnexpectedPayloadType {
+            path,
+            box_type,
+            offset,
+            ..
+        } => EditCliError::InvalidArgument(format!(
+            "path-based -base_media_decode_time rewrites require tfdt boxes: matched {path} (type={box_type}, offset={offset})"
+        )),
+        RewriteError::TooLargeBoxSize {
+            box_type,
+            size,
+            available_size,
+        } => EditCliError::Edit(EditError::TooLargeBoxSize {
+            box_type,
+            size,
+            available_size,
+        }),
+        RewriteError::UnexpectedEof => EditCliError::Edit(EditError::UnexpectedEof),
+    }
+}
+
+fn map_walk_error(error: WalkError) -> EditError {
+    match error {
+        WalkError::Io(error) => EditError::Io(error),
+        WalkError::Header(error) => EditError::Header(error),
+        WalkError::Codec(error) => EditError::Codec(error),
+        WalkError::TooLargeBoxSize {
+            box_type,
+            size,
+            available_size,
+        } => EditError::TooLargeBoxSize {
+            box_type,
+            size,
+            available_size,
+        },
+        WalkError::UnexpectedEof => EditError::UnexpectedEof,
+    }
+}
+
+#[derive(Debug)]
+enum EditCliError {
+    Edit(EditError),
+    InvalidArgument(String),
+    UsageRequested,
+}
+
+impl fmt::Display for EditCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Edit(error) => error.fmt(f),
+            Self::InvalidArgument(message) => f.write_str(message),
+            Self::UsageRequested => f.write_str("usage requested"),
+        }
+    }
+}
+
+impl Error for EditCliError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Edit(error) => Some(error),
+            Self::InvalidArgument(..) | Self::UsageRequested => None,
+        }
+    }
+}
+
+impl From<io::Error> for EditCliError {
+    fn from(value: io::Error) -> Self {
+        Self::Edit(EditError::Io(value))
+    }
 }
 
 #[derive(Clone, Copy)]

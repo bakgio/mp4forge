@@ -1,3 +1,13 @@
+# 0.4.0 (April 22, 2026)
+
+- Added richer additive probe surfaces for broader codec families, codec-specific details, media-characteristics reporting, and lighter-weight probe controls for large-file inspection
+- Added deterministic structured dump and `psshdump` JSON/YAML export, field-level dump payload reporting, and repeatable path or protection filters shared across text and structured output
+- Expanded CLI path ergonomics with parsed-path extraction, subtree-scoped dump selection, path-scoped typed edit flows, and richer `psshdump` filtering by box path, system ID, and KID
+- Improved `divide` by deriving playlist signaling from probed metadata and adding a first-class validation mode for unsupported fragmented layouts before any output is written
+- Added optional `serde` support for reusable report types, including nested probe and dump companion data intended for library-side embedding
+- Expanded checked-in fixture coverage for AV1, VP9, AAC, Opus, and PCM, and added dedicated high-level fuzz targets for probe, structured dump, and typed rewrite surfaces
+- Refined README guidance, examples, tests, and goldens across the newer higher-level library and CLI workflows while preserving the existing low-level usage paths
+
 # 0.3.0 (April 22, 2026)
 
 - Added byte-slice convenience helpers for typed extract, rewrite, and probe workflows so higher-level integrations can stay in-memory without dropping to the lower-level APIs

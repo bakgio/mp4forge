@@ -15,7 +15,7 @@ fn dispatch_prints_usage_for_empty_or_unknown_commands() {
             "  divide       split a fragmented MP4 into track playlists\n",
             "  dump         display the MP4 box tree\n",
             "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type\n",
+            "  extract      extract raw boxes by type or path\n",
             "  psshdump     summarize pssh boxes\n",
             "  probe        summarize an MP4 file\n"
         )
@@ -37,7 +37,7 @@ fn dispatch_prints_usage_for_empty_or_unknown_commands() {
             "  divide       split a fragmented MP4 into track playlists\n",
             "  dump         display the MP4 box tree\n",
             "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type\n",
+            "  extract      extract raw boxes by type or path\n",
             "  psshdump     summarize pssh boxes\n",
             "  probe        summarize an MP4 file\n"
         )
@@ -62,7 +62,7 @@ fn dispatch_handles_help() {
             "  divide       split a fragmented MP4 into track playlists\n",
             "  dump         display the MP4 box tree\n",
             "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type\n",
+            "  extract      extract raw boxes by type or path\n",
             "  psshdump     summarize pssh boxes\n",
             "  probe        summarize an MP4 file\n"
         )

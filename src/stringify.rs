@@ -8,6 +8,39 @@ use crate::codec::{
     ResolvedField,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StructuredStringifyField {
+    pub name: &'static str,
+    pub value: FieldValue,
+    pub rendered_value: String,
+    pub include_display_value: bool,
+}
+
+pub(crate) fn collect_structured_fields(
+    src: &dyn CodecDescription,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<Vec<StructuredStringifyField>, StringifyError> {
+    let mut resolved = src.field_table().resolve_active(src, hooks)?;
+    resolved.sort_by_key(ResolvedField::display_order);
+    let mut rendered_fields = Vec::new();
+
+    for field in resolved {
+        if field.descriptor.constant.is_some() || field.descriptor.display.hidden {
+            continue;
+        }
+
+        let (value, rendered_value, include_display_value) = collect_field(src, field)?;
+        rendered_fields.push(StructuredStringifyField {
+            name: field.name(),
+            value,
+            rendered_value,
+            include_display_value,
+        });
+    }
+
+    Ok(rendered_fields)
+}
+
 /// Renders a descriptor-backed box into the compact single-line form used by tests and CLI output.
 pub fn stringify(
     src: &dyn CodecDescription,
@@ -22,17 +55,10 @@ pub fn stringify_with_indent(
     indent: &str,
     hooks: Option<&dyn FieldHooks>,
 ) -> Result<String, StringifyError> {
-    let mut resolved = src.field_table().resolve_active(src, hooks)?;
-    resolved.sort_by_key(ResolvedField::display_order);
-    let mut rendered_fields = Vec::new();
-
-    for field in resolved {
-        if field.descriptor.constant.is_some() || field.descriptor.display.hidden {
-            continue;
-        }
-
-        rendered_fields.push(render_field(src, field)?);
-    }
+    let rendered_fields = collect_structured_fields(src, hooks)?
+        .into_iter()
+        .map(|field| format!("{}={}", field.name, field.rendered_value))
+        .collect::<Vec<_>>();
 
     if indent.is_empty() {
         return Ok(rendered_fields.join(" "));
@@ -47,24 +73,50 @@ pub fn stringify_with_indent(
     Ok(rendered)
 }
 
-fn render_field(
+fn collect_field(
     src: &dyn CodecDescription,
     field: ResolvedField<'_>,
+) -> Result<(FieldValue, String, bool), StringifyError> {
+    match field.descriptor.role {
+        crate::codec::FieldRole::Version => {
+            let value = FieldValue::Unsigned(u64::from(src.version()));
+            let rendered = value_string(field, src, &value)?;
+            Ok((value, rendered, false))
+        }
+        crate::codec::FieldRole::Flags => {
+            let value = FieldValue::Unsigned(u64::from(src.flags()));
+            let rendered = render_flags(src.flags(), field);
+            Ok((value, rendered, true))
+        }
+        crate::codec::FieldRole::Data => {
+            let value = src.field_value(field.name())?;
+            let rendered = value_string(field, src, &value)?;
+            let include_display_value = src.display_field(field.name()).is_some()
+                || !matches!(
+                    field.descriptor.display.format,
+                    FieldFormat::Default | FieldFormat::Decimal
+                );
+            Ok((value, rendered, include_display_value))
+        }
+    }
+}
+
+fn value_string(
+    field: ResolvedField<'_>,
+    src: &dyn CodecDescription,
+    value: &FieldValue,
 ) -> Result<String, StringifyError> {
-    let value = match field.descriptor.role {
-        crate::codec::FieldRole::Version => src.version().to_string(),
-        crate::codec::FieldRole::Flags => render_flags(src.flags(), field),
+    match field.descriptor.role {
+        crate::codec::FieldRole::Version => render_default_value(value),
+        crate::codec::FieldRole::Flags => Ok(render_flags(src.flags(), field)),
         crate::codec::FieldRole::Data => {
             if let Some(rendered) = src.display_field(field.name()) {
-                rendered
+                Ok(rendered)
             } else {
-                let value = src.field_value(field.name())?;
-                render_value(field, &value)?
+                render_value(field, value)
             }
         }
-    };
-
-    Ok(format!("{}={value}", field.name()))
+    }
 }
 
 fn render_flags(value: u32, field: ResolvedField<'_>) -> String {

@@ -25,11 +25,6 @@
       "SampleEntryType": "avc1",
       "Width": 320,
       "Height": 180,
-      "SampleNum": 10,
-      "ChunkNum": 9,
-      "IDRFrameNum": 1,
-      "Bitrate": 40336,
-      "MaxBitrate": 40336,
       "CodecDetails": {
         "Kind": "avc",
         "ConfigurationVersion": 1,
@@ -58,10 +53,6 @@
       "SampleEntryType": "mp4a",
       "ChannelCount": 2,
       "SampleRate": 44100,
-      "SampleNum": 44,
-      "ChunkNum": 9,
-      "Bitrate": 10570,
-      "MaxBitrate": 10632,
       "CodecDetails": {
         "Kind": "mp4_audio",
         "ObjectTypeIndication": 64,

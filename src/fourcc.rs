@@ -103,6 +103,61 @@ impl fmt::Debug for FourCc {
     }
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for FourCc {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.serde_string())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for FourCc {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_serde_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl FourCc {
+    // Keep the serde form lossless instead of reusing the display formatter's `(c)` expansion.
+    fn serde_string(self) -> String {
+        if self.0.iter().all(|byte| matches!(byte, 0x20..=0x7e)) {
+            self.0.iter().map(|byte| char::from(*byte)).collect()
+        } else {
+            format!(
+                "0x{:02x}{:02x}{:02x}{:02x}",
+                self.0[0], self.0[1], self.0[2], self.0[3]
+            )
+        }
+    }
+
+    fn from_serde_str(value: &str) -> Result<Self, String> {
+        if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            if hex.len() != 8 {
+                return Err(format!(
+                    "hex fourcc values must contain exactly 8 digits, got {}",
+                    hex.len()
+                ));
+            }
+            let parsed = u32::from_str_radix(hex, 16)
+                .map_err(|error| format!("invalid hex fourcc value: {error}"))?;
+            return Ok(Self::from_u32(parsed));
+        }
+
+        Self::try_from(value).map_err(|error| error.to_string())
+    }
+}
+
 /// Error returned when a string does not contain exactly four bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseFourCcError {

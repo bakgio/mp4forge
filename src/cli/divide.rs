@@ -1,6 +1,6 @@
 //! Fragmented-file split command support.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
@@ -11,7 +11,9 @@ use crate::FourCc;
 use crate::boxes::iso14496_12::{Tfhd, Tkhd};
 use crate::extract::{ExtractError, extract_boxes_with_payload};
 use crate::header::{BoxInfo, HeaderError};
-use crate::probe::{ProbeError, ProbeInfo, TrackCodec, probe};
+use crate::probe::{
+    DetailedProbeInfo, DetailedTrackInfo, ProbeError, TrackCodecFamily, probe_detailed,
+};
 use crate::walk::BoxPath;
 use crate::writer::{Writer, WriterError};
 
@@ -32,14 +34,24 @@ const VIDEO_ENC_DIR: &str = "video_enc";
 const AUDIO_ENC_DIR: &str = "audio_enc";
 const INIT_FILE_NAME: &str = "init.mp4";
 const PLAYLIST_FILE_NAME: &str = "playlist.m3u8";
-const MASTER_PLAYLIST_CODECS: &str = "avc1.64001f,mp4a.40.2";
 
 /// Runs the divide subcommand with `args`, writing files under `OUTPUT_DIR`.
 pub fn run<E>(args: &[String], stderr: &mut E) -> i32
 where
     E: Write,
 {
-    match run_inner(args) {
+    let mut stdout = io::sink();
+    run_with_output(args, &mut stdout, stderr)
+}
+
+/// Runs the divide subcommand with `args`, writing validation output to `stdout` when requested
+/// and errors to `stderr`.
+pub fn run_with_output<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> i32
+where
+    W: Write,
+    E: Write,
+{
+    match run_inner(args, stdout) {
         Ok(()) => 0,
         Err(DivideError::UsageRequested) => {
             let _ = write_usage(stderr);
@@ -57,30 +69,97 @@ pub fn write_usage<W>(writer: &mut W) -> io::Result<()>
 where
     W: Write,
 {
-    writeln!(writer, "USAGE: mp4forge divide INPUT.mp4 OUTPUT_DIR")
+    writeln!(writer, "USAGE: mp4forge divide INPUT.mp4 OUTPUT_DIR")?;
+    writeln!(writer, "       mp4forge divide -validate INPUT.mp4")?;
+    writeln!(writer)?;
+    writeln!(writer, "OPTIONS:")?;
+    writeln!(
+        writer,
+        "  -validate    Validate the fragmented divide layout without writing output files"
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "Currently supports fragmented inputs with up to one AVC video track and one MP4A audio track,"
+    )?;
+    writeln!(
+        writer,
+        "including encrypted wrappers that preserve those original sample-entry formats."
+    )
 }
 
-fn run_inner(args: &[String]) -> Result<(), DivideError> {
-    if args.len() != 2 {
-        return Err(DivideError::UsageRequested);
+#[derive(Debug)]
+struct ParsedDivideArgs<'a> {
+    validate_only: bool,
+    input_path: &'a Path,
+    output_dir: Option<&'a Path>,
+}
+
+fn run_inner<W>(args: &[String], stdout: &mut W) -> Result<(), DivideError>
+where
+    W: Write,
+{
+    let parsed = parse_args(args)?;
+    let mut input = File::open(parsed.input_path)?;
+    if parsed.validate_only {
+        let report = validate_divide_reader(&mut input)?;
+        write_validation_report(stdout, &report)?;
+        return Ok(());
     }
 
-    let input_path = Path::new(&args[0]);
-    let output_dir = Path::new(&args[1]);
-    let mut input = File::open(input_path)?;
-    divide_reader(&mut input, output_dir)
+    divide_reader(
+        &mut input,
+        parsed.output_dir.ok_or(DivideError::UsageRequested)?,
+    )
+}
+
+fn parse_args(args: &[String]) -> Result<ParsedDivideArgs<'_>, DivideError> {
+    let mut validate_only = false;
+    let mut positional = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-validate" | "--validate" => {
+                validate_only = true;
+                index += 1;
+            }
+            "-h" | "--help" => return Err(DivideError::UsageRequested),
+            value if value.starts_with('-') => {
+                return Err(invalid_input(format!("unknown divide option: {value}")));
+            }
+            value => {
+                positional.push(Path::new(value));
+                index += 1;
+            }
+        }
+    }
+
+    match (validate_only, positional.as_slice()) {
+        (true, [input_path]) => Ok(ParsedDivideArgs {
+            validate_only,
+            input_path,
+            output_dir: None,
+        }),
+        (false, [input_path, output_dir]) => Ok(ParsedDivideArgs {
+            validate_only,
+            input_path,
+            output_dir: Some(output_dir),
+        }),
+        _ => Err(DivideError::UsageRequested),
+    }
 }
 
 /// Splits a fragmented MP4 reader into per-track outputs under `output_dir`.
+///
+/// The current `divide` surface supports fragmented inputs with at most one AVC video track and
+/// one MP4A audio track, including encrypted `encv` and `enca` wrappers when the original format
+/// is still `avc1` or `mp4a`.
 pub fn divide_reader<R>(reader: &mut R, output_dir: &Path) -> Result<(), DivideError>
 where
     R: Read + Seek,
 {
-    let summary = probe(reader)?;
-    let mut tracks = build_track_outputs(&summary, output_dir)?;
-    if tracks.is_empty() {
-        return Err(DivideError::NoSupportedTracks);
-    }
+    let plans = validate_divide_track_plans(reader)?;
+    let mut tracks = build_track_outputs(&plans, output_dir)?;
 
     reader.seek(SeekFrom::Start(0))?;
     write_init_segments(reader, &mut tracks)?;
@@ -98,8 +177,52 @@ enum TrackKind {
     EncryptedAudio,
 }
 
+/// High-level role assigned to one active track in the currently supported divide layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DivideTrackRole {
+    Video,
+    Audio,
+}
+
+/// Validation summary for one active fragmented track accepted by `divide`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DivideValidationTrack {
+    /// Track identifier selected from `tkhd` and referenced by fragmented runs.
+    pub track_id: u32,
+    /// Role assigned by the current divide layout rules.
+    pub role: DivideTrackRole,
+    /// Whether the selected track uses an encrypted sample-entry wrapper.
+    pub encrypted: bool,
+    /// Normalized codec family derived from the sample entry or protected original format.
+    pub codec_family: TrackCodecFamily,
+    /// Sample-entry box type selected from `stsd`, including encrypted wrappers such as `encv`.
+    pub sample_entry_type: Option<FourCc>,
+    /// Original-format sample-entry type from `frma` when the track is protected.
+    pub original_format: Option<FourCc>,
+    /// Number of fragmented media segments currently associated with the track.
+    pub segment_count: usize,
+}
+
+/// Additive divide preflight report returned when the fragmented layout is currently supported.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DivideValidationReport {
+    /// Active fragmented tracks accepted by the current divide layout rules.
+    pub tracks: Vec<DivideValidationTrack>,
+}
+
+struct TrackLayout {
+    role: DivideTrackRole,
+    kind: TrackKind,
+    codecs: String,
+    audio_channels: Option<u16>,
+    width: Option<u16>,
+    height: Option<u16>,
+}
+
 struct TrackOutput {
     kind: TrackKind,
+    codecs: String,
+    audio_channels: Option<u16>,
     width: Option<u16>,
     height: Option<u16>,
     segment_durations: Vec<f64>,
@@ -109,40 +232,57 @@ struct TrackOutput {
     next_segment_index: usize,
 }
 
+struct ValidatedTrackPlan {
+    validation: DivideValidationTrack,
+    layout: TrackLayout,
+    segment_durations: Vec<f64>,
+}
+
+/// Validates whether `reader` matches the fragmented layout currently supported by
+/// [`divide_reader`] without creating any output files.
+///
+/// On success, the returned report lists the active fragmented tracks that would participate in
+/// the divide output. On failure, the returned [`DivideError`] explains why the current layout is
+/// unsupported.
+pub fn validate_divide_reader<R>(reader: &mut R) -> Result<DivideValidationReport, DivideError>
+where
+    R: Read + Seek,
+{
+    let plans = validate_divide_track_plans(reader)?;
+    Ok(DivideValidationReport {
+        tracks: plans.into_iter().map(|plan| plan.validation).collect(),
+    })
+}
+
+fn validate_divide_track_plans<R>(reader: &mut R) -> Result<Vec<ValidatedTrackPlan>, DivideError>
+where
+    R: Read + Seek,
+{
+    reader.seek(SeekFrom::Start(0))?;
+    let summary = probe_detailed(reader)?;
+    collect_track_plans(&summary)
+}
+
 fn build_track_outputs(
-    summary: &ProbeInfo,
+    plans: &[ValidatedTrackPlan],
     output_dir: &Path,
 ) -> Result<BTreeMap<u32, TrackOutput>, DivideError> {
     let mut tracks = BTreeMap::new();
-    for track in &summary.tracks {
-        let Some((kind, dir_name, width, height)) = track_layout(track) else {
-            continue;
-        };
 
-        let track_dir = output_dir.join(dir_name);
+    for plan in plans {
+        let track_dir = output_dir.join(relative_dir(plan.layout.kind));
         fs::create_dir_all(&track_dir)?;
         let init_writer = Writer::new(File::create(track_dir.join(INIT_FILE_NAME))?);
 
-        let segment_durations = summary
-            .segments
-            .iter()
-            .filter(|segment| segment.track_id == track.track_id)
-            .map(|segment| {
-                if track.timescale == 0 {
-                    0.0
-                } else {
-                    segment.duration as f64 / f64::from(track.timescale)
-                }
-            })
-            .collect::<Vec<_>>();
-
         tracks.insert(
-            track.track_id,
+            plan.validation.track_id,
             TrackOutput {
-                kind,
-                width,
-                height,
-                segment_durations,
+                kind: plan.layout.kind,
+                codecs: plan.layout.codecs.clone(),
+                audio_channels: plan.layout.audio_channels,
+                width: plan.layout.width,
+                height: plan.layout.height,
+                segment_durations: plan.segment_durations.clone(),
                 bandwidth: 0,
                 output_dir: track_dir,
                 init_writer,
@@ -154,25 +294,151 @@ fn build_track_outputs(
     Ok(tracks)
 }
 
-fn track_layout(
-    track: &crate::probe::TrackInfo,
-) -> Option<(TrackKind, &'static str, Option<u16>, Option<u16>)> {
-    match (track.codec, track.encrypted) {
-        (TrackCodec::Avc1, false) => Some((
-            TrackKind::Video,
-            VIDEO_DIR,
-            track.avc.as_ref().map(|avc| avc.width),
-            track.avc.as_ref().map(|avc| avc.height),
-        )),
-        (TrackCodec::Avc1, true) => Some((
-            TrackKind::EncryptedVideo,
-            VIDEO_ENC_DIR,
-            track.avc.as_ref().map(|avc| avc.width),
-            track.avc.as_ref().map(|avc| avc.height),
-        )),
-        (TrackCodec::Mp4a, false) => Some((TrackKind::Audio, AUDIO_DIR, None, None)),
-        (TrackCodec::Mp4a, true) => Some((TrackKind::EncryptedAudio, AUDIO_ENC_DIR, None, None)),
-        (TrackCodec::Unknown, _) => None,
+fn collect_track_plans(
+    summary: &DetailedProbeInfo,
+) -> Result<Vec<ValidatedTrackPlan>, DivideError> {
+    let active_track_ids = summary
+        .segments
+        .iter()
+        .map(|segment| segment.track_id)
+        .collect::<BTreeSet<_>>();
+    let known_track_ids = summary
+        .tracks
+        .iter()
+        .map(|track| track.summary.track_id)
+        .collect::<BTreeSet<_>>();
+
+    if let Some(track_id) = active_track_ids.difference(&known_track_ids).next() {
+        return Err(DivideError::UnknownTrack(*track_id));
+    }
+
+    let mut tracks = BTreeMap::new();
+    let mut selected_video_track_id = None;
+    let mut selected_audio_track_id = None;
+
+    for track in &summary.tracks {
+        if !active_track_ids.contains(&track.summary.track_id) {
+            continue;
+        }
+        let layout = track_layout(track)?;
+        match layout.role {
+            DivideTrackRole::Video => {
+                if let Some(existing_track_id) =
+                    selected_video_track_id.replace(track.summary.track_id)
+                {
+                    return Err(invalid_input(format!(
+                        "{}; found multiple fragmented video tracks ({existing_track_id} and {}).",
+                        supported_scope_message(),
+                        track.summary.track_id
+                    )));
+                }
+            }
+            DivideTrackRole::Audio => {
+                if let Some(existing_track_id) =
+                    selected_audio_track_id.replace(track.summary.track_id)
+                {
+                    return Err(invalid_input(format!(
+                        "{}; found multiple fragmented audio tracks ({existing_track_id} and {}).",
+                        supported_scope_message(),
+                        track.summary.track_id
+                    )));
+                }
+            }
+        }
+
+        let segment_durations = summary
+            .segments
+            .iter()
+            .filter(|segment| segment.track_id == track.summary.track_id)
+            .map(|segment| {
+                if track.summary.timescale == 0 {
+                    0.0
+                } else {
+                    segment.duration as f64 / f64::from(track.summary.timescale)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        tracks.insert(
+            track.summary.track_id,
+            ValidatedTrackPlan {
+                validation: DivideValidationTrack {
+                    track_id: track.summary.track_id,
+                    role: layout.role,
+                    encrypted: track.summary.encrypted,
+                    codec_family: track.codec_family,
+                    sample_entry_type: track.sample_entry_type,
+                    original_format: track.original_format,
+                    segment_count: segment_durations.len(),
+                },
+                layout,
+                segment_durations,
+            },
+        );
+    }
+
+    let plans = tracks.into_values().collect::<Vec<_>>();
+    if plans.is_empty() {
+        return Err(DivideError::NoSupportedTracks);
+    }
+
+    Ok(plans)
+}
+
+fn track_layout(track: &DetailedTrackInfo) -> Result<TrackLayout, DivideError> {
+    match track.codec_family {
+        TrackCodecFamily::Avc => {
+            let avc = track.summary.avc.as_ref().ok_or_else(|| {
+                invalid_input(format!(
+                    "track {} is missing the AVC decoder configuration needed for divide playlist signaling.",
+                    track.summary.track_id
+                ))
+            })?;
+            Ok(TrackLayout {
+                role: DivideTrackRole::Video,
+                kind: if track.summary.encrypted {
+                    TrackKind::EncryptedVideo
+                } else {
+                    TrackKind::Video
+                },
+                codecs: format!(
+                    "avc1.{:02x}{:02x}{:02x}",
+                    avc.profile, avc.profile_compatibility, avc.level
+                ),
+                audio_channels: None,
+                width: track.display_width.or(Some(avc.width)),
+                height: track.display_height.or(Some(avc.height)),
+            })
+        }
+        TrackCodecFamily::Mp4Audio => {
+            let mp4a = track.summary.mp4a.as_ref().ok_or_else(|| {
+                invalid_input(format!(
+                    "track {} is missing the MP4A decoder configuration needed for divide playlist signaling.",
+                    track.summary.track_id
+                ))
+            })?;
+            Ok(TrackLayout {
+                role: DivideTrackRole::Audio,
+                kind: if track.summary.encrypted {
+                    TrackKind::EncryptedAudio
+                } else {
+                    TrackKind::Audio
+                },
+                codecs: mp4a_codec_string(mp4a.object_type_indication, mp4a.audio_object_type),
+                audio_channels: track
+                    .channel_count
+                    .or(Some(mp4a.channel_count))
+                    .filter(|value| *value != 0),
+                width: None,
+                height: None,
+            })
+        }
+        _ => Err(invalid_input(format!(
+            "track {} uses unsupported codec `{}`; {}",
+            track.summary.track_id,
+            track_codec_label(track),
+            supported_scope_message()
+        ))),
     }
 }
 
@@ -332,18 +598,23 @@ fn write_playlists(
         let mut master = File::create(output_dir.join(PLAYLIST_FILE_NAME))?;
         writeln!(master, "#EXTM3U")?;
         if let Some(audio) = audio {
-            writeln!(
+            write!(
                 master,
-                "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"{}/{}\",GROUP-ID=\"audio\",NAME=\"audio\",AUTOSELECT=YES,CHANNELS=\"2\"",
+                "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"{}/{}\",GROUP-ID=\"audio\",NAME=\"audio\",AUTOSELECT=YES",
                 relative_dir(audio.kind),
                 PLAYLIST_FILE_NAME
             )?;
+            if let Some(channels) = audio.audio_channels {
+                write!(master, ",CHANNELS=\"{channels}\"")?;
+            }
+            writeln!(master)?;
         }
 
         write!(
             master,
             "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\"",
-            video.bandwidth, MASTER_PLAYLIST_CODECS
+            video.bandwidth,
+            master_playlist_codecs(video, audio)
         )?;
         if let (Some(width), Some(height)) = (video.width, video.height) {
             write!(master, ",RESOLUTION={}x{}", width, height)?;
@@ -396,6 +667,103 @@ fn relative_dir(kind: TrackKind) -> &'static str {
 
 fn segment_file_name(index: usize) -> String {
     format!("{index}.mp4")
+}
+
+fn master_playlist_codecs(video: &TrackOutput, audio: Option<&TrackOutput>) -> String {
+    match audio {
+        Some(audio) => format!("{},{}", video.codecs, audio.codecs),
+        None => video.codecs.clone(),
+    }
+}
+
+fn mp4a_codec_string(object_type_indication: u8, audio_object_type: u8) -> String {
+    if object_type_indication == 0 {
+        "mp4a".to_string()
+    } else if audio_object_type == 0 {
+        format!("mp4a.{object_type_indication:x}")
+    } else {
+        format!("mp4a.{object_type_indication:x}.{audio_object_type}")
+    }
+}
+
+fn write_validation_report<W>(
+    writer: &mut W,
+    report: &DivideValidationReport,
+) -> Result<(), DivideError>
+where
+    W: Write,
+{
+    writeln!(writer, "supported fragmented divide layout")?;
+    for track in &report.tracks {
+        writeln!(
+            writer,
+            "track {}: role={} codec={} segments={}",
+            track.track_id,
+            validation_role_label(track.role),
+            validation_codec_label(track),
+            track.segment_count
+        )?;
+    }
+    Ok(())
+}
+
+fn validation_role_label(role: DivideTrackRole) -> &'static str {
+    match role {
+        DivideTrackRole::Video => "video",
+        DivideTrackRole::Audio => "audio",
+    }
+}
+
+fn validation_codec_label(track: &DivideValidationTrack) -> String {
+    track
+        .original_format
+        .or(track.sample_entry_type)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| match track.codec_family {
+            TrackCodecFamily::Unknown => "unknown".to_string(),
+            TrackCodecFamily::Avc => "avc".to_string(),
+            TrackCodecFamily::Hevc => "hevc".to_string(),
+            TrackCodecFamily::Av1 => "av1".to_string(),
+            TrackCodecFamily::Vp8 => "vp8".to_string(),
+            TrackCodecFamily::Vp9 => "vp9".to_string(),
+            TrackCodecFamily::Mp4Audio => "mp4a".to_string(),
+            TrackCodecFamily::Opus => "opus".to_string(),
+            TrackCodecFamily::Ac3 => "ac-3".to_string(),
+            TrackCodecFamily::Pcm => "pcm".to_string(),
+            TrackCodecFamily::XmlSubtitle => "stpp".to_string(),
+            TrackCodecFamily::TextSubtitle => "sbtt".to_string(),
+            TrackCodecFamily::WebVtt => "wvtt".to_string(),
+        })
+}
+
+fn track_codec_label(track: &DetailedTrackInfo) -> String {
+    track
+        .original_format
+        .or(track.sample_entry_type)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| match track.codec_family {
+            TrackCodecFamily::Unknown => "unknown".to_string(),
+            TrackCodecFamily::Avc => "avc".to_string(),
+            TrackCodecFamily::Hevc => "hevc".to_string(),
+            TrackCodecFamily::Av1 => "av1".to_string(),
+            TrackCodecFamily::Vp8 => "vp8".to_string(),
+            TrackCodecFamily::Vp9 => "vp9".to_string(),
+            TrackCodecFamily::Mp4Audio => "mp4a".to_string(),
+            TrackCodecFamily::Opus => "opus".to_string(),
+            TrackCodecFamily::Ac3 => "ac-3".to_string(),
+            TrackCodecFamily::Pcm => "pcm".to_string(),
+            TrackCodecFamily::XmlSubtitle => "stpp".to_string(),
+            TrackCodecFamily::TextSubtitle => "sbtt".to_string(),
+            TrackCodecFamily::WebVtt => "wvtt".to_string(),
+        })
+}
+
+fn supported_scope_message() -> &'static str {
+    "divide currently supports fragmented inputs with at most one AVC video track and one MP4A audio track"
+}
+
+fn invalid_input(message: String) -> DivideError {
+    DivideError::Io(io::Error::new(io::ErrorKind::InvalidInput, message))
 }
 
 fn trak_track_id<R>(reader: &mut R, trak: &BoxInfo) -> Result<u32, DivideError>
@@ -490,7 +858,11 @@ impl fmt::Display for DivideError {
             Self::MissingTrackId => f.write_str("track id not found"),
             Self::UnknownTrack(track_id) => write!(f, "unknown track id: {track_id}"),
             Self::UnexpectedMdat => f.write_str("mdat appeared without a preceding moof"),
-            Self::NoSupportedTracks => f.write_str("no supported tracks found"),
+            Self::NoSupportedTracks => write!(
+                f,
+                "no supported fragmented tracks found; {}",
+                supported_scope_message()
+            ),
             Self::NumericOverflow => f.write_str("numeric value does not fit in memory"),
             Self::UsageRequested => f.write_str("usage requested"),
         }

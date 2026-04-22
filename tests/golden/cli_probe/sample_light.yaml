@@ -22,11 +22,6 @@ tracks:
   sample_entry_type: avc1
   width: 320
   height: 180
-  sample_num: 10
-  chunk_num: 9
-  idr_frame_num: 1
-  bitrate: 40336
-  max_bitrate: 40336
   codec_details:
     kind: avc
     configuration_version: 1
@@ -50,10 +45,6 @@ tracks:
   sample_entry_type: mp4a
   channel_count: 2
   sample_rate: 44100
-  sample_num: 44
-  chunk_num: 9
-  bitrate: 10570
-  max_bitrate: 10632
   codec_details:
     kind: mp4_audio
     object_type_indication: 64

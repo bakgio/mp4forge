@@ -1,0 +1,2308 @@
+{
+  "Boxes": [
+    {
+      "BoxType": "ftyp",
+      "Path": "ftyp",
+      "Offset": 0,
+      "Size": 32,
+      "Supported": true,
+      "PayloadStatus": "summary",
+      "PayloadFields": [
+        {
+          "Name": "MajorBrand",
+          "ValueKind": "bytes",
+          "Value": [
+            105,
+            115,
+            111,
+            109
+          ],
+          "DisplayValue": "\"isom\""
+        },
+        {
+          "Name": "MinorVersion",
+          "ValueKind": "unsigned",
+          "Value": 512
+        },
+        {
+          "Name": "CompatibleBrands",
+          "ValueKind": "bytes",
+          "Value": [
+            105,
+            115,
+            111,
+            109,
+            105,
+            115,
+            111,
+            50,
+            97,
+            118,
+            99,
+            49,
+            109,
+            112,
+            52,
+            49
+          ],
+          "DisplayValue": "[{CompatibleBrand=\"isom\"}, {CompatibleBrand=\"iso2\"}, {CompatibleBrand=\"avc1\"}, {CompatibleBrand=\"mp41\"}]"
+        }
+      ],
+      "PayloadSummary": "MajorBrand=\"isom\" MinorVersion=512 CompatibleBrands=[{CompatibleBrand=\"isom\"}, {CompatibleBrand=\"iso2\"}, {CompatibleBrand=\"avc1\"}, {CompatibleBrand=\"mp41\"}]",
+      "Children": [
+      ]
+    },
+    {
+      "BoxType": "free",
+      "Path": "free",
+      "Offset": 32,
+      "Size": 8,
+      "Supported": true,
+      "PayloadStatus": "omitted",
+      "PayloadFields": [
+      ],
+      "Children": [
+      ]
+    },
+    {
+      "BoxType": "mdat",
+      "Path": "mdat",
+      "Offset": 40,
+      "Size": 6402,
+      "Supported": true,
+      "PayloadStatus": "omitted",
+      "PayloadFields": [
+      ],
+      "Children": [
+      ]
+    },
+    {
+      "BoxType": "moov",
+      "Path": "moov",
+      "Offset": 6442,
+      "Size": 1836,
+      "Supported": true,
+      "PayloadStatus": "empty",
+      "PayloadFields": [
+      ],
+      "Children": [
+        {
+          "BoxType": "mvhd",
+          "Path": "moov/mvhd",
+          "Offset": 6450,
+          "Size": 108,
+          "Supported": true,
+          "PayloadStatus": "summary",
+          "PayloadFields": [
+            {
+              "Name": "Version",
+              "ValueKind": "unsigned",
+              "Value": 0
+            },
+            {
+              "Name": "Flags",
+              "ValueKind": "unsigned",
+              "Value": 0,
+              "DisplayValue": "0x000000"
+            },
+            {
+              "Name": "CreationTimeV0",
+              "ValueKind": "unsigned",
+              "Value": 0
+            },
+            {
+              "Name": "ModificationTimeV0",
+              "ValueKind": "unsigned",
+              "Value": 0
+            },
+            {
+              "Name": "Timescale",
+              "ValueKind": "unsigned",
+              "Value": 1000
+            },
+            {
+              "Name": "DurationV0",
+              "ValueKind": "unsigned",
+              "Value": 1024
+            },
+            {
+              "Name": "Rate",
+              "ValueKind": "signed",
+              "Value": 65536,
+              "DisplayValue": "1"
+            },
+            {
+              "Name": "Volume",
+              "ValueKind": "signed",
+              "Value": 256
+            },
+            {
+              "Name": "Matrix",
+              "ValueKind": "signed_array",
+              "Value": [
+                65536,
+                0,
+                0,
+                0,
+                65536,
+                0,
+                0,
+                0,
+                1073741824
+              ],
+              "DisplayValue": "[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000]"
+            },
+            {
+              "Name": "PreDefined",
+              "ValueKind": "signed_array",
+              "Value": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "Name": "NextTrackID",
+              "ValueKind": "unsigned",
+              "Value": 3
+            }
+          ],
+          "PayloadSummary": "Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=1000 DurationV0=1024 Rate=1 Volume=256 Matrix=[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000] PreDefined=[0, 0, 0, 0, 0, 0] NextTrackID=3",
+          "Children": [
+          ]
+        },
+        {
+          "BoxType": "trak",
+          "Path": "moov/trak",
+          "Offset": 6558,
+          "Size": 743,
+          "Supported": true,
+          "PayloadStatus": "empty",
+          "PayloadFields": [
+          ],
+          "Children": [
+            {
+              "BoxType": "tkhd",
+              "Path": "moov/trak/tkhd",
+              "Offset": 6566,
+              "Size": 92,
+              "Supported": true,
+              "PayloadStatus": "summary",
+              "PayloadFields": [
+                {
+                  "Name": "Version",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "Flags",
+                  "ValueKind": "unsigned",
+                  "Value": 3,
+                  "DisplayValue": "0x000003"
+                },
+                {
+                  "Name": "CreationTimeV0",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "ModificationTimeV0",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "TrackID",
+                  "ValueKind": "unsigned",
+                  "Value": 1
+                },
+                {
+                  "Name": "DurationV0",
+                  "ValueKind": "unsigned",
+                  "Value": 1000
+                },
+                {
+                  "Name": "Layer",
+                  "ValueKind": "signed",
+                  "Value": 0
+                },
+                {
+                  "Name": "AlternateGroup",
+                  "ValueKind": "signed",
+                  "Value": 0
+                },
+                {
+                  "Name": "Volume",
+                  "ValueKind": "signed",
+                  "Value": 0
+                },
+                {
+                  "Name": "Matrix",
+                  "ValueKind": "signed_array",
+                  "Value": [
+                    65536,
+                    0,
+                    0,
+                    0,
+                    65536,
+                    0,
+                    0,
+                    0,
+                    1073741824
+                  ],
+                  "DisplayValue": "[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000]"
+                },
+                {
+                  "Name": "Width",
+                  "ValueKind": "unsigned",
+                  "Value": 20971520,
+                  "DisplayValue": "320"
+                },
+                {
+                  "Name": "Height",
+                  "ValueKind": "unsigned",
+                  "Value": 11796480,
+                  "DisplayValue": "180"
+                }
+              ],
+              "PayloadSummary": "Version=0 Flags=0x000003 CreationTimeV0=0 ModificationTimeV0=0 TrackID=1 DurationV0=1000 Layer=0 AlternateGroup=0 Volume=0 Matrix=[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000] Width=320 Height=180",
+              "Children": [
+              ]
+            },
+            {
+              "BoxType": "edts",
+              "Path": "moov/trak/edts",
+              "Offset": 6658,
+              "Size": 36,
+              "Supported": true,
+              "PayloadStatus": "empty",
+              "PayloadFields": [
+              ],
+              "Children": [
+                {
+                  "BoxType": "elst",
+                  "Path": "moov/trak/edts/elst",
+                  "Offset": 6666,
+                  "Size": 28,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "EntryCount",
+                      "ValueKind": "unsigned",
+                      "Value": 1
+                    },
+                    {
+                      "Name": "Entries",
+                      "ValueKind": "bytes",
+                      "Value": [
+                        0,
+                        0,
+                        3,
+                        232,
+                        0,
+                        0,
+                        8,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0
+                      ],
+                      "DisplayValue": "[{SegmentDurationV0=1000 MediaTimeV0=2048 MediaRateInteger=1}]"
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=2048 MediaRateInteger=1}]",
+                  "Children": [
+                  ]
+                }
+              ]
+            },
+            {
+              "BoxType": "mdia",
+              "Path": "moov/trak/mdia",
+              "Offset": 6694,
+              "Size": 607,
+              "Supported": true,
+              "PayloadStatus": "empty",
+              "PayloadFields": [
+              ],
+              "Children": [
+                {
+                  "BoxType": "mdhd",
+                  "Path": "moov/trak/mdia/mdhd",
+                  "Offset": 6702,
+                  "Size": 32,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "CreationTimeV0",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "ModificationTimeV0",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Timescale",
+                      "ValueKind": "unsigned",
+                      "Value": 10240
+                    },
+                    {
+                      "Name": "DurationV0",
+                      "ValueKind": "unsigned",
+                      "Value": 10240
+                    },
+                    {
+                      "Name": "Language",
+                      "ValueKind": "unsigned_array",
+                      "Value": [
+                        5,
+                        14,
+                        7
+                      ],
+                      "DisplayValue": "\"eng\""
+                    },
+                    {
+                      "Name": "PreDefined",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=10240 DurationV0=10240 Language=\"eng\" PreDefined=0",
+                  "Children": [
+                  ]
+                },
+                {
+                  "BoxType": "hdlr",
+                  "Path": "moov/trak/mdia/hdlr",
+                  "Offset": 6734,
+                  "Size": 44,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "PreDefined",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "HandlerType",
+                      "ValueKind": "bytes",
+                      "Value": [
+                        118,
+                        105,
+                        100,
+                        101
+                      ],
+                      "DisplayValue": "\"vide\""
+                    },
+                    {
+                      "Name": "Name",
+                      "ValueKind": "string",
+                      "Value": "VideoHandle",
+                      "DisplayValue": "\"VideoHandle\""
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 PreDefined=0 HandlerType=\"vide\" Name=\"VideoHandle\"",
+                  "Children": [
+                  ]
+                },
+                {
+                  "BoxType": "minf",
+                  "Path": "moov/trak/mdia/minf",
+                  "Offset": 6778,
+                  "Size": 523,
+                  "Supported": true,
+                  "PayloadStatus": "empty",
+                  "PayloadFields": [
+                  ],
+                  "Children": [
+                    {
+                      "BoxType": "vmhd",
+                      "Path": "moov/trak/mdia/minf/vmhd",
+                      "Offset": 6786,
+                      "Size": 20,
+                      "Supported": true,
+                      "PayloadStatus": "summary",
+                      "PayloadFields": [
+                        {
+                          "Name": "Version",
+                          "ValueKind": "unsigned",
+                          "Value": 0
+                        },
+                        {
+                          "Name": "Flags",
+                          "ValueKind": "unsigned",
+                          "Value": 1,
+                          "DisplayValue": "0x000001"
+                        },
+                        {
+                          "Name": "Graphicsmode",
+                          "ValueKind": "unsigned",
+                          "Value": 0
+                        },
+                        {
+                          "Name": "Opcolor",
+                          "ValueKind": "unsigned_array",
+                          "Value": [
+                            0,
+                            0,
+                            0
+                          ]
+                        }
+                      ],
+                      "PayloadSummary": "Version=0 Flags=0x000001 Graphicsmode=0 Opcolor=[0, 0, 0]",
+                      "Children": [
+                      ]
+                    },
+                    {
+                      "BoxType": "dinf",
+                      "Path": "moov/trak/mdia/minf/dinf",
+                      "Offset": 6806,
+                      "Size": 36,
+                      "Supported": true,
+                      "PayloadStatus": "empty",
+                      "PayloadFields": [
+                      ],
+                      "Children": [
+                        {
+                          "BoxType": "dref",
+                          "Path": "moov/trak/mdia/minf/dinf/dref",
+                          "Offset": 6814,
+                          "Size": 28,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1",
+                          "Children": [
+                            {
+                              "BoxType": "url ",
+                              "Path": "moov/trak/mdia/minf/dinf/dref/url ",
+                              "Offset": 6830,
+                              "Size": 12,
+                              "Supported": true,
+                              "PayloadStatus": "summary",
+                              "PayloadFields": [
+                                {
+                                  "Name": "Version",
+                                  "ValueKind": "unsigned",
+                                  "Value": 0
+                                },
+                                {
+                                  "Name": "Flags",
+                                  "ValueKind": "unsigned",
+                                  "Value": 1,
+                                  "DisplayValue": "0x000001"
+                                }
+                              ],
+                              "PayloadSummary": "Version=0 Flags=0x000001",
+                              "Children": [
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "BoxType": "stbl",
+                      "Path": "moov/trak/mdia/minf/stbl",
+                      "Offset": 6842,
+                      "Size": 459,
+                      "Supported": true,
+                      "PayloadStatus": "empty",
+                      "PayloadFields": [
+                      ],
+                      "Children": [
+                        {
+                          "BoxType": "stsd",
+                          "Path": "moov/trak/mdia/minf/stbl/stsd",
+                          "Offset": 6850,
+                          "Size": 167,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1",
+                          "Children": [
+                            {
+                              "BoxType": "avc1",
+                              "Path": "moov/trak/mdia/minf/stbl/stsd/avc1",
+                              "Offset": 6866,
+                              "Size": 151,
+                              "Supported": true,
+                              "PayloadStatus": "summary",
+                              "PayloadFields": [
+                                {
+                                  "Name": "DataReferenceIndex",
+                                  "ValueKind": "unsigned",
+                                  "Value": 1
+                                },
+                                {
+                                  "Name": "PreDefined",
+                                  "ValueKind": "unsigned",
+                                  "Value": 0
+                                },
+                                {
+                                  "Name": "PreDefined2",
+                                  "ValueKind": "unsigned_array",
+                                  "Value": [
+                                    0,
+                                    0,
+                                    0
+                                  ]
+                                },
+                                {
+                                  "Name": "Width",
+                                  "ValueKind": "unsigned",
+                                  "Value": 320
+                                },
+                                {
+                                  "Name": "Height",
+                                  "ValueKind": "unsigned",
+                                  "Value": 180
+                                },
+                                {
+                                  "Name": "Horizresolution",
+                                  "ValueKind": "unsigned",
+                                  "Value": 4718592
+                                },
+                                {
+                                  "Name": "Vertresolution",
+                                  "ValueKind": "unsigned",
+                                  "Value": 4718592
+                                },
+                                {
+                                  "Name": "FrameCount",
+                                  "ValueKind": "unsigned",
+                                  "Value": 1
+                                },
+                                {
+                                  "Name": "Compressorname",
+                                  "ValueKind": "bytes",
+                                  "Value": [
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0
+                                  ],
+                                  "DisplayValue": "\"\""
+                                },
+                                {
+                                  "Name": "Depth",
+                                  "ValueKind": "unsigned",
+                                  "Value": 24
+                                },
+                                {
+                                  "Name": "PreDefined3",
+                                  "ValueKind": "signed",
+                                  "Value": -1
+                                }
+                              ],
+                              "PayloadSummary": "DataReferenceIndex=1 PreDefined=0 PreDefined2=[0, 0, 0] Width=320 Height=180 Horizresolution=4718592 Vertresolution=4718592 FrameCount=1 Compressorname=\"\" Depth=24 PreDefined3=-1",
+                              "Children": [
+                                {
+                                  "BoxType": "avcC",
+                                  "Path": "moov/trak/mdia/minf/stbl/stsd/avc1/avcC",
+                                  "Offset": 6952,
+                                  "Size": 49,
+                                  "Supported": true,
+                                  "PayloadStatus": "summary",
+                                  "PayloadFields": [
+                                    {
+                                      "Name": "ConfigurationVersion",
+                                      "ValueKind": "unsigned",
+                                      "Value": 1,
+                                      "DisplayValue": "0x1"
+                                    },
+                                    {
+                                      "Name": "Profile",
+                                      "ValueKind": "unsigned",
+                                      "Value": 100,
+                                      "DisplayValue": "0x64"
+                                    },
+                                    {
+                                      "Name": "ProfileCompatibility",
+                                      "ValueKind": "unsigned",
+                                      "Value": 0,
+                                      "DisplayValue": "0x0"
+                                    },
+                                    {
+                                      "Name": "Level",
+                                      "ValueKind": "unsigned",
+                                      "Value": 12,
+                                      "DisplayValue": "0xc"
+                                    },
+                                    {
+                                      "Name": "LengthSizeMinusOne",
+                                      "ValueKind": "unsigned",
+                                      "Value": 3,
+                                      "DisplayValue": "0x3"
+                                    },
+                                    {
+                                      "Name": "NumOfSequenceParameterSets",
+                                      "ValueKind": "unsigned",
+                                      "Value": 1,
+                                      "DisplayValue": "0x1"
+                                    },
+                                    {
+                                      "Name": "SequenceParameterSets",
+                                      "ValueKind": "bytes",
+                                      "Value": [
+                                        0,
+                                        25,
+                                        103,
+                                        100,
+                                        0,
+                                        12,
+                                        172,
+                                        217,
+                                        65,
+                                        65,
+                                        159,
+                                        159,
+                                        1,
+                                        108,
+                                        128,
+                                        0,
+                                        0,
+                                        3,
+                                        0,
+                                        128,
+                                        0,
+                                        0,
+                                        10,
+                                        7,
+                                        138,
+                                        20,
+                                        203
+                                      ],
+                                      "DisplayValue": "[{Length=25 NALUnit=[0x67, 0x64, 0x0, 0xc, 0xac, 0xd9, 0x41, 0x41, 0x9f, 0x9f, 0x1, 0x6c, 0x80, 0x0, 0x0, 0x3, 0x0, 0x80, 0x0, 0x0, 0xa, 0x7, 0x8a, 0x14, 0xcb]}]"
+                                    },
+                                    {
+                                      "Name": "NumOfPictureParameterSets",
+                                      "ValueKind": "unsigned",
+                                      "Value": 1,
+                                      "DisplayValue": "0x1"
+                                    },
+                                    {
+                                      "Name": "PictureParameterSets",
+                                      "ValueKind": "bytes",
+                                      "Value": [
+                                        0,
+                                        5,
+                                        104,
+                                        235,
+                                        236,
+                                        178,
+                                        44
+                                      ],
+                                      "DisplayValue": "[{Length=5 NALUnit=[0x68, 0xeb, 0xec, 0xb2, 0x2c]}]"
+                                    }
+                                  ],
+                                  "PayloadSummary": "ConfigurationVersion=0x1 Profile=0x64 ProfileCompatibility=0x0 Level=0xc LengthSizeMinusOne=0x3 NumOfSequenceParameterSets=0x1 SequenceParameterSets=[{Length=25 NALUnit=[0x67, 0x64, 0x0, 0xc, 0xac, 0xd9, 0x41, 0x41, 0x9f, 0x9f, 0x1, 0x6c, 0x80, 0x0, 0x0, 0x3, 0x0, 0x80, 0x0, 0x0, 0xa, 0x7, 0x8a, 0x14, 0xcb]}] NumOfPictureParameterSets=0x1 PictureParameterSets=[{Length=5 NALUnit=[0x68, 0xeb, 0xec, 0xb2, 0x2c]}]",
+                                  "Children": [
+                                  ]
+                                },
+                                {
+                                  "BoxType": "pasp",
+                                  "Path": "moov/trak/mdia/minf/stbl/stsd/avc1/pasp",
+                                  "Offset": 7001,
+                                  "Size": 16,
+                                  "Supported": true,
+                                  "PayloadStatus": "summary",
+                                  "PayloadFields": [
+                                    {
+                                      "Name": "HSpacing",
+                                      "ValueKind": "unsigned",
+                                      "Value": 1
+                                    },
+                                    {
+                                      "Name": "VSpacing",
+                                      "ValueKind": "unsigned",
+                                      "Value": 1
+                                    }
+                                  ],
+                                  "PayloadSummary": "HSpacing=1 VSpacing=1",
+                                  "Children": [
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "BoxType": "stts",
+                          "Path": "moov/trak/mdia/minf/stbl/stts",
+                          "Offset": 7017,
+                          "Size": 24,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            },
+                            {
+                              "Name": "Entries",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                0,
+                                0,
+                                0,
+                                10,
+                                0,
+                                0,
+                                4,
+                                0
+                              ],
+                              "DisplayValue": "[{SampleCount=10 SampleDelta=1024}]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1 Entries=[{SampleCount=10 SampleDelta=1024}]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stss",
+                          "Path": "moov/trak/mdia/minf/stbl/stss",
+                          "Offset": 7041,
+                          "Size": 20,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            },
+                            {
+                              "Name": "SampleNumber",
+                              "ValueKind": "unsigned_array",
+                              "Value": [
+                                1
+                              ]
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1 SampleNumber=[1]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "ctts",
+                          "Path": "moov/trak/mdia/minf/stbl/ctts",
+                          "Offset": 7061,
+                          "Size": 88,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 9
+                            },
+                            {
+                              "Name": "Entries",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                0,
+                                0,
+                                0,
+                                2,
+                                0,
+                                0,
+                                8,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                20,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                8,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                12,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                12,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                4,
+                                0
+                              ],
+                              "DisplayValue": "[{SampleCount=2 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=5120}, {SampleCount=1 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=0}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=9 Entries=[{SampleCount=2 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=5120}, {SampleCount=1 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=0}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stsc",
+                          "Path": "moov/trak/mdia/minf/stbl/stsc",
+                          "Offset": 7149,
+                          "Size": 40,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 2
+                            },
+                            {
+                              "Name": "Entries",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                2,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                2,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                1
+                              ],
+                              "DisplayValue": "[{FirstChunk=1 SamplesPerChunk=2 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=1 SampleDescriptionIndex=1}]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=2 Entries=[{FirstChunk=1 SamplesPerChunk=2 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=1 SampleDescriptionIndex=1}]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stsz",
+                          "Path": "moov/trak/mdia/minf/stbl/stsz",
+                          "Offset": 7189,
+                          "Size": 60,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "SampleSize",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "SampleCount",
+                              "ValueKind": "unsigned",
+                              "Value": 10
+                            },
+                            {
+                              "Name": "EntrySize",
+                              "ValueKind": "unsigned_array",
+                              "Value": [
+                                3679,
+                                86,
+                                545,
+                                180,
+                                69,
+                                60,
+                                182,
+                                22,
+                                204,
+                                15
+                              ]
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 SampleSize=0 SampleCount=10 EntrySize=[3679, 86, 545, 180, 69, 60, 182, 22, 204, 15]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stco",
+                          "Path": "moov/trak/mdia/minf/stbl/stco",
+                          "Offset": 7249,
+                          "Size": 52,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 9
+                            },
+                            {
+                              "Name": "ChunkOffset",
+                              "ValueKind": "unsigned_array",
+                              "Value": [
+                                48,
+                                3836,
+                                4527,
+                                4864,
+                                5043,
+                                5227,
+                                5560,
+                                5702,
+                                6038
+                              ]
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[48, 3836, 4527, 4864, 5043, 5227, 5560, 5702, 6038]",
+                          "Children": [
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "BoxType": "trak",
+          "Path": "moov/trak",
+          "Offset": 7301,
+          "Size": 844,
+          "Supported": true,
+          "PayloadStatus": "empty",
+          "PayloadFields": [
+          ],
+          "Children": [
+            {
+              "BoxType": "tkhd",
+              "Path": "moov/trak/tkhd",
+              "Offset": 7309,
+              "Size": 92,
+              "Supported": true,
+              "PayloadStatus": "summary",
+              "PayloadFields": [
+                {
+                  "Name": "Version",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "Flags",
+                  "ValueKind": "unsigned",
+                  "Value": 3,
+                  "DisplayValue": "0x000003"
+                },
+                {
+                  "Name": "CreationTimeV0",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "ModificationTimeV0",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "TrackID",
+                  "ValueKind": "unsigned",
+                  "Value": 2
+                },
+                {
+                  "Name": "DurationV0",
+                  "ValueKind": "unsigned",
+                  "Value": 1024
+                },
+                {
+                  "Name": "Layer",
+                  "ValueKind": "signed",
+                  "Value": 0
+                },
+                {
+                  "Name": "AlternateGroup",
+                  "ValueKind": "signed",
+                  "Value": 1
+                },
+                {
+                  "Name": "Volume",
+                  "ValueKind": "signed",
+                  "Value": 256
+                },
+                {
+                  "Name": "Matrix",
+                  "ValueKind": "signed_array",
+                  "Value": [
+                    65536,
+                    0,
+                    0,
+                    0,
+                    65536,
+                    0,
+                    0,
+                    0,
+                    1073741824
+                  ],
+                  "DisplayValue": "[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000]"
+                },
+                {
+                  "Name": "Width",
+                  "ValueKind": "unsigned",
+                  "Value": 0,
+                  "DisplayValue": "0"
+                },
+                {
+                  "Name": "Height",
+                  "ValueKind": "unsigned",
+                  "Value": 0,
+                  "DisplayValue": "0"
+                }
+              ],
+              "PayloadSummary": "Version=0 Flags=0x000003 CreationTimeV0=0 ModificationTimeV0=0 TrackID=2 DurationV0=1024 Layer=0 AlternateGroup=1 Volume=256 Matrix=[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000] Width=0 Height=0",
+              "Children": [
+              ]
+            },
+            {
+              "BoxType": "edts",
+              "Path": "moov/trak/edts",
+              "Offset": 7401,
+              "Size": 36,
+              "Supported": true,
+              "PayloadStatus": "empty",
+              "PayloadFields": [
+              ],
+              "Children": [
+                {
+                  "BoxType": "elst",
+                  "Path": "moov/trak/edts/elst",
+                  "Offset": 7409,
+                  "Size": 28,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "EntryCount",
+                      "ValueKind": "unsigned",
+                      "Value": 1
+                    },
+                    {
+                      "Name": "Entries",
+                      "ValueKind": "bytes",
+                      "Value": [
+                        0,
+                        0,
+                        3,
+                        232,
+                        0,
+                        0,
+                        4,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0
+                      ],
+                      "DisplayValue": "[{SegmentDurationV0=1000 MediaTimeV0=1024 MediaRateInteger=1}]"
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=1024 MediaRateInteger=1}]",
+                  "Children": [
+                  ]
+                }
+              ]
+            },
+            {
+              "BoxType": "mdia",
+              "Path": "moov/trak/mdia",
+              "Offset": 7437,
+              "Size": 708,
+              "Supported": true,
+              "PayloadStatus": "empty",
+              "PayloadFields": [
+              ],
+              "Children": [
+                {
+                  "BoxType": "mdhd",
+                  "Path": "moov/trak/mdia/mdhd",
+                  "Offset": 7445,
+                  "Size": 32,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "CreationTimeV0",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "ModificationTimeV0",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Timescale",
+                      "ValueKind": "unsigned",
+                      "Value": 44100
+                    },
+                    {
+                      "Name": "DurationV0",
+                      "ValueKind": "unsigned",
+                      "Value": 45124
+                    },
+                    {
+                      "Name": "Language",
+                      "ValueKind": "unsigned_array",
+                      "Value": [
+                        5,
+                        14,
+                        7
+                      ],
+                      "DisplayValue": "\"eng\""
+                    },
+                    {
+                      "Name": "PreDefined",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=44100 DurationV0=45124 Language=\"eng\" PreDefined=0",
+                  "Children": [
+                  ]
+                },
+                {
+                  "BoxType": "hdlr",
+                  "Path": "moov/trak/mdia/hdlr",
+                  "Offset": 7477,
+                  "Size": 44,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "PreDefined",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "HandlerType",
+                      "ValueKind": "bytes",
+                      "Value": [
+                        115,
+                        111,
+                        117,
+                        110
+                      ],
+                      "DisplayValue": "\"soun\""
+                    },
+                    {
+                      "Name": "Name",
+                      "ValueKind": "string",
+                      "Value": "SoundHandle",
+                      "DisplayValue": "\"SoundHandle\""
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 PreDefined=0 HandlerType=\"soun\" Name=\"SoundHandle\"",
+                  "Children": [
+                  ]
+                },
+                {
+                  "BoxType": "minf",
+                  "Path": "moov/trak/mdia/minf",
+                  "Offset": 7521,
+                  "Size": 624,
+                  "Supported": true,
+                  "PayloadStatus": "empty",
+                  "PayloadFields": [
+                  ],
+                  "Children": [
+                    {
+                      "BoxType": "smhd",
+                      "Path": "moov/trak/mdia/minf/smhd",
+                      "Offset": 7529,
+                      "Size": 16,
+                      "Supported": true,
+                      "PayloadStatus": "summary",
+                      "PayloadFields": [
+                        {
+                          "Name": "Version",
+                          "ValueKind": "unsigned",
+                          "Value": 0
+                        },
+                        {
+                          "Name": "Flags",
+                          "ValueKind": "unsigned",
+                          "Value": 0,
+                          "DisplayValue": "0x000000"
+                        },
+                        {
+                          "Name": "Balance",
+                          "ValueKind": "signed",
+                          "Value": 0,
+                          "DisplayValue": "0"
+                        }
+                      ],
+                      "PayloadSummary": "Version=0 Flags=0x000000 Balance=0",
+                      "Children": [
+                      ]
+                    },
+                    {
+                      "BoxType": "dinf",
+                      "Path": "moov/trak/mdia/minf/dinf",
+                      "Offset": 7545,
+                      "Size": 36,
+                      "Supported": true,
+                      "PayloadStatus": "empty",
+                      "PayloadFields": [
+                      ],
+                      "Children": [
+                        {
+                          "BoxType": "dref",
+                          "Path": "moov/trak/mdia/minf/dinf/dref",
+                          "Offset": 7553,
+                          "Size": 28,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1",
+                          "Children": [
+                            {
+                              "BoxType": "url ",
+                              "Path": "moov/trak/mdia/minf/dinf/dref/url ",
+                              "Offset": 7569,
+                              "Size": 12,
+                              "Supported": true,
+                              "PayloadStatus": "summary",
+                              "PayloadFields": [
+                                {
+                                  "Name": "Version",
+                                  "ValueKind": "unsigned",
+                                  "Value": 0
+                                },
+                                {
+                                  "Name": "Flags",
+                                  "ValueKind": "unsigned",
+                                  "Value": 1,
+                                  "DisplayValue": "0x000001"
+                                }
+                              ],
+                              "PayloadSummary": "Version=0 Flags=0x000001",
+                              "Children": [
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "BoxType": "stbl",
+                      "Path": "moov/trak/mdia/minf/stbl",
+                      "Offset": 7581,
+                      "Size": 564,
+                      "Supported": true,
+                      "PayloadStatus": "empty",
+                      "PayloadFields": [
+                      ],
+                      "Children": [
+                        {
+                          "BoxType": "stsd",
+                          "Path": "moov/trak/mdia/minf/stbl/stsd",
+                          "Offset": 7589,
+                          "Size": 106,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=1",
+                          "Children": [
+                            {
+                              "BoxType": "mp4a",
+                              "Path": "moov/trak/mdia/minf/stbl/stsd/mp4a",
+                              "Offset": 7605,
+                              "Size": 90,
+                              "Supported": true,
+                              "PayloadStatus": "summary",
+                              "PayloadFields": [
+                                {
+                                  "Name": "DataReferenceIndex",
+                                  "ValueKind": "unsigned",
+                                  "Value": 1
+                                },
+                                {
+                                  "Name": "EntryVersion",
+                                  "ValueKind": "unsigned",
+                                  "Value": 0
+                                },
+                                {
+                                  "Name": "ChannelCount",
+                                  "ValueKind": "unsigned",
+                                  "Value": 2
+                                },
+                                {
+                                  "Name": "SampleSize",
+                                  "ValueKind": "unsigned",
+                                  "Value": 16
+                                },
+                                {
+                                  "Name": "PreDefined",
+                                  "ValueKind": "unsigned",
+                                  "Value": 0
+                                },
+                                {
+                                  "Name": "SampleRate",
+                                  "ValueKind": "unsigned",
+                                  "Value": 2890137600,
+                                  "DisplayValue": "44100"
+                                }
+                              ],
+                              "PayloadSummary": "DataReferenceIndex=1 EntryVersion=0 ChannelCount=2 SampleSize=16 PreDefined=0 SampleRate=44100",
+                              "Children": [
+                                {
+                                  "BoxType": "esds",
+                                  "Path": "moov/trak/mdia/minf/stbl/stsd/mp4a/esds",
+                                  "Offset": 7641,
+                                  "Size": 54,
+                                  "Supported": true,
+                                  "PayloadStatus": "summary",
+                                  "PayloadFields": [
+                                    {
+                                      "Name": "Version",
+                                      "ValueKind": "unsigned",
+                                      "Value": 0
+                                    },
+                                    {
+                                      "Name": "Flags",
+                                      "ValueKind": "unsigned",
+                                      "Value": 0,
+                                      "DisplayValue": "0x000000"
+                                    },
+                                    {
+                                      "Name": "Descriptors",
+                                      "ValueKind": "bytes",
+                                      "Value": [
+                                        3,
+                                        128,
+                                        128,
+                                        128,
+                                        37,
+                                        0,
+                                        2,
+                                        0,
+                                        4,
+                                        128,
+                                        128,
+                                        128,
+                                        23,
+                                        64,
+                                        21,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        41,
+                                        74,
+                                        0,
+                                        0,
+                                        41,
+                                        74,
+                                        5,
+                                        128,
+                                        128,
+                                        128,
+                                        5,
+                                        18,
+                                        16,
+                                        86,
+                                        229,
+                                        0,
+                                        6,
+                                        128,
+                                        128,
+                                        128,
+                                        1,
+                                        2
+                                      ],
+                                      "DisplayValue": "[{Tag=ESDescr Size=37 ESID=2 StreamDependenceFlag=false UrlFlag=false OcrStreamFlag=false StreamPriority=0}, {Tag=DecoderConfigDescr Size=23 ObjectTypeIndication=0x40 StreamType=5 UpStream=false Reserved=true BufferSizeDB=0 MaxBitrate=10570 AvgBitrate=10570}, {Tag=DecSpecificInfo Size=5 Data=[0x12, 0x10, 0x56, 0xe5, 0x0]}, {Tag=SLConfigDescr Size=1 Data=[0x2]}]"
+                                    }
+                                  ],
+                                  "PayloadSummary": "Version=0 Flags=0x000000 Descriptors=[{Tag=ESDescr Size=37 ESID=2 StreamDependenceFlag=false UrlFlag=false OcrStreamFlag=false StreamPriority=0}, {Tag=DecoderConfigDescr Size=23 ObjectTypeIndication=0x40 StreamType=5 UpStream=false Reserved=true BufferSizeDB=0 MaxBitrate=10570 AvgBitrate=10570}, {Tag=DecSpecificInfo Size=5 Data=[0x12, 0x10, 0x56, 0xe5, 0x0]}, {Tag=SLConfigDescr Size=1 Data=[0x2]}]",
+                                  "Children": [
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "BoxType": "stts",
+                          "Path": "moov/trak/mdia/minf/stbl/stts",
+                          "Offset": 7695,
+                          "Size": 48,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 4
+                            },
+                            {
+                              "Name": "Entries",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                5,
+                                225,
+                                0,
+                                0,
+                                0,
+                                41,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                2,
+                                99
+                              ],
+                              "DisplayValue": "[{SampleCount=1 SampleDelta=1024}, {SampleCount=1 SampleDelta=1505}, {SampleCount=41 SampleDelta=1024}, {SampleCount=1 SampleDelta=611}]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=4 Entries=[{SampleCount=1 SampleDelta=1024}, {SampleCount=1 SampleDelta=1505}, {SampleCount=41 SampleDelta=1024}, {SampleCount=1 SampleDelta=611}]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stsc",
+                          "Path": "moov/trak/mdia/minf/stbl/stsc",
+                          "Offset": 7743,
+                          "Size": 100,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 7
+                            },
+                            {
+                              "Name": "Entries",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                2,
+                                0,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                3,
+                                0,
+                                0,
+                                0,
+                                5,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                6,
+                                0,
+                                0,
+                                0,
+                                5,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                7,
+                                0,
+                                0,
+                                0,
+                                4,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                9,
+                                0,
+                                0,
+                                0,
+                                13,
+                                0,
+                                0,
+                                0,
+                                1
+                              ],
+                              "DisplayValue": "[{FirstChunk=1 SamplesPerChunk=1 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=3 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=4 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=6 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=7 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=9 SamplesPerChunk=13 SampleDescriptionIndex=1}]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=7 Entries=[{FirstChunk=1 SamplesPerChunk=1 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=3 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=4 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=6 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=7 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=9 SamplesPerChunk=13 SampleDescriptionIndex=1}]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stsz",
+                          "Path": "moov/trak/mdia/minf/stbl/stsz",
+                          "Offset": 7843,
+                          "Size": 196,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "SampleSize",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "SampleCount",
+                              "ValueKind": "unsigned",
+                              "Value": 44
+                            },
+                            {
+                              "Name": "EntrySize",
+                              "ValueKind": "unsigned_array",
+                              "Value": [
+                                23,
+                                39,
+                                35,
+                                36,
+                                36,
+                                35,
+                                31,
+                                33,
+                                28,
+                                30,
+                                33,
+                                29,
+                                23,
+                                25,
+                                25,
+                                36,
+                                27,
+                                36,
+                                35,
+                                25,
+                                28,
+                                36,
+                                27,
+                                29,
+                                28,
+                                29,
+                                34,
+                                36,
+                                30,
+                                32,
+                                34,
+                                29,
+                                24,
+                                34,
+                                35,
+                                28,
+                                24,
+                                30,
+                                29,
+                                29,
+                                27,
+                                31,
+                                34,
+                                35
+                              ]
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 SampleSize=0 SampleCount=44 EntrySize=[23, 39, 35, 36, 36, 35, 31, 33, 28, 30, 33, 29, 23, 25, 25, 36, 27, 36, 35, 25, 28, 36, 27, 29, 28, 29, 34, 36, 30, 32, 34, 29, 24, 34, 35, 28, 24, 30, 29, 29, 27, 31, 34, 35]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "stco",
+                          "Path": "moov/trak/mdia/minf/stbl/stco",
+                          "Offset": 8039,
+                          "Size": 52,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 9
+                            },
+                            {
+                              "Name": "ChunkOffset",
+                              "ValueKind": "unsigned_array",
+                              "Value": [
+                                3813,
+                                4381,
+                                4707,
+                                4933,
+                                5103,
+                                5409,
+                                5582,
+                                5906,
+                                6053
+                              ]
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[3813, 4381, 4707, 4933, 5103, 5409, 5582, 5906, 6053]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "sgpd",
+                          "Path": "moov/trak/mdia/minf/stbl/sgpd",
+                          "Offset": 8091,
+                          "Size": 26,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "GroupingType",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                114,
+                                111,
+                                108,
+                                108
+                              ],
+                              "DisplayValue": "\"roll\""
+                            },
+                            {
+                              "Name": "DefaultLength",
+                              "ValueKind": "unsigned",
+                              "Value": 2
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            },
+                            {
+                              "Name": "RollDistances",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                255,
+                                255
+                              ],
+                              "DisplayValue": "[-1]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=1 Flags=0x000000 GroupingType=\"roll\" DefaultLength=2 EntryCount=1 RollDistances=[-1]",
+                          "Children": [
+                          ]
+                        },
+                        {
+                          "BoxType": "sbgp",
+                          "Path": "moov/trak/mdia/minf/stbl/sbgp",
+                          "Offset": 8117,
+                          "Size": 28,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "Version",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "Flags",
+                              "ValueKind": "unsigned",
+                              "Value": 0,
+                              "DisplayValue": "0x000000"
+                            },
+                            {
+                              "Name": "GroupingType",
+                              "ValueKind": "unsigned",
+                              "Value": 1919904876
+                            },
+                            {
+                              "Name": "EntryCount",
+                              "ValueKind": "unsigned",
+                              "Value": 1
+                            },
+                            {
+                              "Name": "Entries",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                0,
+                                0,
+                                0,
+                                44,
+                                0,
+                                0,
+                                0,
+                                1
+                              ],
+                              "DisplayValue": "[{SampleCount=44 GroupDescriptionIndex=1}]"
+                            }
+                          ],
+                          "PayloadSummary": "Version=0 Flags=0x000000 GroupingType=1919904876 EntryCount=1 Entries=[{SampleCount=44 GroupDescriptionIndex=1}]",
+                          "Children": [
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "BoxType": "udta",
+          "Path": "moov/udta",
+          "Offset": 8145,
+          "Size": 133,
+          "Supported": true,
+          "PayloadStatus": "empty",
+          "PayloadFields": [
+          ],
+          "Children": [
+            {
+              "BoxType": "meta",
+              "Path": "moov/udta/meta",
+              "Offset": 8153,
+              "Size": 90,
+              "Supported": true,
+              "PayloadStatus": "summary",
+              "PayloadFields": [
+                {
+                  "Name": "Version",
+                  "ValueKind": "unsigned",
+                  "Value": 0
+                },
+                {
+                  "Name": "Flags",
+                  "ValueKind": "unsigned",
+                  "Value": 0,
+                  "DisplayValue": "0x000000"
+                }
+              ],
+              "PayloadSummary": "Version=0 Flags=0x000000",
+              "Children": [
+                {
+                  "BoxType": "hdlr",
+                  "Path": "moov/udta/meta/hdlr",
+                  "Offset": 8165,
+                  "Size": 33,
+                  "Supported": true,
+                  "PayloadStatus": "summary",
+                  "PayloadFields": [
+                    {
+                      "Name": "Version",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "Flags",
+                      "ValueKind": "unsigned",
+                      "Value": 0,
+                      "DisplayValue": "0x000000"
+                    },
+                    {
+                      "Name": "PreDefined",
+                      "ValueKind": "unsigned",
+                      "Value": 0
+                    },
+                    {
+                      "Name": "HandlerType",
+                      "ValueKind": "bytes",
+                      "Value": [
+                        109,
+                        100,
+                        105,
+                        114
+                      ],
+                      "DisplayValue": "\"mdir\""
+                    },
+                    {
+                      "Name": "Name",
+                      "ValueKind": "string",
+                      "Value": "",
+                      "DisplayValue": "\"\""
+                    }
+                  ],
+                  "PayloadSummary": "Version=0 Flags=0x000000 PreDefined=0 HandlerType=\"mdir\" Name=\"\"",
+                  "Children": [
+                  ]
+                },
+                {
+                  "BoxType": "ilst",
+                  "Path": "moov/udta/meta/ilst",
+                  "Offset": 8198,
+                  "Size": 45,
+                  "Supported": true,
+                  "PayloadStatus": "empty",
+                  "PayloadFields": [
+                  ],
+                  "Children": [
+                    {
+                      "BoxType": "(c)too",
+                      "Path": "moov/udta/meta/ilst/(c)too",
+                      "Offset": 8206,
+                      "Size": 37,
+                      "Supported": true,
+                      "PayloadStatus": "empty",
+                      "PayloadFields": [
+                      ],
+                      "Children": [
+                        {
+                          "BoxType": "data",
+                          "Path": "moov/udta/meta/ilst/(c)too/data",
+                          "Offset": 8214,
+                          "Size": 29,
+                          "Supported": true,
+                          "PayloadStatus": "summary",
+                          "PayloadFields": [
+                            {
+                              "Name": "DataType",
+                              "ValueKind": "unsigned",
+                              "Value": 1,
+                              "DisplayValue": "UTF8"
+                            },
+                            {
+                              "Name": "DataLang",
+                              "ValueKind": "unsigned",
+                              "Value": 0
+                            },
+                            {
+                              "Name": "EncodingTool",
+                              "ValueKind": "bytes",
+                              "Value": [
+                                76,
+                                97,
+                                118,
+                                102,
+                                53,
+                                56,
+                                46,
+                                50,
+                                57,
+                                46,
+                                49,
+                                48,
+                                48
+                              ],
+                              "DisplayValue": "\"Lavf58.29.100\""
+                            }
+                          ],
+                          "PayloadSummary": "DataType=UTF8 DataLang=0 EncodingTool=\"Lavf58.29.100\"",
+                          "Children": [
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "BoxType": "loci",
+              "Path": "moov/udta/loci",
+              "Offset": 8243,
+              "Size": 35,
+              "Supported": false,
+              "PayloadStatus": "omitted",
+              "PayloadFields": [
+              ],
+              "Children": [
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

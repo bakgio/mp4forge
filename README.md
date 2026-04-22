@@ -20,13 +20,16 @@
 - Low-level traversal, extraction, stringify, probe, and writer APIs
 - Thin typed path-based helpers and byte-slice convenience wrappers for common extraction, rewrite, and probe flows
 - Built-in CLI for `dump`, `extract`, `probe`, `psshdump`, `edit`, and `divide`
-- Shared-fixture coverage for regular MP4, fragmented MP4, encrypted init segments, and QuickTime-style metadata cases
+- Shared-fixture coverage for regular MP4, fragmented MP4, encrypted init segments, QuickTime-style metadata cases, and derived real codec fixtures for additional codec-family coverage
 
 ## Installation
 
 ```toml
 [dependencies]
-mp4forge = "0.3.0"
+mp4forge = "0.4.0"
+
+# With optional features:
+# mp4forge = { version = "0.4.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:
@@ -43,6 +46,17 @@ cargo install --path . --locked
 
 The published crate includes both the library and the `mp4forge` binary from `src/bin/mp4forge.rs`.
 
+## Feature Flags
+
+`mp4forge` keeps the default dependency surface minimal and currently exposes one optional public
+feature flag:
+
+- `serde`: derives `Serialize` and `Deserialize` for the reusable public report structs under
+  `mp4forge::cli::probe` and `mp4forge::cli::dump`, along with their nested public codec-detail,
+  media-characteristics, `FieldValue`, and `FourCc` data. This is intended for library-side report
+  embedding and uses the Rust field names of those public structs; the CLI `-format` outputs keep
+  their existing hand-authored JSON and YAML schemas.
+
 ## CLI
 
 ```text
@@ -52,22 +66,39 @@ COMMAND:
   divide       split a fragmented MP4 into track playlists
   dump         display the MP4 box tree
   edit         rewrite selected boxes
-  extract      extract raw boxes by type
+  extract      extract raw boxes by type or path
   psshdump     summarize pssh boxes
   probe        summarize an MP4 file
 ```
 
-For example:
+`divide` currently targets fragmented inputs with up to one AVC video track and one MP4A audio
+track, including encrypted wrappers that preserve those original sample-entry formats. Pass
+`-validate` when you want the same probe-driven layout checks without creating any output files.
 
-```sh
-mp4forge dump input.mp4
-mp4forge probe input.mp4
-mp4forge psshdump encrypted_init.mp4
-```
+`dump` defaults to the existing human-readable tree view. Pass `-format json` or `-format yaml` for
+deterministic structured tree export with stable `payload_fields` for supported boxes; `-full` and
+`-a` still control when large raw or unsupported payloads expand beyond the default summary-oriented
+view. Add repeatable `-path <box/path>` filters when you want text or structured output rooted at
+only the matched parsed subtrees instead of the whole file.
 
-## Feature Flags
+`edit` keeps the existing global `tfdt` replacement and `-drop` behavior, and now also accepts
+repeatable `-path` filters when you want `-base_media_decode_time` to target only matching parsed
+box paths.
 
-`mp4forge` currently ships without public Cargo feature flags.
+`psshdump` defaults to the existing human-readable protection summary. Pass `-format json` or
+`-format yaml` for deterministic structured reports with box offsets, system IDs, KIDs, `Data`
+bytes, and the legacy raw-box base64 payload. Add repeatable `-path <box/path>`, `-system-id
+<uuid>`, or `-kid <uuid>` filters when you want text and structured reports to return only the
+matching protection boxes.
+
+`probe` defaults to structured JSON output. When the input carries parsed codec-configuration
+boxes, the report now includes a nested `codec_details` object per track for families such as AVC,
+HEVC, AV1, VP8/VP9, MP4A, Opus, AC-3, PCM, XML subtitles, text subtitles, and WebVTT. When sample
+entries carry `btrt`, `colr`, `pasp`, or `fiel`, the richer CLI path also emits nested
+`media_characteristics` data such as declared bitrate, colorimetry, pixel aspect ratio, and
+field-order hints. Pass `-detail light` for a lighter-weight probe that skips per-sample,
+per-chunk, bitrate, and IDR aggregation, or use `mp4forge::probe::ProbeOptions` from the library
+when you need the same control programmatically.
 
 > See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage patterns.
 

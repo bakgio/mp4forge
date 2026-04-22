@@ -26,7 +26,7 @@ where
             let _ = write_usage(stderr);
             0
         }
-        "divide" => divide::run(&args[1..], stderr),
+        "divide" => divide::run_with_output(&args[1..], stdout, stderr),
         "dump" => dump::run(&args[1..], stdout, stderr),
         "edit" => edit::run(&args[1..], stderr),
         "extract" => extract::run(&args[1..], stdout, stderr),
@@ -53,7 +53,7 @@ where
     )?;
     writeln!(writer, "  dump         display the MP4 box tree")?;
     writeln!(writer, "  edit         rewrite selected boxes")?;
-    writeln!(writer, "  extract      extract raw boxes by type")?;
+    writeln!(writer, "  extract      extract raw boxes by type or path")?;
     writeln!(writer, "  psshdump     summarize pssh boxes")?;
     writeln!(writer, "  probe        summarize an MP4 file")?;
     Ok(())
