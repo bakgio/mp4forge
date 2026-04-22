@@ -26,7 +26,7 @@
 
 ```toml
 [dependencies]
-mp4forge = "0.2.0"
+mp4forge = "0.3.0"
 ```
 
 Install the CLI from crates.io:
