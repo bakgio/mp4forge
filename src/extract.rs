@@ -1,12 +1,13 @@
 //! Path-based box extraction helpers built on the structure walker.
 //!
 //! This module keeps the existing low-level extraction surface available while also exposing thin
-//! typed helpers for callers that already know the payload type they expect at a given path.
+//! typed helpers for callers that already know the payload type they expect at a given path,
+//! including exact raw-byte helpers and byte-slice convenience wrappers for in-memory workflows.
 
 use std::any::type_name;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read, Seek};
+use std::io::{self, Cursor, Read, Seek};
 
 use crate::BoxInfo;
 use crate::FourCc;
@@ -132,6 +133,103 @@ where
     extract_boxes_as_with_registry(reader, parent, paths, &registry)
 }
 
+/// Extracts every box that matches `path` and returns each match as exact serialized bytes,
+/// including the original box header.
+///
+/// When `parent` is present, `path` is evaluated relative to that box. Returns an empty vector
+/// when no boxes match.
+pub fn extract_box_bytes<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let paths = [path];
+    extract_boxes_bytes(reader, parent, &paths)
+}
+
+/// Extracts every box that matches any path in `paths` and returns each match as exact serialized
+/// bytes, including the original box header.
+///
+/// When `parent` is present, every path is evaluated relative to that box. The returned bytes are
+/// copied directly from the source stream without decoding or re-encoding, so the original header
+/// form and payload bytes are preserved verbatim.
+pub fn extract_boxes_bytes<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let registry = default_registry();
+    extract_boxes_bytes_with_registry(reader, parent, paths, &registry)
+}
+
+/// Extracts every box that matches `path` and returns each matched payload as exact on-disk bytes.
+///
+/// When `parent` is present, `path` is evaluated relative to that box. For container boxes, the
+/// returned payload bytes still include any serialized child boxes because those bytes are part of
+/// the matched payload.
+pub fn extract_box_payload_bytes<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let paths = [path];
+    extract_boxes_payload_bytes(reader, parent, &paths)
+}
+
+/// Extracts every box that matches any path in `paths` and returns each matched payload as exact
+/// on-disk bytes.
+///
+/// When `parent` is present, every path is evaluated relative to that box. The returned bytes are
+/// copied directly from the source stream without decoding or re-encoding, preserving the payload
+/// exactly as stored in the file.
+pub fn extract_boxes_payload_bytes<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let registry = default_registry();
+    extract_boxes_payload_bytes_with_registry(reader, parent, paths, &registry)
+}
+
+/// Extracts every box that matches `path`, decodes the payloads, and clones them as `T` from an
+/// in-memory MP4 byte slice.
+///
+/// This is equivalent to calling [`extract_box_as`] with `Cursor<&[u8]>` and no parent box. Paths
+/// are always evaluated from the file root. Returns an empty vector when no boxes match.
+pub fn extract_box_as_bytes<T>(input: &[u8], path: BoxPath) -> Result<Vec<T>, ExtractError>
+where
+    T: CodecBox + Clone + 'static,
+{
+    let paths = [path];
+    extract_boxes_as_bytes::<T>(input, &paths)
+}
+
+/// Extracts every box that matches any path in `paths`, decodes the payloads, and clones them as
+/// `T` from an in-memory MP4 byte slice.
+///
+/// This is equivalent to calling [`extract_boxes_as`] with `Cursor<&[u8]>` and no parent box.
+/// Every matched box must decode to `T`, otherwise
+/// [`ExtractError::UnexpectedPayloadType`] is returned with the matched path and offset.
+pub fn extract_boxes_as_bytes<T>(input: &[u8], paths: &[BoxPath]) -> Result<Vec<T>, ExtractError>
+where
+    T: CodecBox + Clone + 'static,
+{
+    let mut reader = Cursor::new(input);
+    extract_boxes_as(&mut reader, None, paths)
+}
+
 /// Extracts every box that matches any path in `paths` using `registry` and returns the matching
 /// header metadata.
 ///
@@ -177,6 +275,40 @@ where
     Ok(matches)
 }
 
+/// Extracts every box that matches any path in `paths` using `registry` and returns each match as
+/// exact serialized bytes, including the original box header.
+///
+/// Use this when custom or context-sensitive box registrations are required to walk into matched
+/// subtrees while preserving the matched bytes verbatim.
+pub fn extract_boxes_bytes_with_registry<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    extract_matched_bytes(reader, parent, paths, registry, ExtractedByteRange::FullBox)
+}
+
+/// Extracts every box that matches any path in `paths` using `registry` and returns each matched
+/// payload as exact on-disk bytes.
+///
+/// Use this when custom or context-sensitive box registrations are required to walk into matched
+/// subtrees while preserving the matched payload bytes verbatim.
+pub fn extract_boxes_payload_bytes_with_registry<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    extract_matched_bytes(reader, parent, paths, registry, ExtractedByteRange::Payload)
+}
+
 /// Extracts every box that matches any path in `paths`, decodes the payloads with `registry`, and
 /// clones them as `T`.
 ///
@@ -217,6 +349,12 @@ where
 struct MatchedBox {
     info: BoxInfo,
     path: BoxPath,
+}
+
+#[derive(Clone, Copy)]
+enum ExtractedByteRange {
+    FullBox,
+    Payload,
 }
 
 fn collect_matches<R>(
@@ -272,6 +410,26 @@ where
     Ok(matches)
 }
 
+fn extract_matched_bytes<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+    range: ExtractedByteRange,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let matched_boxes = collect_matches(reader, parent, paths, registry)?;
+    let mut extracted = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        extracted.push(read_matched_bytes(reader, &matched.info, range)?);
+    }
+
+    Ok(extracted)
+}
+
 fn decode_payload<R>(
     reader: &mut R,
     matched: &MatchedBox,
@@ -297,6 +455,46 @@ where
         source,
     })?;
     Ok(payload)
+}
+
+fn read_matched_bytes<R>(
+    reader: &mut R,
+    info: &BoxInfo,
+    range: ExtractedByteRange,
+) -> Result<Vec<u8>, ExtractError>
+where
+    R: Read + Seek,
+{
+    let len = match range {
+        ExtractedByteRange::FullBox => {
+            info.seek_to_start(reader)?;
+            info.size()
+        }
+        ExtractedByteRange::Payload => {
+            info.seek_to_payload(reader)?;
+            info.payload_size()?
+        }
+    };
+    read_exact_bytes(reader, len)
+}
+
+fn read_exact_bytes<R>(reader: &mut R, len: u64) -> Result<Vec<u8>, ExtractError>
+where
+    R: Read,
+{
+    let mut bytes = usize::try_from(len)
+        .map(Vec::with_capacity)
+        .unwrap_or_else(|_| Vec::new());
+
+    // `Read::read_to_end` on a `Take` reader does not error on an early underlying EOF, so the
+    // copied byte count must be checked explicitly to preserve exact-byte semantics.
+    let mut limited = reader.take(len);
+    let copied = limited.read_to_end(&mut bytes)? as u64;
+    if copied != len {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
+
+    Ok(bytes)
 }
 
 fn validate_paths(paths: &[BoxPath]) -> Result<(), ExtractError> {

@@ -17,7 +17,8 @@ use mp4forge::boxes::iso14496_14::{
 use mp4forge::codec::{CodecBox, MutableBox, marshal};
 use mp4forge::probe::{
     AacProfileInfo, EditListEntry, TrackCodec, average_sample_bitrate, average_segment_bitrate,
-    detect_aac_profile, find_idr_frames, max_sample_bitrate, max_segment_bitrate, probe, probe_fra,
+    detect_aac_profile, find_idr_frames, max_sample_bitrate, max_segment_bitrate, probe,
+    probe_bytes, probe_fra, probe_fra_bytes,
 };
 use mp4forge::{BoxInfo, FourCc};
 
@@ -120,6 +121,14 @@ fn probe_summarizes_movie_tracks_samples_and_codecs() {
 }
 
 #[test]
+fn probe_bytes_matches_cursor_based_probe() {
+    let file = build_movie_file();
+    let expected = probe(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn probe_and_probe_fra_summarize_fragment_runs() {
     let file = build_fragment_file();
 
@@ -155,6 +164,27 @@ fn probe_and_probe_fra_summarize_fragment_runs() {
     assert_eq!(second.duration, 3_072);
     assert_eq!(second.composition_time_offset, 0);
     assert_eq!(second.size, 36);
+}
+
+#[test]
+fn probe_fra_bytes_matches_cursor_based_probe_fra() {
+    let file = build_fragment_file();
+    let expected = probe_fra(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_fra_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_bytes_propagates_decode_errors() {
+    let file = encode_raw_box(fourcc("ftyp"), &[0x69, 0x73]);
+    let expected = probe(&mut Cursor::new(file.clone())).unwrap_err();
+    let actual = probe_bytes(&file).unwrap_err();
+
+    assert_eq!(
+        std::mem::discriminant(&actual),
+        std::mem::discriminant(&expected)
+    );
+    assert_eq!(actual.to_string(), expected.to_string());
 }
 
 #[test]

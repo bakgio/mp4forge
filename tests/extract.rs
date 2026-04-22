@@ -7,7 +7,9 @@ use mp4forge::boxes::metadata::{
 };
 use mp4forge::codec::{CodecBox, marshal};
 use mp4forge::extract::{
-    ExtractError, extract_box, extract_box_as, extract_box_with_payload, extract_boxes,
+    ExtractError, extract_box, extract_box_as, extract_box_as_bytes, extract_box_bytes,
+    extract_box_payload_bytes, extract_box_with_payload, extract_boxes, extract_boxes_as_bytes,
+    extract_boxes_bytes, extract_boxes_payload_bytes,
 };
 use mp4forge::stringify::stringify;
 use mp4forge::walk::BoxPath;
@@ -152,6 +154,158 @@ fn extract_box_as_returns_typed_payloads() {
 }
 
 #[test]
+fn extract_box_bytes_preserve_exact_leaf_box_bytes_for_relative_paths() {
+    let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
+    let udta = encode_supported_box(&Udta, &leaf);
+    let moov = encode_supported_box(&Moov, &udta);
+
+    let parent = extract_box(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([fourcc("moov")]),
+    )
+    .unwrap()
+    .pop()
+    .unwrap();
+
+    let extracted = extract_box_bytes(
+        &mut Cursor::new(moov),
+        Some(&parent),
+        BoxPath::from([fourcc("udta"), fourcc("zzzz")]),
+    )
+    .unwrap();
+
+    assert_eq!(extracted, vec![leaf]);
+}
+
+#[test]
+fn extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
+    let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
+    let udta = encode_supported_box(&Udta, &leaf);
+    let moov = encode_supported_box(&Moov, &udta);
+
+    let extracted = extract_box_payload_bytes(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("udta")]),
+    )
+    .unwrap();
+
+    assert_eq!(extracted, vec![leaf]);
+}
+
+#[test]
+fn extract_box_as_bytes_returns_typed_payloads_without_cursor() {
+    let mut tkhd_a = Tkhd::default();
+    tkhd_a.track_id = 1;
+    let mut tkhd_b = Tkhd::default();
+    tkhd_b.track_id = 2;
+    let trak_a = encode_supported_box(&Trak, &encode_supported_box(&tkhd_a, &[]));
+    let trak_b = encode_supported_box(&Trak, &encode_supported_box(&tkhd_b, &[]));
+    let moov = encode_supported_box(&Moov, &[trak_a, trak_b].concat());
+
+    let extracted = extract_box_as_bytes::<Tkhd>(
+        &moov,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
+    )
+    .unwrap();
+
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(
+        extracted
+            .iter()
+            .map(|tkhd| tkhd.track_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn extract_boxes_bytes_match_shared_fixture_box_ranges() {
+    let sample = std::fs::read(fixture_path("sample.mp4")).unwrap();
+    let paths = [
+        BoxPath::from([fourcc("ftyp")]),
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("mdhd"),
+        ]),
+    ];
+
+    let infos = extract_boxes(&mut Cursor::new(sample.clone()), None, &paths).unwrap();
+    let extracted = extract_boxes_bytes(&mut Cursor::new(sample.clone()), None, &paths).unwrap();
+
+    assert_eq!(infos.len(), extracted.len());
+    for (info, bytes) in infos.iter().zip(extracted.iter()) {
+        assert_eq!(bytes, &box_bytes_from_file(&sample, info));
+    }
+}
+
+#[test]
+fn extract_boxes_payload_bytes_match_shared_fixture_payload_ranges() {
+    let sample = std::fs::read(fixture_path("sample.mp4")).unwrap();
+    let paths = [BoxPath::from([
+        fourcc("moov"),
+        fourcc("trak"),
+        fourcc("mdia"),
+        fourcc("mdhd"),
+    ])];
+
+    let infos = extract_boxes(&mut Cursor::new(sample.clone()), None, &paths).unwrap();
+    let extracted =
+        extract_boxes_payload_bytes(&mut Cursor::new(sample.clone()), None, &paths).unwrap();
+
+    assert_eq!(infos.len(), extracted.len());
+    for (info, bytes) in infos.iter().zip(extracted.iter()) {
+        assert_eq!(bytes, &payload_bytes_from_file(&sample, info));
+    }
+}
+
+#[test]
+fn extract_boxes_as_bytes_supports_multiple_root_paths() {
+    let mut root_tkhd = Tkhd::default();
+    root_tkhd.track_id = 1;
+    let root_trak = encode_supported_box(&Trak, &encode_supported_box(&root_tkhd, &[]));
+
+    let mut nested_tkhd = Tkhd::default();
+    nested_tkhd.track_id = 2;
+    let nested_trak = encode_supported_box(&Trak, &encode_supported_box(&nested_tkhd, &[]));
+    let moov = encode_supported_box(&Moov, &nested_trak);
+
+    let file = [root_trak, moov].concat();
+    let extracted = extract_boxes_as_bytes::<Tkhd>(
+        &file,
+        &[
+            BoxPath::from([fourcc("trak"), fourcc("tkhd")]),
+            BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        extracted
+            .iter()
+            .map(|tkhd| tkhd.track_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn extract_box_payload_bytes_return_empty_when_nothing_matches() {
+    let moov = encode_supported_box(&Moov, &[]);
+    let extracted = extract_box_payload_bytes(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("zzzz")]),
+    )
+    .unwrap();
+
+    assert!(extracted.is_empty());
+}
+
+#[test]
 fn extract_box_as_uses_walked_lookup_context() {
     let qt = fourcc("qt  ");
     let ftyp = Ftyp {
@@ -198,6 +352,33 @@ fn extract_box_as_uses_walked_lookup_context() {
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].item_name, fourcc("data"));
     assert_eq!(extracted[0].data.data, b"1.0.0");
+}
+
+#[test]
+fn extract_box_as_bytes_reports_payload_type_context() {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = 7;
+    let trak = encode_supported_box(&Trak, &encode_supported_box(&tkhd, &[]));
+    let moov = encode_supported_box(&Moov, &trak);
+
+    let error = extract_box_as_bytes::<Meta>(
+        &moov,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractError::UnexpectedPayloadType {
+            ref path,
+            box_type,
+            offset,
+            expected_type
+        } if path.as_slice() == [fourcc("moov"), fourcc("trak"), fourcc("tkhd")]
+            && box_type == fourcc("tkhd")
+            && offset == 16
+            && expected_type == std::any::type_name::<Meta>()
+    ));
 }
 
 #[test]
@@ -333,4 +514,16 @@ fn encode_raw_box(box_type: FourCc, payload: &[u8]) -> Vec<u8> {
     let mut bytes = info.encode();
     bytes.extend_from_slice(payload);
     bytes
+}
+
+fn box_bytes_from_file(file: &[u8], info: &BoxInfo) -> Vec<u8> {
+    let start = usize::try_from(info.offset()).unwrap();
+    let end = usize::try_from(info.offset() + info.size()).unwrap();
+    file[start..end].to_vec()
+}
+
+fn payload_bytes_from_file(file: &[u8], info: &BoxInfo) -> Vec<u8> {
+    let start = usize::try_from(info.offset() + info.header_size()).unwrap();
+    let end = usize::try_from(info.offset() + info.size()).unwrap();
+    file[start..end].to_vec()
 }
