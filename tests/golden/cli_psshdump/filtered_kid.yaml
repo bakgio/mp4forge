@@ -1,0 +1,16 @@
+entries:
+- index: 1
+  path: moof/pssh
+  offset: 89
+  size: 54
+  version: 1
+  flags: 0
+  system_id: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed
+  kid_count: 1
+  kids:
+    - fedcba98-7654-3210-fedc-ba9876543210
+  data_size: 2
+  data_bytes:
+    - 187
+    - 204
+  raw_box_base64: 'AAAANnBzc2gBAAAA7e+LqXnWSs6jyCfc1R0h7QAAAAH+3LqYdlQyEP7cuph2VDIQAAAAArvM'

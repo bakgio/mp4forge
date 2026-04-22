@@ -1,0 +1,1666 @@
+boxes:
+- box_type: ftyp
+  path: ftyp
+  offset: 0
+  size: 32
+  supported: true
+  payload_status: summary
+  payload_fields:
+    - name: MajorBrand
+      value_kind: bytes
+      value:
+        - 105
+        - 115
+        - 111
+        - 109
+      display_value: '"isom"'
+    - name: MinorVersion
+      value_kind: unsigned
+      value: 512
+    - name: CompatibleBrands
+      value_kind: bytes
+      value:
+        - 105
+        - 115
+        - 111
+        - 109
+        - 105
+        - 115
+        - 111
+        - 50
+        - 97
+        - 118
+        - 99
+        - 49
+        - 109
+        - 112
+        - 52
+        - 49
+      display_value: '[{CompatibleBrand="isom"}, {CompatibleBrand="iso2"}, {CompatibleBrand="avc1"}, {CompatibleBrand="mp41"}]'
+  payload_summary: 'MajorBrand="isom" MinorVersion=512 CompatibleBrands=[{CompatibleBrand="isom"}, {CompatibleBrand="iso2"}, {CompatibleBrand="avc1"}, {CompatibleBrand="mp41"}]'
+  children: []
+- box_type: free
+  path: free
+  offset: 32
+  size: 8
+  supported: true
+  payload_status: omitted
+  payload_fields: []
+  children: []
+- box_type: mdat
+  path: mdat
+  offset: 40
+  size: 6402
+  supported: true
+  payload_status: omitted
+  payload_fields: []
+  children: []
+- box_type: moov
+  path: moov
+  offset: 6442
+  size: 1836
+  supported: true
+  payload_status: empty
+  payload_fields: []
+  children:
+  - box_type: mvhd
+    path: moov/mvhd
+    offset: 6450
+    size: 108
+    supported: true
+    payload_status: summary
+    payload_fields:
+      - name: Version
+        value_kind: unsigned
+        value: 0
+      - name: Flags
+        value_kind: unsigned
+        value: 0
+        display_value: 0x000000
+      - name: CreationTimeV0
+        value_kind: unsigned
+        value: 0
+      - name: ModificationTimeV0
+        value_kind: unsigned
+        value: 0
+      - name: Timescale
+        value_kind: unsigned
+        value: 1000
+      - name: DurationV0
+        value_kind: unsigned
+        value: 1024
+      - name: Rate
+        value_kind: signed
+        value: 65536
+        display_value: 1
+      - name: Volume
+        value_kind: signed
+        value: 256
+      - name: Matrix
+        value_kind: signed_array
+        value:
+          - 65536
+          - 0
+          - 0
+          - 0
+          - 65536
+          - 0
+          - 0
+          - 0
+          - 1073741824
+        display_value: '[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000]'
+      - name: PreDefined
+        value_kind: signed_array
+        value:
+          - 0
+          - 0
+          - 0
+          - 0
+          - 0
+          - 0
+      - name: NextTrackID
+        value_kind: unsigned
+        value: 3
+    payload_summary: 'Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=1000 DurationV0=1024 Rate=1 Volume=256 Matrix=[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000] PreDefined=[0, 0, 0, 0, 0, 0] NextTrackID=3'
+    children: []
+  - box_type: trak
+    path: moov/trak
+    offset: 6558
+    size: 743
+    supported: true
+    payload_status: empty
+    payload_fields: []
+    children:
+    - box_type: tkhd
+      path: moov/trak/tkhd
+      offset: 6566
+      size: 92
+      supported: true
+      payload_status: summary
+      payload_fields:
+        - name: Version
+          value_kind: unsigned
+          value: 0
+        - name: Flags
+          value_kind: unsigned
+          value: 3
+          display_value: 0x000003
+        - name: CreationTimeV0
+          value_kind: unsigned
+          value: 0
+        - name: ModificationTimeV0
+          value_kind: unsigned
+          value: 0
+        - name: TrackID
+          value_kind: unsigned
+          value: 1
+        - name: DurationV0
+          value_kind: unsigned
+          value: 1000
+        - name: Layer
+          value_kind: signed
+          value: 0
+        - name: AlternateGroup
+          value_kind: signed
+          value: 0
+        - name: Volume
+          value_kind: signed
+          value: 0
+        - name: Matrix
+          value_kind: signed_array
+          value:
+            - 65536
+            - 0
+            - 0
+            - 0
+            - 65536
+            - 0
+            - 0
+            - 0
+            - 1073741824
+          display_value: '[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000]'
+        - name: Width
+          value_kind: unsigned
+          value: 20971520
+          display_value: 320
+        - name: Height
+          value_kind: unsigned
+          value: 11796480
+          display_value: 180
+      payload_summary: 'Version=0 Flags=0x000003 CreationTimeV0=0 ModificationTimeV0=0 TrackID=1 DurationV0=1000 Layer=0 AlternateGroup=0 Volume=0 Matrix=[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000] Width=320 Height=180'
+      children: []
+    - box_type: edts
+      path: moov/trak/edts
+      offset: 6658
+      size: 36
+      supported: true
+      payload_status: empty
+      payload_fields: []
+      children:
+      - box_type: elst
+        path: moov/trak/edts/elst
+        offset: 6666
+        size: 28
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: EntryCount
+            value_kind: unsigned
+            value: 1
+          - name: Entries
+            value_kind: bytes
+            value:
+              - 0
+              - 0
+              - 3
+              - 232
+              - 0
+              - 0
+              - 8
+              - 0
+              - 0
+              - 1
+              - 0
+              - 0
+            display_value: '[{SegmentDurationV0=1000 MediaTimeV0=2048 MediaRateInteger=1}]'
+        payload_summary: 'Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=2048 MediaRateInteger=1}]'
+        children: []
+    - box_type: mdia
+      path: moov/trak/mdia
+      offset: 6694
+      size: 607
+      supported: true
+      payload_status: empty
+      payload_fields: []
+      children:
+      - box_type: mdhd
+        path: moov/trak/mdia/mdhd
+        offset: 6702
+        size: 32
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: CreationTimeV0
+            value_kind: unsigned
+            value: 0
+          - name: ModificationTimeV0
+            value_kind: unsigned
+            value: 0
+          - name: Timescale
+            value_kind: unsigned
+            value: 10240
+          - name: DurationV0
+            value_kind: unsigned
+            value: 10240
+          - name: Language
+            value_kind: unsigned_array
+            value:
+              - 5
+              - 14
+              - 7
+            display_value: '"eng"'
+          - name: PreDefined
+            value_kind: unsigned
+            value: 0
+        payload_summary: 'Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=10240 DurationV0=10240 Language="eng" PreDefined=0'
+        children: []
+      - box_type: hdlr
+        path: moov/trak/mdia/hdlr
+        offset: 6734
+        size: 44
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: PreDefined
+            value_kind: unsigned
+            value: 0
+          - name: HandlerType
+            value_kind: bytes
+            value:
+              - 118
+              - 105
+              - 100
+              - 101
+            display_value: '"vide"'
+          - name: Name
+            value_kind: string
+            value: VideoHandle
+            display_value: '"VideoHandle"'
+        payload_summary: 'Version=0 Flags=0x000000 PreDefined=0 HandlerType="vide" Name="VideoHandle"'
+        children: []
+      - box_type: minf
+        path: moov/trak/mdia/minf
+        offset: 6778
+        size: 523
+        supported: true
+        payload_status: empty
+        payload_fields: []
+        children:
+        - box_type: vmhd
+          path: moov/trak/mdia/minf/vmhd
+          offset: 6786
+          size: 20
+          supported: true
+          payload_status: summary
+          payload_fields:
+            - name: Version
+              value_kind: unsigned
+              value: 0
+            - name: Flags
+              value_kind: unsigned
+              value: 1
+              display_value: 0x000001
+            - name: Graphicsmode
+              value_kind: unsigned
+              value: 0
+            - name: Opcolor
+              value_kind: unsigned_array
+              value:
+                - 0
+                - 0
+                - 0
+          payload_summary: 'Version=0 Flags=0x000001 Graphicsmode=0 Opcolor=[0, 0, 0]'
+          children: []
+        - box_type: dinf
+          path: moov/trak/mdia/minf/dinf
+          offset: 6806
+          size: 36
+          supported: true
+          payload_status: empty
+          payload_fields: []
+          children:
+          - box_type: dref
+            path: moov/trak/mdia/minf/dinf/dref
+            offset: 6814
+            size: 28
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=1'
+            children:
+            - box_type: 'url '
+              path: 'moov/trak/mdia/minf/dinf/dref/url '
+              offset: 6830
+              size: 12
+              supported: true
+              payload_status: summary
+              payload_fields:
+                - name: Version
+                  value_kind: unsigned
+                  value: 0
+                - name: Flags
+                  value_kind: unsigned
+                  value: 1
+                  display_value: 0x000001
+              payload_summary: 'Version=0 Flags=0x000001'
+              children: []
+        - box_type: stbl
+          path: moov/trak/mdia/minf/stbl
+          offset: 6842
+          size: 459
+          supported: true
+          payload_status: empty
+          payload_fields: []
+          children:
+          - box_type: stsd
+            path: moov/trak/mdia/minf/stbl/stsd
+            offset: 6850
+            size: 167
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=1'
+            children:
+            - box_type: avc1
+              path: moov/trak/mdia/minf/stbl/stsd/avc1
+              offset: 6866
+              size: 151
+              supported: true
+              payload_status: summary
+              payload_fields:
+                - name: DataReferenceIndex
+                  value_kind: unsigned
+                  value: 1
+                - name: PreDefined
+                  value_kind: unsigned
+                  value: 0
+                - name: PreDefined2
+                  value_kind: unsigned_array
+                  value:
+                    - 0
+                    - 0
+                    - 0
+                - name: Width
+                  value_kind: unsigned
+                  value: 320
+                - name: Height
+                  value_kind: unsigned
+                  value: 180
+                - name: Horizresolution
+                  value_kind: unsigned
+                  value: 4718592
+                - name: Vertresolution
+                  value_kind: unsigned
+                  value: 4718592
+                - name: FrameCount
+                  value_kind: unsigned
+                  value: 1
+                - name: Compressorname
+                  value_kind: bytes
+                  value:
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                    - 0
+                  display_value: '""'
+                - name: Depth
+                  value_kind: unsigned
+                  value: 24
+                - name: PreDefined3
+                  value_kind: signed
+                  value: -1
+              payload_summary: 'DataReferenceIndex=1 PreDefined=0 PreDefined2=[0, 0, 0] Width=320 Height=180 Horizresolution=4718592 Vertresolution=4718592 FrameCount=1 Compressorname="" Depth=24 PreDefined3=-1'
+              children:
+              - box_type: avcC
+                path: moov/trak/mdia/minf/stbl/stsd/avc1/avcC
+                offset: 6952
+                size: 49
+                supported: true
+                payload_status: summary
+                payload_fields:
+                  - name: ConfigurationVersion
+                    value_kind: unsigned
+                    value: 1
+                    display_value: 0x1
+                  - name: Profile
+                    value_kind: unsigned
+                    value: 100
+                    display_value: 0x64
+                  - name: ProfileCompatibility
+                    value_kind: unsigned
+                    value: 0
+                    display_value: 0x0
+                  - name: Level
+                    value_kind: unsigned
+                    value: 12
+                    display_value: 0xc
+                  - name: LengthSizeMinusOne
+                    value_kind: unsigned
+                    value: 3
+                    display_value: 0x3
+                  - name: NumOfSequenceParameterSets
+                    value_kind: unsigned
+                    value: 1
+                    display_value: 0x1
+                  - name: SequenceParameterSets
+                    value_kind: bytes
+                    value:
+                      - 0
+                      - 25
+                      - 103
+                      - 100
+                      - 0
+                      - 12
+                      - 172
+                      - 217
+                      - 65
+                      - 65
+                      - 159
+                      - 159
+                      - 1
+                      - 108
+                      - 128
+                      - 0
+                      - 0
+                      - 3
+                      - 0
+                      - 128
+                      - 0
+                      - 0
+                      - 10
+                      - 7
+                      - 138
+                      - 20
+                      - 203
+                    display_value: '[{Length=25 NALUnit=[0x67, 0x64, 0x0, 0xc, 0xac, 0xd9, 0x41, 0x41, 0x9f, 0x9f, 0x1, 0x6c, 0x80, 0x0, 0x0, 0x3, 0x0, 0x80, 0x0, 0x0, 0xa, 0x7, 0x8a, 0x14, 0xcb]}]'
+                  - name: NumOfPictureParameterSets
+                    value_kind: unsigned
+                    value: 1
+                    display_value: 0x1
+                  - name: PictureParameterSets
+                    value_kind: bytes
+                    value:
+                      - 0
+                      - 5
+                      - 104
+                      - 235
+                      - 236
+                      - 178
+                      - 44
+                    display_value: '[{Length=5 NALUnit=[0x68, 0xeb, 0xec, 0xb2, 0x2c]}]'
+                payload_summary: 'ConfigurationVersion=0x1 Profile=0x64 ProfileCompatibility=0x0 Level=0xc LengthSizeMinusOne=0x3 NumOfSequenceParameterSets=0x1 SequenceParameterSets=[{Length=25 NALUnit=[0x67, 0x64, 0x0, 0xc, 0xac, 0xd9, 0x41, 0x41, 0x9f, 0x9f, 0x1, 0x6c, 0x80, 0x0, 0x0, 0x3, 0x0, 0x80, 0x0, 0x0, 0xa, 0x7, 0x8a, 0x14, 0xcb]}] NumOfPictureParameterSets=0x1 PictureParameterSets=[{Length=5 NALUnit=[0x68, 0xeb, 0xec, 0xb2, 0x2c]}]'
+                children: []
+              - box_type: pasp
+                path: moov/trak/mdia/minf/stbl/stsd/avc1/pasp
+                offset: 7001
+                size: 16
+                supported: true
+                payload_status: summary
+                payload_fields:
+                  - name: HSpacing
+                    value_kind: unsigned
+                    value: 1
+                  - name: VSpacing
+                    value_kind: unsigned
+                    value: 1
+                payload_summary: 'HSpacing=1 VSpacing=1'
+                children: []
+          - box_type: stts
+            path: moov/trak/mdia/minf/stbl/stts
+            offset: 7017
+            size: 24
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+              - name: Entries
+                value_kind: bytes
+                value:
+                  - 0
+                  - 0
+                  - 0
+                  - 10
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                display_value: '[{SampleCount=10 SampleDelta=1024}]'
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=1 Entries=[{SampleCount=10 SampleDelta=1024}]'
+            children: []
+          - box_type: stss
+            path: moov/trak/mdia/minf/stbl/stss
+            offset: 7041
+            size: 20
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+              - name: SampleNumber
+                value_kind: unsigned_array
+                value:
+                  - 1
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=1 SampleNumber=[1]'
+            children: []
+          - box_type: ctts
+            path: moov/trak/mdia/minf/stbl/ctts
+            offset: 7061
+            size: 88
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 9
+              - name: Entries
+                value_kind: bytes
+                value:
+                  - 0
+                  - 0
+                  - 0
+                  - 2
+                  - 0
+                  - 0
+                  - 8
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 20
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 8
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 12
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 12
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                display_value: '[{SampleCount=2 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=5120}, {SampleCount=1 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=0}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}]'
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=9 Entries=[{SampleCount=2 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=5120}, {SampleCount=1 SampleOffsetV0=2048}, {SampleCount=1 SampleOffsetV0=0}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}, {SampleCount=1 SampleOffsetV0=3072}, {SampleCount=1 SampleOffsetV0=1024}]'
+            children: []
+          - box_type: stsc
+            path: moov/trak/mdia/minf/stbl/stsc
+            offset: 7149
+            size: 40
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 2
+              - name: Entries
+                value_kind: bytes
+                value:
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 2
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 2
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                display_value: '[{FirstChunk=1 SamplesPerChunk=2 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=1 SampleDescriptionIndex=1}]'
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=2 Entries=[{FirstChunk=1 SamplesPerChunk=2 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=1 SampleDescriptionIndex=1}]'
+            children: []
+          - box_type: stsz
+            path: moov/trak/mdia/minf/stbl/stsz
+            offset: 7189
+            size: 60
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: SampleSize
+                value_kind: unsigned
+                value: 0
+              - name: SampleCount
+                value_kind: unsigned
+                value: 10
+              - name: EntrySize
+                value_kind: unsigned_array
+                value:
+                  - 3679
+                  - 86
+                  - 545
+                  - 180
+                  - 69
+                  - 60
+                  - 182
+                  - 22
+                  - 204
+                  - 15
+            payload_summary: 'Version=0 Flags=0x000000 SampleSize=0 SampleCount=10 EntrySize=[3679, 86, 545, 180, 69, 60, 182, 22, 204, 15]'
+            children: []
+          - box_type: stco
+            path: moov/trak/mdia/minf/stbl/stco
+            offset: 7249
+            size: 52
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 9
+              - name: ChunkOffset
+                value_kind: unsigned_array
+                value:
+                  - 48
+                  - 3836
+                  - 4527
+                  - 4864
+                  - 5043
+                  - 5227
+                  - 5560
+                  - 5702
+                  - 6038
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[48, 3836, 4527, 4864, 5043, 5227, 5560, 5702, 6038]'
+            children: []
+  - box_type: trak
+    path: moov/trak
+    offset: 7301
+    size: 844
+    supported: true
+    payload_status: empty
+    payload_fields: []
+    children:
+    - box_type: tkhd
+      path: moov/trak/tkhd
+      offset: 7309
+      size: 92
+      supported: true
+      payload_status: summary
+      payload_fields:
+        - name: Version
+          value_kind: unsigned
+          value: 0
+        - name: Flags
+          value_kind: unsigned
+          value: 3
+          display_value: 0x000003
+        - name: CreationTimeV0
+          value_kind: unsigned
+          value: 0
+        - name: ModificationTimeV0
+          value_kind: unsigned
+          value: 0
+        - name: TrackID
+          value_kind: unsigned
+          value: 2
+        - name: DurationV0
+          value_kind: unsigned
+          value: 1024
+        - name: Layer
+          value_kind: signed
+          value: 0
+        - name: AlternateGroup
+          value_kind: signed
+          value: 1
+        - name: Volume
+          value_kind: signed
+          value: 256
+        - name: Matrix
+          value_kind: signed_array
+          value:
+            - 65536
+            - 0
+            - 0
+            - 0
+            - 65536
+            - 0
+            - 0
+            - 0
+            - 1073741824
+          display_value: '[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000]'
+        - name: Width
+          value_kind: unsigned
+          value: 0
+          display_value: 0
+        - name: Height
+          value_kind: unsigned
+          value: 0
+          display_value: 0
+      payload_summary: 'Version=0 Flags=0x000003 CreationTimeV0=0 ModificationTimeV0=0 TrackID=2 DurationV0=1024 Layer=0 AlternateGroup=1 Volume=256 Matrix=[0x10000, 0x0, 0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x40000000] Width=0 Height=0'
+      children: []
+    - box_type: edts
+      path: moov/trak/edts
+      offset: 7401
+      size: 36
+      supported: true
+      payload_status: empty
+      payload_fields: []
+      children:
+      - box_type: elst
+        path: moov/trak/edts/elst
+        offset: 7409
+        size: 28
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: EntryCount
+            value_kind: unsigned
+            value: 1
+          - name: Entries
+            value_kind: bytes
+            value:
+              - 0
+              - 0
+              - 3
+              - 232
+              - 0
+              - 0
+              - 4
+              - 0
+              - 0
+              - 1
+              - 0
+              - 0
+            display_value: '[{SegmentDurationV0=1000 MediaTimeV0=1024 MediaRateInteger=1}]'
+        payload_summary: 'Version=0 Flags=0x000000 EntryCount=1 Entries=[{SegmentDurationV0=1000 MediaTimeV0=1024 MediaRateInteger=1}]'
+        children: []
+    - box_type: mdia
+      path: moov/trak/mdia
+      offset: 7437
+      size: 708
+      supported: true
+      payload_status: empty
+      payload_fields: []
+      children:
+      - box_type: mdhd
+        path: moov/trak/mdia/mdhd
+        offset: 7445
+        size: 32
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: CreationTimeV0
+            value_kind: unsigned
+            value: 0
+          - name: ModificationTimeV0
+            value_kind: unsigned
+            value: 0
+          - name: Timescale
+            value_kind: unsigned
+            value: 44100
+          - name: DurationV0
+            value_kind: unsigned
+            value: 45124
+          - name: Language
+            value_kind: unsigned_array
+            value:
+              - 5
+              - 14
+              - 7
+            display_value: '"eng"'
+          - name: PreDefined
+            value_kind: unsigned
+            value: 0
+        payload_summary: 'Version=0 Flags=0x000000 CreationTimeV0=0 ModificationTimeV0=0 Timescale=44100 DurationV0=45124 Language="eng" PreDefined=0'
+        children: []
+      - box_type: hdlr
+        path: moov/trak/mdia/hdlr
+        offset: 7477
+        size: 44
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: PreDefined
+            value_kind: unsigned
+            value: 0
+          - name: HandlerType
+            value_kind: bytes
+            value:
+              - 115
+              - 111
+              - 117
+              - 110
+            display_value: '"soun"'
+          - name: Name
+            value_kind: string
+            value: SoundHandle
+            display_value: '"SoundHandle"'
+        payload_summary: 'Version=0 Flags=0x000000 PreDefined=0 HandlerType="soun" Name="SoundHandle"'
+        children: []
+      - box_type: minf
+        path: moov/trak/mdia/minf
+        offset: 7521
+        size: 624
+        supported: true
+        payload_status: empty
+        payload_fields: []
+        children:
+        - box_type: smhd
+          path: moov/trak/mdia/minf/smhd
+          offset: 7529
+          size: 16
+          supported: true
+          payload_status: summary
+          payload_fields:
+            - name: Version
+              value_kind: unsigned
+              value: 0
+            - name: Flags
+              value_kind: unsigned
+              value: 0
+              display_value: 0x000000
+            - name: Balance
+              value_kind: signed
+              value: 0
+              display_value: 0
+          payload_summary: 'Version=0 Flags=0x000000 Balance=0'
+          children: []
+        - box_type: dinf
+          path: moov/trak/mdia/minf/dinf
+          offset: 7545
+          size: 36
+          supported: true
+          payload_status: empty
+          payload_fields: []
+          children:
+          - box_type: dref
+            path: moov/trak/mdia/minf/dinf/dref
+            offset: 7553
+            size: 28
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=1'
+            children:
+            - box_type: 'url '
+              path: 'moov/trak/mdia/minf/dinf/dref/url '
+              offset: 7569
+              size: 12
+              supported: true
+              payload_status: summary
+              payload_fields:
+                - name: Version
+                  value_kind: unsigned
+                  value: 0
+                - name: Flags
+                  value_kind: unsigned
+                  value: 1
+                  display_value: 0x000001
+              payload_summary: 'Version=0 Flags=0x000001'
+              children: []
+        - box_type: stbl
+          path: moov/trak/mdia/minf/stbl
+          offset: 7581
+          size: 564
+          supported: true
+          payload_status: empty
+          payload_fields: []
+          children:
+          - box_type: stsd
+            path: moov/trak/mdia/minf/stbl/stsd
+            offset: 7589
+            size: 106
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=1'
+            children:
+            - box_type: mp4a
+              path: moov/trak/mdia/minf/stbl/stsd/mp4a
+              offset: 7605
+              size: 90
+              supported: true
+              payload_status: summary
+              payload_fields:
+                - name: DataReferenceIndex
+                  value_kind: unsigned
+                  value: 1
+                - name: EntryVersion
+                  value_kind: unsigned
+                  value: 0
+                - name: ChannelCount
+                  value_kind: unsigned
+                  value: 2
+                - name: SampleSize
+                  value_kind: unsigned
+                  value: 16
+                - name: PreDefined
+                  value_kind: unsigned
+                  value: 0
+                - name: SampleRate
+                  value_kind: unsigned
+                  value: 2890137600
+                  display_value: 44100
+              payload_summary: 'DataReferenceIndex=1 EntryVersion=0 ChannelCount=2 SampleSize=16 PreDefined=0 SampleRate=44100'
+              children:
+              - box_type: esds
+                path: moov/trak/mdia/minf/stbl/stsd/mp4a/esds
+                offset: 7641
+                size: 54
+                supported: true
+                payload_status: summary
+                payload_fields:
+                  - name: Version
+                    value_kind: unsigned
+                    value: 0
+                  - name: Flags
+                    value_kind: unsigned
+                    value: 0
+                    display_value: 0x000000
+                  - name: Descriptors
+                    value_kind: bytes
+                    value:
+                      - 3
+                      - 128
+                      - 128
+                      - 128
+                      - 37
+                      - 0
+                      - 2
+                      - 0
+                      - 4
+                      - 128
+                      - 128
+                      - 128
+                      - 23
+                      - 64
+                      - 21
+                      - 0
+                      - 0
+                      - 0
+                      - 0
+                      - 0
+                      - 41
+                      - 74
+                      - 0
+                      - 0
+                      - 41
+                      - 74
+                      - 5
+                      - 128
+                      - 128
+                      - 128
+                      - 5
+                      - 18
+                      - 16
+                      - 86
+                      - 229
+                      - 0
+                      - 6
+                      - 128
+                      - 128
+                      - 128
+                      - 1
+                      - 2
+                    display_value: '[{Tag=ESDescr Size=37 ESID=2 StreamDependenceFlag=false UrlFlag=false OcrStreamFlag=false StreamPriority=0}, {Tag=DecoderConfigDescr Size=23 ObjectTypeIndication=0x40 StreamType=5 UpStream=false Reserved=true BufferSizeDB=0 MaxBitrate=10570 AvgBitrate=10570}, {Tag=DecSpecificInfo Size=5 Data=[0x12, 0x10, 0x56, 0xe5, 0x0]}, {Tag=SLConfigDescr Size=1 Data=[0x2]}]'
+                payload_summary: 'Version=0 Flags=0x000000 Descriptors=[{Tag=ESDescr Size=37 ESID=2 StreamDependenceFlag=false UrlFlag=false OcrStreamFlag=false StreamPriority=0}, {Tag=DecoderConfigDescr Size=23 ObjectTypeIndication=0x40 StreamType=5 UpStream=false Reserved=true BufferSizeDB=0 MaxBitrate=10570 AvgBitrate=10570}, {Tag=DecSpecificInfo Size=5 Data=[0x12, 0x10, 0x56, 0xe5, 0x0]}, {Tag=SLConfigDescr Size=1 Data=[0x2]}]'
+                children: []
+          - box_type: stts
+            path: moov/trak/mdia/minf/stbl/stts
+            offset: 7695
+            size: 48
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 4
+              - name: Entries
+                value_kind: bytes
+                value:
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 5
+                  - 225
+                  - 0
+                  - 0
+                  - 0
+                  - 41
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 2
+                  - 99
+                display_value: '[{SampleCount=1 SampleDelta=1024}, {SampleCount=1 SampleDelta=1505}, {SampleCount=41 SampleDelta=1024}, {SampleCount=1 SampleDelta=611}]'
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=4 Entries=[{SampleCount=1 SampleDelta=1024}, {SampleCount=1 SampleDelta=1505}, {SampleCount=41 SampleDelta=1024}, {SampleCount=1 SampleDelta=611}]'
+            children: []
+          - box_type: stsc
+            path: moov/trak/mdia/minf/stbl/stsc
+            offset: 7743
+            size: 100
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 7
+              - name: Entries
+                value_kind: bytes
+                value:
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 2
+                  - 0
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 3
+                  - 0
+                  - 0
+                  - 0
+                  - 5
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 6
+                  - 0
+                  - 0
+                  - 0
+                  - 5
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 7
+                  - 0
+                  - 0
+                  - 0
+                  - 4
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                  - 0
+                  - 0
+                  - 0
+                  - 9
+                  - 0
+                  - 0
+                  - 0
+                  - 13
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                display_value: '[{FirstChunk=1 SamplesPerChunk=1 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=3 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=4 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=6 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=7 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=9 SamplesPerChunk=13 SampleDescriptionIndex=1}]'
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=7 Entries=[{FirstChunk=1 SamplesPerChunk=1 SampleDescriptionIndex=1}, {FirstChunk=2 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=3 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=4 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=6 SamplesPerChunk=5 SampleDescriptionIndex=1}, {FirstChunk=7 SamplesPerChunk=4 SampleDescriptionIndex=1}, {FirstChunk=9 SamplesPerChunk=13 SampleDescriptionIndex=1}]'
+            children: []
+          - box_type: stsz
+            path: moov/trak/mdia/minf/stbl/stsz
+            offset: 7843
+            size: 196
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: SampleSize
+                value_kind: unsigned
+                value: 0
+              - name: SampleCount
+                value_kind: unsigned
+                value: 44
+              - name: EntrySize
+                value_kind: unsigned_array
+                value:
+                  - 23
+                  - 39
+                  - 35
+                  - 36
+                  - 36
+                  - 35
+                  - 31
+                  - 33
+                  - 28
+                  - 30
+                  - 33
+                  - 29
+                  - 23
+                  - 25
+                  - 25
+                  - 36
+                  - 27
+                  - 36
+                  - 35
+                  - 25
+                  - 28
+                  - 36
+                  - 27
+                  - 29
+                  - 28
+                  - 29
+                  - 34
+                  - 36
+                  - 30
+                  - 32
+                  - 34
+                  - 29
+                  - 24
+                  - 34
+                  - 35
+                  - 28
+                  - 24
+                  - 30
+                  - 29
+                  - 29
+                  - 27
+                  - 31
+                  - 34
+                  - 35
+            payload_summary: 'Version=0 Flags=0x000000 SampleSize=0 SampleCount=44 EntrySize=[23, 39, 35, 36, 36, 35, 31, 33, 28, 30, 33, 29, 23, 25, 25, 36, 27, 36, 35, 25, 28, 36, 27, 29, 28, 29, 34, 36, 30, 32, 34, 29, 24, 34, 35, 28, 24, 30, 29, 29, 27, 31, 34, 35]'
+            children: []
+          - box_type: stco
+            path: moov/trak/mdia/minf/stbl/stco
+            offset: 8039
+            size: 52
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: EntryCount
+                value_kind: unsigned
+                value: 9
+              - name: ChunkOffset
+                value_kind: unsigned_array
+                value:
+                  - 3813
+                  - 4381
+                  - 4707
+                  - 4933
+                  - 5103
+                  - 5409
+                  - 5582
+                  - 5906
+                  - 6053
+            payload_summary: 'Version=0 Flags=0x000000 EntryCount=9 ChunkOffset=[3813, 4381, 4707, 4933, 5103, 5409, 5582, 5906, 6053]'
+            children: []
+          - box_type: sgpd
+            path: moov/trak/mdia/minf/stbl/sgpd
+            offset: 8091
+            size: 26
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 1
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: GroupingType
+                value_kind: bytes
+                value:
+                  - 114
+                  - 111
+                  - 108
+                  - 108
+                display_value: '"roll"'
+              - name: DefaultLength
+                value_kind: unsigned
+                value: 2
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+              - name: RollDistances
+                value_kind: bytes
+                value:
+                  - 255
+                  - 255
+                display_value: '[-1]'
+            payload_summary: 'Version=1 Flags=0x000000 GroupingType="roll" DefaultLength=2 EntryCount=1 RollDistances=[-1]'
+            children: []
+          - box_type: sbgp
+            path: moov/trak/mdia/minf/stbl/sbgp
+            offset: 8117
+            size: 28
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: Version
+                value_kind: unsigned
+                value: 0
+              - name: Flags
+                value_kind: unsigned
+                value: 0
+                display_value: 0x000000
+              - name: GroupingType
+                value_kind: unsigned
+                value: 1919904876
+              - name: EntryCount
+                value_kind: unsigned
+                value: 1
+              - name: Entries
+                value_kind: bytes
+                value:
+                  - 0
+                  - 0
+                  - 0
+                  - 44
+                  - 0
+                  - 0
+                  - 0
+                  - 1
+                display_value: '[{SampleCount=44 GroupDescriptionIndex=1}]'
+            payload_summary: 'Version=0 Flags=0x000000 GroupingType=1919904876 EntryCount=1 Entries=[{SampleCount=44 GroupDescriptionIndex=1}]'
+            children: []
+  - box_type: udta
+    path: moov/udta
+    offset: 8145
+    size: 133
+    supported: true
+    payload_status: empty
+    payload_fields: []
+    children:
+    - box_type: meta
+      path: moov/udta/meta
+      offset: 8153
+      size: 90
+      supported: true
+      payload_status: summary
+      payload_fields:
+        - name: Version
+          value_kind: unsigned
+          value: 0
+        - name: Flags
+          value_kind: unsigned
+          value: 0
+          display_value: 0x000000
+      payload_summary: 'Version=0 Flags=0x000000'
+      children:
+      - box_type: hdlr
+        path: moov/udta/meta/hdlr
+        offset: 8165
+        size: 33
+        supported: true
+        payload_status: summary
+        payload_fields:
+          - name: Version
+            value_kind: unsigned
+            value: 0
+          - name: Flags
+            value_kind: unsigned
+            value: 0
+            display_value: 0x000000
+          - name: PreDefined
+            value_kind: unsigned
+            value: 0
+          - name: HandlerType
+            value_kind: bytes
+            value:
+              - 109
+              - 100
+              - 105
+              - 114
+            display_value: '"mdir"'
+          - name: Name
+            value_kind: string
+            value: ''
+            display_value: '""'
+        payload_summary: 'Version=0 Flags=0x000000 PreDefined=0 HandlerType="mdir" Name=""'
+        children: []
+      - box_type: ilst
+        path: moov/udta/meta/ilst
+        offset: 8198
+        size: 45
+        supported: true
+        payload_status: empty
+        payload_fields: []
+        children:
+        - box_type: '(c)too'
+          path: 'moov/udta/meta/ilst/(c)too'
+          offset: 8206
+          size: 37
+          supported: true
+          payload_status: empty
+          payload_fields: []
+          children:
+          - box_type: data
+            path: 'moov/udta/meta/ilst/(c)too/data'
+            offset: 8214
+            size: 29
+            supported: true
+            payload_status: summary
+            payload_fields:
+              - name: DataType
+                value_kind: unsigned
+                value: 1
+                display_value: UTF8
+              - name: DataLang
+                value_kind: unsigned
+                value: 0
+              - name: EncodingTool
+                value_kind: bytes
+                value:
+                  - 76
+                  - 97
+                  - 118
+                  - 102
+                  - 53
+                  - 56
+                  - 46
+                  - 50
+                  - 57
+                  - 46
+                  - 49
+                  - 48
+                  - 48
+                display_value: '"Lavf58.29.100"'
+            payload_summary: 'DataType=UTF8 DataLang=0 EncodingTool="Lavf58.29.100"'
+            children: []
+    - box_type: loci
+      path: moov/udta/loci
+      offset: 8243
+      size: 35
+      supported: false
+      payload_status: omitted
+      payload_fields: []
+      children: []

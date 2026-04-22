@@ -1,0 +1,23 @@
+{
+  "Entries": [
+    {
+      "Index": 1,
+      "Path": "moof/pssh",
+      "Offset": 89,
+      "Size": 54,
+      "Version": 1,
+      "Flags": 0,
+      "SystemId": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+      "KidCount": 1,
+      "Kids": [
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ],
+      "DataSize": 2,
+      "DataBytes": [
+        187,
+        204
+      ],
+      "RawBoxBase64": "AAAANnBzc2gBAAAA7e+LqXnWSs6jyCfc1R0h7QAAAAH+3LqYdlQyEP7cuph2VDIQAAAAArvM"
+    }
+  ]
+}

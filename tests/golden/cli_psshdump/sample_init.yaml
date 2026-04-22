@@ -1,0 +1,14 @@
+entries:
+- index: 0
+  path: moov/pssh
+  offset: 1307
+  size: 52
+  version: 1
+  flags: 0
+  system_id: 1077efec-c0b2-4d02-ace3-3c1e52e2fb4b
+  kid_count: 1
+  kids:
+    - 01234567-89ab-cdef-0123-456789abcdef
+  data_size: 0
+  data_bytes: []
+  raw_box_base64: 'AAAANHBzc2gBAAAAEHfv7MCyTQKs4zweUuL7SwAAAAEBI0VniavN7wEjRWeJq83vAAAAAA=='

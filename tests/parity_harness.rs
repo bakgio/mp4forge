@@ -9,8 +9,8 @@ use mp4forge::FourCc;
 use mp4forge::cli::{divide, edit, extract, probe as cli_probe, pssh};
 use mp4forge::extract::extract_box;
 use mp4forge::probe::{
-    ProbeError, TrackCodec, average_sample_bitrate, average_segment_bitrate, find_idr_frames,
-    max_sample_bitrate, max_segment_bitrate, probe,
+    ProbeError, ProbeOptions, TrackCodec, average_sample_bitrate, average_segment_bitrate,
+    find_idr_frames, max_sample_bitrate, max_segment_bitrate, probe, probe_with_options,
 };
 use mp4forge::walk::BoxPath;
 
@@ -297,6 +297,61 @@ fn probe_report_matches_library_summary_across_shared_fixtures() {
             };
             assert_eq!(expected_idr, expected_track.idr_frame_num);
             assert_eq!(report_track.idr_frame_num, expected_idr);
+        }
+    }
+}
+
+#[test]
+fn lightweight_probe_report_matches_library_summary_across_representative_fixtures() {
+    for file_name in ["sample.mp4", "sample_fragmented.mp4", "sample_qt.mp4"] {
+        let path = fixture_path(file_name);
+
+        let mut summary_file = fs::File::open(&path).unwrap();
+        let summary = probe_with_options(&mut summary_file, ProbeOptions::lightweight()).unwrap();
+
+        let mut report_file = fs::File::open(&path).unwrap();
+        let report = cli_probe::build_report_with_options(
+            &mut report_file,
+            cli_probe::ProbeReportOptions::lightweight(),
+        )
+        .unwrap();
+
+        assert_eq!(report.major_brand, summary.major_brand.to_string());
+        assert_eq!(
+            report.compatible_brands,
+            summary
+                .compatible_brands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.fast_start, summary.fast_start);
+        assert_eq!(report.timescale, summary.timescale);
+        assert_eq!(report.duration, summary.duration);
+        assert!(summary.segments.is_empty());
+        assert_eq!(report.tracks.len(), summary.tracks.len());
+
+        for (summary_track, report_track) in summary.tracks.iter().zip(report.tracks.iter()) {
+            assert!(summary_track.samples.is_empty());
+            assert!(summary_track.chunks.is_empty());
+
+            assert_eq!(report_track.track_id, summary_track.track_id);
+            assert_eq!(report_track.timescale, summary_track.timescale);
+            assert_eq!(report_track.duration, summary_track.duration);
+            assert_eq!(report_track.encrypted, summary_track.encrypted);
+            assert_eq!(
+                report_track.width,
+                summary_track.avc.as_ref().map(|avc| avc.width)
+            );
+            assert_eq!(
+                report_track.height,
+                summary_track.avc.as_ref().map(|avc| avc.height)
+            );
+            assert_eq!(report_track.sample_num, None);
+            assert_eq!(report_track.chunk_num, None);
+            assert_eq!(report_track.idr_frame_num, None);
+            assert_eq!(report_track.bitrate, None);
+            assert_eq!(report_track.max_bitrate, None);
         }
     }
 }

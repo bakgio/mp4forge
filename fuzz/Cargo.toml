@@ -46,4 +46,25 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "probe_reports"
+path = "fuzz_targets/probe_reports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dump_reports"
+path = "fuzz_targets/dump_reports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "typed_rewrites"
+path = "fuzz_targets/typed_rewrites.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

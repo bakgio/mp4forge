@@ -30,13 +30,41 @@ fn extract_command_writes_matching_raw_boxes() {
 }
 
 #[test]
+fn extract_command_writes_matching_raw_boxes_by_path() {
+    let file = build_extract_input_file();
+    let path = write_temp_file("extract-cli-path", &file);
+    let args = vec![
+        "-path".to_string(),
+        "moov/mvhd".to_string(),
+        path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = extract::run(&args, &mut stdout, &mut stderr);
+
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert_eq!(stdout.len(), 108);
+    assert_eq!(&stdout[4..8], b"mvhd");
+}
+
+#[test]
 fn extract_command_rejects_invalid_arguments() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     assert_eq!(extract::run(&[], &mut stdout, &mut stderr), 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "USAGE: mp4forge extract BOX_TYPE INPUT.mp4\n"
+        concat!(
+            "USAGE: mp4forge extract BOX_TYPE INPUT.mp4\n",
+            "       mp4forge extract -path <box/path> [-path <box/path> ...] INPUT.mp4\n",
+            "\n",
+            "OPTIONS:\n",
+            "  -path <box/path>      Extract raw boxes that match the parsed slash-delimited box path\n"
+        )
     );
 
     let mut stdout = Vec::new();
@@ -53,6 +81,29 @@ fn extract_command_rejects_invalid_arguments() {
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
         "Error: invalid box type: xxxxx\n"
+    );
+}
+
+#[test]
+fn extract_command_rejects_invalid_path_arguments() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    assert_eq!(
+        extract::run(
+            &[
+                "-path".to_string(),
+                "moov/trakk".to_string(),
+                fixture_path("sample.mp4").to_string_lossy().into_owned(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        ),
+        1
+    );
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error: invalid box path: invalid box path segment 2 (\"trakk\"): fourcc values must be exactly 4 bytes, got 5\n"
     );
 }
 
@@ -94,6 +145,28 @@ fn extract_command_matches_shared_fixture_reference_sizes() {
             expected_len
         );
     }
+}
+
+#[test]
+fn extract_command_matches_shared_fixture_reference_paths() {
+    let args = vec![
+        "--path".to_string(),
+        "moov/*/mdia/mdhd".to_string(),
+        fixture_path("sample.mp4").to_string_lossy().into_owned(),
+    ];
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = extract::run(&args, &mut stdout, &mut stderr);
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert_eq!(stdout.len(), 64);
+
+    let infos = parse_box_stream(&stdout);
+    assert_eq!(infos.len(), 2);
+    assert!(infos.iter().all(|info| info.box_type() == fourcc("mdhd")));
+    assert_eq!(infos.iter().map(BoxInfo::size).sum::<u64>(), 64);
 }
 
 fn build_extract_input_file() -> Vec<u8> {

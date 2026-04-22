@@ -3,22 +3,37 @@
 use std::io::Cursor;
 
 use mp4forge::boxes::AnyTypeBox;
+use mp4forge::boxes::av1::AV1CodecConfiguration;
+use mp4forge::boxes::etsi_ts_102_366::Dac3;
 use mp4forge::boxes::iso14496_12::{
-    AVCDecoderConfiguration, AudioSampleEntry, Ctts, CttsEntry, Edts, Elst, ElstEntry, Ftyp, Mdhd,
-    Mdia, Minf, Moof, Moov, Mvhd, SampleEntry, Stbl, Stco, Stsc, StscEntry, Stsd, Stsz, Stts,
-    SttsEntry, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+    AVCDecoderConfiguration, AudioSampleEntry, Btrt, Colr, Ctts, CttsEntry, Edts, Elst, ElstEntry,
+    Fiel, Frma, Ftyp, HEVCDecoderConfiguration, Hdlr, Mdhd, Mdia, Minf, Moof, Moov, Mvhd, Pasp,
+    SampleEntry, Schm, Sinf, Stbl, Stco, Stsc, StscEntry, Stsd, Stsz, Stts, SttsEntry,
+    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
     TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
-    TRUN_SAMPLE_SIZE_PRESENT, Tfdt, Tfhd, Tkhd, Traf, Trak, Trun, TrunEntry, VisualSampleEntry,
+    TRUN_SAMPLE_SIZE_PRESENT, TextSubtitleSampleEntry, Tfdt, Tfhd, Tkhd, Traf, Trak, Trun,
+    TrunEntry, VisualSampleEntry, XMLSubtitleSampleEntry,
 };
 use mp4forge::boxes::iso14496_14::{
     DECODER_CONFIG_DESCRIPTOR_TAG, DECODER_SPECIFIC_INFO_TAG, DecoderConfigDescriptor, Descriptor,
     Esds,
 };
+use mp4forge::boxes::iso14496_30::{WVTTSampleEntry, WebVTTConfigurationBox, WebVTTSourceLabelBox};
+use mp4forge::boxes::iso23001_5::PcmC;
+use mp4forge::boxes::opus::DOps;
+use mp4forge::boxes::vp::VpCodecConfiguration;
 use mp4forge::codec::{CodecBox, MutableBox, marshal};
 use mp4forge::probe::{
-    AacProfileInfo, EditListEntry, TrackCodec, average_sample_bitrate, average_segment_bitrate,
-    detect_aac_profile, find_idr_frames, max_sample_bitrate, max_segment_bitrate, probe,
-    probe_bytes, probe_fra, probe_fra_bytes,
+    AacProfileInfo, EditListEntry, ProbeOptions, TrackCodec, TrackCodecDetails, TrackCodecFamily,
+    average_sample_bitrate, average_segment_bitrate, detect_aac_profile, find_idr_frames,
+    max_sample_bitrate, max_segment_bitrate, probe, probe_bytes, probe_bytes_with_options,
+    probe_codec_detailed, probe_codec_detailed_bytes, probe_codec_detailed_bytes_with_options,
+    probe_codec_detailed_with_options, probe_detailed, probe_detailed_bytes,
+    probe_detailed_bytes_with_options, probe_detailed_with_options, probe_fra, probe_fra_bytes,
+    probe_fra_codec_detailed, probe_fra_codec_detailed_bytes, probe_fra_detailed,
+    probe_fra_detailed_bytes, probe_media_characteristics, probe_media_characteristics_bytes,
+    probe_media_characteristics_bytes_with_options, probe_media_characteristics_with_options,
+    probe_with_options,
 };
 use mp4forge::{BoxInfo, FourCc};
 
@@ -129,6 +144,156 @@ fn probe_bytes_matches_cursor_based_probe() {
 }
 
 #[test]
+fn probe_with_options_skips_expensive_expansions_but_preserves_core_summary() {
+    let file = build_movie_file();
+    let mut reader = Cursor::new(file.clone());
+
+    let full = probe(&mut Cursor::new(file)).unwrap();
+    let info = probe_with_options(&mut reader, ProbeOptions::lightweight()).unwrap();
+
+    assert_eq!(info.major_brand, full.major_brand);
+    assert_eq!(info.minor_version, full.minor_version);
+    assert_eq!(info.compatible_brands, full.compatible_brands);
+    assert_eq!(info.fast_start, full.fast_start);
+    assert_eq!(info.timescale, full.timescale);
+    assert_eq!(info.duration, full.duration);
+    assert_eq!(info.segments, Vec::new());
+    assert_eq!(info.tracks.len(), full.tracks.len());
+
+    for (light_track, full_track) in info.tracks.iter().zip(full.tracks.iter()) {
+        assert_eq!(light_track.track_id, full_track.track_id);
+        assert_eq!(light_track.timescale, full_track.timescale);
+        assert_eq!(light_track.duration, full_track.duration);
+        assert_eq!(light_track.codec, full_track.codec);
+        assert_eq!(light_track.encrypted, full_track.encrypted);
+        assert_eq!(light_track.edit_list, full_track.edit_list);
+        assert_eq!(light_track.avc, full_track.avc);
+        assert_eq!(light_track.mp4a, full_track.mp4a);
+        assert!(light_track.samples.is_empty());
+        assert!(light_track.chunks.is_empty());
+    }
+}
+
+#[test]
+fn probe_with_options_bytes_matches_cursor_based_probe() {
+    let file = build_movie_file();
+    let options = ProbeOptions::lightweight();
+    let expected = probe_with_options(&mut Cursor::new(file.clone()), options).unwrap();
+    let actual = probe_bytes_with_options(&file, options).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_detailed_exposes_handler_language_sample_entry_and_codec_family() {
+    let file = build_movie_file();
+    let mut reader = Cursor::new(file);
+
+    let info = probe_detailed(&mut reader).unwrap();
+
+    assert_eq!(info.tracks.len(), 2);
+
+    let video = &info.tracks[0];
+    assert_eq!(video.summary.track_id, 1);
+    assert_eq!(video.codec_family, TrackCodecFamily::Avc);
+    assert_eq!(video.handler_type, Some(fourcc("vide")));
+    assert_eq!(video.language.as_deref(), Some("eng"));
+    assert_eq!(video.sample_entry_type, Some(fourcc("avc1")));
+    assert_eq!(video.original_format, None);
+    assert_eq!(video.display_width, Some(320));
+    assert_eq!(video.display_height, Some(180));
+    assert_eq!(video.channel_count, None);
+    assert_eq!(video.sample_rate, None);
+
+    let audio = &info.tracks[1];
+    assert_eq!(audio.summary.track_id, 2);
+    assert_eq!(audio.codec_family, TrackCodecFamily::Mp4Audio);
+    assert_eq!(audio.handler_type, Some(fourcc("soun")));
+    assert_eq!(audio.language.as_deref(), Some("eng"));
+    assert_eq!(audio.sample_entry_type, Some(fourcc("mp4a")));
+    assert_eq!(audio.original_format, None);
+    assert_eq!(audio.display_width, None);
+    assert_eq!(audio.display_height, None);
+    assert_eq!(audio.channel_count, Some(2));
+    assert_eq!(audio.sample_rate, Some(48_000));
+}
+
+#[test]
+fn probe_detailed_bytes_matches_cursor_based_probe_detailed() {
+    let file = build_movie_file();
+    let expected = probe_detailed(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_detailed_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_detailed_with_options_preserves_metadata_without_sample_tables() {
+    let file = build_av01_movie_file();
+    let mut reader = Cursor::new(file.clone());
+
+    let full = probe_detailed(&mut Cursor::new(file)).unwrap();
+    let info = probe_detailed_with_options(&mut reader, ProbeOptions::lightweight()).unwrap();
+
+    assert_eq!(info.major_brand, full.major_brand);
+    assert_eq!(info.timescale, full.timescale);
+    assert_eq!(info.duration, full.duration);
+    assert_eq!(info.segments, Vec::new());
+    assert_eq!(info.tracks.len(), 1);
+    assert_eq!(info.tracks[0].codec_family, full.tracks[0].codec_family);
+    assert_eq!(info.tracks[0].handler_type, full.tracks[0].handler_type);
+    assert_eq!(info.tracks[0].language, full.tracks[0].language);
+    assert_eq!(
+        info.tracks[0].sample_entry_type,
+        full.tracks[0].sample_entry_type
+    );
+    assert_eq!(info.tracks[0].display_width, full.tracks[0].display_width);
+    assert_eq!(info.tracks[0].display_height, full.tracks[0].display_height);
+    assert!(info.tracks[0].summary.samples.is_empty());
+    assert!(info.tracks[0].summary.chunks.is_empty());
+}
+
+#[test]
+fn probe_detailed_bytes_with_options_matches_cursor_based_probe_detailed() {
+    let file = build_movie_file();
+    let options = ProbeOptions::lightweight();
+    let expected = probe_detailed_with_options(&mut Cursor::new(file.clone()), options).unwrap();
+    let actual = probe_detailed_bytes_with_options(&file, options).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_codec_detailed_bytes_matches_cursor_based_probe_codec_detailed() {
+    let file = build_hevc_movie_file();
+    let expected = probe_codec_detailed(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_codec_detailed_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_codec_detailed_with_options_skips_fragment_segments() {
+    let file = build_fragment_file();
+    let mut reader = Cursor::new(file.clone());
+
+    let full = probe_codec_detailed(&mut Cursor::new(file)).unwrap();
+    let info = probe_codec_detailed_with_options(&mut reader, ProbeOptions::lightweight()).unwrap();
+
+    assert_eq!(info.major_brand, full.major_brand);
+    assert_eq!(info.timescale, full.timescale);
+    assert_eq!(info.duration, full.duration);
+    assert!(!full.segments.is_empty());
+    assert!(info.segments.is_empty());
+}
+
+#[test]
+fn probe_codec_detailed_bytes_with_options_matches_cursor_based_probe_codec_detailed() {
+    let file = build_hevc_movie_file();
+    let options = ProbeOptions::lightweight();
+    let expected =
+        probe_codec_detailed_with_options(&mut Cursor::new(file.clone()), options).unwrap();
+    let actual = probe_codec_detailed_bytes_with_options(&file, options).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn probe_and_probe_fra_summarize_fragment_runs() {
     let file = build_fragment_file();
 
@@ -167,11 +332,338 @@ fn probe_and_probe_fra_summarize_fragment_runs() {
 }
 
 #[test]
+fn probe_fra_detailed_bytes_matches_cursor_based_probe_fra_detailed() {
+    let file = build_fragment_file();
+    let expected = probe_fra_detailed(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_fra_detailed_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_fra_codec_detailed_bytes_matches_cursor_based_probe_fra_codec_detailed() {
+    let file = build_fragment_file();
+    let expected = probe_fra_codec_detailed(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_fra_codec_detailed_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn probe_fra_bytes_matches_cursor_based_probe_fra() {
     let file = build_fragment_file();
     let expected = probe_fra(&mut Cursor::new(file.clone())).unwrap();
     let actual = probe_fra_bytes(&file).unwrap();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_detailed_recognizes_av01_track_family() {
+    let file = build_av01_movie_file();
+    let mut reader = Cursor::new(file);
+
+    let info = probe_detailed(&mut reader).unwrap();
+
+    assert_eq!(info.tracks.len(), 1);
+    let track = &info.tracks[0];
+    assert_eq!(track.summary.codec, TrackCodec::Unknown);
+    assert_eq!(track.codec_family, TrackCodecFamily::Av1);
+    assert_eq!(track.handler_type, Some(fourcc("vide")));
+    assert_eq!(track.language.as_deref(), Some("eng"));
+    assert_eq!(track.sample_entry_type, Some(fourcc("av01")));
+    assert_eq!(track.original_format, None);
+    assert_eq!(track.display_width, Some(640));
+    assert_eq!(track.display_height, Some(360));
+    assert_eq!(track.summary.samples.len(), 1);
+}
+
+#[test]
+fn probe_codec_detailed_exposes_richer_landed_codec_details() {
+    {
+        let mut reader = Cursor::new(build_hevc_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::Hevc);
+        match &track.codec_details {
+            TrackCodecDetails::Hevc(details) => {
+                assert_eq!(details.configuration_version, 1);
+                assert_eq!(details.profile_space, 1);
+                assert!(details.tier_flag);
+                assert_eq!(details.profile_idc, 2);
+                assert_eq!(details.profile_compatibility_mask, 0x4000_0000);
+                assert_eq!(details.constraint_indicator, [1, 2, 3, 4, 5, 6]);
+                assert_eq!(details.level_idc, 120);
+                assert_eq!(details.chroma_format_idc, 1);
+                assert_eq!(details.bit_depth_luma, 10);
+                assert_eq!(details.bit_depth_chroma, 10);
+                assert_eq!(details.avg_frame_rate, 30_000);
+                assert_eq!(details.length_size, 4);
+            }
+            other => panic!("expected HEVC details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_av01_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::Av1);
+        match &track.codec_details {
+            TrackCodecDetails::Av1(details) => {
+                assert_eq!(details.seq_profile, 0);
+                assert_eq!(details.seq_level_idx_0, 13);
+                assert_eq!(details.seq_tier_0, 1);
+                assert_eq!(details.bit_depth, 10);
+                assert!(!details.monochrome);
+                assert_eq!(details.chroma_subsampling_x, 1);
+                assert_eq!(details.chroma_subsampling_y, 0);
+                assert_eq!(details.chroma_sample_position, 2);
+                assert_eq!(details.initial_presentation_delay_minus_one, Some(3));
+            }
+            other => panic!("expected AV1 details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_vp09_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::Vp9);
+        match &track.codec_details {
+            TrackCodecDetails::Vp9(details) => {
+                assert_eq!(details.profile, 2);
+                assert_eq!(details.level, 31);
+                assert_eq!(details.bit_depth, 10);
+                assert_eq!(details.chroma_subsampling, 1);
+                assert!(details.full_range);
+                assert_eq!(details.colour_primaries, 9);
+                assert_eq!(details.transfer_characteristics, 16);
+                assert_eq!(details.matrix_coefficients, 9);
+                assert_eq!(details.codec_initialization_data_size, 3);
+            }
+            other => panic!("expected VP9 details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_opus_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::Opus);
+        match &track.codec_details {
+            TrackCodecDetails::Opus(details) => {
+                assert_eq!(details.output_channel_count, 2);
+                assert_eq!(details.pre_skip, 312);
+                assert_eq!(details.input_sample_rate, 48_000);
+                assert_eq!(details.output_gain, 0);
+                assert_eq!(details.channel_mapping_family, 1);
+                assert_eq!(details.stream_count, Some(2));
+                assert_eq!(details.coupled_count, Some(1));
+                assert_eq!(details.channel_mapping, vec![0, 1]);
+            }
+            other => panic!("expected Opus details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_ac3_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::Ac3);
+        match &track.codec_details {
+            TrackCodecDetails::Ac3(details) => {
+                assert_eq!(details.sample_rate_code, 1);
+                assert_eq!(details.bit_stream_identification, 8);
+                assert_eq!(details.bit_stream_mode, 3);
+                assert_eq!(details.audio_coding_mode, 7);
+                assert!(details.lfe_on);
+                assert_eq!(details.bit_rate_code, 10);
+            }
+            other => panic!("expected AC-3 details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_pcm_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::Pcm);
+        match &track.codec_details {
+            TrackCodecDetails::Pcm(details) => {
+                assert_eq!(details.format_flags, 1);
+                assert_eq!(details.sample_size, 24);
+            }
+            other => panic!("expected PCM details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_stpp_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::XmlSubtitle);
+        match &track.codec_details {
+            TrackCodecDetails::XmlSubtitle(details) => {
+                assert_eq!(details.namespace, "urn:ebu:tt:metadata");
+                assert_eq!(details.schema_location, "urn:ebu:tt:schema");
+                assert_eq!(details.auxiliary_mime_types, "application/ttml+xml");
+            }
+            other => panic!("expected XML subtitle details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_sbtt_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::TextSubtitle);
+        match &track.codec_details {
+            TrackCodecDetails::TextSubtitle(details) => {
+                assert_eq!(details.content_encoding, "utf-8");
+                assert_eq!(details.mime_format, "text/plain");
+            }
+            other => panic!("expected text subtitle details, got {other:?}"),
+        }
+    }
+
+    {
+        let mut reader = Cursor::new(build_wvtt_movie_file());
+        let info = probe_codec_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec_family, TrackCodecFamily::WebVtt);
+        match &track.codec_details {
+            TrackCodecDetails::WebVtt(details) => {
+                assert_eq!(details.config.as_deref(), Some("WEBVTT"));
+                assert_eq!(details.source_label.as_deref(), Some("eng"));
+            }
+            other => panic!("expected WebVTT details, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn probe_detailed_reports_protected_sample_entry_metadata() {
+    let file = build_encrypted_video_movie_file();
+    let mut reader = Cursor::new(file);
+
+    let info = probe_detailed(&mut reader).unwrap();
+
+    assert_eq!(info.tracks.len(), 1);
+    let track = &info.tracks[0];
+    assert_eq!(track.summary.codec, TrackCodec::Avc1);
+    assert!(track.summary.encrypted);
+    assert_eq!(track.codec_family, TrackCodecFamily::Avc);
+    assert_eq!(track.handler_type, Some(fourcc("vide")));
+    assert_eq!(track.language.as_deref(), Some("eng"));
+    assert_eq!(track.sample_entry_type, Some(fourcc("encv")));
+    assert_eq!(track.original_format, Some(fourcc("avc1")));
+    assert_eq!(
+        track
+            .protection_scheme
+            .as_ref()
+            .map(|value| (value.scheme_type, value.scheme_version)),
+        Some((fourcc("cenc"), 0x0001_0000))
+    );
+    assert_eq!(track.display_width, Some(320));
+    assert_eq!(track.display_height, Some(180));
+}
+
+#[test]
+fn probe_codec_detailed_reports_protected_hevc_codec_details() {
+    let file = build_encrypted_hevc_movie_file();
+    let mut reader = Cursor::new(file);
+
+    let info = probe_codec_detailed(&mut reader).unwrap();
+
+    assert_eq!(info.tracks.len(), 1);
+    let track = &info.tracks[0];
+    assert_eq!(track.summary.summary.codec, TrackCodec::Avc1);
+    assert!(track.summary.summary.encrypted);
+    assert_eq!(track.summary.codec_family, TrackCodecFamily::Hevc);
+    assert_eq!(track.summary.sample_entry_type, Some(fourcc("encv")));
+    assert_eq!(track.summary.original_format, Some(fourcc("hvc1")));
+    match &track.codec_details {
+        TrackCodecDetails::Hevc(details) => {
+            assert_eq!(details.profile_idc, 2);
+            assert_eq!(details.length_size, 4);
+        }
+        other => panic!("expected HEVC details, got {other:?}"),
+    }
+}
+
+#[test]
+fn probe_media_characteristics_exposes_sample_entry_side_metadata() {
+    let file = build_media_characteristics_movie_file();
+    let mut reader = Cursor::new(file);
+
+    let info = probe_media_characteristics(&mut reader).unwrap();
+
+    assert_eq!(info.tracks.len(), 1);
+    let track = &info.tracks[0];
+    assert_eq!(track.summary.summary.track_id, 1);
+    assert_eq!(track.summary.codec_family, TrackCodecFamily::Avc);
+    assert_eq!(track.summary.sample_entry_type, Some(fourcc("avc1")));
+    assert_eq!(
+        track.media_characteristics.declared_bitrate,
+        Some(mp4forge::probe::DeclaredBitrateInfo {
+            buffer_size_db: 32_768,
+            max_bitrate: 4_000_000,
+            avg_bitrate: 2_500_000,
+        })
+    );
+    assert_eq!(
+        track.media_characteristics.color,
+        Some(mp4forge::probe::ColorInfo {
+            colour_type: fourcc("nclx"),
+            colour_primaries: Some(9),
+            transfer_characteristics: Some(16),
+            matrix_coefficients: Some(9),
+            full_range: Some(true),
+            profile_size: None,
+            unknown_size: None,
+        })
+    );
+    assert_eq!(
+        track.media_characteristics.pixel_aspect_ratio,
+        Some(mp4forge::probe::PixelAspectRatioInfo {
+            h_spacing: 4,
+            v_spacing: 3,
+        })
+    );
+    assert_eq!(
+        track.media_characteristics.field_order,
+        Some(mp4forge::probe::FieldOrderInfo {
+            field_count: 2,
+            field_ordering: 6,
+            interlaced: true,
+        })
+    );
+}
+
+#[test]
+fn probe_media_characteristics_bytes_matches_cursor_based_probe() {
+    let file = build_media_characteristics_movie_file();
+    let expected = probe_media_characteristics(&mut Cursor::new(file.clone())).unwrap();
+    let actual = probe_media_characteristics_bytes(&file).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn probe_media_characteristics_with_options_preserves_media_fields_without_sample_tables() {
+    let file = build_media_characteristics_movie_file();
+    let options = ProbeOptions::lightweight();
+    let expected =
+        probe_media_characteristics_with_options(&mut Cursor::new(file.clone()), options).unwrap();
+    let actual = probe_media_characteristics_bytes_with_options(&file, options).unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.tracks.len(), 1);
+    assert!(actual.tracks[0].summary.summary.samples.is_empty());
+    assert!(actual.tracks[0].summary.summary.chunks.is_empty());
+    assert!(
+        actual.tracks[0]
+            .media_characteristics
+            .declared_bitrate
+            .is_some()
+    );
 }
 
 #[test]
@@ -316,6 +808,7 @@ fn build_video_trak(chunk_offsets: &[u64; 2]) -> Vec<u8> {
     mdhd.duration_v0 = 3_072;
     mdhd.language = [5, 14, 7];
     let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("vide", "VideoHandler");
 
     let mut stsd = Stsd::default();
     stsd.entry_count = 1;
@@ -377,7 +870,7 @@ fn build_video_trak(chunk_offsets: &[u64; 2]) -> Vec<u8> {
 
     let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, ctts, stsc, stsz].concat());
     let minf = encode_supported_box(&Minf, &stbl);
-    let mdia = encode_supported_box(&Mdia, &[mdhd, minf].concat());
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
     encode_supported_box(&Trak, &[tkhd, edts, mdia].concat())
 }
 
@@ -392,6 +885,7 @@ fn build_audio_trak(chunk_offsets: &[u64; 2]) -> Vec<u8> {
     mdhd.duration_v0 = 2_048;
     mdhd.language = [5, 14, 7];
     let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("soun", "SoundHandler");
 
     let mut stsd = Stsd::default();
     stsd.entry_count = 1;
@@ -430,7 +924,7 @@ fn build_audio_trak(chunk_offsets: &[u64; 2]) -> Vec<u8> {
 
     let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
     let minf = encode_supported_box(&Minf, &stbl);
-    let mdia = encode_supported_box(&Mdia, &[mdhd, minf].concat());
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
     encode_supported_box(&Trak, &[tkhd, mdia].concat())
 }
 
@@ -513,6 +1007,626 @@ fn build_fragment_moof_two() -> Vec<u8> {
     encode_supported_box(&Moof, &traf)
 }
 
+fn build_av01_movie_file() -> Vec<u8> {
+    let ftyp = encode_supported_box(
+        &Ftyp {
+            major_brand: fourcc("isom"),
+            minor_version: 0x0200,
+            compatible_brands: vec![fourcc("isom"), fourcc("iso8"), fourcc("av01")],
+        },
+        &[],
+    );
+
+    let placeholder_moov = build_av01_moov(&[0]);
+    let mdat_payload = vec![0x12, 0x34, 0x56, 0x78];
+    let mdat_data_offset = ftyp.len() as u64 + placeholder_moov.len() as u64 + 8;
+    let moov = build_av01_moov(&[mdat_data_offset]);
+    let mdat = encode_raw_box(fourcc("mdat"), &mdat_payload);
+    [ftyp, moov, mdat].concat()
+}
+
+fn build_av01_moov(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let mut mvhd = Mvhd::default();
+    mvhd.timescale = 1_000;
+    mvhd.duration_v0 = 1_000;
+    mvhd.rate = 1 << 16;
+    mvhd.volume = 1 << 8;
+    mvhd.next_track_id = 2;
+    let mvhd = encode_supported_box(&mvhd, &[]);
+    let video = build_av01_trak(chunk_offsets);
+    encode_supported_box(&Moov, &[mvhd, video].concat())
+}
+
+fn build_av01_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = 1;
+    tkhd.duration_v0 = 1_000;
+    tkhd.width = u32::from(640_u16) << 16;
+    tkhd.height = u32::from(360_u16) << 16;
+    let tkhd = encode_supported_box(&tkhd, &[]);
+
+    let mut mdhd = Mdhd::default();
+    mdhd.timescale = 1_000;
+    mdhd.duration_v0 = 1_000;
+    mdhd.language = [5, 14, 7];
+    let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("vide", "VideoHandler");
+
+    let mut stsd = Stsd::default();
+    stsd.entry_count = 1;
+    let av01 = encode_supported_box(
+        &video_sample_entry_with_type("av01", 640, 360),
+        &encode_supported_box(&av1_config(), &[]),
+    );
+    let stsd = encode_supported_box(&stsd, &av01);
+
+    let mut stco = Stco::default();
+    stco.entry_count = 1;
+    stco.chunk_offset = chunk_offsets.to_vec();
+    let stco = encode_supported_box(&stco, &[]);
+
+    let mut stts = Stts::default();
+    stts.entry_count = 1;
+    stts.entries = vec![SttsEntry {
+        sample_count: 1,
+        sample_delta: 1_000,
+    }];
+    let stts = encode_supported_box(&stts, &[]);
+
+    let mut stsc = Stsc::default();
+    stsc.entry_count = 1;
+    stsc.entries = vec![StscEntry {
+        first_chunk: 1,
+        samples_per_chunk: 1,
+        sample_description_index: 1,
+    }];
+    let stsc = encode_supported_box(&stsc, &[]);
+
+    let mut stsz = Stsz::default();
+    stsz.sample_count = 1;
+    stsz.entry_size = vec![4];
+    let stsz = encode_supported_box(&stsz, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
+    encode_supported_box(&Trak, &[tkhd, mdia].concat())
+}
+
+fn build_encrypted_video_movie_file() -> Vec<u8> {
+    let ftyp = encode_supported_box(
+        &Ftyp {
+            major_brand: fourcc("iso6"),
+            minor_version: 1,
+            compatible_brands: vec![fourcc("iso6"), fourcc("dash"), fourcc("cenc")],
+        },
+        &[],
+    );
+
+    let placeholder_moov = build_encrypted_video_moov(&[0]);
+    let mdat_payload = [avc_sample(5)].concat();
+    let mdat_data_offset = ftyp.len() as u64 + placeholder_moov.len() as u64 + 8;
+    let moov = build_encrypted_video_moov(&[mdat_data_offset]);
+    let mdat = encode_raw_box(fourcc("mdat"), &mdat_payload);
+    [ftyp, moov, mdat].concat()
+}
+
+fn build_encrypted_video_moov(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let mut mvhd = Mvhd::default();
+    mvhd.timescale = 1_000;
+    mvhd.duration_v0 = 1_000;
+    mvhd.rate = 1 << 16;
+    mvhd.volume = 1 << 8;
+    mvhd.next_track_id = 2;
+    let mvhd = encode_supported_box(&mvhd, &[]);
+    let video = build_encrypted_video_trak(chunk_offsets);
+    encode_supported_box(&Moov, &[mvhd, video].concat())
+}
+
+fn build_encrypted_video_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = 1;
+    tkhd.duration_v0 = 1_000;
+    tkhd.width = u32::from(320_u16) << 16;
+    tkhd.height = u32::from(180_u16) << 16;
+    let tkhd = encode_supported_box(&tkhd, &[]);
+
+    let mut mdhd = Mdhd::default();
+    mdhd.timescale = 1_000;
+    mdhd.duration_v0 = 1_000;
+    mdhd.language = [5, 14, 7];
+    let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("vide", "VideoHandler");
+
+    let mut schm = Schm::default();
+    schm.set_version(0);
+    schm.scheme_type = fourcc("cenc");
+    schm.scheme_version = 0x0001_0000;
+    let sinf = encode_supported_box(
+        &Sinf,
+        &[
+            encode_supported_box(
+                &Frma {
+                    data_format: fourcc("avc1"),
+                },
+                &[],
+            ),
+            encode_supported_box(&schm, &[]),
+        ]
+        .concat(),
+    );
+
+    let mut stsd = Stsd::default();
+    stsd.entry_count = 1;
+    let encv = encode_supported_box(
+        &video_sample_entry_with_type("encv", 320, 180),
+        &[encode_supported_box(&avc_config(), &[]), sinf].concat(),
+    );
+    let stsd = encode_supported_box(&stsd, &encv);
+
+    let mut stco = Stco::default();
+    stco.entry_count = 1;
+    stco.chunk_offset = chunk_offsets.to_vec();
+    let stco = encode_supported_box(&stco, &[]);
+
+    let mut stts = Stts::default();
+    stts.entry_count = 1;
+    stts.entries = vec![SttsEntry {
+        sample_count: 1,
+        sample_delta: 1_000,
+    }];
+    let stts = encode_supported_box(&stts, &[]);
+
+    let mut stsc = Stsc::default();
+    stsc.entry_count = 1;
+    stsc.entries = vec![StscEntry {
+        first_chunk: 1,
+        samples_per_chunk: 1,
+        sample_description_index: 1,
+    }];
+    let stsc = encode_supported_box(&stsc, &[]);
+
+    let mut stsz = Stsz::default();
+    stsz.sample_count = 1;
+    stsz.entry_size = vec![5];
+    let stsz = encode_supported_box(&stsz, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
+    encode_supported_box(&Trak, &[tkhd, mdia].concat())
+}
+
+fn build_single_track_movie_file(
+    compatible_brands: Vec<FourCc>,
+    track_builder: fn(&[u64; 1]) -> Vec<u8>,
+    mdat_payload: Vec<u8>,
+) -> Vec<u8> {
+    let ftyp = encode_supported_box(
+        &Ftyp {
+            major_brand: fourcc("isom"),
+            minor_version: 0x0200,
+            compatible_brands,
+        },
+        &[],
+    );
+
+    let placeholder_moov = build_single_track_moov(track_builder(&[0]));
+    let mdat_data_offset = ftyp.len() as u64 + placeholder_moov.len() as u64 + 8;
+    let moov = build_single_track_moov(track_builder(&[mdat_data_offset]));
+    let mdat = encode_raw_box(fourcc("mdat"), &mdat_payload);
+    [ftyp, moov, mdat].concat()
+}
+
+fn build_single_track_moov(track: Vec<u8>) -> Vec<u8> {
+    let mut mvhd = Mvhd::default();
+    mvhd.timescale = 1_000;
+    mvhd.duration_v0 = 1_000;
+    mvhd.rate = 1 << 16;
+    mvhd.volume = 1 << 8;
+    mvhd.next_track_id = 2;
+    let mvhd = encode_supported_box(&mvhd, &[]);
+    encode_supported_box(&Moov, &[mvhd, track].concat())
+}
+
+fn build_hevc_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("hvc1")],
+        build_hevc_trak,
+        vec![0x12, 0x34, 0x56, 0x78],
+    )
+}
+
+fn build_hevc_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &video_sample_entry_with_type("hvc1", 640, 360),
+        &encode_supported_box(&hevc_config(), &[]),
+    );
+    build_single_sample_video_trak(1, 1_000, 1_000, (640, 360), sample_entry, chunk_offsets, 4)
+}
+
+fn build_vp09_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("vp09")],
+        build_vp09_trak,
+        vec![0xaa, 0xbb, 0xcc, 0xdd],
+    )
+}
+
+fn build_vp09_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &video_sample_entry_with_type("vp09", 640, 360),
+        &encode_supported_box(&vp9_config(), &[]),
+    );
+    build_single_sample_video_trak(1, 1_000, 1_000, (640, 360), sample_entry, chunk_offsets, 4)
+}
+
+fn build_opus_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("Opus")],
+        build_opus_trak,
+        vec![0x11, 0x22, 0x33, 0x44],
+    )
+}
+
+fn build_opus_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &audio_sample_entry_with_type("Opus", 2, 48_000),
+        &encode_supported_box(&opus_config(), &[]),
+    );
+    build_single_sample_audio_trak(1, 48_000, 1_024, sample_entry, chunk_offsets, 4)
+}
+
+fn build_ac3_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("ac-3")],
+        build_ac3_trak,
+        vec![0x21, 0x22, 0x23, 0x24],
+    )
+}
+
+fn build_ac3_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &audio_sample_entry_with_type("ac-3", 6, 48_000),
+        &encode_supported_box(&ac3_config(), &[]),
+    );
+    build_single_sample_audio_trak(1, 48_000, 1_536, sample_entry, chunk_offsets, 4)
+}
+
+fn build_pcm_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("ipcm")],
+        build_pcm_trak,
+        vec![0x31, 0x32, 0x33, 0x34],
+    )
+}
+
+fn build_pcm_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &audio_sample_entry_with_type("ipcm", 2, 48_000),
+        &encode_supported_box(&pcm_config(), &[]),
+    );
+    build_single_sample_audio_trak(1, 48_000, 1_024, sample_entry, chunk_offsets, 4)
+}
+
+fn build_stpp_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("stpp")],
+        build_stpp_trak,
+        vec![0x41, 0x42, 0x43, 0x44],
+    )
+}
+
+fn build_stpp_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(&xml_subtitle_sample_entry(), &[]);
+    build_single_sample_subtitle_trak(1, 1_000, 1_000, sample_entry, chunk_offsets, 4)
+}
+
+fn build_sbtt_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("sbtt")],
+        build_sbtt_trak,
+        vec![0x51, 0x52, 0x53, 0x54],
+    )
+}
+
+fn build_sbtt_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(&text_subtitle_sample_entry(), &[]);
+    build_single_sample_subtitle_trak(1, 1_000, 1_000, sample_entry, chunk_offsets, 4)
+}
+
+fn build_wvtt_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("wvtt")],
+        build_wvtt_trak,
+        vec![0x61, 0x62, 0x63, 0x64],
+    )
+}
+
+fn build_wvtt_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &wvtt_sample_entry(),
+        &[
+            encode_supported_box(
+                &WebVTTConfigurationBox {
+                    config: "WEBVTT".to_string(),
+                },
+                &[],
+            ),
+            encode_supported_box(
+                &WebVTTSourceLabelBox {
+                    source_label: "eng".to_string(),
+                },
+                &[],
+            ),
+        ]
+        .concat(),
+    );
+    build_single_sample_subtitle_trak(1, 1_000, 1_000, sample_entry, chunk_offsets, 4)
+}
+
+fn build_encrypted_hevc_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("iso6"), fourcc("dash"), fourcc("cenc")],
+        build_encrypted_hevc_trak,
+        vec![0x71, 0x72, 0x73, 0x74],
+    )
+}
+
+fn build_encrypted_hevc_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let mut schm = Schm::default();
+    schm.set_version(0);
+    schm.scheme_type = fourcc("cenc");
+    schm.scheme_version = 0x0001_0000;
+    let sinf = encode_supported_box(
+        &Sinf,
+        &[
+            encode_supported_box(
+                &Frma {
+                    data_format: fourcc("hvc1"),
+                },
+                &[],
+            ),
+            encode_supported_box(&schm, &[]),
+        ]
+        .concat(),
+    );
+
+    let sample_entry = encode_supported_box(
+        &video_sample_entry_with_type("encv", 640, 360),
+        &[encode_supported_box(&hevc_config(), &[]), sinf].concat(),
+    );
+    build_single_sample_video_trak(1, 1_000, 1_000, (640, 360), sample_entry, chunk_offsets, 4)
+}
+
+fn build_media_characteristics_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("avc1")],
+        build_media_characteristics_trak,
+        vec![0x81, 0x82, 0x83, 0x84],
+    )
+}
+
+fn build_media_characteristics_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &video_sample_entry_with_type("avc1", 640, 360),
+        &[
+            encode_supported_box(&avc_config(), &[]),
+            encode_supported_box(
+                &Btrt {
+                    buffer_size_db: 32_768,
+                    max_bitrate: 4_000_000,
+                    avg_bitrate: 2_500_000,
+                },
+                &[],
+            ),
+            encode_supported_box(
+                &Colr {
+                    colour_type: fourcc("nclx"),
+                    colour_primaries: 9,
+                    transfer_characteristics: 16,
+                    matrix_coefficients: 9,
+                    full_range_flag: true,
+                    reserved: 0,
+                    profile: Vec::new(),
+                    unknown: Vec::new(),
+                },
+                &[],
+            ),
+            encode_supported_box(
+                &Pasp {
+                    h_spacing: 4,
+                    v_spacing: 3,
+                },
+                &[],
+            ),
+            encode_supported_box(
+                &Fiel {
+                    field_count: 2,
+                    field_ordering: 6,
+                },
+                &[],
+            ),
+        ]
+        .concat(),
+    );
+    build_single_sample_video_trak(1, 1_000, 1_000, (640, 360), sample_entry, chunk_offsets, 4)
+}
+
+fn build_single_sample_video_trak(
+    track_id: u32,
+    timescale: u32,
+    duration: u32,
+    dimensions: (u16, u16),
+    sample_entry: Vec<u8>,
+    chunk_offsets: &[u64; 1],
+    sample_size: u32,
+) -> Vec<u8> {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = track_id;
+    tkhd.duration_v0 = duration;
+    tkhd.width = u32::from(dimensions.0) << 16;
+    tkhd.height = u32::from(dimensions.1) << 16;
+    let tkhd = encode_supported_box(&tkhd, &[]);
+
+    let mut mdhd = Mdhd::default();
+    mdhd.timescale = timescale;
+    mdhd.duration_v0 = duration;
+    mdhd.language = [5, 14, 7];
+    let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("vide", "VideoHandler");
+
+    let mut stsd = Stsd::default();
+    stsd.entry_count = 1;
+    let stsd = encode_supported_box(&stsd, &sample_entry);
+
+    let mut stco = Stco::default();
+    stco.entry_count = 1;
+    stco.chunk_offset = chunk_offsets.to_vec();
+    let stco = encode_supported_box(&stco, &[]);
+
+    let mut stts = Stts::default();
+    stts.entry_count = 1;
+    stts.entries = vec![SttsEntry {
+        sample_count: 1,
+        sample_delta: duration,
+    }];
+    let stts = encode_supported_box(&stts, &[]);
+
+    let mut stsc = Stsc::default();
+    stsc.entry_count = 1;
+    stsc.entries = vec![StscEntry {
+        first_chunk: 1,
+        samples_per_chunk: 1,
+        sample_description_index: 1,
+    }];
+    let stsc = encode_supported_box(&stsc, &[]);
+
+    let mut stsz = Stsz::default();
+    stsz.sample_count = 1;
+    stsz.entry_size = vec![u64::from(sample_size)];
+    let stsz = encode_supported_box(&stsz, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
+    encode_supported_box(&Trak, &[tkhd, mdia].concat())
+}
+
+fn build_single_sample_audio_trak(
+    track_id: u32,
+    timescale: u32,
+    duration: u32,
+    sample_entry: Vec<u8>,
+    chunk_offsets: &[u64; 1],
+    sample_size: u32,
+) -> Vec<u8> {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = track_id;
+    tkhd.duration_v0 = duration;
+    let tkhd = encode_supported_box(&tkhd, &[]);
+
+    let mut mdhd = Mdhd::default();
+    mdhd.timescale = timescale;
+    mdhd.duration_v0 = duration;
+    mdhd.language = [5, 14, 7];
+    let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("soun", "SoundHandler");
+
+    let mut stsd = Stsd::default();
+    stsd.entry_count = 1;
+    let stsd = encode_supported_box(&stsd, &sample_entry);
+
+    let mut stco = Stco::default();
+    stco.entry_count = 1;
+    stco.chunk_offset = chunk_offsets.to_vec();
+    let stco = encode_supported_box(&stco, &[]);
+
+    let mut stts = Stts::default();
+    stts.entry_count = 1;
+    stts.entries = vec![SttsEntry {
+        sample_count: 1,
+        sample_delta: duration,
+    }];
+    let stts = encode_supported_box(&stts, &[]);
+
+    let mut stsc = Stsc::default();
+    stsc.entry_count = 1;
+    stsc.entries = vec![StscEntry {
+        first_chunk: 1,
+        samples_per_chunk: 1,
+        sample_description_index: 1,
+    }];
+    let stsc = encode_supported_box(&stsc, &[]);
+
+    let mut stsz = Stsz::default();
+    stsz.sample_count = 1;
+    stsz.entry_size = vec![u64::from(sample_size)];
+    let stsz = encode_supported_box(&stsz, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
+    encode_supported_box(&Trak, &[tkhd, mdia].concat())
+}
+
+fn build_single_sample_subtitle_trak(
+    track_id: u32,
+    timescale: u32,
+    duration: u32,
+    sample_entry: Vec<u8>,
+    chunk_offsets: &[u64; 1],
+    sample_size: u32,
+) -> Vec<u8> {
+    let mut tkhd = Tkhd::default();
+    tkhd.track_id = track_id;
+    tkhd.duration_v0 = duration;
+    let tkhd = encode_supported_box(&tkhd, &[]);
+
+    let mut mdhd = Mdhd::default();
+    mdhd.timescale = timescale;
+    mdhd.duration_v0 = duration;
+    mdhd.language = [5, 14, 7];
+    let mdhd = encode_supported_box(&mdhd, &[]);
+    let hdlr = handler_box("subt", "SubtitleHandler");
+
+    let mut stsd = Stsd::default();
+    stsd.entry_count = 1;
+    let stsd = encode_supported_box(&stsd, &sample_entry);
+
+    let mut stco = Stco::default();
+    stco.entry_count = 1;
+    stco.chunk_offset = chunk_offsets.to_vec();
+    let stco = encode_supported_box(&stco, &[]);
+
+    let mut stts = Stts::default();
+    stts.entry_count = 1;
+    stts.entries = vec![SttsEntry {
+        sample_count: 1,
+        sample_delta: duration,
+    }];
+    let stts = encode_supported_box(&stts, &[]);
+
+    let mut stsc = Stsc::default();
+    stsc.entry_count = 1;
+    stsc.entries = vec![StscEntry {
+        first_chunk: 1,
+        samples_per_chunk: 1,
+        sample_description_index: 1,
+    }];
+    let stsc = encode_supported_box(&stsc, &[]);
+
+    let mut stsz = Stsz::default();
+    stsz.sample_count = 1;
+    stsz.entry_size = vec![u64::from(sample_size)];
+    let stsz = encode_supported_box(&stsz, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(&Mdia, &[mdhd, hdlr, minf].concat());
+    encode_supported_box(&Trak, &[tkhd, mdia].concat())
+}
+
 fn avc_config() -> AVCDecoderConfiguration {
     AVCDecoderConfiguration {
         configuration_version: 1,
@@ -524,34 +1638,176 @@ fn avc_config() -> AVCDecoderConfiguration {
     }
 }
 
-fn video_sample_entry() -> VisualSampleEntry {
+fn hevc_config() -> HEVCDecoderConfiguration {
+    let mut general_profile_compatibility = [false; 32];
+    general_profile_compatibility[1] = true;
+
+    HEVCDecoderConfiguration {
+        configuration_version: 1,
+        general_profile_space: 1,
+        general_tier_flag: true,
+        general_profile_idc: 2,
+        general_profile_compatibility,
+        general_constraint_indicator: [1, 2, 3, 4, 5, 6],
+        general_level_idc: 120,
+        min_spatial_segmentation_idc: 0,
+        parallelism_type: 0,
+        chroma_format_idc: 1,
+        bit_depth_luma_minus8: 2,
+        bit_depth_chroma_minus8: 2,
+        avg_frame_rate: 30_000,
+        constant_frame_rate: 0,
+        num_temporal_layers: 1,
+        temporal_id_nested: 1,
+        length_size_minus_one: 3,
+        num_of_nalu_arrays: 0,
+        nalu_arrays: Vec::new(),
+    }
+}
+
+fn av1_config() -> AV1CodecConfiguration {
+    AV1CodecConfiguration {
+        seq_profile: 0,
+        seq_level_idx_0: 13,
+        seq_tier_0: 1,
+        high_bitdepth: 1,
+        twelve_bit: 0,
+        monochrome: 0,
+        chroma_subsampling_x: 1,
+        chroma_subsampling_y: 0,
+        chroma_sample_position: 2,
+        initial_presentation_delay_present: 1,
+        initial_presentation_delay_minus_one: 3,
+        config_obus: vec![0x12, 0x34, 0x56],
+    }
+}
+
+fn vp9_config() -> VpCodecConfiguration {
+    let mut config = VpCodecConfiguration::default();
+    config.profile = 2;
+    config.level = 31;
+    config.bit_depth = 10;
+    config.chroma_subsampling = 1;
+    config.video_full_range_flag = 1;
+    config.colour_primaries = 9;
+    config.transfer_characteristics = 16;
+    config.matrix_coefficients = 9;
+    config.codec_initialization_data_size = 3;
+    config.codec_initialization_data = vec![0x01, 0x02, 0x03];
+    config
+}
+
+fn opus_config() -> DOps {
+    DOps {
+        version: 0,
+        output_channel_count: 2,
+        pre_skip: 312,
+        input_sample_rate: 48_000,
+        output_gain: 0,
+        channel_mapping_family: 1,
+        stream_count: 2,
+        coupled_count: 1,
+        channel_mapping: vec![0, 1],
+    }
+}
+
+fn ac3_config() -> Dac3 {
+    Dac3 {
+        fscod: 1,
+        bsid: 8,
+        bsmod: 3,
+        acmod: 7,
+        lfe_on: 1,
+        bit_rate_code: 10,
+    }
+}
+
+fn pcm_config() -> PcmC {
+    let mut config = PcmC::default();
+    config.format_flags = 1;
+    config.pcm_sample_size = 24;
+    config
+}
+
+fn handler_box(handler_type: &str, name: &str) -> Vec<u8> {
+    let mut hdlr = Hdlr::default();
+    hdlr.handler_type = fourcc(handler_type);
+    hdlr.name = name.to_string();
+    encode_supported_box(&hdlr, &[])
+}
+
+fn video_sample_entry_with_type(box_type: &str, width: u16, height: u16) -> VisualSampleEntry {
     let mut entry = VisualSampleEntry {
         sample_entry: SampleEntry {
-            box_type: fourcc("avc1"),
+            box_type: fourcc(box_type),
             data_reference_index: 1,
         },
-        width: 320,
-        height: 180,
+        width,
+        height,
         frame_count: 1,
         ..VisualSampleEntry::default()
     };
-    entry.set_box_type(fourcc("avc1"));
+    entry.set_box_type(fourcc(box_type));
     entry
 }
 
+fn video_sample_entry() -> VisualSampleEntry {
+    video_sample_entry_with_type("avc1", 320, 180)
+}
+
 fn audio_sample_entry() -> AudioSampleEntry {
+    audio_sample_entry_with_type("mp4a", 2, 48_000)
+}
+
+fn audio_sample_entry_with_type(
+    box_type: &str,
+    channel_count: u16,
+    sample_rate: u32,
+) -> AudioSampleEntry {
     let mut entry = AudioSampleEntry {
         sample_entry: SampleEntry {
-            box_type: fourcc("mp4a"),
+            box_type: fourcc(box_type),
             data_reference_index: 1,
         },
-        channel_count: 2,
+        channel_count,
         sample_size: 16,
-        sample_rate: 48_000_u32 << 16,
+        sample_rate: sample_rate << 16,
         ..AudioSampleEntry::default()
     };
-    entry.set_box_type(fourcc("mp4a"));
+    entry.set_box_type(fourcc(box_type));
     entry
+}
+
+fn xml_subtitle_sample_entry() -> XMLSubtitleSampleEntry {
+    XMLSubtitleSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: fourcc("stpp"),
+            data_reference_index: 1,
+        },
+        namespace: "urn:ebu:tt:metadata".to_string(),
+        schema_location: "urn:ebu:tt:schema".to_string(),
+        auxiliary_mime_types: "application/ttml+xml".to_string(),
+    }
+}
+
+fn text_subtitle_sample_entry() -> TextSubtitleSampleEntry {
+    TextSubtitleSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: fourcc("sbtt"),
+            data_reference_index: 1,
+        },
+        content_encoding: "utf-8".to_string(),
+        mime_format: "text/plain".to_string(),
+    }
+}
+
+fn wvtt_sample_entry() -> WVTTSampleEntry {
+    WVTTSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: fourcc("wvtt"),
+            data_reference_index: 1,
+        },
+    }
 }
 
 fn aac_profile_esds(object_type_indication: u8, decoder_specific_info: &[u8]) -> Esds {

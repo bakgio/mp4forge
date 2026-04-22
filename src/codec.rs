@@ -626,6 +626,11 @@ fn select_hooks<'a>(
 }
 
 /// Owned field value transferred between descriptor code and concrete boxes.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "kind", content = "value", rename_all = "snake_case")
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldValue {
     Unsigned(u64),

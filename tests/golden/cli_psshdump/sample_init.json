@@ -1,0 +1,21 @@
+{
+  "Entries": [
+    {
+      "Index": 0,
+      "Path": "moov/pssh",
+      "Offset": 1307,
+      "Size": 52,
+      "Version": 1,
+      "Flags": 0,
+      "SystemId": "1077efec-c0b2-4d02-ace3-3c1e52e2fb4b",
+      "KidCount": 1,
+      "Kids": [
+        "01234567-89ab-cdef-0123-456789abcdef"
+      ],
+      "DataSize": 0,
+      "DataBytes": [
+      ],
+      "RawBoxBase64": "AAAANHBzc2gBAAAAEHfv7MCyTQKs4zweUuL7SwAAAAEBI0VniavN7wEjRWeJq83vAAAAAA=="
+    }
+  ]
+}
