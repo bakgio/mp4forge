@@ -944,10 +944,8 @@ where
                     .tracks
                     .push(probe_trak_codec_detailed(reader, &info, options)?);
             }
-            MOOF => {
-                if options.include_segments {
-                    summary.segments.push(probe_moof(reader, &info)?);
-                }
+            MOOF if options.include_segments => {
+                summary.segments.push(probe_moof(reader, &info)?);
             }
             MDAT => {
                 mdat_appeared = true;
@@ -1004,10 +1002,8 @@ where
                     .tracks
                     .push(probe_trak_media_characteristics(reader, &info, options)?);
             }
-            MOOF => {
-                if options.include_segments {
-                    summary.segments.push(probe_moof(reader, &info)?);
-                }
+            MOOF if options.include_segments => {
+                summary.segments.push(probe_moof(reader, &info)?);
             }
             MDAT => {
                 mdat_appeared = true;
