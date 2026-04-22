@@ -7,7 +7,9 @@ use std::io::Cursor;
 
 use mp4forge::boxes::iso14496_12::{Meta, Moof, Tfdt, Traf};
 use mp4forge::extract::extract_box_as;
-use mp4forge::rewrite::{RewriteError, rewrite_box_as};
+use mp4forge::rewrite::{
+    RewriteError, rewrite_box_as, rewrite_box_as_bytes, rewrite_boxes_as_bytes,
+};
 use mp4forge::walk::BoxPath;
 
 use support::{encode_raw_box, encode_supported_box, fixture_path, fourcc};
@@ -41,6 +43,29 @@ fn rewrite_box_as_updates_matching_typed_payloads() {
 }
 
 #[test]
+fn rewrite_box_as_bytes_updates_matching_typed_payloads() {
+    let input = build_rewrite_input_file();
+    let output = rewrite_box_as_bytes::<Tfdt, _>(
+        &input,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("tfdt")]),
+        |tfdt| {
+            tfdt.base_media_decode_time_v0 = 12_345;
+        },
+    )
+    .unwrap();
+
+    let tfdt = extract_box_as::<_, Tfdt>(
+        &mut Cursor::new(output),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("tfdt")]),
+    )
+    .unwrap();
+
+    assert_eq!(tfdt.len(), 1);
+    assert_eq!(tfdt[0].base_media_decode_time_v0, 12_345);
+}
+
+#[test]
 fn rewrite_box_as_returns_zero_and_preserves_bytes_when_nothing_matches() {
     let input = fs::read(fixture_path("sample_fragmented.mp4")).unwrap();
     let mut reader = Cursor::new(input.clone());
@@ -59,6 +84,17 @@ fn rewrite_box_as_returns_zero_and_preserves_bytes_when_nothing_matches() {
 }
 
 #[test]
+fn rewrite_boxes_as_bytes_preserves_bytes_when_nothing_matches() {
+    let input = fs::read(fixture_path("sample_fragmented.mp4")).unwrap();
+
+    let output =
+        rewrite_boxes_as_bytes::<Tfdt, _>(&input, &[BoxPath::from([fourcc("zzzz")])], |_| {})
+            .unwrap();
+
+    assert_eq!(output, input);
+}
+
+#[test]
 fn rewrite_box_as_reports_payload_type_context() {
     let input = build_rewrite_input_file();
     let mut reader = Cursor::new(input);
@@ -67,6 +103,31 @@ fn rewrite_box_as_reports_payload_type_context() {
     let error = rewrite_box_as::<_, _, Meta, _>(
         &mut reader,
         &mut output,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("tfdt")]),
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RewriteError::UnexpectedPayloadType {
+            ref path,
+            box_type,
+            offset,
+            expected_type
+        } if path.as_slice() == [fourcc("moof"), fourcc("traf"), fourcc("tfdt")]
+            && box_type == fourcc("tfdt")
+            && offset == 16
+            && expected_type == std::any::type_name::<Meta>()
+    ));
+}
+
+#[test]
+fn rewrite_box_as_bytes_reports_payload_type_context() {
+    let input = build_rewrite_input_file();
+
+    let error = rewrite_box_as_bytes::<Meta, _>(
+        &input,
         BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("tfdt")]),
         |_| {},
     )

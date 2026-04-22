@@ -1,4 +1,5 @@
-//! File-summary helpers built on the extraction and box layers.
+//! File-summary helpers built on the extraction and box layers, with byte-slice convenience entry
+//! points for in-memory probe flows.
 
 use std::error::Error;
 use std::fmt;
@@ -264,12 +265,29 @@ where
     Ok(summary)
 }
 
+/// Probes an in-memory MP4 byte slice and returns high-level movie, track, and fragment
+/// summaries.
+///
+/// This is equivalent to calling [`probe`] with `Cursor<&[u8]>`.
+pub fn probe_bytes(input: &[u8]) -> Result<ProbeInfo, ProbeError> {
+    let mut reader = Cursor::new(input);
+    probe(&mut reader)
+}
+
 /// Legacy fragmented-file probe entry point that currently aliases [`probe`].
 pub fn probe_fra<R>(reader: &mut R) -> Result<ProbeInfo, ProbeError>
 where
     R: Read + Seek,
 {
     probe(reader)
+}
+
+/// Legacy fragmented-file probe entry point for in-memory MP4 bytes.
+///
+/// This currently aliases [`probe_bytes`] for callers that already use the `probe_fra` naming.
+pub fn probe_fra_bytes(input: &[u8]) -> Result<ProbeInfo, ProbeError> {
+    let mut reader = Cursor::new(input);
+    probe_fra(&mut reader)
 }
 
 /// Detects the AAC object profile exposed by an `esds` descriptor stream.

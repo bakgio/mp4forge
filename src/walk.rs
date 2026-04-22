@@ -4,17 +4,21 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
+use std::str::FromStr;
 
 use crate::FourCc;
 use crate::boxes::iso14496_12::Ftyp;
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
 use crate::codec::{CodecError, DynCodecBox, unmarshal, unmarshal_any_with_context};
+use crate::fourcc::ParseFourCcError;
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
 
 const FTYP: FourCc = FourCc::from_bytes(*b"ftyp");
 const KEYS: FourCc = FourCc::from_bytes(*b"keys");
 const QT_BRAND: FourCc = FourCc::from_bytes(*b"qt  ");
+const ROOT_MARKER: &str = "<root>";
+const WILDCARD_SEGMENT: &str = "*";
 
 /// Depth-first traversal decision returned by a walk visitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +33,10 @@ pub enum WalkControl {
 ///
 /// Path comparisons used by the extraction and rewrite helpers honor [`FourCc::ANY`] as a
 /// wildcard segment.
+///
+/// In addition to low-level array-based construction, paths can be parsed from slash-delimited
+/// strings such as `moov/trak/tkhd`. The segment `*` maps to [`FourCc::ANY`], and the string
+/// `<root>` maps to the empty path.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoxPath(Vec<FourCc>);
 
@@ -51,6 +59,41 @@ impl BoxPath {
     /// Returns the number of box identifiers in the path.
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Parses a slash-delimited path string into a [`BoxPath`].
+    ///
+    /// Each non-wildcard segment must contain exactly four bytes and is parsed using
+    /// [`FourCc::from_str`]. The segment `*` maps to [`FourCc::ANY`], and `<root>` returns the
+    /// empty path.
+    pub fn parse(value: &str) -> Result<Self, ParseBoxPathError> {
+        if value == ROOT_MARKER {
+            return Ok(Self::empty());
+        }
+
+        let mut path = Vec::new();
+        for (index, segment) in value.split('/').enumerate() {
+            if segment.is_empty() {
+                return Err(ParseBoxPathError::EmptySegment { index });
+            }
+            if segment == ROOT_MARKER {
+                return Err(ParseBoxPathError::RootMarkerMustAppearAlone);
+            }
+            if segment == WILDCARD_SEGMENT {
+                path.push(FourCc::ANY);
+                continue;
+            }
+
+            let box_type =
+                FourCc::try_from(segment).map_err(|source| ParseBoxPathError::InvalidSegment {
+                    index,
+                    segment: segment.to_owned(),
+                    source,
+                })?;
+            path.push(box_type);
+        }
+
+        Ok(Self(path))
     }
 
     fn child_path(&self, box_type: FourCc) -> Self {
@@ -115,6 +158,14 @@ impl From<Vec<FourCc>> for BoxPath {
     }
 }
 
+impl TryFrom<&str> for BoxPath {
+    type Error = ParseBoxPathError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
 impl<const N: usize> From<[FourCc; N]> for BoxPath {
     fn from(value: [FourCc; N]) -> Self {
         Self(value.into())
@@ -124,6 +175,66 @@ impl<const N: usize> From<[FourCc; N]> for BoxPath {
 impl FromIterator<FourCc> for BoxPath {
     fn from_iter<T: IntoIterator<Item = FourCc>>(iter: T) -> Self {
         Self(iter.into_iter().collect())
+    }
+}
+
+impl FromStr for BoxPath {
+    type Err = ParseBoxPathError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+/// Error returned when a string cannot be parsed as a [`BoxPath`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParseBoxPathError {
+    /// One segment between path separators was empty.
+    EmptySegment {
+        /// Zero-based index of the empty segment.
+        index: usize,
+    },
+    /// One segment was neither `*` nor a valid four-byte [`FourCc`].
+    InvalidSegment {
+        /// Zero-based index of the invalid segment.
+        index: usize,
+        /// Original segment text from the parsed path string.
+        segment: String,
+        /// Underlying four-character-code parse failure.
+        source: ParseFourCcError,
+    },
+    /// The special `<root>` marker was combined with additional segments.
+    RootMarkerMustAppearAlone,
+}
+
+impl fmt::Display for ParseBoxPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySegment { index } => {
+                write!(f, "box path segment {} must not be empty", index + 1)
+            }
+            Self::InvalidSegment {
+                index,
+                segment,
+                source,
+            } => write!(
+                f,
+                "invalid box path segment {} ({segment:?}): {source}",
+                index + 1
+            ),
+            Self::RootMarkerMustAppearAlone => {
+                write!(f, "box path root marker {ROOT_MARKER:?} must appear alone")
+            }
+        }
+    }
+}
+
+impl Error for ParseBoxPathError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSegment { source, .. } => Some(source),
+            Self::EmptySegment { .. } | Self::RootMarkerMustAppearAlone => None,
+        }
     }
 }
 

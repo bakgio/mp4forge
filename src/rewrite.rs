@@ -1,12 +1,13 @@
 //! Path-based typed payload rewrite helpers built on the writer layer.
 //!
 //! These helpers preserve the existing low-level writer flow for advanced use cases while offering
-//! a small typed API for common "find payloads at this path and mutate them" rewrite operations.
+//! a small typed API for common "find payloads at this path and mutate them" rewrite operations,
+//! including byte-slice wrappers for in-memory rewrite flows.
 
 use std::any::type_name;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::FourCc;
 use crate::boxes::iso14496_12::Ftyp;
@@ -62,6 +63,46 @@ where
 {
     let registry = default_registry();
     rewrite_boxes_as_with_registry(reader, writer, paths, &registry, edit)
+}
+
+/// Rewrites every payload at `path` in an in-memory MP4 byte slice and returns the rewritten
+/// bytes.
+///
+/// This is equivalent to calling [`rewrite_box_as`] with `Cursor<&[u8]>` input and `Vec<u8>`
+/// output storage. The edit closure runs once per matched box in depth-first order, and unmatched
+/// boxes are copied through verbatim.
+pub fn rewrite_box_as_bytes<T, F>(
+    input: &[u8],
+    path: BoxPath,
+    edit: F,
+) -> Result<Vec<u8>, RewriteError>
+where
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let paths = [path];
+    rewrite_boxes_as_bytes::<T, _>(input, &paths, edit)
+}
+
+/// Rewrites every payload that matches any path in `paths` in an in-memory MP4 byte slice and
+/// returns the rewritten bytes.
+///
+/// This is equivalent to calling [`rewrite_boxes_as`] with `Cursor<&[u8]>` input and `Vec<u8>`
+/// output storage. Every matched payload must decode to `T`, otherwise
+/// [`RewriteError::UnexpectedPayloadType`] is returned with the matched path and offset.
+pub fn rewrite_boxes_as_bytes<T, F>(
+    input: &[u8],
+    paths: &[BoxPath],
+    edit: F,
+) -> Result<Vec<u8>, RewriteError>
+where
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let mut reader = Cursor::new(input);
+    let mut writer = Cursor::new(Vec::with_capacity(input.len()));
+    rewrite_boxes_as(&mut reader, &mut writer, paths, edit)?;
+    Ok(writer.into_inner())
 }
 
 /// Rewrites every payload that matches any path in `paths` using `registry`, downcasts each match

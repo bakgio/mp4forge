@@ -18,7 +18,7 @@
 
 - Typed MP4 and ISOBMFF box model with registry-backed custom box support
 - Low-level traversal, extraction, stringify, probe, and writer APIs
-- Thin typed path-based helpers for common extraction and rewrite flows
+- Thin typed path-based helpers and byte-slice convenience wrappers for common extraction, rewrite, and probe flows
 - Built-in CLI for `dump`, `extract`, `probe`, `psshdump`, `edit`, and `divide`
 - Shared-fixture coverage for regular MP4, fragmented MP4, encrypted init segments, and QuickTime-style metadata cases
 
@@ -26,7 +26,7 @@
 
 ```toml
 [dependencies]
-mp4forge = "0.2.0"
+mp4forge = "0.3.0"
 ```
 
 Install the CLI from crates.io:
@@ -69,7 +69,7 @@ mp4forge psshdump encrypted_init.mp4
 
 `mp4forge` currently ships without public Cargo feature flags.
 
-> See the [`examples/`](./examples) directory for both the low-level and high-level public API story, including typed extraction in `extract_track_ids_typed.rs`, typed rewrite in `rewrite_emsg.rs`, structure walking, probing, writer-backed rewrite, and custom box registration.
+> See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage patterns.
 
 ## License
 
