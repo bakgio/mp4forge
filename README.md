@@ -19,6 +19,7 @@
 - Typed MP4 and ISOBMFF box model with registry-backed custom box support
 - Low-level traversal, extraction, stringify, probe, and writer APIs
 - Thin typed path-based helpers and byte-slice convenience wrappers for common extraction, rewrite, and probe flows
+- Fragmented top-level `sidx` analysis, planning, and rewrite APIs for supported layouts
 - Built-in CLI for `dump`, `extract`, `probe`, `psshdump`, `edit`, and `divide`
 - Shared-fixture coverage for regular MP4, fragmented MP4, encrypted init segments, QuickTime-style metadata cases, and derived real codec fixtures for additional codec-family coverage
 
@@ -26,10 +27,10 @@
 
 ```toml
 [dependencies]
-mp4forge = "0.4.0"
+mp4forge = "0.5.0"
 
 # With optional features:
-# mp4forge = { version = "0.4.0", features = ["serde"] }
+# mp4forge = { version = "0.5.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:

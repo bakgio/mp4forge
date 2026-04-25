@@ -8,8 +8,9 @@ use std::io::{self, Read, Seek, Write};
 use crate::probe::{
     DetailedTrackInfo, ProbeError, ProbeOptions, TrackCodec, TrackCodecDetails, TrackCodecFamily,
     TrackMediaCharacteristics, average_sample_bitrate, average_segment_bitrate, find_idr_frames,
-    max_sample_bitrate, max_segment_bitrate, probe_codec_detailed_with_options,
-    probe_detailed_with_options, probe_media_characteristics_with_options, probe_with_options,
+    max_sample_bitrate, max_segment_bitrate, normalized_codec_family_name,
+    probe_codec_detailed_with_options, probe_detailed_with_options,
+    probe_media_characteristics_with_options, probe_with_options,
 };
 
 /// Structured output format supported by the probe command.
@@ -530,7 +531,12 @@ where
             duration: basic.duration,
             duration_seconds: seconds(basic.duration, basic.timescale),
             codec: detailed_track_codec_string(track),
-            codec_family: track_codec_family_string(track.codec_family).to_string(),
+            codec_family: track_codec_family_string(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            )
+            .to_string(),
             encrypted: basic.encrypted,
             handler_type: track.handler_type.map(|value| value.to_string()),
             language: track.language.clone(),
@@ -616,7 +622,12 @@ where
             duration: basic.duration,
             duration_seconds: seconds(basic.duration, basic.timescale),
             codec: detailed_track_codec_string(&track.summary),
-            codec_family: track_codec_family_string(track.summary.codec_family).to_string(),
+            codec_family: track_codec_family_string(
+                track.summary.codec_family,
+                track.summary.sample_entry_type,
+                track.summary.original_format,
+            )
+            .to_string(),
             codec_details: track.codec_details.clone(),
             encrypted: basic.encrypted,
             handler_type: track.summary.handler_type.map(|value| value.to_string()),
@@ -709,7 +720,12 @@ where
             duration: basic.duration,
             duration_seconds: seconds(basic.duration, basic.timescale),
             codec: detailed_track_codec_string(&track.summary),
-            codec_family: track_codec_family_string(track.summary.codec_family).to_string(),
+            codec_family: track_codec_family_string(
+                track.summary.codec_family,
+                track.summary.sample_entry_type,
+                track.summary.original_format,
+            )
+            .to_string(),
             codec_details: track.codec_details.clone(),
             media_characteristics: track.media_characteristics.clone(),
             encrypted: basic.encrypted,
@@ -920,22 +936,12 @@ fn detailed_track_codec_string(track: &DetailedTrackInfo) -> String {
     }
 }
 
-fn track_codec_family_string(family: TrackCodecFamily) -> &'static str {
-    match family {
-        TrackCodecFamily::Unknown => "unknown",
-        TrackCodecFamily::Avc => "avc",
-        TrackCodecFamily::Hevc => "hevc",
-        TrackCodecFamily::Av1 => "av1",
-        TrackCodecFamily::Vp8 => "vp8",
-        TrackCodecFamily::Vp9 => "vp9",
-        TrackCodecFamily::Mp4Audio => "mp4_audio",
-        TrackCodecFamily::Opus => "opus",
-        TrackCodecFamily::Ac3 => "ac3",
-        TrackCodecFamily::Pcm => "pcm",
-        TrackCodecFamily::XmlSubtitle => "xml_subtitle",
-        TrackCodecFamily::TextSubtitle => "text_subtitle",
-        TrackCodecFamily::WebVtt => "webvtt",
-    }
+fn track_codec_family_string(
+    family: TrackCodecFamily,
+    sample_entry_type: Option<crate::FourCc>,
+    original_format: Option<crate::FourCc>,
+) -> &'static str {
+    normalized_codec_family_name(family, sample_entry_type, original_format)
 }
 
 fn summarize_bitrate(

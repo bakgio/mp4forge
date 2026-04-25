@@ -9,11 +9,11 @@ use mp4forge::boxes::metadata::{
     DATA_TYPE_FLOAT32_BIG_ENDIAN, DATA_TYPE_FLOAT64_BIG_ENDIAN, DATA_TYPE_SIGNED_INT_BIG_ENDIAN,
     DATA_TYPE_STRING_JPEG, DATA_TYPE_STRING_MAC, DATA_TYPE_STRING_UTF8, DATA_TYPE_STRING_UTF16,
     Data, DateData, DescriptionData, DiskNumberData, EncodingToolData, EpisodeGuidData,
-    GaplessPlaybackData, GenreData, GenreIdData, GroupingData, Ilst, IlstMetaContainer, Key, Keys,
-    LegacyGenreData, MediaTypeData, NameData, NumberedMetadataItem, PlaylistIdData, PodcastData,
-    PodcastUrlData, PurchaseDateData, RatingData, SfIdData, SortAlbumArtistData, SortAlbumData,
-    SortArtistData, SortComposerData, SortNameData, SortShowData, StringData, TempoData,
-    TrackNumberData, TvEpisodeData, TvEpisodeIdData, TvNetworkNameData, TvSeasonData,
+    GaplessPlaybackData, GenreData, GenreIdData, GroupingData, Id32, Ilst, IlstMetaContainer, Key,
+    Keys, LegacyGenreData, MediaTypeData, NameData, NumberedMetadataItem, PlaylistIdData,
+    PodcastData, PodcastUrlData, PurchaseDateData, RatingData, SfIdData, SortAlbumArtistData,
+    SortAlbumData, SortArtistData, SortComposerData, SortNameData, SortShowData, StringData,
+    TempoData, TrackNumberData, TvEpisodeData, TvEpisodeIdData, TvNetworkNameData, TvSeasonData,
     TvShowNameData, WriterData,
 };
 use mp4forge::boxes::{AnyTypeBox, default_registry};
@@ -930,6 +930,29 @@ fn keys_reject_truncated_entry_payloads() {
 }
 
 #[test]
+fn id32_roundtrips_and_validates_language_codes() {
+    let mut id32 = Id32::default();
+    id32.set_version(0);
+    id32.language = "eng".to_string();
+    id32.id3v2_data = vec![0x49, 0x44, 0x33];
+
+    assert_box_roundtrip_with_registry(
+        id32,
+        &[0x00, 0x00, 0x00, 0x00, 0x15, 0xc7, 0x49, 0x44, 0x33],
+        "Version=0 Flags=0x000000 Language=\"eng\" ID3v2Data=[0x49, 0x44, 0x33]",
+    );
+
+    let payload = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut decoded = Id32::default();
+    let mut reader = Cursor::new(payload);
+    let error = unmarshal(&mut reader, payload.len() as u64, &mut decoded, None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid field value for Language: language code uses an out-of-range character value"
+    );
+}
+
+#[test]
 fn built_in_registry_reports_context_free_metadata_types() {
     let registry = default_registry();
 
@@ -938,11 +961,16 @@ fn built_in_registry_reports_context_free_metadata_types() {
         Some(&[][..])
     );
     assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"ID32")),
+        Some(&[0][..])
+    );
+    assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"keys")),
         Some(&[][..])
     );
 
     assert!(registry.is_registered(FourCc::from_bytes(*b"ilst")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ID32")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"keys")));
     assert!(!registry.is_registered(FourCc::from_bytes(*b"data")));
     assert!(!registry.is_registered(FourCc::from_bytes(*b"----")));

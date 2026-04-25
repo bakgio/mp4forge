@@ -10,7 +10,9 @@ use std::fmt;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::FourCc;
-use crate::boxes::iso14496_12::Ftyp;
+use crate::boxes::iso14496_12::{
+    Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
+};
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
 use crate::codec::{CodecBox, CodecError, marshal_dyn, unmarshal, unmarshal_any_with_context};
@@ -313,10 +315,15 @@ where
     })?;
 
     let children_offset = info.offset() + info.header_size() + payload_read;
-    let children_size = info
-        .offset()
-        .saturating_add(info.size())
-        .saturating_sub(children_offset);
+    let (children_size, trailing_bytes) = if payload.as_any().is::<VisualSampleEntry>() {
+        visual_sample_entry_children_layout(
+            reader,
+            children_offset,
+            payload_size.saturating_sub(payload_read),
+        )?
+    } else {
+        (payload_size.saturating_sub(payload_read), Vec::new())
+    };
     reader.seek(SeekFrom::Start(children_offset))?;
     rewrite_sequence::<R, W, T, F>(
         reader,
@@ -329,6 +336,9 @@ where
             info.lookup_context().enter(info.box_type()),
         ),
     )?;
+    if !trailing_bytes.is_empty() {
+        writer.write_all(&trailing_bytes)?;
+    }
     info.seek_to_end(reader)?;
     writer.end_box()?;
     Ok(())
@@ -358,6 +368,35 @@ where
     }
 
     Ok(())
+}
+
+fn visual_sample_entry_children_layout<R>(
+    reader: &mut R,
+    extension_offset: u64,
+    extension_size: u64,
+) -> Result<(u64, Vec<u8>), RewriteError>
+where
+    R: Read + Seek,
+{
+    let checkpoint = reader.stream_position()?;
+    reader.seek(SeekFrom::Start(extension_offset))?;
+    let bytes = read_extension_bytes(reader, extension_size)?;
+    reader.seek(SeekFrom::Start(checkpoint))?;
+
+    let child_len = split_box_children_with_optional_trailing_bytes(&bytes);
+    Ok((child_len as u64, bytes[child_len..].to_vec()))
+}
+
+fn read_extension_bytes<R>(reader: &mut R, extension_size: u64) -> Result<Vec<u8>, RewriteError>
+where
+    R: Read,
+{
+    let extension_len = usize::try_from(extension_size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload extension is too large")
+    })?;
+    let mut bytes = vec![0; extension_len];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn decode_box<R, B>(reader: &mut R, info: &BoxInfo) -> Result<B, RewriteError>

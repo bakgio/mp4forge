@@ -25,12 +25,12 @@ impl<W> Writer<W> {
         }
     }
 
-    /// Returns a shared reference to the underlying writer.
+    /// Returns a shared view of the underlying writer.
     pub const fn get_ref(&self) -> &W {
         &self.writer
     }
 
-    /// Returns a mutable reference to the underlying writer.
+    /// Returns a mutable view of the underlying writer.
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.writer
     }

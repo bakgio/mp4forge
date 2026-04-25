@@ -5,14 +5,17 @@ mod support;
 use std::fs;
 use std::io::Cursor;
 
-use mp4forge::boxes::iso14496_12::{Meta, Moof, Tfdt, Traf};
+use mp4forge::boxes::iso14496_12::{Emib, Meta, Moof, Sgpd, Silb, Tfdt, Traf};
 use mp4forge::extract::extract_box_as;
 use mp4forge::rewrite::{
     RewriteError, rewrite_box_as, rewrite_box_as_bytes, rewrite_boxes_as_bytes,
 };
 use mp4forge::walk::BoxPath;
 
-use support::{encode_raw_box, encode_supported_box, fixture_path, fourcc};
+use support::{
+    build_encrypted_fragmented_video_file, build_event_message_movie_file, encode_raw_box,
+    encode_supported_box, fixture_path, fourcc,
+};
 
 #[test]
 fn rewrite_box_as_updates_matching_typed_payloads() {
@@ -66,6 +69,34 @@ fn rewrite_box_as_bytes_updates_matching_typed_payloads() {
 }
 
 #[test]
+fn rewrite_box_as_bytes_updates_fragmented_encrypted_sample_group_descriptions() {
+    let input = build_encrypted_fragmented_video_file();
+    let output = rewrite_box_as_bytes::<Sgpd, _>(
+        &input,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("sgpd")]),
+        |sgpd| {
+            sgpd.seig_entries_l[0].seig_entry.crypt_byte_block = 5;
+            sgpd.seig_entries_l[0].seig_entry.skip_byte_block = 6;
+        },
+    )
+    .unwrap();
+
+    let sgpd = extract_box_as::<_, Sgpd>(
+        &mut Cursor::new(output),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("sgpd")]),
+    )
+    .unwrap();
+
+    assert_eq!(sgpd.len(), 1);
+    assert_eq!(sgpd[0].grouping_type, fourcc("seig"));
+    assert_eq!(sgpd[0].seig_entries_l.len(), 1);
+    assert_eq!(sgpd[0].seig_entries_l[0].seig_entry.crypt_byte_block, 5);
+    assert_eq!(sgpd[0].seig_entries_l[0].seig_entry.skip_byte_block, 6);
+    assert_eq!(sgpd[0].seig_entries_l[0].description_length, 20);
+}
+
+#[test]
 fn rewrite_box_as_returns_zero_and_preserves_bytes_when_nothing_matches() {
     let input = fs::read(fixture_path("sample_fragmented.mp4")).unwrap();
     let mut reader = Cursor::new(input.clone());
@@ -81,6 +112,64 @@ fn rewrite_box_as_returns_zero_and_preserves_bytes_when_nothing_matches() {
 
     assert_eq!(rewritten, 0);
     assert_eq!(output.into_inner(), input);
+}
+
+#[test]
+fn rewrite_box_as_bytes_updates_event_message_boxes() {
+    let input = build_event_message_movie_file();
+    let output = rewrite_box_as_bytes::<Silb, _>(
+        &input,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("evte"),
+            fourcc("silb"),
+        ]),
+        |silb| {
+            silb.schemes[0].value = "event-1b".to_string();
+            silb.other_schemes_flag = false;
+        },
+    )
+    .unwrap();
+    let output =
+        rewrite_box_as_bytes::<Emib, _>(&output, BoxPath::from([fourcc("emib")]), |emib| {
+            emib.event_duration = 3_000;
+            emib.value = "3".to_string();
+        })
+        .unwrap();
+
+    let silb = extract_box_as::<_, Silb>(
+        &mut Cursor::new(output.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("evte"),
+            fourcc("silb"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(silb.len(), 1);
+    assert_eq!(silb[0].schemes[0].value, "event-1b");
+    assert!(!silb[0].other_schemes_flag);
+
+    let emib = extract_box_as::<_, Emib>(
+        &mut Cursor::new(output),
+        None,
+        BoxPath::from([fourcc("emib")]),
+    )
+    .unwrap();
+    assert_eq!(emib.len(), 1);
+    assert_eq!(emib[0].event_duration, 3_000);
+    assert_eq!(emib[0].value, "3");
 }
 
 #[test]

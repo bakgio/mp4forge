@@ -4,7 +4,9 @@ use std::io::Cursor;
 
 use mp4forge::FourCc;
 use mp4forge::boxes::default_registry;
-use mp4forge::boxes::iso23001_7::{Pssh, PsshKid, Tenc};
+use mp4forge::boxes::iso23001_7::{
+    Pssh, PsshKid, SENC_USE_SUBSAMPLE_ENCRYPTION, Senc, SencSample, SencSubsample, Tenc,
+};
 use mp4forge::codec::{CodecBox, MutableBox, marshal, unmarshal, unmarshal_any};
 use mp4forge::stringify::stringify;
 
@@ -114,6 +116,67 @@ fn protection_catalog_roundtrips() {
         "Version=1 Flags=0x000000 SystemID=01020304-0506-0708-090a-0b0c0d0e0f10 KIDCount=2 KIDs=[11121314-1516-1718-191a-1b1c1d1e1f10, 21222324-2526-2728-292a-2b2c2d2e2f20] DataSize=5 Data=[0x21, 0x22, 0x23, 0x24, 0x25]",
     );
 
+    let mut senc = Senc::default();
+    senc.set_version(0);
+    senc.sample_count = 2;
+    senc.samples = vec![
+        SencSample {
+            initialization_vector: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            subsamples: Vec::new(),
+        },
+        SencSample {
+            initialization_vector: vec![0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
+            subsamples: Vec::new(),
+        },
+    ];
+
+    assert_box_roundtrip(
+        senc,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        ],
+        "Version=0 Flags=0x000000 SampleCount=2 Samples=[{InitializationVector=[0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8]}, {InitializationVector=[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]}]",
+    );
+
+    let mut senc_subsamples = Senc::default();
+    senc_subsamples.set_version(0);
+    senc_subsamples.set_flags(SENC_USE_SUBSAMPLE_ENCRYPTION);
+    senc_subsamples.sample_count = 2;
+    senc_subsamples.samples = vec![
+        SencSample {
+            initialization_vector: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            subsamples: vec![
+                SencSubsample {
+                    bytes_of_clear_data: 1,
+                    bytes_of_protected_data: 2,
+                },
+                SencSubsample {
+                    bytes_of_clear_data: 3,
+                    bytes_of_protected_data: 4,
+                },
+            ],
+        },
+        SencSample {
+            initialization_vector: vec![0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
+            subsamples: vec![SencSubsample {
+                bytes_of_clear_data: 5,
+                bytes_of_protected_data: 6,
+            }],
+        },
+    ];
+
+    assert_box_roundtrip(
+        senc_subsamples,
+        &[
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x04, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x00, 0x01, 0x00, 0x05,
+            0x00, 0x00, 0x00, 0x06,
+        ],
+        "Version=0 Flags=0x000002 SampleCount=2 Samples=[{InitializationVector=[0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8] Subsamples=[{BytesOfClearData=1 BytesOfProtectedData=2}, {BytesOfClearData=3 BytesOfProtectedData=4}]}, {InitializationVector=[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18] Subsamples=[{BytesOfClearData=5 BytesOfProtectedData=6}]}]",
+    );
+
     let mut tenc_constant_iv = Tenc::default();
     tenc_constant_iv.set_version(1);
     tenc_constant_iv.reserved = 0x00;
@@ -181,10 +244,15 @@ fn built_in_registry_reports_supported_versions_for_landed_protection_types() {
         Some(&[0, 1][..])
     );
     assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"senc")),
+        Some(&[0][..])
+    );
+    assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"tenc")),
         Some(&[0, 1][..])
     );
     assert!(registry.is_registered(FourCc::from_bytes(*b"pssh")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"senc")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"tenc")));
 }
 
@@ -229,4 +297,56 @@ fn tenc_rejects_constant_iv_length_mismatch_during_marshal() {
         error.to_string(),
         "invalid element count for field DefaultConstantIV: expected 4, got 3"
     );
+}
+
+#[test]
+fn senc_rejects_sample_count_mismatch_during_marshal() {
+    let mut senc = Senc::default();
+    senc.set_version(0);
+    senc.sample_count = 2;
+    senc.samples = vec![SencSample {
+        initialization_vector: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        subsamples: Vec::new(),
+    }];
+
+    let error = marshal(&mut Vec::new(), &senc, None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid element count for field Samples: expected 2, got 1"
+    );
+}
+
+#[test]
+fn senc_rejects_subsample_records_without_flag_during_marshal() {
+    let mut senc = Senc::default();
+    senc.set_version(0);
+    senc.sample_count = 1;
+    senc.samples = vec![SencSample {
+        initialization_vector: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        subsamples: vec![SencSubsample {
+            bytes_of_clear_data: 1,
+            bytes_of_protected_data: 2,
+        }],
+    }];
+
+    let error = marshal(&mut Vec::new(), &senc, None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid field value for Samples: subsample records require the UseSubSampleEncryption flag"
+    );
+}
+
+#[test]
+fn senc_rejects_unsupported_versions_during_unmarshal() {
+    let payload = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut decoded = Senc::default();
+    let error = unmarshal(
+        &mut Cursor::new(payload),
+        payload.len() as u64,
+        &mut decoded,
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "unsupported box version 1 for type senc");
 }

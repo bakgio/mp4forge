@@ -12,6 +12,9 @@ use mp4forge::probe::{
     ProbeError, ProbeOptions, TrackCodec, average_sample_bitrate, average_segment_bitrate,
     find_idr_frames, max_sample_bitrate, max_segment_bitrate, probe, probe_with_options,
 };
+use mp4forge::sidx::{
+    TopLevelSidxPlanOptions, apply_top_level_sidx_plan_bytes, plan_top_level_sidx_update_bytes,
+};
 use mp4forge::walk::BoxPath;
 
 use support::{fixture_path, read_golden, read_text, temp_output_dir, write_temp_file};
@@ -539,6 +542,84 @@ fn fragmented_and_encrypted_cli_surfaces_match_shared_fixture_expectations() {
 
     let _ = fs::remove_file(&edit_output);
     let _ = fs::remove_dir_all(&divide_output_dir);
+}
+
+#[test]
+fn probe_surfaces_stay_stable_after_top_level_sidx_refresh_on_shared_fixture() {
+    let input = fs::read(fixture_path("sample_fragmented.mp4")).unwrap();
+    let original_summary = probe(&mut Cursor::new(&input)).unwrap();
+    let original_report = cli_probe::build_report(&mut Cursor::new(&input)).unwrap();
+
+    let plan = plan_top_level_sidx_update_bytes(
+        &input,
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: true,
+            non_zero_ept: false,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let output = apply_top_level_sidx_plan_bytes(&input, &plan).unwrap();
+
+    let refreshed_summary = probe(&mut Cursor::new(&output)).unwrap();
+    let refreshed_report = cli_probe::build_report(&mut Cursor::new(&output)).unwrap();
+    let sidx = extract_box(
+        &mut Cursor::new(&output),
+        None,
+        BoxPath::from([fourcc("sidx")]),
+    )
+    .unwrap();
+
+    assert_eq!(sidx.len(), 1);
+    assert_eq!(original_report, refreshed_report);
+    assert_eq!(original_summary.major_brand, refreshed_summary.major_brand);
+    assert_eq!(
+        original_summary.minor_version,
+        refreshed_summary.minor_version
+    );
+    assert_eq!(
+        original_summary.compatible_brands,
+        refreshed_summary.compatible_brands
+    );
+    assert_eq!(original_summary.fast_start, refreshed_summary.fast_start);
+    assert_eq!(original_summary.timescale, refreshed_summary.timescale);
+    assert_eq!(original_summary.duration, refreshed_summary.duration);
+    assert_eq!(original_summary.tracks, refreshed_summary.tracks);
+    assert_eq!(
+        original_summary.segments.len(),
+        refreshed_summary.segments.len()
+    );
+
+    let offset_delta = sidx[0].size();
+    for (original_segment, refreshed_segment) in original_summary
+        .segments
+        .iter()
+        .zip(refreshed_summary.segments.iter())
+    {
+        assert_eq!(original_segment.track_id, refreshed_segment.track_id);
+        assert_eq!(
+            original_segment.moof_offset + offset_delta,
+            refreshed_segment.moof_offset
+        );
+        assert_eq!(
+            original_segment.base_media_decode_time,
+            refreshed_segment.base_media_decode_time
+        );
+        assert_eq!(
+            original_segment.default_sample_duration,
+            refreshed_segment.default_sample_duration
+        );
+        assert_eq!(
+            original_segment.sample_count,
+            refreshed_segment.sample_count
+        );
+        assert_eq!(original_segment.duration, refreshed_segment.duration);
+        assert_eq!(
+            original_segment.composition_time_offset,
+            refreshed_segment.composition_time_offset
+        );
+        assert_eq!(original_segment.size, refreshed_segment.size);
+    }
 }
 
 fn expected_bitrate(

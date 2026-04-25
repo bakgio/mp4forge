@@ -66,7 +66,7 @@ fn edit_command_validates_argument_shape() {
 }
 
 #[test]
-fn edit_command_accepts_go_style_long_options() {
+fn edit_command_accepts_double_dash_long_options() {
     let input = build_edit_input_file();
     let input_path = write_temp_file("edit-long-options-input", &input);
     let output_path = write_temp_file("edit-long-options-output", &[]);
