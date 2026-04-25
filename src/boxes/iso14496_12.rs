@@ -1,13 +1,18 @@
 //! Core ISO BMFF timing and structure boxes.
 
-use std::io::{SeekFrom, Write};
+use std::io::{Cursor, SeekFrom, Write};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::boxes::iso23001_7::{
+    Senc, decode_senc_payload, encode_senc_payload, render_senc_samples_display,
+};
 use crate::boxes::{AnyTypeBox, BoxLookupContext, BoxRegistry};
 use crate::codec::{
-    CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode, read_exact_vec_untrusted,
-    untrusted_prealloc_hint,
+    ANY_VERSION, CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError,
+    FieldValueRead, FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode,
+    read_exact_vec_untrusted, untrusted_prealloc_hint,
 };
+use crate::header::{BoxInfo, SMALL_HEADER_SIZE};
 use crate::{FourCc, codec_field};
 
 const URL_SELF_CONTAINED: u32 = 0x000001;
@@ -18,6 +23,23 @@ const SCHEME_URI_PRESENT: u32 = 0x000001;
 const COLR_NCLX: FourCc = FourCc::from_bytes(*b"nclx");
 const COLR_RICC: FourCc = FourCc::from_bytes(*b"rICC");
 const COLR_PROF: FourCc = FourCc::from_bytes(*b"prof");
+
+/// User-type identifier for the spherical-video XML payload carried in `uuid` boxes.
+pub const UUID_SPHERICAL_VIDEO_V1: [u8; 16] = [
+    0xff, 0xcc, 0x82, 0x63, 0xf8, 0x55, 0x4a, 0x93, 0x88, 0x14, 0x58, 0x7a, 0x02, 0x52, 0x1f, 0xdd,
+];
+/// User-type identifier for the fragment-absolute-timing payload carried in `uuid` boxes.
+pub const UUID_FRAGMENT_ABSOLUTE_TIMING: [u8; 16] = [
+    0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7, 0x57, 0xb2,
+];
+/// User-type identifier for the fragment-run table payload carried in `uuid` boxes.
+pub const UUID_FRAGMENT_RUN_TABLE: [u8; 16] = [
+    0xd4, 0x80, 0x7e, 0xf2, 0xca, 0x39, 0x46, 0x95, 0x8e, 0x54, 0x26, 0xcb, 0x9e, 0x46, 0xa7, 0x9f,
+];
+/// User-type identifier for the sample-encryption payload carried in `uuid` boxes.
+pub const UUID_SAMPLE_ENCRYPTION: [u8; 16] = [
+    0xa2, 0x39, 0x4f, 0x52, 0x5a, 0x9b, 0x4f, 0x14, 0xa2, 0x44, 0x6c, 0x42, 0x7c, 0x64, 0x8d, 0xf4,
+];
 
 /// `tfhd` flag indicating that `base_data_offset` is present.
 pub const TFHD_BASE_DATA_OFFSET_PRESENT: u32 = 0x000001;
@@ -46,6 +68,23 @@ pub const TRUN_SAMPLE_SIZE_PRESENT: u32 = 0x000200;
 pub const TRUN_SAMPLE_FLAGS_PRESENT: u32 = 0x000400;
 /// `trun` flag indicating that each entry carries a composition time offset.
 pub const TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT: u32 = 0x000800;
+/// Known `prft` flags value for timestamps captured at encoder input.
+pub const PRFT_TIME_ENCODER_INPUT: u32 = 0x000000;
+/// Known `prft` flags value for timestamps captured at encoder output.
+pub const PRFT_TIME_ENCODER_OUTPUT: u32 = 0x000001;
+/// Known `prft` flags value for timestamps captured when the containing `moof` was finalized.
+pub const PRFT_TIME_MOOF_FINALIZED: u32 = 0x000002;
+/// Known `prft` flags value for timestamps captured when the containing `moof` was written.
+pub const PRFT_TIME_MOOF_WRITTEN: u32 = 0x000004;
+/// Known `prft` flags value for timestamps captured at an arbitrary but internally consistent point.
+pub const PRFT_TIME_ARBITRARY_CONSISTENT: u32 = 0x000008;
+/// Known `prft` flags value for timestamps captured by an external time source.
+pub const PRFT_TIME_CAPTURED: u32 = 0x000018;
+/// Number of NTP whole seconds between `1900-01-01` and the UNIX epoch.
+pub const PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
+
+const PRFT_NTP_FRACTION_SCALE: u128 = 1u128 << 32;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FullBoxState {
@@ -127,10 +166,25 @@ fn bytes_to_fourcc_vec(
     })
 }
 
+fn bytes_to_track_id_vec(
+    field_name: &'static str,
+    bytes: Vec<u8>,
+) -> Result<Vec<u32>, FieldValueError> {
+    parse_fixed_chunks(field_name, &bytes, 4, |chunk| read_u32(chunk, 0))
+}
+
 fn fourcc_vec_to_bytes(values: &[FourCc]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for value in values {
         bytes.extend_from_slice(value.as_bytes());
+    }
+    bytes
+}
+
+fn track_id_vec_to_bytes(values: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_be_bytes());
     }
     bytes
 }
@@ -168,6 +222,619 @@ fn render_array(values: impl IntoIterator<Item = String>) -> String {
 
 fn render_hex_bytes(bytes: &[u8]) -> String {
     render_array(bytes.iter().map(|byte| format!("0x{:x}", byte)))
+}
+
+fn render_uuid(value: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        value[0],
+        value[1],
+        value[2],
+        value[3],
+        value[4],
+        value[5],
+        value[6],
+        value[7],
+        value[8],
+        value[9],
+        value[10],
+        value[11],
+        value[12],
+        value[13],
+        value[14],
+        value[15],
+    )
+}
+
+fn bytes_to_uuid(field_name: &'static str, bytes: Vec<u8>) -> Result<[u8; 16], FieldValueError> {
+    bytes
+        .try_into()
+        .map_err(|_| invalid_value(field_name, "value must be exactly 16 bytes"))
+}
+
+fn encode_uuid_full_box_header(
+    field_name: &'static str,
+    version: u8,
+    flags: u32,
+) -> Result<[u8; 4], FieldValueError> {
+    if flags & 0xff00_0000 != 0 {
+        return Err(invalid_value(field_name, "flags exceed 24 bits"));
+    }
+
+    Ok([
+        version,
+        ((flags >> 16) & 0xff) as u8,
+        ((flags >> 8) & 0xff) as u8,
+        (flags & 0xff) as u8,
+    ])
+}
+
+fn render_uuid_fragment_run_entries(entries: &[UuidFragmentRunEntry]) -> String {
+    render_array(entries.iter().map(|entry| {
+        format!(
+            "{{FragmentAbsoluteTime={} FragmentAbsoluteDuration={}}}",
+            entry.fragment_absolute_time, entry.fragment_absolute_duration
+        )
+    }))
+}
+
+fn encode_uuid_fragment_absolute_timing(
+    field_name: &'static str,
+    timing: &UuidFragmentAbsoluteTiming,
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut payload = Vec::with_capacity(
+        if timing.version == 1 {
+            20_usize
+        } else {
+            12_usize
+        }
+        .max(4),
+    );
+    payload.extend_from_slice(&encode_uuid_full_box_header(
+        field_name,
+        timing.version,
+        timing.flags,
+    )?);
+    match timing.version {
+        0 => {
+            payload.extend_from_slice(
+                &u32::try_from(timing.fragment_absolute_time)
+                    .map_err(|_| invalid_value(field_name, "version 0 time does not fit in u32"))?
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(
+                &u32::try_from(timing.fragment_absolute_duration)
+                    .map_err(|_| {
+                        invalid_value(field_name, "version 0 duration does not fit in u32")
+                    })?
+                    .to_be_bytes(),
+            );
+        }
+        1 => {
+            payload.extend_from_slice(&timing.fragment_absolute_time.to_be_bytes());
+            payload.extend_from_slice(&timing.fragment_absolute_duration.to_be_bytes());
+        }
+        _ => {
+            return Err(invalid_value(
+                field_name,
+                "fragment timing payload version is not supported",
+            ));
+        }
+    }
+    Ok(payload)
+}
+
+fn decode_uuid_fragment_absolute_timing(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<UuidFragmentAbsoluteTiming, FieldValueError> {
+    if payload.len() < 4 {
+        return Err(invalid_value(
+            field_name,
+            "fragment timing payload is truncated",
+        ));
+    }
+
+    let version = payload[0];
+    let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+    match version {
+        0 => {
+            if payload.len() != 12 {
+                return Err(invalid_value(
+                    field_name,
+                    "fragment timing payload length does not match version 0",
+                ));
+            }
+            Ok(UuidFragmentAbsoluteTiming {
+                version,
+                flags,
+                fragment_absolute_time: u64::from(read_u32(payload, 4)),
+                fragment_absolute_duration: u64::from(read_u32(payload, 8)),
+            })
+        }
+        1 => {
+            if payload.len() != 20 {
+                return Err(invalid_value(
+                    field_name,
+                    "fragment timing payload length does not match version 1",
+                ));
+            }
+            Ok(UuidFragmentAbsoluteTiming {
+                version,
+                flags,
+                fragment_absolute_time: read_u64(payload, 4),
+                fragment_absolute_duration: read_u64(payload, 12),
+            })
+        }
+        _ => Err(invalid_value(
+            field_name,
+            "fragment timing payload version is not supported",
+        )),
+    }
+}
+
+fn encode_uuid_fragment_run_entries(
+    field_name: &'static str,
+    table: &UuidFragmentRunTable,
+) -> Result<Vec<u8>, FieldValueError> {
+    if usize::from(table.fragment_count) != table.entries.len() {
+        return Err(invalid_value(
+            field_name,
+            "fragment count does not match the number of entries",
+        ));
+    }
+
+    let mut payload = Vec::new();
+    for entry in &table.entries {
+        match table.version {
+            0 => {
+                payload.extend_from_slice(
+                    &u32::try_from(entry.fragment_absolute_time)
+                        .map_err(|_| {
+                            invalid_value(field_name, "version 0 time does not fit in u32")
+                        })?
+                        .to_be_bytes(),
+                );
+                payload.extend_from_slice(
+                    &u32::try_from(entry.fragment_absolute_duration)
+                        .map_err(|_| {
+                            invalid_value(field_name, "version 0 duration does not fit in u32")
+                        })?
+                        .to_be_bytes(),
+                );
+            }
+            1 => {
+                payload.extend_from_slice(&entry.fragment_absolute_time.to_be_bytes());
+                payload.extend_from_slice(&entry.fragment_absolute_duration.to_be_bytes());
+            }
+            _ => {
+                return Err(invalid_value(
+                    field_name,
+                    "fragment run table payload version is not supported",
+                ));
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+fn encode_uuid_fragment_run_table(
+    field_name: &'static str,
+    table: &UuidFragmentRunTable,
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&encode_uuid_full_box_header(
+        field_name,
+        table.version,
+        table.flags,
+    )?);
+    payload.push(table.fragment_count);
+    payload.extend_from_slice(&encode_uuid_fragment_run_entries(field_name, table)?);
+    Ok(payload)
+}
+
+fn decode_uuid_fragment_run_entries(
+    field_name: &'static str,
+    version: u8,
+    fragment_count: u8,
+    payload: &[u8],
+) -> Result<Vec<UuidFragmentRunEntry>, FieldValueError> {
+    let bytes_per_entry = match version {
+        0 => 8_usize,
+        1 => 16_usize,
+        _ => {
+            return Err(invalid_value(
+                field_name,
+                "fragment run table payload version is not supported",
+            ));
+        }
+    };
+    let expected_len = usize::from(fragment_count)
+        .checked_mul(bytes_per_entry)
+        .ok_or_else(|| invalid_value(field_name, "fragment run table payload is too large"))?;
+    if payload.len() != expected_len {
+        return Err(invalid_value(
+            field_name,
+            "fragment run table payload length does not match the fragment count",
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(usize::from(fragment_count)));
+    let mut offset = 0_usize;
+    while offset < payload.len() {
+        let (fragment_absolute_time, fragment_absolute_duration) = match version {
+            0 => (
+                u64::from(read_u32(payload, offset)),
+                u64::from(read_u32(payload, offset + 4)),
+            ),
+            1 => (read_u64(payload, offset), read_u64(payload, offset + 8)),
+            _ => unreachable!(),
+        };
+        entries.push(UuidFragmentRunEntry {
+            fragment_absolute_time,
+            fragment_absolute_duration,
+        });
+        offset += bytes_per_entry;
+    }
+    Ok(entries)
+}
+
+fn decode_uuid_fragment_run_table(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<UuidFragmentRunTable, FieldValueError> {
+    if payload.len() < 5 {
+        return Err(invalid_value(
+            field_name,
+            "fragment run table payload is truncated",
+        ));
+    }
+
+    let version = payload[0];
+    let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+    let fragment_count = payload[4];
+    let entries =
+        decode_uuid_fragment_run_entries(field_name, version, fragment_count, &payload[5..])?;
+    Ok(UuidFragmentRunTable {
+        version,
+        flags,
+        fragment_count,
+        entries,
+    })
+}
+
+fn encode_uuid_payload(
+    user_type: [u8; 16],
+    payload: &UuidPayload,
+) -> Result<Vec<u8>, FieldValueError> {
+    match payload {
+        UuidPayload::Raw(bytes) => Ok(bytes.clone()),
+        UuidPayload::SphericalVideoV1(data) => {
+            if user_type != UUID_SPHERICAL_VIDEO_V1 {
+                return Err(invalid_value(
+                    "Payload",
+                    "spherical payload requires the spherical UUID user type",
+                ));
+            }
+            Ok(data.xml_data.clone())
+        }
+        UuidPayload::FragmentAbsoluteTiming(data) => {
+            if user_type != UUID_FRAGMENT_ABSOLUTE_TIMING {
+                return Err(invalid_value(
+                    "Payload",
+                    "fragment timing payload requires the fragment-timing UUID user type",
+                ));
+            }
+            encode_uuid_fragment_absolute_timing("Payload", data)
+        }
+        UuidPayload::FragmentRunTable(data) => {
+            if user_type != UUID_FRAGMENT_RUN_TABLE {
+                return Err(invalid_value(
+                    "Payload",
+                    "fragment run table payload requires the fragment-run UUID user type",
+                ));
+            }
+            encode_uuid_fragment_run_table("Payload", data)
+        }
+        UuidPayload::SampleEncryption(data) => {
+            if user_type != UUID_SAMPLE_ENCRYPTION {
+                return Err(invalid_value(
+                    "Payload",
+                    "sample encryption payload requires the sample-encryption UUID user type",
+                ));
+            }
+            encode_senc_payload(data).map_err(|error| match error {
+                CodecError::FieldValue(field_error) => field_error,
+                CodecError::UnsupportedVersion { .. } => invalid_value(
+                    "Payload",
+                    "sample encryption payload version is not supported",
+                ),
+                CodecError::InvalidLength { .. } => invalid_value(
+                    "Payload",
+                    "sample count does not match the number of sample records",
+                ),
+                _ => invalid_value("Payload", "sample encryption payload is invalid"),
+            })
+        }
+    }
+}
+
+fn decode_uuid_payload(
+    user_type: [u8; 16],
+    payload: &[u8],
+) -> Result<UuidPayload, FieldValueError> {
+    if user_type == UUID_SPHERICAL_VIDEO_V1 {
+        return Ok(UuidPayload::SphericalVideoV1(SphericalVideoV1Metadata {
+            xml_data: payload.to_vec(),
+        }));
+    }
+    if user_type == UUID_FRAGMENT_ABSOLUTE_TIMING {
+        return Ok(UuidPayload::FragmentAbsoluteTiming(
+            decode_uuid_fragment_absolute_timing("Payload", payload)?,
+        ));
+    }
+    if user_type == UUID_FRAGMENT_RUN_TABLE {
+        return Ok(UuidPayload::FragmentRunTable(
+            decode_uuid_fragment_run_table("Payload", payload)?,
+        ));
+    }
+    if user_type == UUID_SAMPLE_ENCRYPTION {
+        return Ok(UuidPayload::SampleEncryption(
+            decode_senc_payload(payload).map_err(|error| match error {
+                CodecError::FieldValue(field_error) => field_error,
+                CodecError::UnsupportedVersion { .. } => invalid_value(
+                    "Payload",
+                    "sample encryption payload version is not supported",
+                ),
+                CodecError::InvalidLength { .. } => invalid_value(
+                    "Payload",
+                    "sample count does not match the number of sample records",
+                ),
+                _ => invalid_value("Payload", "sample encryption payload is invalid"),
+            })?,
+        ));
+    }
+    Ok(UuidPayload::Raw(payload.to_vec()))
+}
+
+fn encoded_loudness_entries_len(
+    version: u8,
+    entries: &[LoudnessEntry],
+) -> Result<u32, FieldValueError> {
+    let bytes = encode_loudness_entries("Entries", version, entries)?;
+    u32::try_from(bytes.len())
+        .map_err(|_| invalid_value("Entries", "encoded payload length does not fit in u32"))
+}
+
+fn encode_loudness_entries(
+    field_name: &'static str,
+    version: u8,
+    entries: &[LoudnessEntry],
+) -> Result<Vec<u8>, FieldValueError> {
+    if version > 1 {
+        return Err(invalid_value(
+            field_name,
+            "unsupported loudness box version",
+        ));
+    }
+    if version == 0 && entries.len() != 1 {
+        return Err(invalid_value(
+            field_name,
+            "version 0 loudness boxes must contain exactly one entry",
+        ));
+    }
+    if version == 1 && entries.len() > 0x3f {
+        return Err(invalid_value(
+            field_name,
+            "entry count does not fit in the loudness count field",
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    if version >= 1 {
+        bytes.push(entries.len() as u8);
+    }
+
+    for entry in entries {
+        if version >= 1 {
+            if entry.eq_set_id > 0x3f {
+                return Err(invalid_value("EQSetID", "value does not fit in 6 bits"));
+            }
+            bytes.push(entry.eq_set_id & 0x3f);
+        }
+        if entry.downmix_id > 0x03ff {
+            return Err(invalid_value("DownmixID", "value does not fit in 10 bits"));
+        }
+        if entry.drc_set_id > 0x3f {
+            return Err(invalid_value("DRCSetID", "value does not fit in 6 bits"));
+        }
+        if entry.bs_sample_peak_level > 0x0fff {
+            return Err(invalid_value(
+                "BsSamplePeakLevel",
+                "value does not fit in 12 bits",
+            ));
+        }
+        if entry.bs_true_peak_level > 0x0fff {
+            return Err(invalid_value(
+                "BsTruePeakLevel",
+                "value does not fit in 12 bits",
+            ));
+        }
+        if entry.measurement_system_for_tp > 0x0f {
+            return Err(invalid_value(
+                "MeasurementSystemForTP",
+                "value does not fit in 4 bits",
+            ));
+        }
+        if entry.reliability_for_tp > 0x0f {
+            return Err(invalid_value(
+                "ReliabilityForTP",
+                "value does not fit in 4 bits",
+            ));
+        }
+        if entry.measurements.len() > usize::from(u8::MAX) {
+            return Err(invalid_value(
+                "Measurements",
+                "entry count does not fit in u8",
+            ));
+        }
+
+        let downmix_and_drc = (entry.downmix_id << 6) | u16::from(entry.drc_set_id & 0x3f);
+        bytes.extend_from_slice(&downmix_and_drc.to_be_bytes());
+
+        let peak_levels = (u32::from(entry.bs_sample_peak_level) << 12)
+            | u32::from(entry.bs_true_peak_level & 0x0fff);
+        push_uint("PeakLevels", &mut bytes, 3, u64::from(peak_levels))?;
+        bytes.push((entry.measurement_system_for_tp << 4) | (entry.reliability_for_tp & 0x0f));
+        bytes.push(entry.measurements.len() as u8);
+
+        for measurement in &entry.measurements {
+            if measurement.measurement_system > 0x0f {
+                return Err(invalid_value(
+                    "MeasurementSystem",
+                    "value does not fit in 4 bits",
+                ));
+            }
+            if measurement.reliability > 0x0f {
+                return Err(invalid_value("Reliability", "value does not fit in 4 bits"));
+            }
+
+            bytes.push(measurement.method_definition);
+            bytes.push(measurement.method_value);
+            bytes.push((measurement.measurement_system << 4) | (measurement.reliability & 0x0f));
+        }
+    }
+
+    Ok(bytes)
+}
+
+fn decode_loudness_entries(
+    field_name: &'static str,
+    version: u8,
+    payload: &[u8],
+) -> Result<Vec<LoudnessEntry>, FieldValueError> {
+    if version > 1 {
+        return Err(invalid_value(
+            field_name,
+            "unsupported loudness box version",
+        ));
+    }
+
+    let mut offset = 0_usize;
+    let entry_count = if version >= 1 {
+        if payload.is_empty() {
+            return Err(invalid_value(field_name, "payload is truncated"));
+        }
+        let info_type = payload[0] >> 6;
+        if info_type != 0 {
+            return Err(invalid_value(
+                field_name,
+                "loudness info type is not supported",
+            ));
+        }
+        offset += 1;
+        usize::from(payload[0] & 0x3f)
+    } else {
+        1
+    };
+
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(entry_count));
+    for _ in 0..entry_count {
+        let eq_set_id = if version >= 1 {
+            if offset >= payload.len() {
+                return Err(invalid_value(field_name, "payload is truncated"));
+            }
+            let value = payload[offset] & 0x3f;
+            offset += 1;
+            value
+        } else {
+            0
+        };
+
+        if payload.len().saturating_sub(offset) < 7 {
+            return Err(invalid_value(field_name, "payload is truncated"));
+        }
+
+        let downmix_and_drc = read_u16(payload, offset);
+        offset += 2;
+        let peak_levels = read_uint(payload, offset, 3) as u32;
+        offset += 3;
+        let measurement_system_and_reliability_for_tp = payload[offset];
+        offset += 1;
+        let measurement_count = usize::from(payload[offset]);
+        offset += 1;
+
+        let mut measurements = Vec::with_capacity(untrusted_prealloc_hint(measurement_count));
+        for _ in 0..measurement_count {
+            if payload.len().saturating_sub(offset) < 3 {
+                return Err(invalid_value(field_name, "payload is truncated"));
+            }
+            let method_definition = payload[offset];
+            let method_value = payload[offset + 1];
+            let measurement_system_and_reliability = payload[offset + 2];
+            offset += 3;
+
+            measurements.push(LoudnessMeasurement {
+                method_definition,
+                method_value,
+                measurement_system: measurement_system_and_reliability >> 4,
+                reliability: measurement_system_and_reliability & 0x0f,
+            });
+        }
+
+        entries.push(LoudnessEntry {
+            eq_set_id,
+            downmix_id: downmix_and_drc >> 6,
+            drc_set_id: (downmix_and_drc & 0x3f) as u8,
+            bs_sample_peak_level: ((peak_levels >> 12) & 0x0fff) as u16,
+            bs_true_peak_level: (peak_levels & 0x0fff) as u16,
+            measurement_system_for_tp: measurement_system_and_reliability_for_tp >> 4,
+            reliability_for_tp: measurement_system_and_reliability_for_tp & 0x0f,
+            measurements,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(invalid_value(field_name, "payload has trailing bytes"));
+    }
+
+    Ok(entries)
+}
+
+fn render_loudness_measurements(measurements: &[LoudnessMeasurement]) -> String {
+    render_array(measurements.iter().map(|measurement| {
+        format!(
+            "{{MethodDefinition={} MethodValue={} MeasurementSystem={} Reliability={}}}",
+            measurement.method_definition,
+            measurement.method_value,
+            measurement.measurement_system,
+            measurement.reliability,
+        )
+    }))
+}
+
+fn render_loudness_entries(version: u8, entries: &[LoudnessEntry]) -> String {
+    render_array(entries.iter().map(|entry| {
+        let mut fields = Vec::new();
+        if version >= 1 {
+            fields.push(format!("EQSetID={}", entry.eq_set_id));
+        }
+        fields.push(format!("DownmixID={}", entry.downmix_id));
+        fields.push(format!("DRCSetID={}", entry.drc_set_id));
+        fields.push(format!("BsSamplePeakLevel={}", entry.bs_sample_peak_level));
+        fields.push(format!("BsTruePeakLevel={}", entry.bs_true_peak_level));
+        fields.push(format!(
+            "MeasurementSystemForTP={}",
+            entry.measurement_system_for_tp
+        ));
+        fields.push(format!("ReliabilityForTP={}", entry.reliability_for_tp));
+        fields.push(format!(
+            "Measurements={}",
+            render_loudness_measurements(&entry.measurements)
+        ));
+        format!("{{{}}}", fields.join(" "))
+    }))
 }
 
 fn quoted_fourcc(value: FourCc) -> String {
@@ -616,6 +1283,34 @@ macro_rules! empty_box_codec {
     };
 }
 
+macro_rules! empty_full_box_codec {
+    ($name:ident) => {
+        impl FieldValueRead for $name {
+            fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+                Err(missing_field(field_name))
+            }
+        }
+
+        impl FieldValueWrite for $name {
+            fn set_field_value(
+                &mut self,
+                field_name: &'static str,
+                value: FieldValue,
+            ) -> Result<(), FieldValueError> {
+                Err(unexpected_field(field_name, value))
+            }
+        }
+
+        impl CodecBox for $name {
+            const FIELD_TABLE: FieldTable = FieldTable::new(&[
+                codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+                codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+            ]);
+            const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+        }
+    };
+}
+
 macro_rules! simple_container_box {
     ($name:ident, $box_type:expr) => {
         #[doc = "Container box with no direct payload fields."]
@@ -669,6 +1364,72 @@ macro_rules! raw_data_box {
     };
 }
 
+macro_rules! track_id_list_box {
+    ($name:ident, $box_type:expr, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        pub struct $name {
+            pub track_ids: Vec<u32>,
+        }
+
+        impl FieldHooks for $name {
+            fn field_length(&self, name: &'static str) -> Option<u32> {
+                match name {
+                    "TrackIDs" => field_len_bytes(self.track_ids.len(), 4),
+                    _ => None,
+                }
+            }
+
+            fn display_field(&self, name: &'static str) -> Option<String> {
+                match name {
+                    "TrackIDs" => Some(render_array(
+                        self.track_ids.iter().map(|track_id| track_id.to_string()),
+                    )),
+                    _ => None,
+                }
+            }
+        }
+
+        impl ImmutableBox for $name {
+            fn box_type(&self) -> FourCc {
+                FourCc::from_bytes($box_type)
+            }
+        }
+
+        impl MutableBox for $name {}
+
+        impl FieldValueRead for $name {
+            fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+                match field_name {
+                    "TrackIDs" => Ok(FieldValue::Bytes(track_id_vec_to_bytes(&self.track_ids))),
+                    _ => Err(missing_field(field_name)),
+                }
+            }
+        }
+
+        impl FieldValueWrite for $name {
+            fn set_field_value(
+                &mut self,
+                field_name: &'static str,
+                value: FieldValue,
+            ) -> Result<(), FieldValueError> {
+                match (field_name, value) {
+                    ("TrackIDs", FieldValue::Bytes(bytes)) => {
+                        self.track_ids = bytes_to_track_id_vec(field_name, bytes)?;
+                        Ok(())
+                    }
+                    (field_name, value) => Err(unexpected_field(field_name, value)),
+                }
+            }
+        }
+
+        impl CodecBox for $name {
+            const FIELD_TABLE: FieldTable =
+                FieldTable::new(&[codec_field!("TrackIDs", 0, with_bit_width(8), as_bytes())]);
+        }
+    };
+}
+
 simple_container_box!(Dinf, *b"dinf");
 simple_container_box!(Edts, *b"edts");
 simple_container_box!(Mdia, *b"mdia");
@@ -680,11 +1441,648 @@ simple_container_box!(Mfra, *b"mfra");
 simple_container_box!(Stbl, *b"stbl");
 simple_container_box!(Traf, *b"traf");
 simple_container_box!(Trak, *b"trak");
-simple_container_box!(Udta, *b"udta");
+simple_container_box!(Tref, *b"tref");
 
 raw_data_box!(Free, *b"free");
 raw_data_box!(Skip, *b"skip");
 raw_data_box!(Mdat, *b"mdat");
+
+/// Closed-caption sample-data box that preserves its payload bytes verbatim.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cdat {
+    pub data: Vec<u8>,
+}
+
+impl_leaf_box!(Cdat, *b"cdat");
+
+impl FieldValueRead for Cdat {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Data" => Ok(FieldValue::Bytes(self.data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Cdat {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Data", FieldValue::Bytes(data)) => {
+                self.data = data;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Cdat {
+    const FIELD_TABLE: FieldTable =
+        FieldTable::new(&[codec_field!("Data", 0, with_bit_width(8), as_bytes())]);
+}
+
+/// User-data container carried by boxes such as `moov` and `trak`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Udta;
+
+impl_leaf_box!(Udta, *b"udta");
+empty_box_codec!(Udta);
+
+/// User-data loudness container that groups track and album loudness boxes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ludt;
+
+impl_leaf_box!(Ludt, *b"ludt");
+empty_box_codec!(Ludt);
+
+/// One loudness measurement record carried by `tlou` and `alou`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoudnessMeasurement {
+    pub method_definition: u8,
+    pub method_value: u8,
+    pub measurement_system: u8,
+    pub reliability: u8,
+}
+
+/// One loudness entry carried by `tlou` and `alou`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoudnessEntry {
+    pub eq_set_id: u8,
+    pub downmix_id: u16,
+    pub drc_set_id: u8,
+    pub bs_sample_peak_level: u16,
+    pub bs_true_peak_level: u16,
+    pub measurement_system_for_tp: u8,
+    pub reliability_for_tp: u8,
+    pub measurements: Vec<LoudnessMeasurement>,
+}
+
+macro_rules! define_loudness_info_box {
+    ($(#[$doc:meta])* $name:ident, $box_type:expr) => {
+        $(#[$doc])*
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        pub struct $name {
+            full_box: FullBoxState,
+            pub entries: Vec<LoudnessEntry>,
+        }
+
+        impl FieldHooks for $name {
+            fn field_length(&self, name: &'static str) -> Option<u32> {
+                match name {
+                    "Entries" => encoded_loudness_entries_len(self.version(), &self.entries).ok(),
+                    _ => None,
+                }
+            }
+
+            fn display_field(&self, name: &'static str) -> Option<String> {
+                match name {
+                    "Entries" => Some(render_loudness_entries(self.version(), &self.entries)),
+                    _ => None,
+                }
+            }
+        }
+
+        impl ImmutableBox for $name {
+            fn box_type(&self) -> FourCc {
+                FourCc::from_bytes($box_type)
+            }
+
+            fn version(&self) -> u8 {
+                self.full_box.version
+            }
+
+            fn flags(&self) -> u32 {
+                self.full_box.flags
+            }
+        }
+
+        impl MutableBox for $name {
+            fn set_version(&mut self, version: u8) {
+                self.full_box.version = version;
+            }
+
+            fn set_flags(&mut self, flags: u32) {
+                self.full_box.flags = flags;
+            }
+        }
+
+        impl FieldValueRead for $name {
+            fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+                match field_name {
+                    "Entries" => Ok(FieldValue::Bytes(encode_loudness_entries(
+                        field_name,
+                        self.version(),
+                        &self.entries,
+                    )?)),
+                    _ => Err(missing_field(field_name)),
+                }
+            }
+        }
+
+        impl FieldValueWrite for $name {
+            fn set_field_value(
+                &mut self,
+                field_name: &'static str,
+                value: FieldValue,
+            ) -> Result<(), FieldValueError> {
+                match (field_name, value) {
+                    ("Entries", FieldValue::Bytes(value)) => {
+                        self.entries = decode_loudness_entries(field_name, self.version(), &value)?;
+                        Ok(())
+                    }
+                    (field_name, value) => Err(unexpected_field(field_name, value)),
+                }
+            }
+        }
+
+        impl CodecBox for $name {
+            const FIELD_TABLE: FieldTable = FieldTable::new(&[
+                codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+                codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+                codec_field!("Entries", 2, with_bit_width(8), with_dynamic_length(), as_bytes()),
+            ]);
+            const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
+
+            fn custom_marshal(
+                &self,
+                writer: &mut dyn Write,
+            ) -> Result<Option<u64>, CodecError> {
+                if self.version() > 1 {
+                    return Err(CodecError::UnsupportedVersion {
+                        box_type: self.box_type(),
+                        version: self.version(),
+                    });
+                }
+                if self.flags() != 0 {
+                    return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+                }
+
+                let entries = encode_loudness_entries("Entries", self.version(), &self.entries)?;
+                let mut payload = Vec::with_capacity(4 + entries.len());
+                payload.push(self.version());
+                payload.extend_from_slice(&self.flags().to_be_bytes()[1..]);
+                payload.extend_from_slice(&entries);
+                writer.write_all(&payload)?;
+                Ok(Some(payload.len() as u64))
+            }
+
+            fn custom_unmarshal(
+                &mut self,
+                reader: &mut dyn ReadSeek,
+                payload_size: u64,
+            ) -> Result<Option<u64>, CodecError> {
+                let payload_len = usize::try_from(payload_size)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+                if payload_len < 4 {
+                    return Err(invalid_value("Payload", "payload is too short").into());
+                }
+
+                let payload = read_exact_vec_untrusted(reader, payload_len)?;
+                let version = payload[0];
+                if version > 1 {
+                    return Err(CodecError::UnsupportedVersion {
+                        box_type: self.box_type(),
+                        version,
+                    });
+                }
+                let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+                if flags != 0 {
+                    return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+                }
+
+                self.full_box = FullBoxState { version, flags };
+                self.entries = decode_loudness_entries("Entries", version, &payload[4..])?;
+                Ok(Some(payload_size))
+            }
+        }
+    };
+}
+
+define_loudness_info_box!(
+    /// Track loudness metadata box carried under `ludt`.
+    TrackLoudnessInfo,
+    *b"tlou"
+);
+
+define_loudness_info_box!(
+    /// Album loudness metadata box carried under `ludt`.
+    AlbumLoudnessInfo,
+    *b"alou"
+);
+
+/// Spherical-video metadata payload stored inside one `uuid` box subtype.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SphericalVideoV1Metadata {
+    pub xml_data: Vec<u8>,
+}
+
+/// Fragment-absolute-timing payload stored inside one `uuid` box subtype.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UuidFragmentAbsoluteTiming {
+    pub version: u8,
+    pub flags: u32,
+    pub fragment_absolute_time: u64,
+    pub fragment_absolute_duration: u64,
+}
+
+/// One fragment timing record carried by a fragment-run table `uuid` payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UuidFragmentRunEntry {
+    pub fragment_absolute_time: u64,
+    pub fragment_absolute_duration: u64,
+}
+
+/// Fragment-run table payload stored inside one `uuid` box subtype.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UuidFragmentRunTable {
+    pub version: u8,
+    pub flags: u32,
+    pub fragment_count: u8,
+    pub entries: Vec<UuidFragmentRunEntry>,
+}
+
+/// Typed payload variants for `uuid` boxes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UuidPayload {
+    Raw(Vec<u8>),
+    SphericalVideoV1(SphericalVideoV1Metadata),
+    FragmentAbsoluteTiming(UuidFragmentAbsoluteTiming),
+    FragmentRunTable(UuidFragmentRunTable),
+    SampleEncryption(Senc),
+}
+
+impl Default for UuidPayload {
+    fn default() -> Self {
+        Self::Raw(Vec::new())
+    }
+}
+
+/// User-type box that keeps unknown payloads opaque while modeling selected UUID subtypes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Uuid {
+    pub user_type: [u8; 16],
+    pub payload: UuidPayload,
+}
+
+impl FieldHooks for Uuid {
+    fn field_length(&self, name: &'static str) -> Option<u32> {
+        match name {
+            "RawPayload" => match &self.payload {
+                UuidPayload::Raw(bytes) => u32::try_from(bytes.len()).ok(),
+                _ => None,
+            },
+            "XMLData" => match &self.payload {
+                UuidPayload::SphericalVideoV1(data) => u32::try_from(data.xml_data.len()).ok(),
+                _ => None,
+            },
+            "Entries" => match &self.payload {
+                UuidPayload::FragmentRunTable(data) => {
+                    u32::try_from(encode_uuid_fragment_run_entries(name, data).ok()?.len()).ok()
+                }
+                _ => None,
+            },
+            "Samples" => match &self.payload {
+                UuidPayload::SampleEncryption(data) => {
+                    let payload = encode_senc_payload(data).ok()?;
+                    u32::try_from(payload.len().saturating_sub(8)).ok()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn field_enabled(&self, name: &'static str) -> Option<bool> {
+        match name {
+            "RawPayload" => Some(matches!(self.payload, UuidPayload::Raw(_))),
+            "XMLData" => Some(matches!(self.payload, UuidPayload::SphericalVideoV1(_))),
+            "Version" | "Flags" => Some(matches!(
+                self.payload,
+                UuidPayload::FragmentAbsoluteTiming(_)
+                    | UuidPayload::FragmentRunTable(_)
+                    | UuidPayload::SampleEncryption(_)
+            )),
+            "FragmentAbsoluteTime" | "FragmentAbsoluteDuration" => Some(matches!(
+                self.payload,
+                UuidPayload::FragmentAbsoluteTiming(_)
+            )),
+            "FragmentCount" | "Entries" => {
+                Some(matches!(self.payload, UuidPayload::FragmentRunTable(_)))
+            }
+            "SampleCount" | "Samples" => {
+                Some(matches!(self.payload, UuidPayload::SampleEncryption(_)))
+            }
+            _ => None,
+        }
+    }
+
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match (name, &self.payload) {
+            ("XMLData", UuidPayload::SphericalVideoV1(data)) => Some(quote_bytes(&data.xml_data)),
+            ("Entries", UuidPayload::FragmentRunTable(data)) => {
+                Some(render_uuid_fragment_run_entries(&data.entries))
+            }
+            ("Samples", UuidPayload::SampleEncryption(data)) => {
+                Some(render_senc_samples_display(&data.samples))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ImmutableBox for Uuid {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"uuid")
+    }
+
+    fn version(&self) -> u8 {
+        match &self.payload {
+            UuidPayload::FragmentAbsoluteTiming(data) => data.version,
+            UuidPayload::FragmentRunTable(data) => data.version,
+            UuidPayload::SampleEncryption(data) => data.version(),
+            _ => ANY_VERSION,
+        }
+    }
+
+    fn flags(&self) -> u32 {
+        match &self.payload {
+            UuidPayload::FragmentAbsoluteTiming(data) => data.flags,
+            UuidPayload::FragmentRunTable(data) => data.flags,
+            UuidPayload::SampleEncryption(data) => data.flags(),
+            _ => 0,
+        }
+    }
+}
+
+impl MutableBox for Uuid {
+    fn set_version(&mut self, version: u8) {
+        match &mut self.payload {
+            UuidPayload::FragmentAbsoluteTiming(data) => data.version = version,
+            UuidPayload::FragmentRunTable(data) => data.version = version,
+            UuidPayload::SampleEncryption(data) => data.set_version(version),
+            _ => {}
+        }
+    }
+
+    fn set_flags(&mut self, flags: u32) {
+        match &mut self.payload {
+            UuidPayload::FragmentAbsoluteTiming(data) => data.flags = flags,
+            UuidPayload::FragmentRunTable(data) => data.flags = flags,
+            UuidPayload::SampleEncryption(data) => data.set_flags(flags),
+            _ => {}
+        }
+    }
+}
+
+impl FieldValueRead for Uuid {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match (field_name, &self.payload) {
+            ("UserType", _) => Ok(FieldValue::Bytes(self.user_type.to_vec())),
+            ("RawPayload", UuidPayload::Raw(bytes)) => Ok(FieldValue::Bytes(bytes.clone())),
+            ("XMLData", UuidPayload::SphericalVideoV1(data)) => {
+                Ok(FieldValue::Bytes(data.xml_data.clone()))
+            }
+            ("FragmentAbsoluteTime", UuidPayload::FragmentAbsoluteTiming(data)) => {
+                Ok(FieldValue::Unsigned(data.fragment_absolute_time))
+            }
+            ("FragmentAbsoluteDuration", UuidPayload::FragmentAbsoluteTiming(data)) => {
+                Ok(FieldValue::Unsigned(data.fragment_absolute_duration))
+            }
+            ("FragmentCount", UuidPayload::FragmentRunTable(data)) => {
+                Ok(FieldValue::Unsigned(u64::from(data.fragment_count)))
+            }
+            ("Entries", UuidPayload::FragmentRunTable(data)) => Ok(FieldValue::Bytes(
+                encode_uuid_fragment_run_entries(field_name, data)?,
+            )),
+            ("SampleCount", UuidPayload::SampleEncryption(data)) => {
+                Ok(FieldValue::Unsigned(u64::from(data.sample_count)))
+            }
+            ("Samples", UuidPayload::SampleEncryption(data)) => Ok(FieldValue::Bytes(
+                encode_senc_payload(data).map_err(|_| {
+                    invalid_value(field_name, "sample encryption payload is invalid")
+                })?[8..]
+                    .to_vec(),
+            )),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Uuid {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("UserType", FieldValue::Bytes(value)) => {
+                let payload_bytes = encode_uuid_payload(self.user_type, &self.payload)?;
+                self.user_type = bytes_to_uuid(field_name, value)?;
+                self.payload = if payload_bytes.is_empty() {
+                    match self.user_type {
+                        UUID_SPHERICAL_VIDEO_V1 => {
+                            UuidPayload::SphericalVideoV1(SphericalVideoV1Metadata::default())
+                        }
+                        UUID_FRAGMENT_ABSOLUTE_TIMING => UuidPayload::FragmentAbsoluteTiming(
+                            UuidFragmentAbsoluteTiming::default(),
+                        ),
+                        UUID_FRAGMENT_RUN_TABLE => {
+                            UuidPayload::FragmentRunTable(UuidFragmentRunTable::default())
+                        }
+                        UUID_SAMPLE_ENCRYPTION => UuidPayload::SampleEncryption(Senc::default()),
+                        _ => UuidPayload::Raw(Vec::new()),
+                    }
+                } else {
+                    decode_uuid_payload(self.user_type, &payload_bytes)?
+                };
+                Ok(())
+            }
+            ("RawPayload", FieldValue::Bytes(value)) => {
+                self.payload = UuidPayload::Raw(value);
+                Ok(())
+            }
+            ("XMLData", FieldValue::Bytes(value)) => {
+                if self.user_type != UUID_SPHERICAL_VIDEO_V1 {
+                    return Err(invalid_value(
+                        field_name,
+                        "field requires the spherical UUID user type",
+                    ));
+                }
+                self.payload =
+                    UuidPayload::SphericalVideoV1(SphericalVideoV1Metadata { xml_data: value });
+                Ok(())
+            }
+            ("FragmentAbsoluteTime", FieldValue::Unsigned(value)) => {
+                let UuidPayload::FragmentAbsoluteTiming(data) = &mut self.payload else {
+                    return Err(missing_field(field_name));
+                };
+                data.fragment_absolute_time = value;
+                Ok(())
+            }
+            ("FragmentAbsoluteDuration", FieldValue::Unsigned(value)) => {
+                let UuidPayload::FragmentAbsoluteTiming(data) = &mut self.payload else {
+                    return Err(missing_field(field_name));
+                };
+                data.fragment_absolute_duration = value;
+                Ok(())
+            }
+            ("FragmentCount", FieldValue::Unsigned(value)) => {
+                let UuidPayload::FragmentRunTable(data) = &mut self.payload else {
+                    return Err(missing_field(field_name));
+                };
+                data.fragment_count = u8_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Entries", FieldValue::Bytes(value)) => {
+                let UuidPayload::FragmentRunTable(data) = &mut self.payload else {
+                    return Err(missing_field(field_name));
+                };
+                data.entries = decode_uuid_fragment_run_entries(
+                    field_name,
+                    data.version,
+                    data.fragment_count,
+                    &value,
+                )?;
+                Ok(())
+            }
+            ("SampleCount", FieldValue::Unsigned(value)) => {
+                let UuidPayload::SampleEncryption(data) = &mut self.payload else {
+                    return Err(missing_field(field_name));
+                };
+                data.sample_count = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Samples", FieldValue::Bytes(value)) => {
+                let UuidPayload::SampleEncryption(data) = &mut self.payload else {
+                    return Err(missing_field(field_name));
+                };
+                let mut payload = Vec::with_capacity(8 + value.len());
+                payload.push(data.version());
+                payload.extend_from_slice(&(data.flags() & 0x00ff_ffff).to_be_bytes()[1..]);
+                payload.extend_from_slice(&data.sample_count.to_be_bytes());
+                payload.extend_from_slice(&value);
+                *data = decode_senc_payload(&payload).map_err(|_| {
+                    invalid_value(field_name, "sample encryption payload is invalid")
+                })?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Uuid {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!(
+            "UserType",
+            0,
+            with_bit_width(8),
+            with_length(16),
+            as_bytes(),
+            as_uuid()
+        ),
+        codec_field!(
+            "RawPayload",
+            1,
+            with_bit_width(8),
+            with_dynamic_length(),
+            as_bytes(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "XMLData",
+            2,
+            with_bit_width(8),
+            with_dynamic_length(),
+            as_bytes(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "Version",
+            3,
+            with_bit_width(8),
+            as_version_field(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "Flags",
+            4,
+            with_bit_width(24),
+            as_flags_field(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "FragmentAbsoluteTime",
+            5,
+            with_bit_width(64),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "FragmentAbsoluteDuration",
+            6,
+            with_bit_width(64),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "FragmentCount",
+            7,
+            with_bit_width(8),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "Entries",
+            8,
+            with_bit_width(8),
+            with_dynamic_length(),
+            as_bytes(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "SampleCount",
+            9,
+            with_bit_width(32),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "Samples",
+            10,
+            with_bit_width(8),
+            with_dynamic_length(),
+            as_bytes(),
+            with_dynamic_presence()
+        ),
+    ]);
+
+    fn custom_marshal(&self, writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        let payload_bytes = encode_uuid_payload(self.user_type, &self.payload)?;
+        let mut payload = Vec::with_capacity(16 + payload_bytes.len());
+        payload.extend_from_slice(&self.user_type);
+        payload.extend_from_slice(&payload_bytes);
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        if payload_len < 16 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let payload = read_exact_vec_untrusted(reader, payload_len)?;
+        self.user_type = payload[..16].try_into().unwrap();
+        self.payload = decode_uuid_payload(self.user_type, &payload[16..])?;
+        Ok(Some(payload_size))
+    }
+}
 
 /// File type and compatibility declaration box.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -903,7 +2301,7 @@ impl CodecBox for Styp {
 }
 
 empty_hooks!(
-    Dref, Url, Urn, Mfhd, Mfro, Mehd, Mdhd, Tfdt, Tfhd, Trep, Trex, Vmhd, Stsd, Cslg
+    Dref, Url, Urn, Mfhd, Mfro, Prft, Mehd, Mdhd, Tfdt, Tfhd, Trep, Trex, Vmhd, Stsd, Cslg
 );
 
 /// Data reference box that counts child data-entry boxes.
@@ -1146,6 +2544,129 @@ impl CodecBox for Mfro {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
 
+/// Producer reference time box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prft {
+    full_box: FullBoxState,
+    pub reference_track_id: u32,
+    pub ntp_timestamp: u64,
+    pub media_time_v0: u32,
+    pub media_time_v1: u64,
+}
+
+impl_full_box!(Prft, *b"prft");
+
+impl Prft {
+    /// Returns the active media time for the current box version.
+    pub fn media_time(&self) -> u64 {
+        match self.version() {
+            0 => u64::from(self.media_time_v0),
+            1 => self.media_time_v1,
+            _ => 0,
+        }
+    }
+
+    /// Returns the whole-second component of the stored NTP timestamp.
+    pub fn ntp_seconds(&self) -> u32 {
+        (self.ntp_timestamp >> 32) as u32
+    }
+
+    /// Returns the fractional component of the stored NTP timestamp.
+    pub fn ntp_fraction(&self) -> u32 {
+        self.ntp_timestamp as u32
+    }
+
+    /// Returns the fractional NTP component converted to nanoseconds.
+    pub fn ntp_fraction_nanos(&self) -> u32 {
+        ((u128::from(self.ntp_fraction()) * NANOS_PER_SECOND) / PRFT_NTP_FRACTION_SCALE) as u32
+    }
+
+    /// Returns the whole-second UNIX-epoch component represented by the NTP timestamp.
+    ///
+    /// Returns `None` when the stored timestamp predates `1970-01-01T00:00:00Z`.
+    pub fn unix_seconds(&self) -> Option<u64> {
+        u64::from(self.ntp_seconds()).checked_sub(PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS)
+    }
+
+    /// Returns the stored NTP timestamp as a UNIX `SystemTime`.
+    ///
+    /// Returns `None` when the stored timestamp predates `1970-01-01T00:00:00Z`.
+    pub fn unix_time(&self) -> Option<SystemTime> {
+        let seconds = self.unix_seconds()?;
+        UNIX_EPOCH.checked_add(Duration::new(seconds, self.ntp_fraction_nanos()))
+    }
+
+    /// Returns the known capture-point name for the stored `prft` flags value.
+    pub fn flag_meaning(&self) -> Option<&'static str> {
+        Self::known_flag_meaning(self.flags())
+    }
+
+    /// Returns the known capture-point name for one `prft` flags value.
+    pub fn known_flag_meaning(flags: u32) -> Option<&'static str> {
+        match flags {
+            PRFT_TIME_ENCODER_INPUT => Some("time_encoder_input"),
+            PRFT_TIME_ENCODER_OUTPUT => Some("time_encoder_output"),
+            PRFT_TIME_MOOF_FINALIZED => Some("time_moof_finalized"),
+            PRFT_TIME_MOOF_WRITTEN => Some("time_moof_written"),
+            PRFT_TIME_ARBITRARY_CONSISTENT => Some("time_arbitrary_consistent"),
+            PRFT_TIME_CAPTURED => Some("time_captured"),
+            _ => None,
+        }
+    }
+}
+
+impl FieldValueRead for Prft {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "ReferenceTrackID" => Ok(FieldValue::Unsigned(u64::from(self.reference_track_id))),
+            "NTPTimestamp" => Ok(FieldValue::Unsigned(self.ntp_timestamp)),
+            "MediaTimeV0" => Ok(FieldValue::Unsigned(u64::from(self.media_time_v0))),
+            "MediaTimeV1" => Ok(FieldValue::Unsigned(self.media_time_v1)),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Prft {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("ReferenceTrackID", FieldValue::Unsigned(value)) => {
+                self.reference_track_id = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("NTPTimestamp", FieldValue::Unsigned(value)) => {
+                self.ntp_timestamp = value;
+                Ok(())
+            }
+            ("MediaTimeV0", FieldValue::Unsigned(value)) => {
+                self.media_time_v0 = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("MediaTimeV1", FieldValue::Unsigned(value)) => {
+                self.media_time_v1 = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Prft {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("ReferenceTrackID", 2, with_bit_width(32)),
+        codec_field!("NTPTimestamp", 3, with_bit_width(64)),
+        codec_field!("MediaTimeV0", 4, with_bit_width(32), with_version(0)),
+        codec_field!("MediaTimeV1", 5, with_bit_width(64), with_version(1)),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
+}
+
 /// Movie extends header box.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Mehd {
@@ -1358,6 +2879,202 @@ impl CodecBox for Mdhd {
         codec_field!("PreDefined", 11, with_bit_width(16)),
     ]);
     const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
+}
+
+fn validate_c_string_value(field_name: &'static str, value: &str) -> Result<(), FieldValueError> {
+    if value.as_bytes().contains(&0) {
+        return Err(invalid_value(
+            field_name,
+            "value must not contain NUL bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_c_string(field_name: &'static str, bytes: &[u8]) -> Result<String, CodecError> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8(bytes[..end].to_vec()).map_err(|_| CodecError::InvalidUtf8 { field_name })
+}
+
+fn parse_required_c_string(
+    field_name: &'static str,
+    bytes: &[u8],
+) -> Result<(String, usize), FieldValueError> {
+    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
+        return Err(invalid_value(field_name, "string is not NUL-terminated"));
+    };
+
+    let value = String::from_utf8(bytes[..end].to_vec())
+        .map_err(|_| invalid_value(field_name, "string is not valid UTF-8"))?;
+    Ok((value, end + 1))
+}
+
+fn decode_required_c_string(
+    field_name: &'static str,
+    bytes: &[u8],
+) -> Result<(String, usize), CodecError> {
+    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
+        return Err(invalid_value(field_name, "string is not NUL-terminated").into());
+    };
+
+    let value = String::from_utf8(bytes[..end].to_vec())
+        .map_err(|_| CodecError::InvalidUtf8 { field_name })?;
+    Ok((value, end + 1))
+}
+
+fn looks_like_missing_elng_full_box_header(bytes: &[u8]) -> bool {
+    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
+        return false;
+    };
+
+    end > 0
+        && bytes[end..].iter().all(|byte| *byte == 0)
+        && bytes[..end]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
+/// Extended-language box carried alongside `mdhd` when a track uses a language tag that does not
+/// fit the compact ISO-639-2 code stored in the media header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Elng {
+    full_box: FullBoxState,
+    pub extended_language: String,
+    missing_full_box_header: bool,
+}
+
+impl FieldHooks for Elng {}
+
+impl ImmutableBox for Elng {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"elng")
+    }
+
+    fn version(&self) -> u8 {
+        self.full_box.version
+    }
+
+    fn flags(&self) -> u32 {
+        self.full_box.flags
+    }
+}
+
+impl MutableBox for Elng {
+    fn set_version(&mut self, version: u8) {
+        self.full_box.version = version;
+        self.missing_full_box_header = false;
+    }
+
+    fn set_flags(&mut self, flags: u32) {
+        self.full_box.flags = flags;
+        self.missing_full_box_header = false;
+    }
+}
+
+impl FieldValueRead for Elng {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "ExtendedLanguage" => Ok(FieldValue::String(self.extended_language.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Elng {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("ExtendedLanguage", FieldValue::String(value)) => {
+                validate_c_string_value(field_name, &value)?;
+                self.extended_language = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Elng {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!(
+            "ExtendedLanguage",
+            2,
+            with_bit_width(8),
+            as_string(StringFieldMode::NullTerminated)
+        ),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_marshal(&self, writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        validate_c_string_value("ExtendedLanguage", &self.extended_language)?;
+        if self.version() != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version: self.version(),
+            });
+        }
+        if self.flags() != 0 {
+            return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+        }
+
+        let mut payload = Vec::with_capacity(4 + self.extended_language.len() + 1);
+        if !self.missing_full_box_header {
+            payload.push(self.version());
+            push_uint("Flags", &mut payload, 3, u64::from(self.flags()))?;
+        }
+        payload.extend_from_slice(self.extended_language.as_bytes());
+        payload.push(0);
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+
+        if (payload.len() < 4 || !payload.starts_with(&[0, 0, 0, 0]))
+            && looks_like_missing_elng_full_box_header(&payload)
+        {
+            self.full_box = FullBoxState::default();
+            self.extended_language = decode_c_string("ExtendedLanguage", &payload)?;
+            self.missing_full_box_header = true;
+            return Ok(Some(payload_size));
+        }
+
+        if payload.len() < 4 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let version = payload[0];
+        if version != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+        let flags = read_uint(&payload, 1, 3) as u32;
+        if flags != 0 {
+            return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+        }
+
+        self.full_box = FullBoxState { version, flags };
+        self.extended_language = decode_c_string("ExtendedLanguage", &payload[4..])?;
+        self.missing_full_box_header = false;
+        Ok(Some(payload_size))
+    }
 }
 
 /// Movie header box.
@@ -1990,6 +3707,253 @@ impl CodecBox for Tkhd {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
 }
 
+/// One level-assignment record carried by [`Leva`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LevaLevel {
+    pub track_id: u32,
+    pub padding_flag: bool,
+    pub assignment_type: u8,
+    pub grouping_type: u32,
+    pub grouping_type_parameter: u32,
+    pub sub_track_id: u32,
+}
+
+/// Level-assignment box used by track-extension property paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Leva {
+    full_box: FullBoxState,
+    pub level_count: u8,
+    pub levels: Vec<LevaLevel>,
+}
+
+fn format_leva_levels(levels: &[LevaLevel]) -> String {
+    render_array(levels.iter().map(|level| match level.assignment_type {
+        0 => format!(
+            "{{TrackID={} PaddingFlag={} AssignmentType={} GroupingType=0x{:08x}}}",
+            level.track_id, level.padding_flag, level.assignment_type, level.grouping_type
+        ),
+        1 => format!(
+            "{{TrackID={} PaddingFlag={} AssignmentType={} GroupingType=0x{:08x} GroupingTypeParameter={}}}",
+            level.track_id,
+            level.padding_flag,
+            level.assignment_type,
+            level.grouping_type,
+            level.grouping_type_parameter
+        ),
+        4 => format!(
+            "{{TrackID={} PaddingFlag={} AssignmentType={} SubTrackID={}}}",
+            level.track_id, level.padding_flag, level.assignment_type, level.sub_track_id
+        ),
+        _ => format!(
+            "{{TrackID={} PaddingFlag={} AssignmentType={}}}",
+            level.track_id, level.padding_flag, level.assignment_type
+        ),
+    }))
+}
+
+fn encode_leva_levels(
+    field_name: &'static str,
+    levels: &[LevaLevel],
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut bytes = Vec::new();
+    for level in levels {
+        if level.assignment_type > 4 {
+            return Err(invalid_value(
+                field_name,
+                "assignment type uses a reserved layout",
+            ));
+        }
+
+        bytes.extend_from_slice(&level.track_id.to_be_bytes());
+        bytes.push((u8::from(level.padding_flag) << 7) | level.assignment_type);
+        match level.assignment_type {
+            0 => bytes.extend_from_slice(&level.grouping_type.to_be_bytes()),
+            1 => {
+                bytes.extend_from_slice(&level.grouping_type.to_be_bytes());
+                bytes.extend_from_slice(&level.grouping_type_parameter.to_be_bytes());
+            }
+            2 | 3 => {}
+            4 => bytes.extend_from_slice(&level.sub_track_id.to_be_bytes()),
+            _ => unreachable!(),
+        }
+    }
+    Ok(bytes)
+}
+
+fn parse_leva_levels(
+    field_name: &'static str,
+    level_count: u8,
+    bytes: &[u8],
+) -> Result<Vec<LevaLevel>, FieldValueError> {
+    let mut levels = Vec::with_capacity(untrusted_prealloc_hint(usize::from(level_count)));
+    let mut offset = 0usize;
+
+    for _ in 0..level_count {
+        if bytes.len().saturating_sub(offset) < 5 {
+            return Err(invalid_value(field_name, "level payload is truncated"));
+        }
+
+        let track_id = read_u32(bytes, offset);
+        let assignment_header = bytes[offset + 4];
+        offset += 5;
+
+        let padding_flag = assignment_header & 0x80 != 0;
+        let assignment_type = assignment_header & 0x7f;
+        let mut level = LevaLevel {
+            track_id,
+            padding_flag,
+            assignment_type,
+            ..LevaLevel::default()
+        };
+
+        match assignment_type {
+            0 => {
+                if bytes.len().saturating_sub(offset) < 4 {
+                    return Err(invalid_value(
+                        field_name,
+                        "grouping type payload is truncated",
+                    ));
+                }
+                level.grouping_type = read_u32(bytes, offset);
+                offset += 4;
+            }
+            1 => {
+                if bytes.len().saturating_sub(offset) < 8 {
+                    return Err(invalid_value(
+                        field_name,
+                        "grouping type parameter payload is truncated",
+                    ));
+                }
+                level.grouping_type = read_u32(bytes, offset);
+                level.grouping_type_parameter = read_u32(bytes, offset + 4);
+                offset += 8;
+            }
+            2 | 3 => {}
+            4 => {
+                if bytes.len().saturating_sub(offset) < 4 {
+                    return Err(invalid_value(field_name, "sub-track payload is truncated"));
+                }
+                level.sub_track_id = read_u32(bytes, offset);
+                offset += 4;
+            }
+            _ => {
+                return Err(invalid_value(
+                    field_name,
+                    "assignment type uses a reserved layout",
+                ));
+            }
+        }
+
+        levels.push(level);
+    }
+
+    if offset != bytes.len() {
+        return Err(invalid_value(
+            field_name,
+            "level payload length does not match the level count",
+        ));
+    }
+
+    Ok(levels)
+}
+
+impl FieldHooks for Leva {
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "Levels" => Some(format_leva_levels(&self.levels)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Leva, *b"leva");
+
+impl FieldValueRead for Leva {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "LevelCount" => Ok(FieldValue::Unsigned(u64::from(self.level_count))),
+            "Levels" => {
+                require_count(field_name, u32::from(self.level_count), self.levels.len())?;
+                Ok(FieldValue::Bytes(encode_leva_levels(
+                    field_name,
+                    &self.levels,
+                )?))
+            }
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Leva {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("LevelCount", FieldValue::Unsigned(value)) => {
+                self.level_count = u8_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Levels", FieldValue::Bytes(bytes)) => {
+                self.levels = parse_leva_levels(field_name, self.level_count, &bytes)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Leva {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("LevelCount", 2, with_bit_width(8)),
+        codec_field!("Levels", 3, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+}
+
+track_id_list_box!(
+    Cdsc,
+    *b"cdsc",
+    "Track-link type box for content-description links."
+);
+track_id_list_box!(
+    Dpnd,
+    *b"dpnd",
+    "Track-link type box for track-dependency links."
+);
+track_id_list_box!(Font, *b"font", "Track-link type box for font links.");
+track_id_list_box!(Hind, *b"hind", "Track-link type box for hint dependencies.");
+track_id_list_box!(Hint, *b"hint", "Track-link type box for hint-track links.");
+track_id_list_box!(
+    Ipir,
+    *b"ipir",
+    "Track-link type box for auxiliary-picture links."
+);
+track_id_list_box!(
+    Mpod,
+    *b"mpod",
+    "Track-link type box for metadata-pod links."
+);
+track_id_list_box!(Subt, *b"subt", "Track-link type box for subtitle links.");
+track_id_list_box!(
+    Sync,
+    *b"sync",
+    "Track-link type box for synchronized-track links."
+);
+track_id_list_box!(
+    Vdep,
+    *b"vdep",
+    "Track-link type box for video-dependency links."
+);
+track_id_list_box!(
+    Vplx,
+    *b"vplx",
+    "Track-link type box for video-multiplex links."
+);
+
 /// Track extension properties box.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Trep {
@@ -2256,6 +4220,26 @@ impl CodecBox for Smhd {
     ]);
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
+
+/// Subtitle media header box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sthd {
+    full_box: FullBoxState,
+}
+
+impl_full_box!(Sthd, *b"sthd");
+empty_hooks!(Sthd);
+empty_full_box_codec!(Sthd);
+
+/// Null media header box that carries no additional media-header fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Nmhd {
+    full_box: FullBoxState,
+}
+
+impl_full_box!(Nmhd, *b"nmhd");
+empty_hooks!(Nmhd);
+empty_full_box_codec!(Nmhd);
 
 /// Sample description box.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3756,6 +5740,270 @@ impl CodecBox for Meta {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
 
+/// Track-kind metadata box that stores a scheme URI and value string.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Kind {
+    full_box: FullBoxState,
+    pub scheme_uri: String,
+    pub value: String,
+}
+
+impl FieldHooks for Kind {}
+
+impl_full_box!(Kind, *b"kind");
+
+impl FieldValueRead for Kind {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "SchemeURI" => Ok(FieldValue::String(self.scheme_uri.clone())),
+            "Value" => Ok(FieldValue::String(self.value.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Kind {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("SchemeURI", FieldValue::String(value)) => {
+                validate_c_string_value(field_name, &value)?;
+                self.scheme_uri = value;
+                Ok(())
+            }
+            ("Value", FieldValue::String(value)) => {
+                validate_c_string_value(field_name, &value)?;
+                self.value = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Kind {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!(
+            "SchemeURI",
+            2,
+            with_bit_width(8),
+            as_string(StringFieldMode::NullTerminated)
+        ),
+        codec_field!(
+            "Value",
+            3,
+            with_bit_width(8),
+            as_string(StringFieldMode::NullTerminated)
+        ),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_marshal(&self, writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        validate_c_string_value("SchemeURI", &self.scheme_uri)?;
+        validate_c_string_value("Value", &self.value)?;
+        if self.version() != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version: self.version(),
+            });
+        }
+
+        let mut payload = Vec::with_capacity(6 + self.scheme_uri.len() + self.value.len());
+        payload.push(self.version());
+        push_uint("Flags", &mut payload, 3, u64::from(self.flags()))?;
+        payload.extend_from_slice(self.scheme_uri.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.value.as_bytes());
+        payload.push(0);
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+
+        if payload.len() < 6 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let version = payload[0];
+        if version != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        let (scheme_uri, scheme_len) = decode_required_c_string("SchemeURI", &payload[4..])?;
+        let value_offset = 4 + scheme_len;
+        let (value, value_len) = decode_required_c_string("Value", &payload[value_offset..])?;
+        if value_offset + value_len != payload.len() {
+            return Err(invalid_value("Payload", "payload has trailing bytes").into());
+        }
+
+        self.full_box = FullBoxState {
+            version,
+            flags: read_uint(&payload, 1, 3) as u32,
+        };
+        self.scheme_uri = scheme_uri;
+        self.value = value;
+        Ok(Some(payload_size))
+    }
+}
+
+/// MIME metadata box that preserves whether the payload omitted the trailing NUL byte.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Mime {
+    full_box: FullBoxState,
+    pub content_type: String,
+    pub lacks_zero_termination: bool,
+}
+
+impl FieldHooks for Mime {
+    fn field_enabled(&self, name: &'static str) -> Option<bool> {
+        match name {
+            "LacksZeroTermination" => Some(self.lacks_zero_termination),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Mime, *b"mime");
+
+impl FieldValueRead for Mime {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "ContentType" => Ok(FieldValue::String(self.content_type.clone())),
+            "LacksZeroTermination" => Ok(FieldValue::Boolean(self.lacks_zero_termination)),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Mime {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("ContentType", FieldValue::String(value)) => {
+                validate_c_string_value(field_name, &value)?;
+                self.content_type = value;
+                Ok(())
+            }
+            ("LacksZeroTermination", FieldValue::Boolean(value)) => {
+                self.lacks_zero_termination = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Mime {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!(
+            "ContentType",
+            2,
+            with_bit_width(8),
+            as_string(StringFieldMode::NullTerminated)
+        ),
+        codec_field!(
+            "LacksZeroTermination",
+            3,
+            with_bit_width(1),
+            as_boolean(),
+            with_dynamic_presence()
+        ),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_marshal(&self, writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        validate_c_string_value("ContentType", &self.content_type)?;
+        if self.version() != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version: self.version(),
+            });
+        }
+        if self.lacks_zero_termination && self.content_type.is_empty() {
+            return Err(
+                invalid_value("ContentType", "non-terminated payload must not be empty").into(),
+            );
+        }
+
+        let mut payload = Vec::with_capacity(
+            4 + self.content_type.len() + usize::from(!self.lacks_zero_termination),
+        );
+        payload.push(self.version());
+        push_uint("Flags", &mut payload, 3, u64::from(self.flags()))?;
+        payload.extend_from_slice(self.content_type.as_bytes());
+        if !self.lacks_zero_termination {
+            payload.push(0);
+        }
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+
+        if payload.len() < 5 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let version = payload[0];
+        if version != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        let content_bytes = if payload.last() == Some(&0) {
+            self.lacks_zero_termination = false;
+            &payload[4..payload.len() - 1]
+        } else {
+            self.lacks_zero_termination = true;
+            &payload[4..]
+        };
+
+        if content_bytes.contains(&0) {
+            return Err(invalid_value("ContentType", "value must not contain NUL bytes").into());
+        }
+
+        self.full_box = FullBoxState {
+            version,
+            flags: read_uint(&payload, 1, 3) as u32,
+        };
+        self.content_type =
+            String::from_utf8(content_bytes.to_vec()).map_err(|_| CodecError::InvalidUtf8 {
+                field_name: "ContentType",
+            })?;
+        Ok(Some(payload_size))
+    }
+}
+
 /// Handler reference box.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hdlr {
@@ -4280,6 +6528,212 @@ impl CodecBox for Sbgp {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
 }
 
+/// One subsample record carried by [`Subs`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubsSample {
+    pub subsample_size: u32,
+    pub subsample_priority: u8,
+    pub discardable: u8,
+    pub codec_specific_parameters: u32,
+}
+
+/// One sample entry inside [`Subs`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubsEntry {
+    pub sample_delta: u32,
+    pub subsample_count: u16,
+    pub subsamples: Vec<SubsSample>,
+}
+
+/// Subsample-information box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Subs {
+    full_box: FullBoxState,
+    pub entry_count: u32,
+    pub entries: Vec<SubsEntry>,
+}
+
+fn format_subs_entries(entries: &[SubsEntry]) -> String {
+    render_array(entries.iter().map(|entry| {
+        format!(
+            "{{SampleDelta={} SubsampleCount={} Subsamples={}}}",
+            entry.sample_delta,
+            entry.subsample_count,
+            render_array(entry.subsamples.iter().map(|subsample| {
+                format!(
+                    "{{SubsampleSize={} SubsamplePriority={} Discardable={} CodecSpecificParameters={}}}",
+                    subsample.subsample_size,
+                    subsample.subsample_priority,
+                    subsample.discardable,
+                    subsample.codec_specific_parameters
+                )
+            }))
+        )
+    }))
+}
+
+fn encode_subs_entries(
+    field_name: &'static str,
+    version: u8,
+    entries: &[SubsEntry],
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut bytes = Vec::new();
+
+    for entry in entries {
+        require_count(
+            field_name,
+            u32::from(entry.subsample_count),
+            entry.subsamples.len(),
+        )?;
+        bytes.extend_from_slice(&entry.sample_delta.to_be_bytes());
+        bytes.extend_from_slice(&entry.subsample_count.to_be_bytes());
+
+        for subsample in &entry.subsamples {
+            if version == 0 {
+                let subsample_size = u16::try_from(subsample.subsample_size).map_err(|_| {
+                    invalid_value(field_name, "version 0 subsample size does not fit in u16")
+                })?;
+                bytes.extend_from_slice(&subsample_size.to_be_bytes());
+            } else {
+                bytes.extend_from_slice(&subsample.subsample_size.to_be_bytes());
+            }
+
+            bytes.push(subsample.subsample_priority);
+            bytes.push(subsample.discardable);
+            bytes.extend_from_slice(&subsample.codec_specific_parameters.to_be_bytes());
+        }
+    }
+
+    Ok(bytes)
+}
+
+fn parse_subs_entries(
+    field_name: &'static str,
+    version: u8,
+    entry_count: u32,
+    bytes: &[u8],
+) -> Result<Vec<SubsEntry>, FieldValueError> {
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(
+        usize::try_from(entry_count).unwrap_or(0),
+    ));
+    let mut offset = 0usize;
+
+    for _ in 0..entry_count {
+        if bytes.len().saturating_sub(offset) < 6 {
+            return Err(invalid_value(field_name, "entry payload is truncated"));
+        }
+
+        let sample_delta = read_u32(bytes, offset);
+        let subsample_count = read_u16(bytes, offset + 4);
+        offset += 6;
+
+        let mut subsamples =
+            Vec::with_capacity(untrusted_prealloc_hint(usize::from(subsample_count)));
+        for _ in 0..subsample_count {
+            let subsample_header_len = if version == 1 { 10 } else { 8 };
+            if bytes.len().saturating_sub(offset) < subsample_header_len {
+                return Err(invalid_value(field_name, "subsample payload is truncated"));
+            }
+
+            let subsample_size = if version == 1 {
+                let value = read_u32(bytes, offset);
+                offset += 4;
+                value
+            } else {
+                let value = u32::from(read_u16(bytes, offset));
+                offset += 2;
+                value
+            };
+
+            let subsample_priority = bytes[offset];
+            let discardable = bytes[offset + 1];
+            let codec_specific_parameters = read_u32(bytes, offset + 2);
+            offset += 6;
+
+            subsamples.push(SubsSample {
+                subsample_size,
+                subsample_priority,
+                discardable,
+                codec_specific_parameters,
+            });
+        }
+
+        entries.push(SubsEntry {
+            sample_delta,
+            subsample_count,
+            subsamples,
+        });
+    }
+
+    if offset != bytes.len() {
+        return Err(invalid_value(
+            field_name,
+            "entry payload length does not match the entry count",
+        ));
+    }
+
+    Ok(entries)
+}
+
+impl FieldHooks for Subs {
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "Entries" => Some(format_subs_entries(&self.entries)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Subs, *b"subs");
+
+impl FieldValueRead for Subs {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "EntryCount" => Ok(FieldValue::Unsigned(u64::from(self.entry_count))),
+            "Entries" => {
+                require_count(field_name, self.entry_count, self.entries.len())?;
+                Ok(FieldValue::Bytes(encode_subs_entries(
+                    field_name,
+                    self.version(),
+                    &self.entries,
+                )?))
+            }
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Subs {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("EntryCount", FieldValue::Unsigned(value)) => {
+                self.entry_count = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Entries", FieldValue::Bytes(bytes)) => {
+                self.entries =
+                    parse_subs_entries(field_name, self.version(), self.entry_count, &bytes)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Subs {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("EntryCount", 2, with_bit_width(32)),
+        codec_field!("Entries", 3, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
+}
+
 /// One packed sample dependency entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SdtpSampleElem {
@@ -4441,6 +6895,26 @@ pub struct TemporalLevelEntryL {
     pub temporal_level_entry: TemporalLevelEntry,
 }
 
+/// Sample-encryption information group description payload for the `seig` grouping type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeigEntry {
+    pub reserved: u8,
+    pub crypt_byte_block: u8,
+    pub skip_byte_block: u8,
+    pub is_protected: u8,
+    pub per_sample_iv_size: u8,
+    pub kid: [u8; 16],
+    pub constant_iv_size: u8,
+    pub constant_iv: Vec<u8>,
+}
+
+/// Length-prefixed sample-encryption information group description payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeigEntryL {
+    pub description_length: u32,
+    pub seig_entry: SeigEntry,
+}
+
 fn format_alternative_startup_opts(opts: &[AlternativeStartupEntryOpt]) -> String {
     render_array(opts.iter().map(|opt| {
         format!(
@@ -4582,6 +7056,128 @@ fn parse_temporal_level_entry(
     })
 }
 
+fn format_seig_entry(entry: &SeigEntry) -> String {
+    let mut rendered = format!(
+        "{{Reserved={} CryptByteBlock={} SkipByteBlock={} IsProtected={} PerSampleIVSize={} KID={}",
+        entry.reserved,
+        entry.crypt_byte_block,
+        entry.skip_byte_block,
+        entry.is_protected,
+        entry.per_sample_iv_size,
+        render_uuid(&entry.kid)
+    );
+    if entry.is_protected == 1 && entry.per_sample_iv_size == 0 {
+        rendered.push_str(&format!(
+            " ConstantIVSize={} ConstantIV={}",
+            entry.constant_iv_size,
+            render_hex_bytes(&entry.constant_iv)
+        ));
+    }
+    rendered.push('}');
+    rendered
+}
+
+fn encode_seig_entry(
+    field_name: &'static str,
+    entry: &SeigEntry,
+) -> Result<Vec<u8>, FieldValueError> {
+    if entry.crypt_byte_block > 0x0f {
+        return Err(invalid_value(
+            field_name,
+            "crypt byte block does not fit in 4 bits",
+        ));
+    }
+    if entry.skip_byte_block > 0x0f {
+        return Err(invalid_value(
+            field_name,
+            "skip byte block does not fit in 4 bits",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(20 + entry.constant_iv.len());
+    bytes.push(entry.reserved);
+    bytes.push((entry.crypt_byte_block << 4) | entry.skip_byte_block);
+    bytes.push(entry.is_protected);
+    bytes.push(entry.per_sample_iv_size);
+    bytes.extend_from_slice(&entry.kid);
+
+    if entry.is_protected == 1 && entry.per_sample_iv_size == 0 {
+        if entry.constant_iv.len() != usize::from(entry.constant_iv_size) {
+            return Err(invalid_value(
+                field_name,
+                "constant IV length does not match the constant IV size",
+            ));
+        }
+        bytes.push(entry.constant_iv_size);
+        bytes.extend_from_slice(&entry.constant_iv);
+    }
+
+    Ok(bytes)
+}
+
+fn parse_seig_entry(
+    field_name: &'static str,
+    bytes: &[u8],
+) -> Result<(SeigEntry, usize), FieldValueError> {
+    if bytes.len() < 20 {
+        return Err(invalid_value(field_name, "seig entry is too short"));
+    }
+
+    let reserved = bytes[0];
+    let crypt_and_skip = bytes[1];
+    let is_protected = bytes[2];
+    let per_sample_iv_size = bytes[3];
+    let kid = bytes[4..20].try_into().unwrap();
+    let mut consumed = 20;
+    let mut constant_iv_size = 0;
+    let mut constant_iv = Vec::new();
+
+    if is_protected == 1 && per_sample_iv_size == 0 {
+        if bytes.len() < consumed + 1 {
+            return Err(invalid_value(
+                field_name,
+                "seig constant IV size is truncated",
+            ));
+        }
+        constant_iv_size = bytes[consumed];
+        consumed += 1;
+        let constant_iv_len = usize::from(constant_iv_size);
+        if bytes.len() < consumed + constant_iv_len {
+            return Err(invalid_value(
+                field_name,
+                "seig constant IV exceeds the remaining payload",
+            ));
+        }
+        constant_iv = bytes[consumed..consumed + constant_iv_len].to_vec();
+        consumed += constant_iv_len;
+    }
+
+    Ok((
+        SeigEntry {
+            reserved,
+            crypt_byte_block: crypt_and_skip >> 4,
+            skip_byte_block: crypt_and_skip & 0x0f,
+            is_protected,
+            per_sample_iv_size,
+            kid,
+            constant_iv_size,
+            constant_iv,
+        },
+        consumed,
+    ))
+}
+
+fn parse_seig_entry_exact(
+    field_name: &'static str,
+    bytes: &[u8],
+) -> Result<SeigEntry, FieldValueError> {
+    let (entry, consumed) = parse_seig_entry(field_name, bytes)?;
+    if consumed != bytes.len() {
+        return Err(invalid_value(field_name, "seig entry has trailing bytes"));
+    }
+    Ok(entry)
+}
+
 /// Sample group description box.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sgpd {
@@ -4598,6 +7194,8 @@ pub struct Sgpd {
     pub visual_random_access_entries_l: Vec<VisualRandomAccessEntryL>,
     pub temporal_level_entries: Vec<TemporalLevelEntry>,
     pub temporal_level_entries_l: Vec<TemporalLevelEntryL>,
+    pub seig_entries: Vec<SeigEntry>,
+    pub seig_entries_l: Vec<SeigEntryL>,
     pub unsupported: Vec<u8>,
 }
 
@@ -4617,6 +7215,8 @@ impl Default for Sgpd {
             visual_random_access_entries_l: Vec::new(),
             temporal_level_entries: Vec::new(),
             temporal_level_entries_l: Vec::new(),
+            seig_entries: Vec::new(),
+            seig_entries_l: Vec::new(),
             unsupported: Vec::new(),
         }
     }
@@ -4642,6 +7242,10 @@ impl Sgpd {
     fn is_temporal_level_grouping_type(&self) -> bool {
         *self.grouping_type.as_bytes() == *b"tele"
     }
+
+    fn is_seig_grouping_type(&self) -> bool {
+        *self.grouping_type.as_bytes() == *b"seig"
+    }
 }
 
 impl FieldHooks for Sgpd {
@@ -4652,6 +7256,7 @@ impl FieldHooks for Sgpd {
         let alternative_startup_entries = self.is_alternative_startup_grouping_type();
         let visual_random_access_entries = self.is_visual_random_access_grouping_type();
         let temporal_level_entries = self.is_temporal_level_grouping_type();
+        let seig_entries = self.is_seig_grouping_type();
 
         match name {
             "RollDistances" => Some(roll_distances && !no_default_length),
@@ -4662,11 +7267,14 @@ impl FieldHooks for Sgpd {
             "VisualRandomAccessEntriesL" => Some(visual_random_access_entries && no_default_length),
             "TemporalLevelEntries" => Some(temporal_level_entries && !no_default_length),
             "TemporalLevelEntriesL" => Some(temporal_level_entries && no_default_length),
+            "SeigEntries" => Some(seig_entries && !no_default_length),
+            "SeigEntriesL" => Some(seig_entries && no_default_length),
             "Unsupported" => Some(
                 !roll_distances
                     && !alternative_startup_entries
                     && !visual_random_access_entries
-                    && !temporal_level_entries,
+                    && !temporal_level_entries
+                    && !seig_entries,
             ),
             _ => None,
         }
@@ -4735,6 +7343,18 @@ impl FieldHooks for Sgpd {
                     )
                 }),
             )),
+            "SeigEntries" => Some(render_array(
+                self.seig_entries.iter().map(format_seig_entry),
+            )),
+            "SeigEntriesL" => Some(render_array(self.seig_entries_l.iter().map(|entry| {
+                format!(
+                    "{{DescriptionLength={} {}}}",
+                    entry.description_length,
+                    format_seig_entry(&entry.seig_entry)
+                        .trim_start_matches('{')
+                        .trim_end_matches('}')
+                )
+            }))),
             _ => None,
         }
     }
@@ -4873,6 +7493,40 @@ impl FieldValueRead for Sgpd {
                     }
                     bytes.extend_from_slice(&entry.description_length.to_be_bytes());
                     bytes.push(encode_temporal_level_entry(&entry.temporal_level_entry));
+                }
+                Ok(FieldValue::Bytes(bytes))
+            }
+            "SeigEntries" => {
+                require_count(field_name, self.entry_count, self.seig_entries.len())?;
+                let mut bytes = Vec::new();
+                for entry in &self.seig_entries {
+                    let encoded = encode_seig_entry(field_name, entry)?;
+                    if self.version() == 1
+                        && self.default_length != 0
+                        && encoded.len() != self.default_length as usize
+                    {
+                        return Err(invalid_value(
+                            field_name,
+                            "seig entry does not match the default length",
+                        ));
+                    }
+                    bytes.extend_from_slice(&encoded);
+                }
+                Ok(FieldValue::Bytes(bytes))
+            }
+            "SeigEntriesL" => {
+                require_count(field_name, self.entry_count, self.seig_entries_l.len())?;
+                let mut bytes = Vec::new();
+                for entry in &self.seig_entries_l {
+                    let encoded = encode_seig_entry(field_name, &entry.seig_entry)?;
+                    if encoded.len() != entry.description_length as usize {
+                        return Err(invalid_value(
+                            field_name,
+                            "seig entry length does not match the description length",
+                        ));
+                    }
+                    bytes.extend_from_slice(&entry.description_length.to_be_bytes());
+                    bytes.extend_from_slice(&encoded);
                 }
                 Ok(FieldValue::Bytes(bytes))
             }
@@ -5069,6 +7723,74 @@ impl FieldValueWrite for Sgpd {
                 self.temporal_level_entries_l = entries;
                 Ok(())
             }
+            ("SeigEntries", FieldValue::Bytes(bytes)) => {
+                if self.version() == 1 {
+                    let entry_len = usize::try_from(self.default_length)
+                        .map_err(|_| invalid_value(field_name, "default length is too large"))?;
+                    if entry_len == 0 {
+                        return Err(invalid_value(
+                            field_name,
+                            "default length must be non-zero for seig entries",
+                        ));
+                    }
+                    let expected_len = field_len_from_count(self.entry_count, entry_len)
+                        .map(|len| len as usize)
+                        .unwrap_or(0);
+                    if bytes.len() != expected_len {
+                        return Err(invalid_value(
+                            field_name,
+                            "seig payload length does not match the entry count",
+                        ));
+                    }
+                    self.seig_entries = bytes
+                        .chunks_exact(entry_len)
+                        .map(|chunk| parse_seig_entry_exact(field_name, chunk))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(());
+                }
+
+                let mut cursor = 0;
+                let mut entries = Vec::new();
+                while cursor < bytes.len() {
+                    let (entry, consumed) = parse_seig_entry(field_name, &bytes[cursor..])?;
+                    cursor += consumed;
+                    entries.push(entry);
+                }
+                require_count(field_name, self.entry_count, entries.len())?;
+                self.seig_entries = entries;
+                Ok(())
+            }
+            ("SeigEntriesL", FieldValue::Bytes(bytes)) => {
+                let mut cursor = 0;
+                let mut entries = Vec::new();
+                while cursor < bytes.len() {
+                    if bytes.len() - cursor < 4 {
+                        return Err(invalid_value(
+                            field_name,
+                            "seig entry length prefix is truncated",
+                        ));
+                    }
+                    let description_length = read_u32(&bytes, cursor);
+                    cursor += 4;
+                    let description_len = usize::try_from(description_length)
+                        .map_err(|_| invalid_value(field_name, "seig description is too large"))?;
+                    if bytes.len() - cursor < description_len {
+                        return Err(invalid_value(
+                            field_name,
+                            "seig entry exceeds the remaining payload",
+                        ));
+                    }
+                    let payload = &bytes[cursor..cursor + description_len];
+                    cursor += description_len;
+                    entries.push(SeigEntryL {
+                        description_length,
+                        seig_entry: parse_seig_entry_exact(field_name, payload)?,
+                    });
+                }
+                require_count(field_name, self.entry_count, entries.len())?;
+                self.seig_entries_l = entries;
+                Ok(())
+            }
             ("Unsupported", FieldValue::Bytes(bytes)) => {
                 self.unsupported = bytes;
                 Ok(())
@@ -5154,14 +7876,190 @@ impl CodecBox for Sgpd {
             with_dynamic_presence()
         ),
         codec_field!(
-            "Unsupported",
+            "SeigEntries",
             14,
+            with_bit_width(8),
+            as_bytes(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "SeigEntriesL",
+            15,
+            with_bit_width(8),
+            as_bytes(),
+            with_dynamic_presence()
+        ),
+        codec_field!(
+            "Unsupported",
+            16,
             with_bit_width(8),
             as_bytes(),
             with_dynamic_presence()
         ),
     ]);
     const SUPPORTED_VERSIONS: &'static [u8] = &[1, 2];
+}
+
+/// One indexed byte range inside an [`SsixSubsegment`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SsixRange {
+    pub level: u8,
+    pub range_size: u32,
+}
+
+/// One subsegment entry inside [`Ssix`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SsixSubsegment {
+    pub range_count: u32,
+    pub ranges: Vec<SsixRange>,
+}
+
+/// Subsegment-index box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ssix {
+    full_box: FullBoxState,
+    pub subsegment_count: u32,
+    pub subsegments: Vec<SsixSubsegment>,
+}
+
+fn format_ssix_subsegments(subsegments: &[SsixSubsegment]) -> String {
+    render_array(subsegments.iter().map(|subsegment| {
+        format!(
+            "{{RangeCount={} Ranges={}}}",
+            subsegment.range_count,
+            render_array(subsegment.ranges.iter().map(|range| {
+                format!("{{Level={} RangeSize={}}}", range.level, range.range_size)
+            }))
+        )
+    }))
+}
+
+fn encode_ssix_subsegments(
+    field_name: &'static str,
+    subsegments: &[SsixSubsegment],
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut bytes = Vec::new();
+    for subsegment in subsegments {
+        require_count(field_name, subsegment.range_count, subsegment.ranges.len())?;
+        bytes.extend_from_slice(&subsegment.range_count.to_be_bytes());
+        for range in &subsegment.ranges {
+            if range.range_size > 0x00ff_ffff {
+                return Err(invalid_value(
+                    field_name,
+                    "range size does not fit in 24 bits",
+                ));
+            }
+            bytes.push(range.level);
+            push_uint(field_name, &mut bytes, 3, u64::from(range.range_size))?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn parse_ssix_subsegments(
+    field_name: &'static str,
+    subsegment_count: u32,
+    bytes: &[u8],
+) -> Result<Vec<SsixSubsegment>, FieldValueError> {
+    let mut subsegments = Vec::with_capacity(untrusted_prealloc_hint(
+        usize::try_from(subsegment_count).unwrap_or(0),
+    ));
+    let mut offset = 0usize;
+
+    for _ in 0..subsegment_count {
+        if bytes.len().saturating_sub(offset) < 4 {
+            return Err(invalid_value(field_name, "subsegment payload is truncated"));
+        }
+
+        let range_count = read_u32(bytes, offset);
+        offset += 4;
+        let mut ranges = Vec::with_capacity(untrusted_prealloc_hint(
+            usize::try_from(range_count).unwrap_or(0),
+        ));
+        for _ in 0..range_count {
+            if bytes.len().saturating_sub(offset) < 4 {
+                return Err(invalid_value(field_name, "range payload is truncated"));
+            }
+
+            ranges.push(SsixRange {
+                level: bytes[offset],
+                range_size: read_uint(bytes, offset + 1, 3) as u32,
+            });
+            offset += 4;
+        }
+
+        subsegments.push(SsixSubsegment {
+            range_count,
+            ranges,
+        });
+    }
+
+    if offset != bytes.len() {
+        return Err(invalid_value(
+            field_name,
+            "subsegment payload length does not match the subsegment count",
+        ));
+    }
+
+    Ok(subsegments)
+}
+
+impl FieldHooks for Ssix {
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "Subsegments" => Some(format_ssix_subsegments(&self.subsegments)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Ssix, *b"ssix");
+
+impl FieldValueRead for Ssix {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "SubsegmentCount" => Ok(FieldValue::Unsigned(u64::from(self.subsegment_count))),
+            "Subsegments" => {
+                require_count(field_name, self.subsegment_count, self.subsegments.len())?;
+                Ok(FieldValue::Bytes(encode_ssix_subsegments(
+                    field_name,
+                    &self.subsegments,
+                )?))
+            }
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Ssix {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("SubsegmentCount", FieldValue::Unsigned(value)) => {
+                self.subsegment_count = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Subsegments", FieldValue::Bytes(bytes)) => {
+                self.subsegments =
+                    parse_ssix_subsegments(field_name, self.subsegment_count, &bytes)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Ssix {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("SubsegmentCount", 2, with_bit_width(32)),
+        codec_field!("Subsegments", 3, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
 
 /// One segment index reference entry.
@@ -5659,6 +8557,164 @@ impl CodecBox for Btrt {
     ]);
 }
 
+/// Clean-aperture box that refines the displayed picture region for a visual sample entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Clap {
+    pub clean_aperture_width_n: u32,
+    pub clean_aperture_width_d: u32,
+    pub clean_aperture_height_n: u32,
+    pub clean_aperture_height_d: u32,
+    pub horiz_off_n: u32,
+    pub horiz_off_d: u32,
+    pub vert_off_n: u32,
+    pub vert_off_d: u32,
+}
+
+impl_leaf_box!(Clap, *b"clap");
+
+impl FieldValueRead for Clap {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "CleanApertureWidthN" => {
+                Ok(FieldValue::Unsigned(u64::from(self.clean_aperture_width_n)))
+            }
+            "CleanApertureWidthD" => {
+                Ok(FieldValue::Unsigned(u64::from(self.clean_aperture_width_d)))
+            }
+            "CleanApertureHeightN" => Ok(FieldValue::Unsigned(u64::from(
+                self.clean_aperture_height_n,
+            ))),
+            "CleanApertureHeightD" => Ok(FieldValue::Unsigned(u64::from(
+                self.clean_aperture_height_d,
+            ))),
+            "HorizOffN" => Ok(FieldValue::Unsigned(u64::from(self.horiz_off_n))),
+            "HorizOffD" => Ok(FieldValue::Unsigned(u64::from(self.horiz_off_d))),
+            "VertOffN" => Ok(FieldValue::Unsigned(u64::from(self.vert_off_n))),
+            "VertOffD" => Ok(FieldValue::Unsigned(u64::from(self.vert_off_d))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Clap {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("CleanApertureWidthN", FieldValue::Unsigned(value)) => {
+                self.clean_aperture_width_n = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("CleanApertureWidthD", FieldValue::Unsigned(value)) => {
+                self.clean_aperture_width_d = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("CleanApertureHeightN", FieldValue::Unsigned(value)) => {
+                self.clean_aperture_height_n = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("CleanApertureHeightD", FieldValue::Unsigned(value)) => {
+                self.clean_aperture_height_d = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("HorizOffN", FieldValue::Unsigned(value)) => {
+                self.horiz_off_n = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("HorizOffD", FieldValue::Unsigned(value)) => {
+                self.horiz_off_d = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("VertOffN", FieldValue::Unsigned(value)) => {
+                self.vert_off_n = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("VertOffD", FieldValue::Unsigned(value)) => {
+                self.vert_off_d = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Clap {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("CleanApertureWidthN", 0, with_bit_width(32)),
+        codec_field!("CleanApertureWidthD", 1, with_bit_width(32)),
+        codec_field!("CleanApertureHeightN", 2, with_bit_width(32)),
+        codec_field!("CleanApertureHeightD", 3, with_bit_width(32)),
+        codec_field!("HorizOffN", 4, with_bit_width(32)),
+        codec_field!("HorizOffD", 5, with_bit_width(32)),
+        codec_field!("VertOffN", 6, with_bit_width(32)),
+        codec_field!("VertOffD", 7, with_bit_width(32)),
+    ]);
+}
+
+/// Content-light-level box carried by some visual sample entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoLL {
+    full_box: FullBoxState,
+    pub max_cll: u16,
+    pub max_fall: u16,
+}
+
+impl FieldHooks for CoLL {}
+
+impl_full_box!(CoLL, *b"CoLL");
+
+impl FieldValueRead for CoLL {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Version" => Ok(FieldValue::Unsigned(u64::from(self.version()))),
+            "Flags" => Ok(FieldValue::Unsigned(u64::from(self.flags()))),
+            "MaxCLL" => Ok(FieldValue::Unsigned(u64::from(self.max_cll))),
+            "MaxFALL" => Ok(FieldValue::Unsigned(u64::from(self.max_fall))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for CoLL {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Version", FieldValue::Unsigned(value)) => {
+                self.set_version(u8_from_unsigned(field_name, value)?);
+                Ok(())
+            }
+            ("Flags", FieldValue::Unsigned(value)) => {
+                self.set_flags(u32_from_unsigned(field_name, value)?);
+                Ok(())
+            }
+            ("MaxCLL", FieldValue::Unsigned(value)) => {
+                self.max_cll = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("MaxFALL", FieldValue::Unsigned(value)) => {
+                self.max_fall = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for CoLL {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("MaxCLL", 2, with_bit_width(16)),
+        codec_field!("MaxFALL", 3, with_bit_width(16)),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+}
+
 /// Color information leaf whose active fields depend on the stored colour type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Colr {
@@ -5993,6 +9049,508 @@ impl CodecBox for Emsg {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0, 1];
 }
 
+/// Event-message sample entry carried under `stsd`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventMessageSampleEntry {
+    pub sample_entry: SampleEntry,
+}
+
+impl Default for EventMessageSampleEntry {
+    fn default() -> Self {
+        Self {
+            sample_entry: SampleEntry {
+                box_type: FourCc::from_bytes(*b"evte"),
+                data_reference_index: 0,
+            },
+        }
+    }
+}
+
+impl FieldHooks for EventMessageSampleEntry {}
+
+impl ImmutableBox for EventMessageSampleEntry {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"evte")
+    }
+}
+
+impl MutableBox for EventMessageSampleEntry {}
+
+impl FieldValueRead for EventMessageSampleEntry {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "DataReferenceIndex" => Ok(FieldValue::Unsigned(u64::from(
+                self.sample_entry.data_reference_index,
+            ))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for EventMessageSampleEntry {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("DataReferenceIndex", FieldValue::Unsigned(value)) => {
+                self.sample_entry.data_reference_index = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for EventMessageSampleEntry {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Reserved0A", 0, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0B", 1, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0C", 2, with_bit_width(16), with_constant("0")),
+        codec_field!("DataReferenceIndex", 3, with_bit_width(16)),
+    ]);
+}
+
+/// One scheme-identification record carried by [`Silb`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SilbEntry {
+    pub scheme_id_uri: String,
+    pub value: String,
+    pub at_least_one_flag: bool,
+}
+
+/// Scheme-identifier box carried by `evte` sample entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Silb {
+    full_box: FullBoxState,
+    pub scheme_count: u32,
+    pub schemes: Vec<SilbEntry>,
+    pub other_schemes_flag: bool,
+}
+
+fn format_silb_schemes(schemes: &[SilbEntry]) -> String {
+    render_array(schemes.iter().map(|scheme| {
+        format!(
+            "{{SchemeIdUri=\"{}\" Value=\"{}\" AtLeastOneFlag={}}}",
+            scheme.scheme_id_uri, scheme.value, scheme.at_least_one_flag
+        )
+    }))
+}
+
+fn encode_silb_schemes(
+    field_name: &'static str,
+    schemes: &[SilbEntry],
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut bytes = Vec::new();
+    for scheme in schemes {
+        validate_c_string_value(field_name, &scheme.scheme_id_uri)?;
+        validate_c_string_value(field_name, &scheme.value)?;
+        bytes.extend_from_slice(scheme.scheme_id_uri.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(scheme.value.as_bytes());
+        bytes.push(0);
+        bytes.push(u8::from(scheme.at_least_one_flag));
+    }
+    Ok(bytes)
+}
+
+fn parse_silb_schemes(
+    field_name: &'static str,
+    scheme_count: u32,
+    bytes: &[u8],
+) -> Result<Vec<SilbEntry>, FieldValueError> {
+    let mut schemes = Vec::with_capacity(untrusted_prealloc_hint(
+        usize::try_from(scheme_count).unwrap_or(0),
+    ));
+    let mut offset = 0usize;
+
+    for _ in 0..scheme_count {
+        let (scheme_id_uri, consumed) = parse_required_c_string(field_name, &bytes[offset..])?;
+        offset += consumed;
+
+        let (value, consumed) = parse_required_c_string(field_name, &bytes[offset..])?;
+        offset += consumed;
+
+        if bytes.len().saturating_sub(offset) < 1 {
+            return Err(invalid_value(
+                field_name,
+                "scheme flag payload is truncated",
+            ));
+        }
+
+        let at_least_one_flag = match bytes[offset] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(invalid_value(field_name, "scheme flag byte must be 0 or 1"));
+            }
+        };
+        offset += 1;
+
+        schemes.push(SilbEntry {
+            scheme_id_uri,
+            value,
+            at_least_one_flag,
+        });
+    }
+
+    if offset != bytes.len() {
+        return Err(invalid_value(
+            field_name,
+            "scheme payload length does not match the scheme count",
+        ));
+    }
+
+    Ok(schemes)
+}
+
+impl FieldHooks for Silb {
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "Schemes" => Some(format_silb_schemes(&self.schemes)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Silb, *b"silb");
+
+impl FieldValueRead for Silb {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "SchemeCount" => Ok(FieldValue::Unsigned(u64::from(self.scheme_count))),
+            "Schemes" => {
+                require_count(field_name, self.scheme_count, self.schemes.len())?;
+                Ok(FieldValue::Bytes(encode_silb_schemes(
+                    field_name,
+                    &self.schemes,
+                )?))
+            }
+            "OtherSchemesFlag" => Ok(FieldValue::Boolean(self.other_schemes_flag)),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Silb {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("SchemeCount", FieldValue::Unsigned(value)) => {
+                self.scheme_count = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Schemes", FieldValue::Bytes(bytes)) => {
+                self.schemes = parse_silb_schemes(field_name, self.scheme_count, &bytes)?;
+                Ok(())
+            }
+            ("OtherSchemesFlag", FieldValue::Boolean(value)) => {
+                self.other_schemes_flag = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Silb {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("SchemeCount", 2, with_bit_width(32)),
+        codec_field!("Schemes", 3, with_bit_width(8), as_bytes()),
+        codec_field!("OtherSchemesFlag", 4, with_bit_width(8), as_boolean()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_marshal(&self, writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        if self.version() != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version: self.version(),
+            });
+        }
+
+        require_count("Schemes", self.scheme_count, self.schemes.len())?;
+
+        let mut payload = Vec::new();
+        payload.push(self.version());
+        push_uint("Flags", &mut payload, 3, u64::from(self.flags()))?;
+        payload.extend_from_slice(&self.scheme_count.to_be_bytes());
+        payload.extend_from_slice(&encode_silb_schemes("Schemes", &self.schemes)?);
+        payload.push(u8::from(self.other_schemes_flag));
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+
+        if payload.len() < 9 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let version = payload[0];
+        if version != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        let other_schemes_flag = match payload[payload.len() - 1] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(invalid_value("OtherSchemesFlag", "flag byte must be 0 or 1").into());
+            }
+        };
+
+        self.full_box = FullBoxState {
+            version,
+            flags: read_uint(&payload, 1, 3) as u32,
+        };
+        self.scheme_count = read_u32(&payload, 4);
+        self.schemes =
+            parse_silb_schemes("Schemes", self.scheme_count, &payload[8..payload.len() - 1])?;
+        self.other_schemes_flag = other_schemes_flag;
+
+        Ok(Some(payload_size))
+    }
+}
+
+/// Embedded event-message instance box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Emib {
+    full_box: FullBoxState,
+    pub presentation_time_delta: i64,
+    pub event_duration: u32,
+    pub id: u32,
+    pub scheme_id_uri: String,
+    pub value: String,
+    pub message_data: Vec<u8>,
+}
+
+impl FieldHooks for Emib {
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "MessageData" => Some(quote_bytes(&self.message_data)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Emib, *b"emib");
+
+impl FieldValueRead for Emib {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "PresentationTimeDelta" => Ok(FieldValue::Signed(self.presentation_time_delta)),
+            "EventDuration" => Ok(FieldValue::Unsigned(u64::from(self.event_duration))),
+            "Id" => Ok(FieldValue::Unsigned(u64::from(self.id))),
+            "SchemeIdUri" => Ok(FieldValue::String(self.scheme_id_uri.clone())),
+            "Value" => Ok(FieldValue::String(self.value.clone())),
+            "MessageData" => Ok(FieldValue::Bytes(self.message_data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Emib {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("PresentationTimeDelta", FieldValue::Signed(value)) => {
+                self.presentation_time_delta = value;
+                Ok(())
+            }
+            ("EventDuration", FieldValue::Unsigned(value)) => {
+                self.event_duration = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Id", FieldValue::Unsigned(value)) => {
+                self.id = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("SchemeIdUri", FieldValue::String(value)) => {
+                validate_c_string_value(field_name, &value)?;
+                self.scheme_id_uri = value;
+                Ok(())
+            }
+            ("Value", FieldValue::String(value)) => {
+                validate_c_string_value(field_name, &value)?;
+                self.value = value;
+                Ok(())
+            }
+            ("MessageData", FieldValue::Bytes(value)) => {
+                self.message_data = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Emib {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("PresentationTimeDelta", 2, with_bit_width(64), as_signed()),
+        codec_field!("EventDuration", 3, with_bit_width(32)),
+        codec_field!("Id", 4, with_bit_width(32)),
+        codec_field!(
+            "SchemeIdUri",
+            5,
+            with_bit_width(8),
+            as_string(StringFieldMode::NullTerminated)
+        ),
+        codec_field!(
+            "Value",
+            6,
+            with_bit_width(8),
+            as_string(StringFieldMode::NullTerminated)
+        ),
+        codec_field!("MessageData", 7, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_marshal(&self, writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        validate_c_string_value("SchemeIdUri", &self.scheme_id_uri)?;
+        validate_c_string_value("Value", &self.value)?;
+        if self.version() != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version: self.version(),
+            });
+        }
+
+        let mut payload = Vec::with_capacity(
+            24 + self.scheme_id_uri.len() + self.value.len() + self.message_data.len() + 2,
+        );
+        payload.push(self.version());
+        push_uint("Flags", &mut payload, 3, u64::from(self.flags()))?;
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&self.presentation_time_delta.to_be_bytes());
+        payload.extend_from_slice(&self.event_duration.to_be_bytes());
+        payload.extend_from_slice(&self.id.to_be_bytes());
+        payload.extend_from_slice(self.scheme_id_uri.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.value.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.message_data);
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+
+        if payload.len() < 24 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let version = payload[0];
+        if version != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        if read_u32(&payload, 4) != 0 {
+            return Err(invalid_value("Reserved", "reserved field must be zero").into());
+        }
+
+        let (scheme_id_uri, scheme_len) = decode_required_c_string("SchemeIdUri", &payload[24..])?;
+        let value_offset = 24 + scheme_len;
+        let (value, value_len) = decode_required_c_string("Value", &payload[value_offset..])?;
+        let message_offset = value_offset + value_len;
+
+        self.full_box = FullBoxState {
+            version,
+            flags: read_uint(&payload, 1, 3) as u32,
+        };
+        self.presentation_time_delta = read_i64(&payload, 8);
+        self.event_duration = read_u32(&payload, 16);
+        self.id = read_u32(&payload, 20);
+        self.scheme_id_uri = scheme_id_uri;
+        self.value = value;
+        self.message_data = payload[message_offset..].to_vec();
+
+        Ok(Some(payload_size))
+    }
+}
+
+/// Empty embedded event-message box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Emeb;
+
+impl FieldHooks for Emeb {}
+
+impl ImmutableBox for Emeb {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"emeb")
+    }
+}
+
+impl MutableBox for Emeb {}
+
+impl FieldValueRead for Emeb {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        Err(missing_field(field_name))
+    }
+}
+
+impl FieldValueWrite for Emeb {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        Err(unexpected_field(field_name, value))
+    }
+}
+
+impl CodecBox for Emeb {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[]);
+
+    fn custom_marshal(&self, _writer: &mut dyn Write) -> Result<Option<u64>, CodecError> {
+        Ok(Some(0))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        let start = reader.stream_position()?;
+        if payload_size != 0 {
+            reader.seek(SeekFrom::Start(start))?;
+            return Err(invalid_value("Payload", "payload must be empty").into());
+        }
+        Ok(Some(0))
+    }
+}
+
 /// Field-ordering leaf used by some video sample entries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fiel {
@@ -6151,6 +9709,140 @@ impl CodecBox for Pasp {
     ]);
 }
 
+/// Mastering-display metadata box carried by some visual sample entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SmDm {
+    full_box: FullBoxState,
+    pub primary_r_chromaticity_x: u16,
+    pub primary_r_chromaticity_y: u16,
+    pub primary_g_chromaticity_x: u16,
+    pub primary_g_chromaticity_y: u16,
+    pub primary_b_chromaticity_x: u16,
+    pub primary_b_chromaticity_y: u16,
+    pub white_point_chromaticity_x: u16,
+    pub white_point_chromaticity_y: u16,
+    pub luminance_max: u32,
+    pub luminance_min: u32,
+}
+
+impl FieldHooks for SmDm {}
+
+impl_full_box!(SmDm, *b"SmDm");
+
+impl FieldValueRead for SmDm {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Version" => Ok(FieldValue::Unsigned(u64::from(self.version()))),
+            "Flags" => Ok(FieldValue::Unsigned(u64::from(self.flags()))),
+            "PrimaryRChromaticityX" => Ok(FieldValue::Unsigned(u64::from(
+                self.primary_r_chromaticity_x,
+            ))),
+            "PrimaryRChromaticityY" => Ok(FieldValue::Unsigned(u64::from(
+                self.primary_r_chromaticity_y,
+            ))),
+            "PrimaryGChromaticityX" => Ok(FieldValue::Unsigned(u64::from(
+                self.primary_g_chromaticity_x,
+            ))),
+            "PrimaryGChromaticityY" => Ok(FieldValue::Unsigned(u64::from(
+                self.primary_g_chromaticity_y,
+            ))),
+            "PrimaryBChromaticityX" => Ok(FieldValue::Unsigned(u64::from(
+                self.primary_b_chromaticity_x,
+            ))),
+            "PrimaryBChromaticityY" => Ok(FieldValue::Unsigned(u64::from(
+                self.primary_b_chromaticity_y,
+            ))),
+            "WhitePointChromaticityX" => Ok(FieldValue::Unsigned(u64::from(
+                self.white_point_chromaticity_x,
+            ))),
+            "WhitePointChromaticityY" => Ok(FieldValue::Unsigned(u64::from(
+                self.white_point_chromaticity_y,
+            ))),
+            "LuminanceMax" => Ok(FieldValue::Unsigned(u64::from(self.luminance_max))),
+            "LuminanceMin" => Ok(FieldValue::Unsigned(u64::from(self.luminance_min))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for SmDm {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Version", FieldValue::Unsigned(value)) => {
+                self.set_version(u8_from_unsigned(field_name, value)?);
+                Ok(())
+            }
+            ("Flags", FieldValue::Unsigned(value)) => {
+                self.set_flags(u32_from_unsigned(field_name, value)?);
+                Ok(())
+            }
+            ("PrimaryRChromaticityX", FieldValue::Unsigned(value)) => {
+                self.primary_r_chromaticity_x = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PrimaryRChromaticityY", FieldValue::Unsigned(value)) => {
+                self.primary_r_chromaticity_y = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PrimaryGChromaticityX", FieldValue::Unsigned(value)) => {
+                self.primary_g_chromaticity_x = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PrimaryGChromaticityY", FieldValue::Unsigned(value)) => {
+                self.primary_g_chromaticity_y = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PrimaryBChromaticityX", FieldValue::Unsigned(value)) => {
+                self.primary_b_chromaticity_x = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PrimaryBChromaticityY", FieldValue::Unsigned(value)) => {
+                self.primary_b_chromaticity_y = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("WhitePointChromaticityX", FieldValue::Unsigned(value)) => {
+                self.white_point_chromaticity_x = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("WhitePointChromaticityY", FieldValue::Unsigned(value)) => {
+                self.white_point_chromaticity_y = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("LuminanceMax", FieldValue::Unsigned(value)) => {
+                self.luminance_max = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("LuminanceMin", FieldValue::Unsigned(value)) => {
+                self.luminance_min = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for SmDm {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("PrimaryRChromaticityX", 2, with_bit_width(16)),
+        codec_field!("PrimaryRChromaticityY", 3, with_bit_width(16)),
+        codec_field!("PrimaryGChromaticityX", 4, with_bit_width(16)),
+        codec_field!("PrimaryGChromaticityY", 5, with_bit_width(16)),
+        codec_field!("PrimaryBChromaticityX", 6, with_bit_width(16)),
+        codec_field!("PrimaryBChromaticityY", 7, with_bit_width(16)),
+        codec_field!("WhitePointChromaticityX", 8, with_bit_width(16)),
+        codec_field!("WhitePointChromaticityY", 9, with_bit_width(16)),
+        codec_field!("LuminanceMax", 10, with_bit_width(32)),
+        codec_field!("LuminanceMin", 11, with_bit_width(32)),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+}
+
 /// Scheme-type declaration box inside a protection-scheme path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schm {
@@ -6257,6 +9949,11 @@ impl Default for SampleEntry {
 }
 
 /// Visual sample-entry wrapper used by multiple codec-specific visual types.
+///
+/// Child boxes remain outside this typed header model and are still traversed through the normal
+/// structure-walking APIs. Some files also carry opaque bytes after the last valid child box; the
+/// box walker and rewrite helpers preserve those layouts instead of failing late while descending
+/// into the trailing payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VisualSampleEntry {
     pub sample_entry: SampleEntry,
@@ -6420,6 +10117,95 @@ impl CodecBox for VisualSampleEntry {
         codec_field!("Depth", 14, with_bit_width(16)),
         codec_field!("PreDefined3", 15, with_bit_width(16), as_signed()),
     ]);
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        const VISUAL_SAMPLE_ENTRY_HEADER_SIZE: usize = 78;
+
+        let start = reader.stream_position()?;
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+        if payload.len() < VISUAL_SAMPLE_ENTRY_HEADER_SIZE {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        if read_u16(&payload, 0) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0A",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 2) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0B",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 4) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0C",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 10) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved1",
+                constant: "0",
+            });
+        }
+
+        self.sample_entry.data_reference_index = read_u16(&payload, 6);
+        self.pre_defined = read_u16(&payload, 8);
+        self.pre_defined2 = [
+            read_u32(&payload, 12),
+            read_u32(&payload, 16),
+            read_u32(&payload, 20),
+        ];
+        self.width = read_u16(&payload, 24);
+        self.height = read_u16(&payload, 26);
+        self.horizresolution = read_u32(&payload, 28);
+        self.vertresolution = read_u32(&payload, 32);
+        self.reserved2 = read_u32(&payload, 36);
+        self.frame_count = read_u16(&payload, 40);
+        self.compressorname = payload[42..74].try_into().unwrap();
+        self.depth = read_u16(&payload, 74);
+        self.pre_defined3 = read_i16(&payload, 76);
+
+        reader.seek(SeekFrom::Start(
+            start + VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64,
+        ))?;
+        Ok(Some(VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64))
+    }
+}
+
+pub(crate) fn split_box_children_with_optional_trailing_bytes(bytes: &[u8]) -> usize {
+    let mut cursor = Cursor::new(bytes);
+    let mut child_payload_len = 0usize;
+
+    loop {
+        let start = cursor.position();
+        let remaining = (bytes.len() as u64).saturating_sub(start);
+        if remaining < SMALL_HEADER_SIZE {
+            break;
+        }
+
+        let info = match BoxInfo::read(&mut cursor) {
+            Ok(info) => info,
+            Err(_) => break,
+        };
+        if info.extend_to_eof() || info.size() < info.header_size() || info.size() > remaining {
+            break;
+        }
+
+        cursor.set_position(start + info.size());
+        child_payload_len = cursor.position() as usize;
+    }
+
+    child_payload_len
 }
 
 /// Audio sample-entry wrapper used by multiple codec-specific audio types.
@@ -7865,15 +11651,23 @@ fn matches_audio_sample_entry_context(box_type: FourCc, context: BoxLookupContex
 pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<AVCDecoderConfiguration>(FourCc::from_bytes(*b"avcC"));
     registry.register::<Btrt>(FourCc::from_bytes(*b"btrt"));
+    registry.register::<Cdat>(FourCc::from_bytes(*b"cdat"));
+    registry.register::<Clap>(FourCc::from_bytes(*b"clap"));
     registry.register::<Colr>(FourCc::from_bytes(*b"colr"));
+    registry.register::<CoLL>(FourCc::from_bytes(*b"CoLL"));
     registry.register::<Co64>(FourCc::from_bytes(*b"co64"));
     registry.register::<Cslg>(FourCc::from_bytes(*b"cslg"));
     registry.register::<Ctts>(FourCc::from_bytes(*b"ctts"));
     registry.register::<Dinf>(FourCc::from_bytes(*b"dinf"));
     registry.register::<Dref>(FourCc::from_bytes(*b"dref"));
     registry.register::<Edts>(FourCc::from_bytes(*b"edts"));
+    registry.register::<Elng>(FourCc::from_bytes(*b"elng"));
     registry.register::<Elst>(FourCc::from_bytes(*b"elst"));
+    registry.register::<Emeb>(FourCc::from_bytes(*b"emeb"));
+    registry.register::<Emib>(FourCc::from_bytes(*b"emib"));
     registry.register::<Emsg>(FourCc::from_bytes(*b"emsg"));
+    registry.register::<EventMessageSampleEntry>(FourCc::from_bytes(*b"evte"));
+    registry.register::<AlbumLoudnessInfo>(FourCc::from_bytes(*b"alou"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc1"));
     registry.register_contextual_any::<WaveAudioData>(
         FourCc::from_bytes(*b"enca"),
@@ -7888,6 +11682,9 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<HEVCDecoderConfiguration>(FourCc::from_bytes(*b"hvcC"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"hev1"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"hvc1"));
+    registry.register::<Kind>(FourCc::from_bytes(*b"kind"));
+    registry.register::<Leva>(FourCc::from_bytes(*b"leva"));
+    registry.register::<Ludt>(FourCc::from_bytes(*b"ludt"));
     registry.register::<Mdat>(FourCc::from_bytes(*b"mdat"));
     registry.register::<Mdhd>(FourCc::from_bytes(*b"mdhd"));
     registry.register::<Mdia>(FourCc::from_bytes(*b"mdia"));
@@ -7896,6 +11693,9 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Mfhd>(FourCc::from_bytes(*b"mfhd"));
     registry.register::<Mfra>(FourCc::from_bytes(*b"mfra"));
     registry.register::<Mfro>(FourCc::from_bytes(*b"mfro"));
+    registry.register::<Mime>(FourCc::from_bytes(*b"mime"));
+    registry.register::<Nmhd>(FourCc::from_bytes(*b"nmhd"));
+    registry.register::<Prft>(FourCc::from_bytes(*b"prft"));
     registry.register::<Minf>(FourCc::from_bytes(*b"minf"));
     registry.register::<Moof>(FourCc::from_bytes(*b"moof"));
     registry.register::<Moov>(FourCc::from_bytes(*b"moov"));
@@ -7913,6 +11713,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Sbgp>(FourCc::from_bytes(*b"sbgp"));
     registry.register::<Schi>(FourCc::from_bytes(*b"schi"));
     registry.register::<Schm>(FourCc::from_bytes(*b"schm"));
+    registry.register::<Silb>(FourCc::from_bytes(*b"silb"));
     registry.register::<TextSubtitleSampleEntry>(FourCc::from_bytes(*b"sbtt"));
     registry.register::<Sdtp>(FourCc::from_bytes(*b"sdtp"));
     registry.register::<Sgpd>(FourCc::from_bytes(*b"sgpd"));
@@ -7920,6 +11721,9 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Sinf>(FourCc::from_bytes(*b"sinf"));
     registry.register::<Skip>(FourCc::from_bytes(*b"skip"));
     registry.register::<Smhd>(FourCc::from_bytes(*b"smhd"));
+    registry.register::<SmDm>(FourCc::from_bytes(*b"SmDm"));
+    registry.register::<Ssix>(FourCc::from_bytes(*b"ssix"));
+    registry.register::<Sthd>(FourCc::from_bytes(*b"sthd"));
     registry.register::<Stbl>(FourCc::from_bytes(*b"stbl"));
     registry.register::<Stco>(FourCc::from_bytes(*b"stco"));
     registry.register::<Stsc>(FourCc::from_bytes(*b"stsc"));
@@ -7928,18 +11732,33 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Stsz>(FourCc::from_bytes(*b"stsz"));
     registry.register::<Stts>(FourCc::from_bytes(*b"stts"));
     registry.register::<Styp>(FourCc::from_bytes(*b"styp"));
+    registry.register::<Subs>(FourCc::from_bytes(*b"subs"));
     registry.register::<Tfdt>(FourCc::from_bytes(*b"tfdt"));
     registry.register::<Tfhd>(FourCc::from_bytes(*b"tfhd"));
     registry.register::<Tfra>(FourCc::from_bytes(*b"tfra"));
     registry.register::<Traf>(FourCc::from_bytes(*b"traf"));
     registry.register::<Trak>(FourCc::from_bytes(*b"trak"));
+    registry.register::<TrackLoudnessInfo>(FourCc::from_bytes(*b"tlou"));
+    registry.register::<Tref>(FourCc::from_bytes(*b"tref"));
     registry.register::<Trep>(FourCc::from_bytes(*b"trep"));
     registry.register::<Trex>(FourCc::from_bytes(*b"trex"));
     registry.register::<Trun>(FourCc::from_bytes(*b"trun"));
     registry.register::<Tkhd>(FourCc::from_bytes(*b"tkhd"));
+    registry.register::<Cdsc>(FourCc::from_bytes(*b"cdsc"));
+    registry.register::<Dpnd>(FourCc::from_bytes(*b"dpnd"));
+    registry.register::<Font>(FourCc::from_bytes(*b"font"));
+    registry.register::<Hind>(FourCc::from_bytes(*b"hind"));
+    registry.register::<Hint>(FourCc::from_bytes(*b"hint"));
+    registry.register::<Ipir>(FourCc::from_bytes(*b"ipir"));
+    registry.register::<Mpod>(FourCc::from_bytes(*b"mpod"));
+    registry.register::<Subt>(FourCc::from_bytes(*b"subt"));
     registry.register::<Udta>(FourCc::from_bytes(*b"udta"));
+    registry.register::<Uuid>(FourCc::from_bytes(*b"uuid"));
     registry.register::<Url>(FourCc::from_bytes(*b"url "));
     registry.register::<Urn>(FourCc::from_bytes(*b"urn "));
+    registry.register::<Sync>(FourCc::from_bytes(*b"sync"));
+    registry.register::<Vdep>(FourCc::from_bytes(*b"vdep"));
+    registry.register::<Vplx>(FourCc::from_bytes(*b"vplx"));
     registry.register::<Vmhd>(FourCc::from_bytes(*b"vmhd"));
     registry.register::<Wave>(FourCc::from_bytes(*b"wave"));
     registry.register::<XMLSubtitleSampleEntry>(FourCc::from_bytes(*b"stpp"));

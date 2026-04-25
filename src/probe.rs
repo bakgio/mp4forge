@@ -11,9 +11,10 @@ use crate::bitio::BitReader;
 use crate::boxes::av1::AV1CodecConfiguration;
 use crate::boxes::etsi_ts_102_366::Dac3;
 use crate::boxes::iso14496_12::{
-    AVCDecoderConfiguration, AudioSampleEntry, Btrt, Co64, Colr, Ctts, Fiel,
-    HEVCDecoderConfiguration, Mvhd, Pasp, Stco, Stsc, Stsz, Stts, TextSubtitleSampleEntry, Tfdt,
-    Tfhd, Tkhd, Trun, VisualSampleEntry, XMLSubtitleSampleEntry,
+    AVCDecoderConfiguration, AudioSampleEntry, Btrt, Clap, Co64, CoLL, Colr, Ctts, Elng,
+    EventMessageSampleEntry, Fiel, HEVCDecoderConfiguration, Mvhd, Pasp, SmDm, Stco, Stsc, Stsz,
+    Stts, TextSubtitleSampleEntry, Tfdt, Tfhd, Tkhd, Trun, VisualSampleEntry,
+    XMLSubtitleSampleEntry,
 };
 use crate::boxes::iso14496_12::{Frma, Hdlr, Schm};
 use crate::boxes::iso14496_14::Esds;
@@ -34,6 +35,7 @@ const MOOF: FourCc = FourCc::from_bytes(*b"moof");
 const MDAT: FourCc = FourCc::from_bytes(*b"mdat");
 const TKHD: FourCc = FourCc::from_bytes(*b"tkhd");
 const EDTS: FourCc = FourCc::from_bytes(*b"edts");
+const ELNG: FourCc = FourCc::from_bytes(*b"elng");
 const ELST: FourCc = FourCc::from_bytes(*b"elst");
 const MDIA: FourCc = FourCc::from_bytes(*b"mdia");
 const HDLR: FourCc = FourCc::from_bytes(*b"hdlr");
@@ -46,6 +48,11 @@ const AVCC: FourCc = FourCc::from_bytes(*b"avcC");
 const HEV1: FourCc = FourCc::from_bytes(*b"hev1");
 const HVC1: FourCc = FourCc::from_bytes(*b"hvc1");
 const HVCC: FourCc = FourCc::from_bytes(*b"hvcC");
+const VVC1: FourCc = FourCc::from_bytes(*b"vvc1");
+const VVI1: FourCc = FourCc::from_bytes(*b"vvi1");
+const VVCC: FourCc = FourCc::from_bytes(*b"vvcC");
+const AVS3: FourCc = FourCc::from_bytes(*b"avs3");
+const AV3C: FourCc = FourCc::from_bytes(*b"av3c");
 const AV01: FourCc = FourCc::from_bytes(*b"av01");
 const AV1C: FourCc = FourCc::from_bytes(*b"av1C");
 const VP08: FourCc = FourCc::from_bytes(*b"vp08");
@@ -53,14 +60,28 @@ const VP09: FourCc = FourCc::from_bytes(*b"vp09");
 const VPCC: FourCc = FourCc::from_bytes(*b"vpcC");
 const ENCV: FourCc = FourCc::from_bytes(*b"encv");
 const BTRT: FourCc = FourCc::from_bytes(*b"btrt");
+const CLAP: FourCc = FourCc::from_bytes(*b"clap");
+const COLL: FourCc = FourCc::from_bytes(*b"CoLL");
 const COLR: FourCc = FourCc::from_bytes(*b"colr");
 const FIEL: FourCc = FourCc::from_bytes(*b"fiel");
 const PASP: FourCc = FourCc::from_bytes(*b"pasp");
+const SMDM: FourCc = FourCc::from_bytes(*b"SmDm");
 const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
 const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
 const DOPS: FourCc = FourCc::from_bytes(*b"dOps");
 const AC_3: FourCc = FourCc::from_bytes(*b"ac-3");
+const EC_3: FourCc = FourCc::from_bytes(*b"ec-3");
 const DAC3: FourCc = FourCc::from_bytes(*b"dac3");
+const DEC3: FourCc = FourCc::from_bytes(*b"dec3");
+const AC_4: FourCc = FourCc::from_bytes(*b"ac-4");
+const DAC4: FourCc = FourCc::from_bytes(*b"dac4");
+const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
+const DFLA: FourCc = FourCc::from_bytes(*b"dfLa");
+const MHA1: FourCc = FourCc::from_bytes(*b"mha1");
+const MHA2: FourCc = FourCc::from_bytes(*b"mha2");
+const MHM1: FourCc = FourCc::from_bytes(*b"mhm1");
+const MHM2: FourCc = FourCc::from_bytes(*b"mhm2");
+const MHAC: FourCc = FourCc::from_bytes(*b"mhaC");
 const IPCM: FourCc = FourCc::from_bytes(*b"ipcm");
 const FPCM: FourCc = FourCc::from_bytes(*b"fpcm");
 const PCMC: FourCc = FourCc::from_bytes(*b"pcmC");
@@ -70,6 +91,7 @@ const ENCA: FourCc = FourCc::from_bytes(*b"enca");
 const STPP: FourCc = FourCc::from_bytes(*b"stpp");
 const SBTT: FourCc = FourCc::from_bytes(*b"sbtt");
 const WVTT: FourCc = FourCc::from_bytes(*b"wvtt");
+const EVTE: FourCc = FourCc::from_bytes(*b"evte");
 const VTTC_CONFIG: FourCc = FourCc::from_bytes(*b"vttC");
 const VLAB: FourCc = FourCc::from_bytes(*b"vlab");
 const COLR_NCLX: FourCc = FourCc::from_bytes(*b"nclx");
@@ -237,7 +259,7 @@ pub struct DetailedTrackInfo {
     pub codec_family: TrackCodecFamily,
     /// Handler type from `hdlr` when present.
     pub handler_type: Option<FourCc>,
-    /// ISO-639-2 language code derived from `mdhd` when present.
+    /// Language tag from `elng` when present, otherwise the ISO-639-2 code derived from `mdhd`.
     pub language: Option<String>,
     /// Sample-entry box type found under `stsd`, including encrypted wrappers such as `encv`.
     pub sample_entry_type: Option<FourCc>,
@@ -339,6 +361,43 @@ impl Default for MediaCharacteristicsProbeInfo {
     }
 }
 
+/// Additive detailed probe summary that extends [`MediaCharacteristicsProbeInfo`] with extra
+/// typed visual sample-entry metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtendedMediaCharacteristicsProbeInfo {
+    /// Major brand from the root `ftyp` box.
+    pub major_brand: FourCc,
+    /// Minor version from the root `ftyp` box.
+    pub minor_version: u32,
+    /// Compatible brands listed by the root `ftyp` box.
+    pub compatible_brands: Vec<FourCc>,
+    /// Whether the `moov` box appears before the first `mdat`.
+    pub fast_start: bool,
+    /// Movie timescale from `mvhd`.
+    pub timescale: u32,
+    /// Movie duration from `mvhd`.
+    pub duration: u64,
+    /// Per-track detailed summaries extracted from `trak` boxes.
+    pub tracks: Vec<ExtendedMediaCharacteristicsTrackInfo>,
+    /// Fragment summaries extracted from `moof` boxes.
+    pub segments: Vec<SegmentInfo>,
+}
+
+impl Default for ExtendedMediaCharacteristicsProbeInfo {
+    fn default() -> Self {
+        Self {
+            major_brand: FourCc::ANY,
+            minor_version: 0,
+            compatible_brands: Vec::new(),
+            fast_start: false,
+            timescale: 0,
+            duration: 0,
+            tracks: Vec::new(),
+            segments: Vec::new(),
+        }
+    }
+}
+
 /// Additive per-track summary that extends [`DetailedTrackInfo`] with parsed codec and media
 /// characteristics.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -351,8 +410,23 @@ pub struct MediaCharacteristicsTrackInfo {
     pub media_characteristics: TrackMediaCharacteristics,
 }
 
-/// Media characteristics derived from sample-entry side boxes such as `btrt`, `colr`, `pasp`,
-/// and `fiel`.
+/// Additive per-track summary that extends [`MediaCharacteristicsTrackInfo`] with extra typed
+/// visual sample-entry metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtendedMediaCharacteristicsTrackInfo {
+    /// Backwards-compatible detailed track summary preserved from [`DetailedTrackInfo`].
+    pub summary: DetailedTrackInfo,
+    /// Parsed codec-specific configuration when it is available for the track family.
+    pub codec_details: TrackCodecDetails,
+    /// Sample-entry media characteristics already parsed by the crate.
+    pub media_characteristics: TrackMediaCharacteristics,
+    /// Additional typed visual sample-entry metadata from boxes such as `clap`, `CoLL`, and
+    /// `SmDm`.
+    pub visual_metadata: TrackVisualMetadata,
+}
+
+/// Media characteristics derived from stable sample-entry side boxes such as `btrt`, `colr`,
+/// `pasp`, and `fiel`.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrackMediaCharacteristics {
@@ -364,6 +438,19 @@ pub struct TrackMediaCharacteristics {
     pub pixel_aspect_ratio: Option<PixelAspectRatioInfo>,
     /// Declared field-order hint from `fiel` when present.
     pub field_order: Option<FieldOrderInfo>,
+}
+
+/// Additional typed visual sample-entry metadata parsed from boxes that were added after the
+/// original [`TrackMediaCharacteristics`] shape was stabilized.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackVisualMetadata {
+    /// Clean-aperture declaration from `clap` when present.
+    pub clean_aperture: Option<CleanApertureInfo>,
+    /// Content-light-level metadata from `CoLL` when present.
+    pub content_light_level: Option<ContentLightLevelInfo>,
+    /// Mastering-display metadata from `SmDm` when present.
+    pub mastering_display: Option<MasteringDisplayInfo>,
 }
 
 /// Declared buffering and bitrate values parsed from `btrt`.
@@ -412,6 +499,38 @@ impl Default for ColorInfo {
     }
 }
 
+/// Clean-aperture values parsed from `clap`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CleanApertureInfo {
+    /// Clean-aperture width numerator.
+    pub width_numerator: u32,
+    /// Clean-aperture width denominator.
+    pub width_denominator: u32,
+    /// Clean-aperture height numerator.
+    pub height_numerator: u32,
+    /// Clean-aperture height denominator.
+    pub height_denominator: u32,
+    /// Horizontal offset numerator.
+    pub horizontal_offset_numerator: u32,
+    /// Horizontal offset denominator.
+    pub horizontal_offset_denominator: u32,
+    /// Vertical offset numerator.
+    pub vertical_offset_numerator: u32,
+    /// Vertical offset denominator.
+    pub vertical_offset_denominator: u32,
+}
+
+/// Content-light-level metadata parsed from `CoLL`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentLightLevelInfo {
+    /// Maximum content light level.
+    pub max_cll: u16,
+    /// Maximum frame-average light level.
+    pub max_fall: u16,
+}
+
 /// Declared pixel aspect ratio parsed from `pasp`.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -432,6 +551,32 @@ pub struct FieldOrderInfo {
     pub field_ordering: u8,
     /// Whether the hint indicates multiple interlaced fields.
     pub interlaced: bool,
+}
+
+/// Mastering-display metadata parsed from `SmDm`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MasteringDisplayInfo {
+    /// Red-primary chromaticity X coordinate.
+    pub primary_r_chromaticity_x: u16,
+    /// Red-primary chromaticity Y coordinate.
+    pub primary_r_chromaticity_y: u16,
+    /// Green-primary chromaticity X coordinate.
+    pub primary_g_chromaticity_x: u16,
+    /// Green-primary chromaticity Y coordinate.
+    pub primary_g_chromaticity_y: u16,
+    /// Blue-primary chromaticity X coordinate.
+    pub primary_b_chromaticity_x: u16,
+    /// Blue-primary chromaticity Y coordinate.
+    pub primary_b_chromaticity_y: u16,
+    /// White-point chromaticity X coordinate.
+    pub white_point_chromaticity_x: u16,
+    /// White-point chromaticity Y coordinate.
+    pub white_point_chromaticity_y: u16,
+    /// Maximum mastering-display luminance.
+    pub luminance_max: u32,
+    /// Minimum mastering-display luminance.
+    pub luminance_min: u32,
 }
 
 /// Parsed codec-specific configuration for one recognized track family.
@@ -695,15 +840,19 @@ struct TrackCodecConfigRefs<'a> {
 #[derive(Default)]
 struct TrackMediaCharacteristicRefs<'a> {
     btrt: Option<&'a Btrt>,
+    clap: Option<&'a Clap>,
+    coll: Option<&'a CoLL>,
     colr: Option<&'a Colr>,
     pasp: Option<&'a Pasp>,
     fiel: Option<&'a Fiel>,
+    smdm: Option<&'a SmDm>,
 }
 
 struct ParsedRichTrackInfo {
     summary: DetailedTrackInfo,
     codec_details: TrackCodecDetails,
     media_characteristics: TrackMediaCharacteristics,
+    visual_metadata: TrackVisualMetadata,
 }
 
 /// Coarse codec classification used by the probe surface.
@@ -748,6 +897,38 @@ pub enum TrackCodecFamily {
     TextSubtitle,
     /// WebVTT text carried by `wvtt`.
     WebVtt,
+}
+
+/// Returns the additive codec-family label used by detailed reporting.
+///
+/// The stable [`TrackCodecFamily`] enum intentionally keeps its current shape. Newer sample-entry
+/// families that do not yet warrant an enum expansion still surface here through their
+/// sample-entry or protected original-format box type.
+pub fn normalized_codec_family_name(
+    codec_family: TrackCodecFamily,
+    sample_entry_type: Option<FourCc>,
+    original_format: Option<FourCc>,
+) -> &'static str {
+    match codec_family {
+        TrackCodecFamily::Unknown => match original_format.or(sample_entry_type) {
+            Some(AVS3) => "avs3",
+            Some(FLAC) => "flac",
+            Some(MHA1 | MHA2 | MHM1 | MHM2) => "mpeg_h",
+            _ => "unknown",
+        },
+        TrackCodecFamily::Avc => "avc",
+        TrackCodecFamily::Hevc => "hevc",
+        TrackCodecFamily::Av1 => "av1",
+        TrackCodecFamily::Vp8 => "vp8",
+        TrackCodecFamily::Vp9 => "vp9",
+        TrackCodecFamily::Mp4Audio => "mp4_audio",
+        TrackCodecFamily::Opus => "opus",
+        TrackCodecFamily::Ac3 => "ac3",
+        TrackCodecFamily::Pcm => "pcm",
+        TrackCodecFamily::XmlSubtitle => "xml_subtitle",
+        TrackCodecFamily::TextSubtitle => "text_subtitle",
+        TrackCodecFamily::WebVtt => "webvtt",
+    }
 }
 
 /// Protection-scheme summary derived from `schm`.
@@ -1015,6 +1196,68 @@ where
     Ok(summary)
 }
 
+/// Probes a file and returns an additive summary with parsed codec, media characteristics, and
+/// extra typed visual sample-entry metadata.
+pub fn probe_extended_media_characteristics<R>(
+    reader: &mut R,
+) -> Result<ExtendedMediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: Read + Seek,
+{
+    probe_extended_media_characteristics_with_options(reader, ProbeOptions::default())
+}
+
+/// Probes a file with additive expansion controls and returns the extended
+/// media-characteristics summary.
+pub fn probe_extended_media_characteristics_with_options<R>(
+    reader: &mut R,
+    options: ProbeOptions,
+) -> Result<ExtendedMediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: Read + Seek,
+{
+    let paths = root_probe_box_paths(options);
+    let infos = extract_boxes(reader, None, &paths)?;
+
+    let mut summary = ExtendedMediaCharacteristicsProbeInfo::default();
+    let mut mdat_appeared = false;
+
+    for info in infos {
+        match info.box_type() {
+            FTYP => {
+                let ftyp = read_payload_as::<_, crate::boxes::iso14496_12::Ftyp>(reader, &info)?;
+                summary.major_brand = ftyp.major_brand;
+                summary.minor_version = ftyp.minor_version;
+                summary.compatible_brands = ftyp.compatible_brands;
+            }
+            MOOV => {
+                summary.fast_start = !mdat_appeared;
+            }
+            MVHD => {
+                let mvhd = read_payload_as::<_, Mvhd>(reader, &info)?;
+                summary.timescale = mvhd.timescale;
+                summary.duration = mvhd.duration();
+            }
+            TRAK => {
+                summary
+                    .tracks
+                    .push(probe_trak_extended_media_characteristics(
+                        reader, &info, options,
+                    )?);
+            }
+            MOOF if options.include_segments => {
+                summary.segments.push(probe_moof(reader, &info)?);
+            }
+            MDAT => {
+                mdat_appeared = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
+}
+
 /// Probes an in-memory MP4 byte slice and returns the coarse movie, track, and fragment
 /// summary.
 ///
@@ -1088,6 +1331,26 @@ pub fn probe_media_characteristics_bytes_with_options(
 ) -> Result<MediaCharacteristicsProbeInfo, ProbeError> {
     let mut reader = Cursor::new(input);
     probe_media_characteristics_with_options(&mut reader, options)
+}
+
+/// Probes an in-memory MP4 byte slice and returns the extended media-characteristics summary.
+///
+/// This is equivalent to calling [`probe_extended_media_characteristics`] with `Cursor<&[u8]>`.
+pub fn probe_extended_media_characteristics_bytes(
+    input: &[u8],
+) -> Result<ExtendedMediaCharacteristicsProbeInfo, ProbeError> {
+    let mut reader = Cursor::new(input);
+    probe_extended_media_characteristics(&mut reader)
+}
+
+/// Probes an in-memory MP4 byte slice with additive expansion controls and returns the extended
+/// media-characteristics summary.
+pub fn probe_extended_media_characteristics_bytes_with_options(
+    input: &[u8],
+    options: ProbeOptions,
+) -> Result<ExtendedMediaCharacteristicsProbeInfo, ProbeError> {
+    let mut reader = Cursor::new(input);
+    probe_extended_media_characteristics_with_options(&mut reader, options)
 }
 
 /// Legacy fragmented-file probe entry point that currently aliases [`probe`].
@@ -1422,12 +1685,15 @@ fn root_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
 }
 
 fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
-    let visual_sample_entries = [AVC1, HEV1, HVC1, AV01, VP08, VP09, ENCV];
-    let audio_sample_entries = [MP4A, OPUS, AC_3, IPCM, FPCM, ENCA];
+    let visual_sample_entries = [AVC1, HEV1, HVC1, VVC1, VVI1, AVS3, AV01, VP08, VP09, ENCV];
+    let audio_sample_entries = [
+        MP4A, OPUS, AC_3, EC_3, AC_4, FLAC, MHA1, MHA2, MHM1, MHM2, IPCM, FPCM, ENCA,
+    ];
     let mut paths = vec![
         BoxPath::from([TKHD]),
         BoxPath::from([EDTS, ELST]),
         BoxPath::from([MDIA, MDHD]),
+        BoxPath::from([MDIA, ELNG]),
         BoxPath::from([MDIA, HDLR]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AVC1]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AVC1, AVCC]),
@@ -1435,6 +1701,12 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, HEV1, HVCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, HVC1]),
         BoxPath::from([MDIA, MINF, STBL, STSD, HVC1, HVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, VVC1]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, VVC1, VVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, VVI1]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, VVI1, VVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, AVS3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, AVS3, AV3C]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AV01]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AV01, AV1C]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VP08]),
@@ -1444,6 +1716,8 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, AVCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, HVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, VVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, AV3C]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, AV1C]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, VPCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, SINF, FRMA]),
@@ -1455,6 +1729,20 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS, DOPS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_3, DAC3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, EC_3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, EC_3, DEC3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, AC_4]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, AC_4, DAC4]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, FLAC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, FLAC, DFLA]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHA1]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHA1, MHAC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHA2]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHA2, MHAC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHM1]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHM1, MHAC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHM2]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MHM2, MHAC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, IPCM]),
         BoxPath::from([MDIA, MINF, STBL, STSD, IPCM, PCMC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, FPCM]),
@@ -1464,12 +1752,18 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, WAVE, ESDS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, DOPS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, DAC3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, DEC3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, DAC4]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, DFLA]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, MHAC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, PCMC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, SINF, FRMA]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, SINF, SCHM]),
         BoxPath::from([MDIA, MINF, STBL, STSD, STPP]),
         BoxPath::from([MDIA, MINF, STBL, STSD, SBTT]),
         BoxPath::from([MDIA, MINF, STBL, STSD, WVTT]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, EVTE]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, EVTE, BTRT]),
         BoxPath::from([MDIA, MINF, STBL, STSD, WVTT, VTTC_CONFIG]),
         BoxPath::from([MDIA, MINF, STBL, STSD, WVTT, VLAB]),
     ];
@@ -1477,9 +1771,12 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
     for sample_entry in visual_sample_entries {
         paths.extend([
             BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, BTRT]),
+            BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, CLAP]),
+            BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, COLL]),
             BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, COLR]),
             BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, PASP]),
             BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, FIEL]),
+            BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry, SMDM]),
         ]);
     }
 
@@ -1537,6 +1834,23 @@ where
     })
 }
 
+fn probe_trak_extended_media_characteristics<R>(
+    reader: &mut R,
+    parent: &BoxInfo,
+    options: ProbeOptions,
+) -> Result<ExtendedMediaCharacteristicsTrackInfo, ProbeError>
+where
+    R: Read + Seek,
+{
+    let track = probe_trak_rich_details(reader, parent, options)?;
+    Ok(ExtendedMediaCharacteristicsTrackInfo {
+        summary: track.summary,
+        codec_details: track.codec_details,
+        media_characteristics: track.media_characteristics,
+        visual_metadata: track.visual_metadata,
+    })
+}
+
 fn probe_trak_rich_details<R>(
     reader: &mut R,
     parent: &BoxInfo,
@@ -1551,6 +1865,7 @@ where
     let mut track = DetailedTrackInfo::default();
     let mut tkhd = None;
     let mut mdhd = None;
+    let mut elng = None;
     let mut visual_sample_entry = None;
     let mut avcc = None;
     let mut hvcc = None;
@@ -1566,9 +1881,12 @@ where
     let mut webvtt_configuration = None;
     let mut webvtt_source_label = None;
     let mut btrt = None;
+    let mut clap = None;
+    let mut coll = None;
     let mut colr = None;
     let mut pasp = None;
     let mut fiel = None;
+    let mut smdm = None;
     let mut original_format = None;
     let mut stco = None;
     let mut co64 = None;
@@ -1600,8 +1918,15 @@ where
                 let payload = downcast_clone::<crate::boxes::iso14496_12::Mdhd>(&extracted)?;
                 track.summary.timescale = payload.timescale;
                 track.summary.duration = payload.duration();
-                track.language = Some(decode_language(payload.language));
+                if elng.is_none() {
+                    track.language = Some(decode_language(payload.language));
+                }
                 mdhd = Some(payload);
+            }
+            ELNG => {
+                let payload = downcast_clone::<Elng>(&extracted)?;
+                track.language = Some(payload.extended_language.clone());
+                elng = Some(payload);
             }
             HDLR => {
                 let payload = downcast_clone::<Hdlr>(&extracted)?;
@@ -1627,6 +1952,18 @@ where
             HVC1 => {
                 track.codec_family = TrackCodecFamily::Hevc;
                 track.sample_entry_type = Some(HVC1);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            VVC1 => {
+                track.sample_entry_type = Some(VVC1);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            VVI1 => {
+                track.sample_entry_type = Some(VVI1);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            AVS3 => {
+                track.sample_entry_type = Some(AVS3);
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
             AV01 => {
@@ -1681,6 +2018,34 @@ where
                 track.sample_entry_type = Some(AC_3);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
+            EC_3 => {
+                track.sample_entry_type = Some(EC_3);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            AC_4 => {
+                track.sample_entry_type = Some(AC_4);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            FLAC => {
+                track.sample_entry_type = Some(FLAC);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            MHA1 => {
+                track.sample_entry_type = Some(MHA1);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            MHA2 => {
+                track.sample_entry_type = Some(MHA2);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            MHM1 => {
+                track.sample_entry_type = Some(MHM1);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            MHM2 => {
+                track.sample_entry_type = Some(MHM2);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
             DAC3 => {
                 dac3 = Some(downcast_clone::<Dac3>(&extracted)?);
             }
@@ -1709,6 +2074,10 @@ where
                 text_subtitle_sample_entry =
                     Some(downcast_clone::<TextSubtitleSampleEntry>(&extracted)?);
             }
+            EVTE => {
+                track.sample_entry_type = Some(EVTE);
+                let _ = downcast_clone::<EventMessageSampleEntry>(&extracted)?;
+            }
             WVTT => {
                 track.codec_family = TrackCodecFamily::WebVtt;
                 track.sample_entry_type = Some(WVTT);
@@ -1722,6 +2091,12 @@ where
             BTRT => {
                 btrt = Some(downcast_clone::<Btrt>(&extracted)?);
             }
+            CLAP => {
+                clap = Some(downcast_clone::<Clap>(&extracted)?);
+            }
+            COLL => {
+                coll = Some(downcast_clone::<CoLL>(&extracted)?);
+            }
             COLR => {
                 colr = Some(downcast_clone::<Colr>(&extracted)?);
             }
@@ -1730,6 +2105,9 @@ where
             }
             FIEL => {
                 fiel = Some(downcast_clone::<Fiel>(&extracted)?);
+            }
+            SMDM => {
+                smdm = Some(downcast_clone::<SmDm>(&extracted)?);
             }
             ESDS => {
                 esds = Some(downcast_clone::<Esds>(&extracted)?);
@@ -1908,17 +2286,23 @@ where
             webvtt_source_label: webvtt_source_label.as_ref(),
         },
     );
-    let media_characteristics = build_track_media_characteristics(&TrackMediaCharacteristicRefs {
+    let media_refs = TrackMediaCharacteristicRefs {
         btrt: btrt.as_ref(),
+        clap: clap.as_ref(),
+        coll: coll.as_ref(),
         colr: colr.as_ref(),
         pasp: pasp.as_ref(),
         fiel: fiel.as_ref(),
-    });
+        smdm: smdm.as_ref(),
+    };
+    let media_characteristics = build_track_media_characteristics(&media_refs);
+    let visual_metadata = build_track_visual_metadata(&media_refs);
 
     Ok(ParsedRichTrackInfo {
         summary: track,
         codec_details,
         media_characteristics,
+        visual_metadata,
     })
 }
 
@@ -2133,6 +2517,30 @@ fn build_track_media_characteristics(
     }
 }
 
+fn build_track_visual_metadata(refs: &TrackMediaCharacteristicRefs<'_>) -> TrackVisualMetadata {
+    TrackVisualMetadata {
+        clean_aperture: refs.clap.map(track_clean_aperture_info),
+        content_light_level: refs.coll.map(|value| ContentLightLevelInfo {
+            max_cll: value.max_cll,
+            max_fall: value.max_fall,
+        }),
+        mastering_display: refs.smdm.map(track_mastering_display_info),
+    }
+}
+
+fn track_clean_aperture_info(value: &Clap) -> CleanApertureInfo {
+    CleanApertureInfo {
+        width_numerator: value.clean_aperture_width_n,
+        width_denominator: value.clean_aperture_width_d,
+        height_numerator: value.clean_aperture_height_n,
+        height_denominator: value.clean_aperture_height_d,
+        horizontal_offset_numerator: value.horiz_off_n,
+        horizontal_offset_denominator: value.horiz_off_d,
+        vertical_offset_numerator: value.vert_off_n,
+        vertical_offset_denominator: value.vert_off_d,
+    }
+}
+
 fn track_color_info(value: &Colr) -> ColorInfo {
     let is_nclx = value.colour_type == COLR_NCLX;
     let stores_profile = matches!(value.colour_type, COLR_RICC | COLR_PROF);
@@ -2144,6 +2552,21 @@ fn track_color_info(value: &Colr) -> ColorInfo {
         full_range: is_nclx.then_some(value.full_range_flag),
         profile_size: stores_profile.then_some(value.profile.len()),
         unknown_size: (!is_nclx && !stores_profile).then_some(value.unknown.len()),
+    }
+}
+
+fn track_mastering_display_info(value: &SmDm) -> MasteringDisplayInfo {
+    MasteringDisplayInfo {
+        primary_r_chromaticity_x: value.primary_r_chromaticity_x,
+        primary_r_chromaticity_y: value.primary_r_chromaticity_y,
+        primary_g_chromaticity_x: value.primary_g_chromaticity_x,
+        primary_g_chromaticity_y: value.primary_g_chromaticity_y,
+        primary_b_chromaticity_x: value.primary_b_chromaticity_x,
+        primary_b_chromaticity_y: value.primary_b_chromaticity_y,
+        white_point_chromaticity_x: value.white_point_chromaticity_x,
+        white_point_chromaticity_y: value.white_point_chromaticity_y,
+        luminance_max: value.luminance_max,
+        luminance_min: value.luminance_min,
     }
 }
 

@@ -439,7 +439,7 @@ fn field_structured_dump_report_prefers_supported_fields_over_legacy_leaf_omissi
 }
 
 #[test]
-fn dump_command_accepts_go_style_long_options() {
+fn dump_command_accepts_double_dash_long_options() {
     let fixture = fixture_path("sample.mp4");
     let args = vec![
         "--full".to_string(),

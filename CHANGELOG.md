@@ -1,3 +1,11 @@
+# 0.5.0 (April 25, 2026)
+
+- Added first-class encrypted metadata coverage for typed `senc`, typed `sgpd(seig)`, resolved sample-encryption helpers, and broader encrypted fragmented fixture coverage across extraction, rewrite, and probe flows
+- Added additive top-level `sidx` analysis, planning, rewrite, documentation, and example support for the supported fragmented-file layouts
+- Expanded typed box coverage across fragmented timing, metadata, and codec families, including `clap`, `SmDm`, `CoLL`, `dec3`, `dac4`, `vvcC`, AVS3, FLAC, MPEG-H, `subs`, `elng`, `ssix`, `leva`, `evte`, `silb`, `emib`, `emeb`, `ID32`, loudness boxes, `prft`, typed `tref` children, `sthd`, `nmhd`, `kind`, `mime`, `cdat`, and selected legacy `uuid` payloads
+- Improved low-level robustness by preserving legal trailing bytes in `VisualSampleEntry` layouts and carrying those bytes cleanly through traversal and rewrite paths
+- Added `prft` timestamp and flag helpers, richer examples, and broader regression coverage for fragmented, encrypted, metadata-rich, and legacy MP4 layouts
+
 # 0.4.0 (April 22, 2026)
 
 - Added richer additive probe surfaces for broader codec families, codec-specific details, media-characteristics reporting, and lighter-weight probe controls for large-file inspection

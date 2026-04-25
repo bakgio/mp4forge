@@ -10,7 +10,7 @@ pub mod probe;
 pub mod pssh;
 pub mod util;
 
-/// Dispatches the top-level command-line arguments to the matching command implementation.
+/// Dispatches the top-level command-line arguments to the matching command handler.
 pub fn dispatch<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> i32
 where
     W: Write,

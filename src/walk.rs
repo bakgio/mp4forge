@@ -7,7 +7,9 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use crate::FourCc;
-use crate::boxes::iso14496_12::Ftyp;
+use crate::boxes::iso14496_12::{
+    Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
+};
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
 use crate::codec::{CodecError, DynCodecBox, unmarshal, unmarshal_any_with_context};
@@ -251,7 +253,13 @@ pub struct WalkHandle<'a, R> {
     info: BoxInfo,
     path: BoxPath,
     descendant_lookup_context: BoxLookupContext,
-    children_offset: Option<u64>,
+    children_layout: Option<ChildrenLayout>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChildrenLayout {
+    offset: u64,
+    size: u64,
 }
 
 impl<'a, R> WalkHandle<'a, R>
@@ -291,7 +299,13 @@ where
             self.info.lookup_context(),
             None,
         )?;
-        self.children_offset = Some(self.info.offset() + self.info.header_size() + read);
+        self.children_layout = Some(children_layout_for_payload(
+            self.reader,
+            &self.info,
+            payload_size,
+            read,
+            boxed.as_ref(),
+        )?);
         Ok((boxed, read))
     }
 
@@ -306,13 +320,17 @@ where
         io::copy(&mut limited, writer).map_err(WalkError::Io)
     }
 
-    fn ensure_children_offset(&mut self) -> Result<u64, WalkError> {
-        if let Some(children_offset) = self.children_offset {
-            return Ok(children_offset);
+    fn ensure_children_layout(&mut self) -> Result<ChildrenLayout, WalkError> {
+        if let Some(children_layout) = self.children_layout {
+            return Ok(children_layout);
         }
 
-        let (_, read) = self.read_payload()?;
-        Ok(self.info.offset() + self.info.header_size() + read)
+        self.read_payload()?;
+        if let Some(children_layout) = self.children_layout {
+            Ok(children_layout)
+        } else {
+            unreachable!("read_payload always computes children layout")
+        }
     }
 }
 
@@ -461,22 +479,20 @@ where
         info: *info,
         path,
         descendant_lookup_context,
-        children_offset: None,
+        children_layout: None,
     };
 
     let control = visitor(&mut handle)?;
     if matches!(control, WalkControl::Descend) {
-        let children_offset = handle.ensure_children_offset()?;
-        let children_size = handle
-            .info
-            .offset()
-            .saturating_add(handle.info.size())
-            .saturating_sub(children_offset);
+        let children_layout = handle.ensure_children_layout()?;
+        handle
+            .reader
+            .seek(SeekFrom::Start(children_layout.offset))?;
         walk_sequence(
             handle.reader,
             handle.registry,
             visitor,
-            children_size,
+            children_layout.size,
             false,
             &handle.path,
             handle.descendant_lookup_context,
@@ -485,6 +501,57 @@ where
 
     handle.info.seek_to_end(handle.reader)?;
     Ok(())
+}
+
+fn children_layout_for_payload<R>(
+    reader: &mut R,
+    info: &BoxInfo,
+    payload_size: u64,
+    payload_read: u64,
+    payload: &dyn DynCodecBox,
+) -> Result<ChildrenLayout, WalkError>
+where
+    R: Read + Seek,
+{
+    let offset = info.offset() + info.header_size() + payload_read;
+    let size = if payload.as_any().is::<VisualSampleEntry>() {
+        visual_sample_entry_child_payload_size(
+            reader,
+            offset,
+            payload_size.saturating_sub(payload_read),
+        )?
+    } else {
+        payload_size.saturating_sub(payload_read)
+    };
+
+    Ok(ChildrenLayout { offset, size })
+}
+
+fn visual_sample_entry_child_payload_size<R>(
+    reader: &mut R,
+    extension_offset: u64,
+    extension_size: u64,
+) -> Result<u64, WalkError>
+where
+    R: Read + Seek,
+{
+    let checkpoint = reader.stream_position()?;
+    reader.seek(SeekFrom::Start(extension_offset))?;
+    let bytes = read_extension_bytes(reader, extension_size)?;
+    reader.seek(SeekFrom::Start(checkpoint))?;
+    Ok(split_box_children_with_optional_trailing_bytes(&bytes) as u64)
+}
+
+fn read_extension_bytes<R>(reader: &mut R, extension_size: u64) -> Result<Vec<u8>, WalkError>
+where
+    R: Read,
+{
+    let extension_len = usize::try_from(extension_size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload extension is too large")
+    })?;
+    let mut bytes = vec![0; extension_len];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn inspect_context_carriers<R>(

@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::io::Cursor;
 
 use mp4forge::FourCc;
-use mp4forge::boxes::etsi_ts_102_366::Dac3;
+use mp4forge::boxes::etsi_ts_102_366::{Dac3, Dec3, Ec3Substream};
 use mp4forge::boxes::iso14496_12::{AudioSampleEntry, SampleEntry};
 use mp4forge::boxes::{AnyTypeBox, default_registry};
 use mp4forge::codec::{CodecBox, marshal, unmarshal, unmarshal_any};
@@ -130,6 +130,32 @@ fn etsi_ts_102_366_catalog_roundtrips() {
         ],
         "DataReferenceIndex=1 EntryVersion=0 ChannelCount=6 SampleSize=16 PreDefined=0 SampleRate=48000",
     );
+    assert_any_box_roundtrip(
+        AudioSampleEntry {
+            sample_entry: SampleEntry {
+                box_type: FourCc::from_bytes(*b"ec-3"),
+                data_reference_index: 1,
+            },
+            entry_version: 0,
+            channel_count: 6,
+            sample_size: 16,
+            pre_defined: 0,
+            sample_rate: 48_000 << 16,
+            quicktime_data: Vec::new(),
+        },
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x01, //
+            0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x06, //
+            0x00, 0x10, //
+            0x00, 0x00, //
+            0x00, 0x00, //
+            0xbb, 0x80, 0x00, 0x00,
+        ],
+        "DataReferenceIndex=1 EntryVersion=0 ChannelCount=6 SampleSize=16 PreDefined=0 SampleRate=48000",
+    );
 
     assert_box_roundtrip(
         Dac3 {
@@ -142,6 +168,21 @@ fn etsi_ts_102_366_catalog_roundtrips() {
         },
         &[0x10, 0x3c, 0xe0],
         "Fscod=0x0 Bsid=0x8 Bsmod=0x0 Acmod=0x7 LfeOn=0x1 BitRateCode=0x7",
+    );
+    assert_box_roundtrip(
+        Dec3 {
+            data_rate: 448,
+            num_ind_sub: 0,
+            ec3_substreams: vec![Ec3Substream {
+                fscod: 2,
+                bsid: 0x10,
+                acmod: 4,
+                ..Ec3Substream::default()
+            }],
+            reserved: Vec::new(),
+        },
+        &[0x0e, 0x00, 0xa0, 0x08, 0x00],
+        "DataRate=448 NumIndSub=0 EC3Subs=[{FSCod=0x2 BSID=0x10 ASVC=0x0 BSMod=0x0 ACMod=0x4 LFEOn=0x0 NumDepSub=0x0 ChanLoc=0x0}]",
     );
 }
 
@@ -157,10 +198,22 @@ fn built_in_registry_reports_supported_versions_for_landed_etsi_ts_102_366_types
         registry.supported_versions(FourCc::from_bytes(*b"dac3")),
         Some(&[][..])
     );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"ec-3")),
+        Some(&[][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"dec3")),
+        Some(&[][..])
+    );
     assert!(registry.is_supported_version(FourCc::from_bytes(*b"ac-3"), 9));
     assert!(registry.is_supported_version(FourCc::from_bytes(*b"dac3"), 9));
+    assert!(registry.is_supported_version(FourCc::from_bytes(*b"ec-3"), 9));
+    assert!(registry.is_supported_version(FourCc::from_bytes(*b"dec3"), 9));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ac-3")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"dac3")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ec-3")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dec3")));
 }
 
 #[test]
@@ -190,5 +243,42 @@ fn dac3_rejects_out_of_range_packed_field_values_when_encoding() {
     assert_eq!(
         error.to_string(),
         "numeric value does not fit field Bsid with width 5"
+    );
+}
+
+#[test]
+fn dec3_rejects_non_zero_reserved_bits_when_decoding() {
+    let mut decoded = Dec3::default();
+    let error = unmarshal(
+        &mut Cursor::new(vec![0x0e, 0x00, 0xa1, 0x08, 0x00]),
+        5,
+        &mut decoded,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid field value for EC3Subs: substream reserved bit is not zero"
+    );
+}
+
+#[test]
+fn dec3_rejects_num_ind_sub_mismatch_during_marshal() {
+    let dec3 = Dec3 {
+        data_rate: 448,
+        num_ind_sub: 1,
+        ec3_substreams: vec![Ec3Substream {
+            fscod: 2,
+            bsid: 0x10,
+            acmod: 4,
+            ..Ec3Substream::default()
+        }],
+        reserved: Vec::new(),
+    };
+
+    let error = marshal(&mut Vec::new(), &dec3, None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid field value for EC3Subs: num_ind_sub does not match the parsed substream count"
     );
 }

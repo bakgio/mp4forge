@@ -1,6 +1,6 @@
 [package]
 name = "mp4forge"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["bakgio"]
@@ -9,7 +9,7 @@ description = "Rust library and CLI for inspecting, probing, extracting, and rew
 repository = "https://github.com/bakgio/mp4forge"
 readme = "README.md"
 keywords = ["mp4", "isobmff", "parser", "video", "cli"]
-categories = ["command-line-utilities", "multimedia::video", "parser-implementations"]
+categories = ["command-line-utilities", "multimedia::video"]
 exclude = [".github/**", "fuzz/**", "tests/**"]
 
 [package.metadata.docs.rs]

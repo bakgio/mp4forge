@@ -1,24 +1,37 @@
 use std::any::type_name;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::time::{Duration, UNIX_EPOCH};
 
 use mp4forge::FourCc;
 use mp4forge::boxes::iso14496_12::{
-    AVCDecoderConfiguration, AVCParameterSet, AlternativeStartupEntry, AlternativeStartupEntryL,
-    AlternativeStartupEntryOpt, AudioSampleEntry, Btrt, Co64, Colr, Cslg, Ctts, CttsEntry, Dinf,
-    Dref, Edts, Elst, ElstEntry, Emsg, Fiel, Free, Frma, Ftyp, HEVCDecoderConfiguration, HEVCNalu,
-    HEVCNaluArray, Hdlr, Mdat, Mdhd, Mdia, Mehd, Meta, Mfhd, Mfra, Mfro, Minf, Moof, Moov, Mvex,
-    Mvhd, Pasp, Saio, Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm, Sdtp, SdtpSampleElem, Sgpd,
-    Sidx, SidxReference, Sinf, Skip, Smhd, Stbl, Stco, Stsc, StscEntry, Stsd, Stss, Stsz, Stts,
-    SttsEntry, Styp, TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
-    TRUN_DATA_OFFSET_PRESENT, TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
-    TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
-    TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry, TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra,
-    TfraEntry, Tkhd, Traf, Trak, Trep, Trex, Trun, TrunEntry, Udta, VisualRandomAccessEntry,
-    VisualSampleEntry, Vmhd, Wave, XMLSubtitleSampleEntry,
+    AVCDecoderConfiguration, AVCParameterSet, AlbumLoudnessInfo, AlternativeStartupEntry,
+    AlternativeStartupEntryL, AlternativeStartupEntryOpt, AudioSampleEntry, Btrt, Cdat, Cdsc, Clap,
+    Co64, CoLL, Colr, Cslg, Ctts, CttsEntry, Dinf, Dpnd, Dref, Edts, Elng, Elst, ElstEntry, Emeb,
+    Emib, Emsg, EventMessageSampleEntry, Fiel, Font, Free, Frma, Ftyp, HEVCDecoderConfiguration,
+    HEVCNalu, HEVCNaluArray, Hdlr, Hind, Hint, Ipir, Kind, Leva, LevaLevel, LoudnessEntry,
+    LoudnessMeasurement, Ludt, Mdat, Mdhd, Mdia, Mehd, Meta, Mfhd, Mfra, Mfro, Mime, Minf, Moof,
+    Moov, Mpod, Mvex, Mvhd, Nmhd, PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS,
+    PRFT_TIME_ARBITRARY_CONSISTENT, PRFT_TIME_CAPTURED, PRFT_TIME_ENCODER_INPUT,
+    PRFT_TIME_ENCODER_OUTPUT, PRFT_TIME_MOOF_FINALIZED, PRFT_TIME_MOOF_WRITTEN, Pasp, Prft, Saio,
+    Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm, Sdtp, SdtpSampleElem, SeigEntry, SeigEntryL,
+    Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf, Skip, SmDm, Smhd, SphericalVideoV1Metadata,
+    Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stss, Stsz, Stts,
+    SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt, Sync, TFHD_BASE_DATA_OFFSET_PRESENT,
+    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TRUN_DATA_OFFSET_PRESENT,
+    TRUN_FIRST_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT,
+    TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry,
+    TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra, TfraEntry, Tkhd, TrackLoudnessInfo, Traf, Trak,
+    Tref, Trep, Trex, Trun, TrunEntry, UUID_FRAGMENT_ABSOLUTE_TIMING, UUID_FRAGMENT_RUN_TABLE,
+    UUID_SAMPLE_ENCRYPTION, UUID_SPHERICAL_VIDEO_V1, Udta, Uuid, UuidFragmentAbsoluteTiming,
+    UuidFragmentRunEntry, UuidFragmentRunTable, UuidPayload, Vdep, VisualRandomAccessEntry,
+    VisualSampleEntry, Vmhd, Vplx, Wave, XMLSubtitleSampleEntry,
 };
+use mp4forge::boxes::iso23001_7::{SENC_USE_SUBSAMPLE_ENCRYPTION, Senc, SencSample, SencSubsample};
 use mp4forge::boxes::{AnyTypeBox, default_registry};
-use mp4forge::codec::{CodecBox, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any};
+use mp4forge::codec::{
+    CodecBox, CodecError, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any,
+};
 use mp4forge::stringify::stringify;
 
 fn assert_box_roundtrip<T>(src: T, payload: &[u8], expected: &str)
@@ -230,6 +243,20 @@ fn core_iso14496_12_catalog_roundtrips() {
     mfro.set_version(0);
     mfro.size = 0x12345678;
 
+    let mut prft_v0 = Prft::default();
+    prft_v0.set_version(0);
+    prft_v0.set_flags(0x000001);
+    prft_v0.reference_track_id = 0x12345678;
+    prft_v0.ntp_timestamp = 0x0000000102030405;
+    prft_v0.media_time_v0 = 0x23456789;
+
+    let mut prft_v1 = Prft::default();
+    prft_v1.set_version(1);
+    prft_v1.set_flags(0x000018);
+    prft_v1.reference_track_id = 0x89abcdef;
+    prft_v1.ntp_timestamp = 0x000000060708090a;
+    prft_v1.media_time_v1 = 0x0000000b0c0d0e0f;
+
     let mut mvhd_v0 = Mvhd::default();
     mvhd_v0.set_version(0);
     mvhd_v0.creation_time_v0 = 0x01234567;
@@ -253,6 +280,12 @@ fn core_iso14496_12_catalog_roundtrips() {
     let mut smhd = Smhd::default();
     smhd.set_version(0);
     smhd.balance = 0x0123;
+
+    let mut sthd = Sthd::default();
+    sthd.set_version(0);
+
+    let mut nmhd = Nmhd::default();
+    nmhd.set_version(0);
 
     let mut stco = Stco::default();
     stco.set_version(0);
@@ -490,7 +523,50 @@ fn core_iso14496_12_catalog_roundtrips() {
     assert_box_roundtrip(Stbl, &[], "");
     assert_box_roundtrip(Traf, &[], "");
     assert_box_roundtrip(Trak, &[], "");
+    assert_box_roundtrip(Tref, &[], "");
     assert_box_roundtrip(Udta, &[], "");
+    macro_rules! assert_tref_child_roundtrip {
+        ($value:expr) => {
+            assert_box_roundtrip(
+                $value,
+                &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+                "TrackIDs=[19088743, 2309737967]",
+            );
+        };
+    }
+    assert_tref_child_roundtrip!(Cdsc {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Dpnd {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Font {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Hind {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Hint {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Ipir {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Mpod {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Subt {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Sync {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Vdep {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
+    assert_tref_child_roundtrip!(Vplx {
+        track_ids: vec![0x01234567, 0x89abcdef],
+    });
     assert_box_roundtrip(
         dref,
         &[0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78],
@@ -562,6 +638,22 @@ fn core_iso14496_12_catalog_roundtrips() {
         "Version=0 Flags=0x000000 Size=305419896",
     );
     assert_box_roundtrip(
+        prft_v0,
+        &[
+            0x00, 0x00, 0x00, 0x01, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x23, 0x45, 0x67, 0x89,
+        ],
+        "Version=0 Flags=0x000001 ReferenceTrackID=305419896 NTPTimestamp=4328719365 MediaTimeV0=591751049",
+    );
+    assert_box_roundtrip(
+        prft_v1,
+        &[
+            0x01, 0x00, 0x00, 0x18, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x00, 0x00, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x00, 0x00, 0x00, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        ],
+        "Version=1 Flags=0x000018 ReferenceTrackID=2309737967 NTPTimestamp=25887770890 MediaTimeV1=47446822415",
+    );
+    assert_box_roundtrip(
         mdhd_v0,
         &[
             0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x23, 0x45, 0x67, 0x89, 0x01, 0x02,
@@ -606,6 +698,8 @@ fn core_iso14496_12_catalog_roundtrips() {
         &[0x00, 0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x00],
         "Version=0 Flags=0x000000 Balance=1.137",
     );
+    assert_box_roundtrip(sthd, &[0x00, 0x00, 0x00, 0x00], "Version=0 Flags=0x000000");
+    assert_box_roundtrip(nmhd, &[0x00, 0x00, 0x00, 0x00], "Version=0 Flags=0x000000");
     assert_box_roundtrip(
         stco,
         &[
@@ -884,6 +978,14 @@ fn additional_iso14496_12_catalog_roundtrips() {
             num_total_samples: 0xcdef,
         },
     ];
+    let seig_kid_a = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ];
+    let seig_kid_b = [
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc,
+        0xfe,
+    ];
 
     let mut sgpd_roll_v1 = Sgpd::default();
     sgpd_roll_v1.set_version(1);
@@ -1001,6 +1103,94 @@ fn additional_iso14496_12_catalog_roundtrips() {
     sgpd_roll_v2.default_sample_description_index = 5;
     sgpd_roll_v2.entry_count = 2;
     sgpd_roll_v2.roll_distances = vec![0x1111, 0x2222];
+
+    let mut sgpd_seig_v1 = Sgpd::default();
+    sgpd_seig_v1.set_version(1);
+    sgpd_seig_v1.grouping_type = FourCc::from_bytes(*b"seig");
+    sgpd_seig_v1.default_length = 20;
+    sgpd_seig_v1.entry_count = 2;
+    sgpd_seig_v1.seig_entries = vec![
+        SeigEntry {
+            crypt_byte_block: 0x0a,
+            skip_byte_block: 0x0b,
+            is_protected: 1,
+            per_sample_iv_size: 8,
+            kid: seig_kid_a,
+            ..SeigEntry::default()
+        },
+        SeigEntry {
+            reserved: 2,
+            crypt_byte_block: 0x01,
+            skip_byte_block: 0x02,
+            kid: seig_kid_b,
+            ..SeigEntry::default()
+        },
+    ];
+
+    let mut sgpd_seig_len_v1 = Sgpd::default();
+    sgpd_seig_len_v1.set_version(1);
+    sgpd_seig_len_v1.grouping_type = FourCc::from_bytes(*b"seig");
+    sgpd_seig_len_v1.default_length = 0;
+    sgpd_seig_len_v1.entry_count = 2;
+    sgpd_seig_len_v1.seig_entries_l = vec![
+        SeigEntryL {
+            description_length: 25,
+            seig_entry: SeigEntry {
+                reserved: 3,
+                crypt_byte_block: 0x04,
+                skip_byte_block: 0x05,
+                is_protected: 1,
+                kid: seig_kid_a,
+                constant_iv_size: 4,
+                constant_iv: vec![0x01, 0x23, 0x45, 0x67],
+                ..SeigEntry::default()
+            },
+        },
+        SeigEntryL {
+            description_length: 20,
+            seig_entry: SeigEntry {
+                reserved: 1,
+                crypt_byte_block: 0x06,
+                skip_byte_block: 0x07,
+                is_protected: 1,
+                per_sample_iv_size: 8,
+                kid: seig_kid_b,
+                ..SeigEntry::default()
+            },
+        },
+    ];
+
+    let mut sgpd_seig_v2 = Sgpd::default();
+    sgpd_seig_v2.set_version(2);
+    sgpd_seig_v2.grouping_type = FourCc::from_bytes(*b"seig");
+    sgpd_seig_v2.default_sample_description_index = 5;
+    sgpd_seig_v2.entry_count = 2;
+    sgpd_seig_v2.seig_entries = vec![
+        SeigEntry {
+            reserved: 3,
+            crypt_byte_block: 0x04,
+            skip_byte_block: 0x05,
+            is_protected: 1,
+            kid: seig_kid_a,
+            constant_iv_size: 4,
+            constant_iv: vec![0x01, 0x23, 0x45, 0x67],
+            ..SeigEntry::default()
+        },
+        SeigEntry {
+            reserved: 2,
+            crypt_byte_block: 0x01,
+            skip_byte_block: 0x02,
+            kid: seig_kid_b,
+            ..SeigEntry::default()
+        },
+    ];
+
+    let mut sgpd_unknown_v1 = Sgpd::default();
+    sgpd_unknown_v1.set_version(1);
+    sgpd_unknown_v1.grouping_type = FourCc::from_bytes(*b"unkn");
+    sgpd_unknown_v1.default_length = 3;
+    sgpd_unknown_v1.entry_count = 2;
+    sgpd_unknown_v1.unsupported = vec![0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
 
     let mut sidx_v0 = Sidx::default();
     sidx_v0.set_version(0);
@@ -1237,6 +1427,46 @@ fn additional_iso14496_12_catalog_roundtrips() {
             0x00, 0x02, 0x11, 0x11, 0x22, 0x22,
         ],
         "Version=2 Flags=0x000000 GroupingType=\"roll\" DefaultSampleDescriptionIndex=5 EntryCount=2 RollDistances=[4369, 8738]",
+    );
+    assert_box_roundtrip(
+        sgpd_seig_v1,
+        &[
+            0x01, 0x00, 0x00, 0x00, b's', b'e', b'i', b'g', 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0xab, 0x01, 0x08, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x02, 0x12, 0x00, 0x00, 0x10, 0x32,
+            0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+        ],
+        "Version=1 Flags=0x000000 GroupingType=\"seig\" DefaultLength=20 EntryCount=2 SeigEntries=[{Reserved=0 CryptByteBlock=10 SkipByteBlock=11 IsProtected=1 PerSampleIVSize=8 KID=01234567-89ab-cdef-0123-456789abcdef}, {Reserved=2 CryptByteBlock=1 SkipByteBlock=2 IsProtected=0 PerSampleIVSize=0 KID=10325476-98ba-dcfe-1032-547698badcfe}]",
+    );
+    assert_box_roundtrip(
+        sgpd_seig_len_v1,
+        &[
+            0x01, 0x00, 0x00, 0x00, b's', b'e', b'i', b'g', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x19, 0x03, 0x45, 0x01, 0x00, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x04, 0x01,
+            0x23, 0x45, 0x67, 0x00, 0x00, 0x00, 0x14, 0x01, 0x67, 0x01, 0x08, 0x10, 0x32, 0x54,
+            0x76, 0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+        ],
+        "Version=1 Flags=0x000000 GroupingType=\"seig\" DefaultLength=0 EntryCount=2 SeigEntriesL=[{DescriptionLength=25 Reserved=3 CryptByteBlock=4 SkipByteBlock=5 IsProtected=1 PerSampleIVSize=0 KID=01234567-89ab-cdef-0123-456789abcdef ConstantIVSize=4 ConstantIV=[0x1, 0x23, 0x45, 0x67]}, {DescriptionLength=20 Reserved=1 CryptByteBlock=6 SkipByteBlock=7 IsProtected=1 PerSampleIVSize=8 KID=10325476-98ba-dcfe-1032-547698badcfe}]",
+    );
+    assert_box_roundtrip(
+        sgpd_seig_v2,
+        &[
+            0x02, 0x00, 0x00, 0x00, b's', b'e', b'i', b'g', 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+            0x00, 0x02, 0x03, 0x45, 0x01, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x04, 0x01, 0x23, 0x45, 0x67, 0x02,
+            0x12, 0x00, 0x00, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54,
+            0x76, 0x98, 0xba, 0xdc, 0xfe,
+        ],
+        "Version=2 Flags=0x000000 GroupingType=\"seig\" DefaultSampleDescriptionIndex=5 EntryCount=2 SeigEntries=[{Reserved=3 CryptByteBlock=4 SkipByteBlock=5 IsProtected=1 PerSampleIVSize=0 KID=01234567-89ab-cdef-0123-456789abcdef ConstantIVSize=4 ConstantIV=[0x1, 0x23, 0x45, 0x67]}, {Reserved=2 CryptByteBlock=1 SkipByteBlock=2 IsProtected=0 PerSampleIVSize=0 KID=10325476-98ba-dcfe-1032-547698badcfe}]",
+    );
+    assert_box_roundtrip(
+        sgpd_unknown_v1,
+        &[
+            0x01, 0x00, 0x00, 0x00, b'u', b'n', b'k', b'n', 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x02, 0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33,
+        ],
+        "Version=1 Flags=0x000000 GroupingType=\"unkn\" DefaultLength=3 EntryCount=2 Unsupported=[0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33]",
     );
     assert_box_roundtrip(
         sidx_v0,
@@ -1538,6 +1768,39 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         mime_format: String::from("bar/baz"),
     };
 
+    let evte = EventMessageSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"evte"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let mut silb = Silb::default();
+    silb.set_version(0);
+    silb.scheme_count = 2;
+    silb.schemes = vec![
+        SilbEntry {
+            scheme_id_uri: String::from("urn:test"),
+            value: String::from("one"),
+            at_least_one_flag: false,
+        },
+        SilbEntry {
+            scheme_id_uri: String::from("urn:alt"),
+            value: String::from("two"),
+            at_least_one_flag: true,
+        },
+    ];
+    silb.other_schemes_flag = true;
+
+    let mut emib = Emib::default();
+    emib.set_version(0);
+    emib.presentation_time_delta = -1_000;
+    emib.event_duration = 2_000;
+    emib.id = 0x1234;
+    emib.scheme_id_uri = String::from("urn:test");
+    emib.value = String::from("2");
+    emib.message_data = b"abc".to_vec();
+
     assert_box_roundtrip(
         Btrt {
             buffer_size_db: 0x12345678,
@@ -1548,6 +1811,35 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
             0x12, 0x34, 0x56, 0x78, 0x34, 0x56, 0x78, 0x9a, 0x56, 0x78, 0x9a, 0xbc,
         ],
         "BufferSizeDB=305419896 MaxBitrate=878082202 AvgBitrate=1450744508",
+    );
+    assert_box_roundtrip(
+        Clap {
+            clean_aperture_width_n: 0x01234567,
+            clean_aperture_width_d: 0x89abcdef,
+            clean_aperture_height_n: 0x10203040,
+            clean_aperture_height_d: 0x50607080,
+            horiz_off_n: 0x11223344,
+            horiz_off_d: 0x55667788,
+            vert_off_n: 0x99aabbcc,
+            vert_off_d: 0xddeeff00,
+        },
+        &[
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60,
+            0x70, 0x80, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+            0xdd, 0xee, 0xff, 0x00,
+        ],
+        "CleanApertureWidthN=19088743 CleanApertureWidthD=2309737967 CleanApertureHeightN=270544960 CleanApertureHeightD=1348497536 HorizOffN=287454020 HorizOffD=1432778632 VertOffN=2578103244 VertOffD=3723427584",
+    );
+    assert_box_roundtrip(
+        {
+            let mut coll = CoLL::default();
+            coll.set_version(0);
+            coll.max_cll = 0x1234;
+            coll.max_fall = 0x5678;
+            coll
+        },
+        &[0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78],
+        "Version=0 Flags=0x000000 MaxCLL=4660 MaxFALL=22136",
     );
     assert_box_roundtrip(
         Colr {
@@ -1622,6 +1914,28 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         },
         &[0x01, 0x23, 0x45, 0x67, 0x23, 0x45, 0x67, 0x89],
         "HSpacing=19088743 VSpacing=591751049",
+    );
+    assert_box_roundtrip(
+        {
+            let mut smdm = SmDm::default();
+            smdm.set_version(0);
+            smdm.primary_r_chromaticity_x = 0x0123;
+            smdm.primary_r_chromaticity_y = 0x2345;
+            smdm.primary_g_chromaticity_x = 0x4567;
+            smdm.primary_g_chromaticity_y = 0x6789;
+            smdm.primary_b_chromaticity_x = 0x89ab;
+            smdm.primary_b_chromaticity_y = 0xabcd;
+            smdm.white_point_chromaticity_x = 0xcdef;
+            smdm.white_point_chromaticity_y = 0x1357;
+            smdm.luminance_max = 0x89abcdef;
+            smdm.luminance_min = 0x10203040;
+            smdm
+        },
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x23, 0x23, 0x45, 0x45, 0x67, 0x67, 0x89, 0x89, 0xab,
+            0xab, 0xcd, 0xcd, 0xef, 0x13, 0x57, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x20, 0x30, 0x40,
+        ],
+        "Version=0 Flags=0x000000 PrimaryRChromaticityX=291 PrimaryRChromaticityY=9029 PrimaryGChromaticityX=17767 PrimaryGChromaticityY=26505 PrimaryBChromaticityX=35243 PrimaryBChromaticityY=43981 WhitePointChromaticityX=52719 WhitePointChromaticityY=4951 LuminanceMax=2309737967 LuminanceMin=270544960",
     );
     assert_box_roundtrip(
         schm,
@@ -1710,6 +2024,30 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         ],
         "DataReferenceIndex=4660 ContentEncoding=\"foo\" MIMEFormat=\"bar/baz\"",
     );
+    assert_box_roundtrip(
+        evte,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_box_roundtrip(
+        silb,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, b'u', b'r', b'n', b':', b't', b'e',
+            b's', b't', 0x00, b'o', b'n', b'e', 0x00, 0x00, b'u', b'r', b'n', b':', b'a', b'l',
+            b't', 0x00, b't', b'w', b'o', 0x00, 0x01, 0x01,
+        ],
+        "Version=0 Flags=0x000000 SchemeCount=2 Schemes=[{SchemeIdUri=\"urn:test\" Value=\"one\" AtLeastOneFlag=false}, {SchemeIdUri=\"urn:alt\" Value=\"two\" AtLeastOneFlag=true}] OtherSchemesFlag=true",
+    );
+    assert_box_roundtrip(
+        emib,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xfc, 0x18, 0x00, 0x00, 0x07, 0xd0, 0x00, 0x00, 0x12, 0x34, b'u', b'r', b'n', b':',
+            b't', b'e', b's', b't', 0x00, b'2', 0x00, b'a', b'b', b'c',
+        ],
+        "Version=0 Flags=0x000000 PresentationTimeDelta=-1000 EventDuration=2000 Id=4660 SchemeIdUri=\"urn:test\" Value=\"2\" MessageData=\"abc\"",
+    );
+    assert_box_roundtrip(Emeb, &[], "");
     assert_any_box_roundtrip(
         visual,
         &[
@@ -1754,7 +2092,165 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
 }
 
 #[test]
-fn irregular_decode_helpers_match_reference_behavior() {
+fn compact_metadata_iso14496_12_catalog_roundtrips() {
+    let mut elng = Elng::default();
+    elng.extended_language = "en-US".into();
+
+    let mut subs = Subs::default();
+    subs.entry_count = 1;
+    subs.entries = vec![SubsEntry {
+        sample_delta: 100,
+        subsample_count: 1,
+        subsamples: vec![SubsSample {
+            subsample_size: 0x1234,
+            subsample_priority: 2,
+            discardable: 1,
+            codec_specific_parameters: 0x12345678,
+        }],
+    }];
+
+    let mut ssix = Ssix::default();
+    ssix.subsegment_count = 2;
+    ssix.subsegments = vec![
+        SsixSubsegment {
+            range_count: 1,
+            ranges: vec![SsixRange {
+                level: 2,
+                range_size: 0x012345,
+            }],
+        },
+        SsixSubsegment {
+            range_count: 2,
+            ranges: vec![
+                SsixRange {
+                    level: 4,
+                    range_size: 0x10,
+                },
+                SsixRange {
+                    level: 6,
+                    range_size: 0x00ab_cdef,
+                },
+            ],
+        },
+    ];
+
+    let mut leva = Leva::default();
+    leva.level_count = 4;
+    leva.levels = vec![
+        LevaLevel {
+            track_id: 1,
+            padding_flag: true,
+            assignment_type: 0,
+            grouping_type: u32::from_be_bytes(*b"roll"),
+            ..LevaLevel::default()
+        },
+        LevaLevel {
+            track_id: 2,
+            assignment_type: 1,
+            grouping_type: u32::from_be_bytes(*b"tele"),
+            grouping_type_parameter: 9,
+            ..LevaLevel::default()
+        },
+        LevaLevel {
+            track_id: 3,
+            assignment_type: 4,
+            sub_track_id: 17,
+            ..LevaLevel::default()
+        },
+        LevaLevel {
+            track_id: 4,
+            padding_flag: true,
+            assignment_type: 3,
+            ..LevaLevel::default()
+        },
+    ];
+
+    assert_box_roundtrip(
+        elng,
+        &[0x00, 0x00, 0x00, 0x00, b'e', b'n', b'-', b'U', b'S', 0x00],
+        "Version=0 Flags=0x000000 ExtendedLanguage=\"en-US\"",
+    );
+    assert_box_roundtrip(
+        subs,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x00, 0x01,
+            0x12, 0x34, 0x02, 0x01, 0x12, 0x34, 0x56, 0x78,
+        ],
+        "Version=0 Flags=0x000000 EntryCount=1 Entries=[{SampleDelta=100 SubsampleCount=1 Subsamples=[{SubsampleSize=4660 SubsamplePriority=2 Discardable=1 CodecSpecificParameters=305419896}]}]",
+    );
+    assert_box_roundtrip(
+        ssix,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01,
+            0x23, 0x45, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x00, 0x10, 0x06, 0xab, 0xcd, 0xef,
+        ],
+        "Version=0 Flags=0x000000 SubsegmentCount=2 Subsegments=[{RangeCount=1 Ranges=[{Level=2 RangeSize=74565}]}, {RangeCount=2 Ranges=[{Level=4 RangeSize=16}, {Level=6 RangeSize=11259375}]}]",
+    );
+    assert_box_roundtrip(
+        leva,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x80, b'r', b'o', b'l', b'l',
+            0x00, 0x00, 0x00, 0x02, 0x01, b't', b'e', b'l', b'e', 0x00, 0x00, 0x00, 0x09, 0x00,
+            0x00, 0x00, 0x03, 0x04, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x04, 0x83,
+        ],
+        "Version=0 Flags=0x000000 LevelCount=4 Levels=[{TrackID=1 PaddingFlag=true AssignmentType=0 GroupingType=0x726f6c6c}, {TrackID=2 PaddingFlag=false AssignmentType=1 GroupingType=0x74656c65 GroupingTypeParameter=9}, {TrackID=3 PaddingFlag=false AssignmentType=4 SubTrackID=17}, {TrackID=4 PaddingFlag=true AssignmentType=3}]",
+    );
+}
+
+#[test]
+fn compact_track_payload_metadata_iso14496_12_catalog_roundtrips() {
+    let mut kind = Kind::default();
+    kind.set_version(0);
+    kind.set_flags(0x000005);
+    kind.scheme_uri = "urn:test".into();
+    kind.value = "main".into();
+
+    let mut mime = Mime::default();
+    mime.set_version(0);
+    mime.set_flags(0x000006);
+    mime.content_type = "text/plain".into();
+
+    let mut mime_without_zero = Mime::default();
+    mime_without_zero.set_version(0);
+    mime_without_zero.set_flags(0x000001);
+    mime_without_zero.content_type = "application/ttml+xml".into();
+    mime_without_zero.lacks_zero_termination = true;
+
+    assert_box_roundtrip(
+        kind,
+        &[
+            0x00, 0x00, 0x00, 0x05, b'u', b'r', b'n', b':', b't', b'e', b's', b't', 0x00, b'm',
+            b'a', b'i', b'n', 0x00,
+        ],
+        "Version=0 Flags=0x000005 SchemeURI=\"urn:test\" Value=\"main\"",
+    );
+    assert_box_roundtrip(
+        mime,
+        &[
+            0x00, 0x00, 0x00, 0x06, b't', b'e', b'x', b't', b'/', b'p', b'l', b'a', b'i', b'n',
+            0x00,
+        ],
+        "Version=0 Flags=0x000006 ContentType=\"text/plain\"",
+    );
+    assert_box_roundtrip(
+        mime_without_zero,
+        &[
+            0x00, 0x00, 0x00, 0x01, b'a', b'p', b'p', b'l', b'i', b'c', b'a', b't', b'i', b'o',
+            b'n', b'/', b't', b't', b'm', b'l', b'+', b'x', b'm', b'l',
+        ],
+        "Version=0 Flags=0x000001 ContentType=\"application/ttml+xml\" LacksZeroTermination=true",
+    );
+    assert_box_roundtrip(
+        Cdat {
+            data: vec![0xde, 0xad, 0xbe, 0xef],
+        },
+        &[0xde, 0xad, 0xbe, 0xef],
+        "Data=[0xde, 0xad, 0xbe, 0xef]",
+    );
+}
+
+#[test]
+fn irregular_decode_helpers_match_expected_behavior() {
     let handler_cases = [
         ([0x00, 0x00, 0x00, 0x00], b"abema".as_slice(), "abema"),
         ([0x00, 0x00, 0x00, 0x00], b"".as_slice(), ""),
@@ -1804,6 +2300,25 @@ fn irregular_decode_helpers_match_reference_behavior() {
 }
 
 #[test]
+fn elng_preserves_payloads_without_full_box_header_bytes() {
+    let payload = [b'd', b'k', 0x00];
+    let mut decoded = Elng::default();
+    let mut reader = Cursor::new(payload.to_vec());
+    let read = unmarshal(&mut reader, payload.len() as u64, &mut decoded, None).unwrap();
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded.extended_language, "dk");
+    assert_eq!(
+        stringify(&decoded, None).unwrap(),
+        "Version=0 Flags=0x000000 ExtendedLanguage=\"dk\""
+    );
+
+    let mut encoded = Vec::new();
+    let written = marshal(&mut encoded, &decoded, None).unwrap();
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(encoded, payload);
+}
+
+#[test]
 fn counted_payload_validation_rejects_truncated_sbgp_entries() {
     let payload = [
         0x00, 0x00, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x00, 0x00, 0x00, 0x02, 0x23, 0x45, 0x67,
@@ -1815,6 +2330,592 @@ fn counted_payload_validation_rejects_truncated_sbgp_entries() {
     assert_eq!(
         error.to_string(),
         "invalid field value for Entries: entry payload length does not match the entry count"
+    );
+}
+
+#[test]
+fn compact_metadata_validation_rejects_malformed_payloads() {
+    let subs_payload = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x00, 0x01, 0x12,
+        0x34, 0x02,
+    ];
+    let mut subs = Subs::default();
+    let mut subs_reader = Cursor::new(subs_payload);
+    let subs_error =
+        unmarshal(&mut subs_reader, subs_payload.len() as u64, &mut subs, None).unwrap_err();
+    assert_eq!(
+        subs_error.to_string(),
+        "invalid field value for Entries: subsample payload is truncated"
+    );
+
+    let mut ssix = Ssix::default();
+    ssix.subsegment_count = 1;
+    ssix.subsegments = vec![SsixSubsegment {
+        range_count: 1,
+        ranges: vec![SsixRange {
+            level: 1,
+            range_size: 0x01ff_ffff,
+        }],
+    }];
+    let ssix_error = marshal(&mut Vec::new(), &ssix, None).unwrap_err();
+    assert_eq!(
+        ssix_error.to_string(),
+        "invalid field value for Subsegments: range size does not fit in 24 bits"
+    );
+
+    let leva_payload = [0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05];
+    let mut leva = Leva::default();
+    let mut leva_reader = Cursor::new(leva_payload);
+    let leva_error =
+        unmarshal(&mut leva_reader, leva_payload.len() as u64, &mut leva, None).unwrap_err();
+    assert_eq!(
+        leva_error.to_string(),
+        "invalid field value for Levels: assignment type uses a reserved layout"
+    );
+
+    let kind_payload = [
+        0x00, 0x00, 0x00, 0x00, b'u', b'r', b'n', b':', b't', b'e', b's', b't', 0x00, b'm', b'a',
+        b'i', b'n',
+    ];
+    let mut kind = Kind::default();
+    let mut kind_reader = Cursor::new(kind_payload);
+    let kind_error =
+        unmarshal(&mut kind_reader, kind_payload.len() as u64, &mut kind, None).unwrap_err();
+    assert_eq!(
+        kind_error.to_string(),
+        "invalid field value for Value: string is not NUL-terminated"
+    );
+
+    let mime_payload = [0x00, 0x00, 0x00, 0x00];
+    let mut mime = Mime::default();
+    let mut mime_reader = Cursor::new(mime_payload);
+    let mime_error =
+        unmarshal(&mut mime_reader, mime_payload.len() as u64, &mut mime, None).unwrap_err();
+    assert_eq!(
+        mime_error.to_string(),
+        "invalid field value for Payload: payload is too short"
+    );
+
+    let mut non_terminated_empty_mime = Mime::default();
+    non_terminated_empty_mime.set_version(0);
+    non_terminated_empty_mime.lacks_zero_termination = true;
+    let mime_encode_error = marshal(&mut Vec::new(), &non_terminated_empty_mime, None).unwrap_err();
+    assert_eq!(
+        mime_encode_error.to_string(),
+        "invalid field value for ContentType: non-terminated payload must not be empty"
+    );
+}
+
+#[test]
+fn loudness_and_uuid_boxes_roundtrip() {
+    assert_box_roundtrip(Ludt, &[], "");
+
+    let mut tlou = TrackLoudnessInfo::default();
+    tlou.set_version(1);
+    tlou.entries = vec![LoudnessEntry {
+        eq_set_id: 7,
+        downmix_id: 12,
+        drc_set_id: 18,
+        bs_sample_peak_level: 528,
+        bs_true_peak_level: 801,
+        measurement_system_for_tp: 4,
+        reliability_for_tp: 6,
+        measurements: vec![
+            LoudnessMeasurement {
+                method_definition: 7,
+                method_value: 8,
+                measurement_system: 9,
+                reliability: 10,
+            },
+            LoudnessMeasurement {
+                method_definition: 11,
+                method_value: 12,
+                measurement_system: 13,
+                reliability: 14,
+            },
+        ],
+    }];
+    assert_box_roundtrip(
+        tlou,
+        &[
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x03, 0x12, 0x21, 0x03, 0x21, 0x46, 0x02, 0x07,
+            0x08, 0x9a, 0x0b, 0x0c, 0xde,
+        ],
+        "Version=1 Flags=0x000000 Entries=[{EQSetID=7 DownmixID=12 DRCSetID=18 BsSamplePeakLevel=528 BsTruePeakLevel=801 MeasurementSystemForTP=4 ReliabilityForTP=6 Measurements=[{MethodDefinition=7 MethodValue=8 MeasurementSystem=9 Reliability=10}, {MethodDefinition=11 MethodValue=12 MeasurementSystem=13 Reliability=14}]}]",
+    );
+
+    let mut alou = AlbumLoudnessInfo::default();
+    alou.set_version(0);
+    alou.entries = vec![LoudnessEntry {
+        downmix_id: 9,
+        drc_set_id: 17,
+        bs_sample_peak_level: 274,
+        bs_true_peak_level: 291,
+        measurement_system_for_tp: 2,
+        reliability_for_tp: 3,
+        measurements: vec![LoudnessMeasurement {
+            method_definition: 1,
+            method_value: 2,
+            measurement_system: 4,
+            reliability: 5,
+        }],
+        ..LoudnessEntry::default()
+    }];
+    assert_box_roundtrip(
+        alou,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x51, 0x11, 0x21, 0x23, 0x23, 0x01, 0x01, 0x02, 0x45,
+        ],
+        "Version=0 Flags=0x000000 Entries=[{DownmixID=9 DRCSetID=17 BsSamplePeakLevel=274 BsTruePeakLevel=291 MeasurementSystemForTP=2 ReliabilityForTP=3 Measurements=[{MethodDefinition=1 MethodValue=2 MeasurementSystem=4 Reliability=5}]}]",
+    );
+
+    assert_box_roundtrip(
+        Uuid {
+            user_type: UUID_SPHERICAL_VIDEO_V1,
+            payload: UuidPayload::SphericalVideoV1(SphericalVideoV1Metadata {
+                xml_data: b"<rdf>S</rdf>".to_vec(),
+            }),
+        },
+        &[
+            0xff, 0xcc, 0x82, 0x63, 0xf8, 0x55, 0x4a, 0x93, 0x88, 0x14, 0x58, 0x7a, 0x02, 0x52,
+            0x1f, 0xdd, 0x3c, 0x72, 0x64, 0x66, 0x3e, 0x53, 0x3c, 0x2f, 0x72, 0x64, 0x66, 0x3e,
+        ],
+        "UserType=ffcc8263-f855-4a93-8814-587a02521fdd XMLData=\"<rdf>S</rdf>\"",
+    );
+
+    assert_box_roundtrip(
+        Uuid {
+            user_type: UUID_FRAGMENT_ABSOLUTE_TIMING,
+            payload: UuidPayload::FragmentAbsoluteTiming(UuidFragmentAbsoluteTiming {
+                version: 0,
+                flags: 0,
+                fragment_absolute_time: 0x1234_5678,
+                fragment_absolute_duration: 0x9abc_def0,
+            }),
+        },
+        &[
+            0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7,
+            0x57, 0xb2, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        ],
+        "UserType=6d1d9b05-42d5-44e6-80e2-141daff757b2 Version=0 Flags=0x000000 FragmentAbsoluteTime=305419896 FragmentAbsoluteDuration=2596069104",
+    );
+
+    assert_box_roundtrip(
+        Uuid {
+            user_type: UUID_FRAGMENT_ABSOLUTE_TIMING,
+            payload: UuidPayload::FragmentAbsoluteTiming(UuidFragmentAbsoluteTiming {
+                version: 1,
+                flags: 0,
+                fragment_absolute_time: 0x0001_05c6_49bd_a400,
+                fragment_absolute_duration: 0x0000_0000_0005_4600,
+            }),
+        },
+        &[
+            0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7,
+            0x57, 0xb2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x05, 0xc6, 0x49, 0xbd, 0xa4, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x46, 0x00,
+        ],
+        "UserType=6d1d9b05-42d5-44e6-80e2-141daff757b2 Version=1 Flags=0x000000 FragmentAbsoluteTime=287824175539200 FragmentAbsoluteDuration=345600",
+    );
+
+    assert_box_roundtrip(
+        Uuid {
+            user_type: UUID_FRAGMENT_RUN_TABLE,
+            payload: UuidPayload::FragmentRunTable(UuidFragmentRunTable {
+                version: 0,
+                flags: 0,
+                fragment_count: 2,
+                entries: vec![
+                    UuidFragmentRunEntry {
+                        fragment_absolute_time: 16,
+                        fragment_absolute_duration: 32,
+                    },
+                    UuidFragmentRunEntry {
+                        fragment_absolute_time: 48,
+                        fragment_absolute_duration: 64,
+                    },
+                ],
+            }),
+        },
+        &[
+            0xd4, 0x80, 0x7e, 0xf2, 0xca, 0x39, 0x46, 0x95, 0x8e, 0x54, 0x26, 0xcb, 0x9e, 0x46,
+            0xa7, 0x9f, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+            0x20, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x40,
+        ],
+        "UserType=d4807ef2-ca39-4695-8e54-26cb9e46a79f Version=0 Flags=0x000000 FragmentCount=2 Entries=[{FragmentAbsoluteTime=16 FragmentAbsoluteDuration=32}, {FragmentAbsoluteTime=48 FragmentAbsoluteDuration=64}]",
+    );
+
+    assert_box_roundtrip(
+        Uuid {
+            user_type: UUID_FRAGMENT_RUN_TABLE,
+            payload: UuidPayload::FragmentRunTable(UuidFragmentRunTable {
+                version: 1,
+                flags: 0,
+                fragment_count: 1,
+                entries: vec![UuidFragmentRunEntry {
+                    fragment_absolute_time: 0x0001_05c6_49c2_ea00,
+                    fragment_absolute_duration: 0x0000_0000_0005_4600,
+                }],
+            }),
+        },
+        &[
+            0xd4, 0x80, 0x7e, 0xf2, 0xca, 0x39, 0x46, 0x95, 0x8e, 0x54, 0x26, 0xcb, 0x9e, 0x46,
+            0xa7, 0x9f, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x05, 0xc6, 0x49, 0xc2, 0xea,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x46, 0x00,
+        ],
+        "UserType=d4807ef2-ca39-4695-8e54-26cb9e46a79f Version=1 Flags=0x000000 FragmentCount=1 Entries=[{FragmentAbsoluteTime=287824175884800 FragmentAbsoluteDuration=345600}]",
+    );
+
+    let mut legacy_sample_encryption = Senc::default();
+    legacy_sample_encryption.set_version(0);
+    legacy_sample_encryption.set_flags(SENC_USE_SUBSAMPLE_ENCRYPTION);
+    legacy_sample_encryption.sample_count = 1;
+    legacy_sample_encryption.samples = vec![SencSample {
+        initialization_vector: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        subsamples: vec![SencSubsample {
+            bytes_of_clear_data: 5,
+            bytes_of_protected_data: 16,
+        }],
+    }];
+    assert_box_roundtrip(
+        Uuid {
+            user_type: UUID_SAMPLE_ENCRYPTION,
+            payload: UuidPayload::SampleEncryption(legacy_sample_encryption),
+        },
+        &[
+            0xa2, 0x39, 0x4f, 0x52, 0x5a, 0x9b, 0x4f, 0x14, 0xa2, 0x44, 0x6c, 0x42, 0x7c, 0x64,
+            0x8d, 0xf4, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x10,
+        ],
+        "UserType=a2394f52-5a9b-4f14-a244-6c427c648df4 Version=0 Flags=0x000002 SampleCount=1 Samples=[{InitializationVector=[0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8] Subsamples=[{BytesOfClearData=5 BytesOfProtectedData=16}]}]",
+    );
+
+    assert_box_roundtrip(
+        Uuid {
+            user_type: [
+                0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef,
+            ],
+            payload: UuidPayload::Raw(vec![0xde, 0xad, 0xbe]),
+        },
+        &[
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0xde, 0xad, 0xbe,
+        ],
+        "UserType=10325476-98ba-dcfe-0123-456789abcdef RawPayload=[0xde, 0xad, 0xbe]",
+    );
+}
+
+#[test]
+fn loudness_and_uuid_validation_rejects_malformed_payloads() {
+    let tlou_payload = [0x01, 0x00, 0x00, 0x00, 0x40];
+    let mut tlou = TrackLoudnessInfo::default();
+    let mut tlou_reader = Cursor::new(tlou_payload);
+    let tlou_error =
+        unmarshal(&mut tlou_reader, tlou_payload.len() as u64, &mut tlou, None).unwrap_err();
+    assert_eq!(
+        tlou_error.to_string(),
+        "invalid field value for Entries: loudness info type is not supported"
+    );
+
+    let uuid_payload = [0x01, 0x02, 0x03];
+    let mut uuid = Uuid::default();
+    let mut uuid_reader = Cursor::new(uuid_payload);
+    let uuid_error =
+        unmarshal(&mut uuid_reader, uuid_payload.len() as u64, &mut uuid, None).unwrap_err();
+    assert_eq!(
+        uuid_error.to_string(),
+        "invalid field value for Payload: payload is too short"
+    );
+
+    let fragment_timing_payload = [
+        0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7, 0x57,
+        0xb2, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut fragment_timing = Uuid::default();
+    let mut fragment_timing_reader = Cursor::new(fragment_timing_payload);
+    let fragment_timing_error = unmarshal(
+        &mut fragment_timing_reader,
+        fragment_timing_payload.len() as u64,
+        &mut fragment_timing,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        fragment_timing_error.to_string(),
+        "invalid field value for Payload: fragment timing payload length does not match version 1"
+    );
+
+    let fragment_run_payload = [
+        0xd4, 0x80, 0x7e, 0xf2, 0xca, 0x39, 0x46, 0x95, 0x8e, 0x54, 0x26, 0xcb, 0x9e, 0x46, 0xa7,
+        0x9f, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00,
+    ];
+    let mut fragment_run = Uuid::default();
+    let mut fragment_run_reader = Cursor::new(fragment_run_payload);
+    let fragment_run_error = unmarshal(
+        &mut fragment_run_reader,
+        fragment_run_payload.len() as u64,
+        &mut fragment_run,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        fragment_run_error.to_string(),
+        "invalid field value for Payload: fragment run table payload length does not match the fragment count"
+    );
+
+    let sample_encryption_payload = [
+        0xa2, 0x39, 0x4f, 0x52, 0x5a, 0x9b, 0x4f, 0x14, 0xa2, 0x44, 0x6c, 0x42, 0x7c, 0x64, 0x8d,
+        0xf4, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut sample_encryption = Uuid::default();
+    let mut sample_encryption_reader = Cursor::new(sample_encryption_payload);
+    let sample_encryption_error = unmarshal(
+        &mut sample_encryption_reader,
+        sample_encryption_payload.len() as u64,
+        &mut sample_encryption,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        sample_encryption_error.to_string(),
+        "invalid field value for Payload: sample encryption payload version is not supported"
+    );
+}
+
+#[test]
+fn event_message_validation_rejects_malformed_payloads() {
+    let silb_payload = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'u', b'r', b'n', b':', b't', b'e', b's',
+        b't', 0x00, b'o', b'n', b'e', 0x00, 0x00,
+    ];
+    let mut silb = Silb::default();
+    let mut silb_reader = Cursor::new(silb_payload);
+    let silb_error =
+        unmarshal(&mut silb_reader, silb_payload.len() as u64, &mut silb, None).unwrap_err();
+    assert_eq!(
+        silb_error.to_string(),
+        "invalid field value for Schemes: scheme flag payload is truncated"
+    );
+
+    let emib_payload = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc,
+        0x18, 0x00, 0x00, 0x07, 0xd0, 0x00, 0x00, 0x12, 0x34, b'u', b'r', b'n', b':', b't', b'e',
+        b's', b't', 0x00, b'2', 0x00, b'a', b'b', b'c',
+    ];
+    let mut emib = Emib::default();
+    let mut emib_reader = Cursor::new(emib_payload);
+    let emib_error =
+        unmarshal(&mut emib_reader, emib_payload.len() as u64, &mut emib, None).unwrap_err();
+    assert_eq!(
+        emib_error.to_string(),
+        "invalid field value for Reserved: reserved field must be zero"
+    );
+
+    let emeb_payload = [0x00];
+    let mut emeb = Emeb;
+    let mut emeb_reader = Cursor::new(emeb_payload);
+    let emeb_error =
+        unmarshal(&mut emeb_reader, emeb_payload.len() as u64, &mut emeb, None).unwrap_err();
+    assert_eq!(
+        emeb_error.to_string(),
+        "invalid field value for Payload: payload must be empty"
+    );
+}
+
+#[test]
+fn sgpd_seig_rejects_default_length_mismatch_during_marshal() {
+    let mut sgpd = Sgpd::default();
+    sgpd.set_version(1);
+    sgpd.grouping_type = FourCc::from_bytes(*b"seig");
+    sgpd.default_length = 20;
+    sgpd.entry_count = 1;
+    sgpd.seig_entries = vec![SeigEntry {
+        crypt_byte_block: 1,
+        skip_byte_block: 2,
+        is_protected: 1,
+        kid: [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ],
+        constant_iv_size: 4,
+        constant_iv: vec![0x01, 0x23, 0x45, 0x67],
+        ..SeigEntry::default()
+    }];
+
+    let error = marshal(&mut Vec::new(), &sgpd, None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid field value for SeigEntries: seig entry does not match the default length"
+    );
+}
+
+#[test]
+fn prft_validation_rejects_unsupported_versions_and_truncated_payloads() {
+    let mut prft = Prft::default();
+
+    let unsupported_payload = [
+        0x02, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
+        0x05, 0x23, 0x45, 0x67, 0x89,
+    ];
+    let error = unmarshal(
+        &mut Cursor::new(unsupported_payload),
+        unsupported_payload.len() as u64,
+        &mut prft,
+        None,
+    )
+    .unwrap_err();
+    match error {
+        CodecError::UnsupportedVersion { box_type, version } => {
+            assert_eq!(box_type, FourCc::from_bytes(*b"prft"));
+            assert_eq!(version, 2);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let truncated_payload = [
+        0x00, 0x00, 0x00, 0x01, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
+        0x05, 0x23, 0x45, 0x67,
+    ];
+    let error = unmarshal(
+        &mut Cursor::new(truncated_payload),
+        truncated_payload.len() as u64,
+        &mut prft,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(error, CodecError::Io(_)));
+}
+
+#[test]
+fn prft_helpers_surface_timestamp_parts_unix_time_and_known_flag_meanings() {
+    let seconds = PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS + 1_234;
+    let fraction = 0x8000_0000;
+
+    let mut prft = Prft::default();
+    prft.set_version(1);
+    prft.set_flags(PRFT_TIME_CAPTURED);
+    prft.reference_track_id = 3;
+    prft.ntp_timestamp = (seconds << 32) | u64::from(fraction);
+    prft.media_time_v1 = 42;
+
+    assert_eq!(prft.media_time(), 42);
+    assert_eq!(prft.ntp_seconds(), seconds as u32);
+    assert_eq!(prft.ntp_fraction(), fraction);
+    assert_eq!(prft.ntp_fraction_nanos(), 500_000_000);
+    assert_eq!(prft.unix_seconds(), Some(1_234));
+    assert_eq!(
+        prft.unix_time(),
+        Some(UNIX_EPOCH + Duration::new(1_234, 500_000_000))
+    );
+    assert_eq!(prft.flag_meaning(), Some("time_captured"));
+
+    assert_eq!(
+        Prft::known_flag_meaning(PRFT_TIME_ENCODER_INPUT),
+        Some("time_encoder_input")
+    );
+    assert_eq!(
+        Prft::known_flag_meaning(PRFT_TIME_ENCODER_OUTPUT),
+        Some("time_encoder_output")
+    );
+    assert_eq!(
+        Prft::known_flag_meaning(PRFT_TIME_MOOF_FINALIZED),
+        Some("time_moof_finalized")
+    );
+    assert_eq!(
+        Prft::known_flag_meaning(PRFT_TIME_MOOF_WRITTEN),
+        Some("time_moof_written")
+    );
+    assert_eq!(
+        Prft::known_flag_meaning(PRFT_TIME_ARBITRARY_CONSISTENT),
+        Some("time_arbitrary_consistent")
+    );
+    assert_eq!(
+        Prft::known_flag_meaning(PRFT_TIME_CAPTURED),
+        Some("time_captured")
+    );
+    assert_eq!(Prft::known_flag_meaning(0x000003), None);
+
+    let mut before_unix = Prft::default();
+    before_unix.ntp_timestamp = 0x0000_0001_0000_0000;
+    assert_eq!(before_unix.unix_seconds(), None);
+    assert_eq!(before_unix.unix_time(), None);
+}
+
+#[test]
+fn subtitle_media_header_boxes_reject_unsupported_versions_and_truncated_payloads() {
+    for (box_type, mut decoder) in [
+        (
+            FourCc::from_bytes(*b"sthd"),
+            EitherEmptyFullBox::Sthd(Sthd::default()),
+        ),
+        (
+            FourCc::from_bytes(*b"nmhd"),
+            EitherEmptyFullBox::Nmhd(Nmhd::default()),
+        ),
+    ] {
+        let unsupported_payload = [0x01, 0x00, 0x00, 0x00];
+        let error = decoder.unmarshal_payload(&unsupported_payload).unwrap_err();
+        match error {
+            CodecError::UnsupportedVersion {
+                box_type: actual_box_type,
+                version,
+            } => {
+                assert_eq!(actual_box_type, box_type);
+                assert_eq!(version, 1);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let truncated_payload = [0x00, 0x00, 0x00];
+        let error = decoder.unmarshal_payload(&truncated_payload).unwrap_err();
+        assert!(matches!(error, CodecError::Io(_)));
+    }
+}
+
+enum EitherEmptyFullBox {
+    Sthd(Sthd),
+    Nmhd(Nmhd),
+}
+
+impl EitherEmptyFullBox {
+    fn unmarshal_payload(&mut self, payload: &[u8]) -> Result<(), CodecError> {
+        match self {
+            Self::Sthd(box_value) => {
+                unmarshal(
+                    &mut Cursor::new(payload),
+                    payload.len() as u64,
+                    box_value,
+                    None,
+                )?;
+            }
+            Self::Nmhd(box_value) => {
+                unmarshal(
+                    &mut Cursor::new(payload),
+                    payload.len() as u64,
+                    box_value,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn tref_child_validation_rejects_misaligned_payloads() {
+    let payload = [0x01, 0x23, 0x45, 0x67, 0x89];
+    let mut cdsc = Cdsc::default();
+    let error = unmarshal(
+        &mut Cursor::new(payload),
+        payload.len() as u64,
+        &mut cdsc,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid field value for TrackIDs: value does not align with entry size"
     );
 }
 
@@ -1835,12 +2936,68 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
         Some(&[0][..])
     );
     assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"elng")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"alou")),
+        Some(&[0, 1][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"cdat")),
+        Some(&[][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"leva")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"ludt")),
+        Some(&[][..])
+    );
+    assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"saio")),
         Some(&[0, 1][..])
     );
     assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"prft")),
+        Some(&[0, 1][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"sthd")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"nmhd")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"CoLL")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"kind")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"mime")),
+        Some(&[0][..])
+    );
+    assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"sgpd")),
         Some(&[1, 2][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"SmDm")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"ssix")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"subs")),
+        Some(&[0, 1][..])
     );
     assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"tfra")),
@@ -1850,21 +3007,74 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
         registry.supported_versions(FourCc::from_bytes(*b"emsg")),
         Some(&[0, 1][..])
     );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"emib")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"silb")),
+        Some(&[0][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"tref")),
+        Some(&[][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"tlou")),
+        Some(&[0, 1][..])
+    );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"uuid")),
+        Some(&[][..])
+    );
     assert!(registry.is_registered(FourCc::from_bytes(*b"ftyp")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"alou")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"avcC")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"btrt")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"cdat")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"clap")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"colr")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"CoLL")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"elng")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"emeb")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"emib")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"evte")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"hdlr")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"hvcC")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"kind")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"leva")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ludt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"avc1")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"mime")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mp4a")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"pasp")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"prft")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"schm")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sbtt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sidx")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"silb")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"SmDm")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ssix")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sthd")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"stpp")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sync")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"subt")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"subs")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"nmhd")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"tref")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"tlou")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"trun")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"vdep")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"vplx")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"uuid")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"wave")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"cdsc")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dpnd")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"font")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"hind")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"hint")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ipir")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"mpod")));
 }
 
 #[test]

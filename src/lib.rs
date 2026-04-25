@@ -8,6 +8,8 @@ pub mod boxes;
 pub mod cli;
 /// Descriptor-driven binary codec primitives.
 pub mod codec;
+/// Resolved common-encryption metadata helpers built on typed box models.
+pub mod encryption;
 /// Path-based box extraction helpers, including typed convenience reads.
 pub mod extract;
 /// Four-character box identifier support.
@@ -18,6 +20,8 @@ pub mod header;
 pub mod probe;
 /// Path-based typed payload rewrite helpers built on the writer layer.
 pub mod rewrite;
+/// Fragmented top-level `sidx` analysis, planning, and rewrite helpers.
+pub mod sidx;
 /// Stable field-order string rendering for descriptor-backed boxes.
 pub mod stringify;
 /// Depth-first structure walking with path tracking and lazy payload access.

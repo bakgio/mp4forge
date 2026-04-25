@@ -187,7 +187,7 @@ pub enum DivideTrackRole {
 /// Validation summary for one active fragmented track accepted by `divide`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DivideValidationTrack {
-    /// Track identifier selected from `tkhd` and referenced by fragmented runs.
+    /// Track identifier selected from `tkhd` and used by fragmented runs.
     pub track_id: u32,
     /// Role assigned by the current divide layout rules.
     pub role: DivideTrackRole,

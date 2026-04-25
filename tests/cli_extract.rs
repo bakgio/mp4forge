@@ -108,7 +108,7 @@ fn extract_command_rejects_invalid_path_arguments() {
 }
 
 #[test]
-fn extract_command_matches_shared_fixture_reference_sizes() {
+fn extract_command_matches_shared_fixture_expected_sizes() {
     let cases = [
         ("sample.mp4", "ftyp", fourcc("ftyp"), 1_usize, 32_usize),
         ("sample.mp4", "mdhd", fourcc("mdhd"), 2, 64),
@@ -148,7 +148,7 @@ fn extract_command_matches_shared_fixture_reference_sizes() {
 }
 
 #[test]
-fn extract_command_matches_shared_fixture_reference_paths() {
+fn extract_command_matches_shared_fixture_expected_paths() {
     let args = vec![
         "--path".to_string(),
         "moov/*/mdia/mdhd".to_string(),

@@ -4,8 +4,9 @@ use std::io::{SeekFrom, Write};
 
 use crate::boxes::{AnyTypeBox, BoxLookupContext, BoxRegistry};
 use crate::codec::{
-    CodecBox, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead, FieldValueWrite,
-    ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted, untrusted_prealloc_hint,
+    CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
+    untrusted_prealloc_hint,
 };
 use crate::stringify::stringify;
 use crate::{BoxInfo, FourCc, codec_field};
@@ -181,6 +182,65 @@ fn bytes_to_fourcc(field_name: &'static str, bytes: Vec<u8>) -> Result<FourCc, F
 
 fn quote_fourcc(value: FourCc) -> String {
     format!("\"{value}\"")
+}
+
+fn validate_iso639_2_language(
+    field_name: &'static str,
+    language: &str,
+) -> Result<[u8; 3], FieldValueError> {
+    let bytes = language.as_bytes();
+    if bytes.len() != 3 {
+        return Err(invalid_value(
+            field_name,
+            "value must be exactly 3 lowercase ISO-639-2 letters",
+        ));
+    }
+
+    let mut validated = [0_u8; 3];
+    for (slot, byte) in validated.iter_mut().zip(bytes.iter().copied()) {
+        if !byte.is_ascii_lowercase() {
+            return Err(invalid_value(
+                field_name,
+                "value must be exactly 3 lowercase ISO-639-2 letters",
+            ));
+        }
+        *slot = byte;
+    }
+
+    Ok(validated)
+}
+
+fn encode_iso639_2_language(
+    field_name: &'static str,
+    language: &str,
+) -> Result<u16, FieldValueError> {
+    let [first, second, third] = validate_iso639_2_language(field_name, language)?;
+    Ok((u16::from(first - b'`') << 10) | (u16::from(second - b'`') << 5) | u16::from(third - b'`'))
+}
+
+fn decode_iso639_2_language(
+    field_name: &'static str,
+    packed_language: u16,
+) -> Result<String, CodecError> {
+    let values = [
+        ((packed_language >> 10) & 0x1f) as u8,
+        ((packed_language >> 5) & 0x1f) as u8,
+        (packed_language & 0x1f) as u8,
+    ];
+
+    let mut language = [0_u8; 3];
+    for (slot, value) in language.iter_mut().zip(values) {
+        if !(1..=26).contains(&value) {
+            return Err(invalid_value(
+                field_name,
+                "language code uses an out-of-range character value",
+            )
+            .into());
+        }
+        *slot = b'`' + value;
+    }
+
+    Ok(String::from_utf8(language.to_vec()).unwrap())
 }
 
 fn quote_bytes(bytes: &[u8]) -> String {
@@ -2404,9 +2464,146 @@ impl CodecBox for Keys {
     ]);
 }
 
+/// ID3v2 metadata box that stores a packed ISO-639-2 language code plus raw tag bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Id32 {
+    full_box: FullBoxState,
+    pub language: String,
+    pub id3v2_data: Vec<u8>,
+}
+
+impl FieldHooks for Id32 {}
+
+impl ImmutableBox for Id32 {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"ID32")
+    }
+
+    fn version(&self) -> u8 {
+        self.full_box.version
+    }
+
+    fn flags(&self) -> u32 {
+        self.full_box.flags
+    }
+}
+
+impl MutableBox for Id32 {
+    fn set_version(&mut self, version: u8) {
+        self.full_box.version = version;
+    }
+
+    fn set_flags(&mut self, flags: u32) {
+        self.full_box.flags = flags;
+    }
+}
+
+impl FieldValueRead for Id32 {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Language" => Ok(FieldValue::String(self.language.clone())),
+            "ID3v2Data" => Ok(FieldValue::Bytes(self.id3v2_data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Id32 {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Language", FieldValue::String(value)) => {
+                validate_iso639_2_language(field_name, &value)?;
+                self.language = value;
+                Ok(())
+            }
+            ("ID3v2Data", FieldValue::Bytes(value)) => {
+                self.id3v2_data = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Id32 {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!(
+            "Language",
+            2,
+            with_bit_width(8),
+            as_string(crate::codec::StringFieldMode::RawBox)
+        ),
+        codec_field!("ID3v2Data", 3, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_marshal(
+        &self,
+        writer: &mut dyn Write,
+    ) -> Result<Option<u64>, crate::codec::CodecError> {
+        if self.version() != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version: self.version(),
+            });
+        }
+        if self.flags() != 0 {
+            return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+        }
+
+        let packed_language = encode_iso639_2_language("Language", &self.language)?;
+        let mut payload = Vec::with_capacity(6 + self.id3v2_data.len());
+        payload.push(self.version());
+        payload.extend_from_slice(&self.flags().to_be_bytes()[1..]);
+        payload.extend_from_slice(&packed_language.to_be_bytes());
+        payload.extend_from_slice(&self.id3v2_data);
+        writer.write_all(&payload)?;
+        Ok(Some(payload.len() as u64))
+    }
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, crate::codec::CodecError> {
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        if payload_len < 6 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        let payload = read_exact_vec_untrusted(reader, payload_len)?;
+        let version = payload[0];
+        if version != 0 {
+            return Err(CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+        if flags != 0 {
+            return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+        }
+
+        self.full_box = FullBoxState { version, flags };
+        self.language =
+            decode_iso639_2_language("Language", u16::from_be_bytes([payload[4], payload[5]]))?;
+        self.id3v2_data = payload[6..].to_vec();
+        Ok(Some(payload_size))
+    }
+}
+
 /// Registers the currently landed metadata boxes in `registry`.
 pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Ilst>(FourCc::from_bytes(*b"ilst"));
+    registry.register::<Id32>(FourCc::from_bytes(*b"ID32"));
     registry.register::<Keys>(FourCc::from_bytes(*b"keys"));
     registry.register_contextual::<AccountKindData>(
         FourCc::from_bytes(*b"data"),

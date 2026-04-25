@@ -7,12 +7,20 @@ use crate::codec::{CodecBox, DynCodecBox};
 
 /// AV1 sample-entry and codec-configuration box definitions.
 pub mod av1;
+/// AVS3 sample-entry and decoder-configuration box definitions.
+pub mod avs3;
 /// ETSI TS 102 366 AC-3 sample-entry and decoder-configuration box definitions.
 pub mod etsi_ts_102_366;
+/// ETSI TS 103 190 AC-4 sample-entry and decoder-configuration box definitions.
+pub mod etsi_ts_103_190;
+/// FLAC sample-entry and decoder-configuration box definitions.
+pub mod flac;
 /// ISO/IEC 14496-12 box definitions and codec support.
 pub mod iso14496_12;
 /// ISO/IEC 14496-14 ES descriptor box definitions and codec support.
 pub mod iso14496_14;
+/// ISO/IEC 14496-15 VVC sample-entry and decoder-configuration box definitions.
+pub mod iso14496_15;
 /// ISO/IEC 14496-30 WebVTT box definitions and codec support.
 pub mod iso14496_30;
 /// ISO/IEC 23001-5 uncompressed-audio box definitions and codec support.
@@ -21,6 +29,8 @@ pub mod iso23001_5;
 pub mod iso23001_7;
 /// Item-list metadata and key-table box definitions.
 pub mod metadata;
+/// MPEG-H sample-entry and decoder-configuration box definitions.
+pub mod mpeg_h;
 /// Opus sample-entry and decoder-configuration box definitions.
 pub mod opus;
 /// 3GPP `udta`-scoped metadata string box definitions and codec support.
@@ -423,9 +433,14 @@ pub fn default_registry() -> BoxRegistry {
     metadata::register_boxes(&mut registry);
     threegpp::register_boxes(&mut registry);
     av1::register_boxes(&mut registry);
+    avs3::register_boxes(&mut registry);
     etsi_ts_102_366::register_boxes(&mut registry);
+    etsi_ts_103_190::register_boxes(&mut registry);
+    flac::register_boxes(&mut registry);
+    mpeg_h::register_boxes(&mut registry);
     opus::register_boxes(&mut registry);
     vp::register_boxes(&mut registry);
+    iso14496_15::register_boxes(&mut registry);
     iso23001_5::register_boxes(&mut registry);
     iso23001_7::register_boxes(&mut registry);
     registry

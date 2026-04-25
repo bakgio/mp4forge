@@ -1,7 +1,12 @@
 use std::io::Cursor;
 
 use mp4forge::boxes::AnyTypeBox;
-use mp4forge::boxes::iso14496_12::{Ftyp, Meta, Moov, Tkhd, Trak, Udta};
+use mp4forge::boxes::iso14496_12::{
+    Cdsc, Elng, Emeb, Emib, EventMessageSampleEntry, Ftyp, Leva, LevaLevel, Mdia, Meta, Minf, Moov,
+    Mvex, Saio, Saiz, Sbgp, Sgpd, Silb, Ssix, SsixRange, SsixSubsegment, Stbl, Subs, SubsEntry,
+    SubsSample, Tkhd, Trak, Tref, Trep, Udta,
+};
+use mp4forge::boxes::iso23001_7::{Senc, Tenc};
 use mp4forge::boxes::metadata::{
     DATA_TYPE_STRING_UTF8, Data, Ilst, Key, Keys, NumberedMetadataItem,
 };
@@ -17,7 +22,9 @@ use mp4forge::{BoxInfo, FourCc};
 
 mod support;
 
-use support::fixture_path;
+use support::{
+    build_encrypted_fragmented_video_file, build_event_message_movie_file, fixture_path,
+};
 
 #[test]
 fn extract_boxes_match_exact_wildcard_and_relative_paths() {
@@ -195,6 +202,47 @@ fn extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
 }
 
 #[test]
+fn extract_box_as_decodes_known_tref_children_and_preserves_unknown_ones_as_raw_bytes() {
+    let cdsc = encode_supported_box(
+        &Cdsc {
+            track_ids: vec![9, 11],
+        },
+        &[],
+    );
+    let unknown = encode_raw_box(fourcc("zzzz"), &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let tref = encode_supported_box(&Tref, &[cdsc.clone(), unknown.clone()].concat());
+    let trak = encode_supported_box(&Trak, &tref);
+    let moov = encode_supported_box(&Moov, &trak);
+
+    let extracted_cdsc = extract_box_as::<_, Cdsc>(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("tref"),
+            fourcc("cdsc"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_cdsc.len(), 1);
+    assert_eq!(extracted_cdsc[0].track_ids, vec![9, 11]);
+
+    let extracted_unknown = extract_box_bytes(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("tref"),
+            fourcc("zzzz"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_unknown, vec![unknown]);
+}
+
+#[test]
 fn extract_box_as_bytes_returns_typed_payloads_without_cursor() {
     let mut tkhd_a = Tkhd::default();
     tkhd_a.track_id = 1;
@@ -218,6 +266,281 @@ fn extract_box_as_bytes_returns_typed_payloads_without_cursor() {
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
+}
+
+#[test]
+fn extract_box_as_decodes_fragmented_encrypted_metadata_boxes() {
+    let file = build_encrypted_fragmented_video_file();
+
+    let tenc = extract_box_as::<_, Tenc>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("encv"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("tenc"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(tenc.len(), 1);
+    assert_eq!(tenc[0].default_is_protected, 1);
+    assert_eq!(tenc[0].default_per_sample_iv_size, 8);
+    assert_eq!(
+        tenc[0].default_kid,
+        [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+            0xdc, 0xfe,
+        ]
+    );
+
+    let saiz = extract_box_as::<_, Saiz>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("saiz")]),
+    )
+    .unwrap();
+    assert_eq!(saiz.len(), 1);
+    assert_eq!(saiz[0].sample_count, 1);
+    assert_eq!(saiz[0].sample_info_size, vec![16]);
+
+    let saio = extract_box_as::<_, Saio>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("saio")]),
+    )
+    .unwrap();
+    assert_eq!(saio.len(), 1);
+    assert_eq!(saio[0].entry_count, 1);
+    assert_eq!(saio[0].offset(0), 0);
+
+    let senc = extract_box_as::<_, Senc>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("senc")]),
+    )
+    .unwrap();
+    assert_eq!(senc.len(), 1);
+    assert!(senc[0].uses_subsample_encryption());
+    assert_eq!(senc[0].sample_count, 1);
+    assert_eq!(
+        senc[0].samples[0].initialization_vector,
+        vec![1, 2, 3, 4, 5, 6, 7, 8]
+    );
+    assert_eq!(senc[0].samples[0].subsamples.len(), 1);
+    assert_eq!(senc[0].samples[0].subsamples[0].bytes_of_clear_data, 32);
+    assert_eq!(
+        senc[0].samples[0].subsamples[0].bytes_of_protected_data,
+        480
+    );
+
+    let sgpd = extract_box_as::<_, Sgpd>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("sgpd")]),
+    )
+    .unwrap();
+    assert_eq!(sgpd.len(), 1);
+    assert_eq!(sgpd[0].grouping_type, fourcc("seig"));
+    assert_eq!(sgpd[0].seig_entries_l.len(), 1);
+    assert_eq!(sgpd[0].seig_entries_l[0].description_length, 20);
+    assert_eq!(sgpd[0].seig_entries_l[0].seig_entry.per_sample_iv_size, 8);
+    assert_eq!(sgpd[0].seig_entries_l[0].seig_entry.crypt_byte_block, 1);
+    assert_eq!(sgpd[0].seig_entries_l[0].seig_entry.skip_byte_block, 9);
+
+    let sbgp = extract_box_as::<_, Sbgp>(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("sbgp")]),
+    )
+    .unwrap();
+    assert_eq!(sbgp.len(), 1);
+    assert_eq!(sbgp[0].grouping_type, u32::from_be_bytes(*b"seig"));
+    assert_eq!(sbgp[0].entries.len(), 1);
+    assert_eq!(sbgp[0].entries[0].sample_count, 1);
+    assert_eq!(sbgp[0].entries[0].group_description_index, 65_537);
+}
+
+#[test]
+fn extract_box_as_decodes_compact_metadata_boxes() {
+    let mut elng = Elng::default();
+    elng.extended_language = "en-US".into();
+    let elng = encode_supported_box(&elng, &[]);
+
+    let mut subs = Subs::default();
+    subs.entry_count = 1;
+    subs.entries = vec![SubsEntry {
+        sample_delta: 7,
+        subsample_count: 1,
+        subsamples: vec![SubsSample {
+            subsample_size: 11,
+            subsample_priority: 2,
+            discardable: 0,
+            codec_specific_parameters: 0x01020304,
+        }],
+    }];
+    let subs = encode_supported_box(&subs, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &subs);
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(&Mdia, &[elng, minf].concat());
+    let trak = encode_supported_box(&Trak, &mdia);
+
+    let mut leva = Leva::default();
+    leva.level_count = 1;
+    leva.levels = vec![LevaLevel {
+        track_id: 9,
+        assignment_type: 4,
+        sub_track_id: 11,
+        ..LevaLevel::default()
+    }];
+    let mut trep = Trep::default();
+    trep.track_id = 9;
+    let trep = encode_supported_box(&trep, &encode_supported_box(&leva, &[]));
+    let mvex = encode_supported_box(&Mvex, &trep);
+
+    let mut ssix = Ssix::default();
+    ssix.subsegment_count = 1;
+    ssix.subsegments = vec![SsixSubsegment {
+        range_count: 1,
+        ranges: vec![SsixRange {
+            level: 3,
+            range_size: 0x44,
+        }],
+    }];
+    let ssix = encode_supported_box(&ssix, &[]);
+
+    let moov = encode_supported_box(&Moov, &[trak, mvex].concat());
+    let file = [moov, ssix].concat();
+
+    let extracted_elng = extract_box_as::<_, Elng>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("elng"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_elng.len(), 1);
+    assert_eq!(extracted_elng[0].extended_language, "en-US");
+
+    let extracted_subs = extract_box_as::<_, Subs>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("subs"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_subs.len(), 1);
+    assert_eq!(extracted_subs[0].entries[0].sample_delta, 7);
+    assert_eq!(
+        extracted_subs[0].entries[0].subsamples[0].codec_specific_parameters,
+        0x01020304
+    );
+
+    let extracted_leva = extract_box_as::<_, Leva>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("mvex"),
+            fourcc("trep"),
+            fourcc("leva"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_leva.len(), 1);
+    assert_eq!(extracted_leva[0].levels[0].track_id, 9);
+    assert_eq!(extracted_leva[0].levels[0].sub_track_id, 11);
+
+    let extracted_ssix = extract_box_as::<_, Ssix>(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([fourcc("ssix")]),
+    )
+    .unwrap();
+    assert_eq!(extracted_ssix.len(), 1);
+    assert_eq!(extracted_ssix[0].subsegments[0].ranges[0].level, 3);
+    assert_eq!(extracted_ssix[0].subsegments[0].ranges[0].range_size, 0x44);
+}
+
+#[test]
+fn extract_box_as_decodes_event_message_boxes() {
+    let file = build_event_message_movie_file();
+
+    let evte = extract_box_as::<_, EventMessageSampleEntry>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("evte"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(evte.len(), 1);
+    assert_eq!(evte[0].sample_entry.data_reference_index, 1);
+
+    let silb = extract_box_as::<_, Silb>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("evte"),
+            fourcc("silb"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(silb.len(), 1);
+    assert_eq!(silb[0].scheme_count, 2);
+    assert_eq!(silb[0].schemes[0].scheme_id_uri, "urn:mpeg:dash:event:2012");
+    assert_eq!(silb[0].schemes[1].value, "splice");
+    assert!(silb[0].schemes[1].at_least_one_flag);
+    assert!(silb[0].other_schemes_flag);
+
+    let emib = extract_box_as::<_, Emib>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("emib")]),
+    )
+    .unwrap();
+    assert_eq!(emib.len(), 1);
+    assert_eq!(emib[0].presentation_time_delta, -1_000);
+    assert_eq!(emib[0].event_duration, 2_000);
+    assert_eq!(emib[0].scheme_id_uri, "urn:scte:scte35:2013:bin");
+    assert_eq!(emib[0].message_data, vec![0x01, 0x02, 0x03]);
+
+    let emeb = extract_box_as::<_, Emeb>(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([fourcc("emeb")]),
+    )
+    .unwrap();
+    assert_eq!(emeb.len(), 1);
 }
 
 #[test]
@@ -424,7 +747,7 @@ fn extract_box_rejects_empty_paths() {
 }
 
 #[test]
-fn extract_boxes_match_shared_fixture_reference_paths() {
+fn extract_boxes_match_shared_fixture_expected_paths() {
     let sample = std::fs::read(fixture_path("sample.mp4")).unwrap();
     let ftyp = extract_box(
         &mut Cursor::new(sample.clone()),
