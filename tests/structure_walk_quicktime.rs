@@ -6,8 +6,94 @@ use mp4forge::boxes::metadata::{
 };
 use mp4forge::boxes::{AnyTypeBox, BoxLookupContext};
 use mp4forge::codec::{CodecBox, marshal};
+#[cfg(feature = "async")]
+use mp4forge::walk::{AsyncWalkFuture, AsyncWalkHandle, AsyncWalkVisitor, walk_structure_async};
 use mp4forge::walk::{BoxPath, WalkControl, walk_structure};
 use mp4forge::{BoxInfo, FourCc};
+
+#[cfg(feature = "async")]
+type AsyncCursorWalkHandle<'a> = AsyncWalkHandle<'a, Cursor<Vec<u8>>>;
+
+#[cfg(feature = "async")]
+struct AsyncQuickTimeVisitor<'a> {
+    visited: &'a mut Vec<BoxPath>,
+}
+
+#[cfg(feature = "async")]
+impl AsyncWalkVisitor<Cursor<Vec<u8>>> for AsyncQuickTimeVisitor<'_> {
+    type Future<'a>
+        = AsyncWalkFuture<'a>
+    where
+        Self: 'a;
+
+    fn visit<'a, 'r>(&'a mut self, handle: &'a mut AsyncCursorWalkHandle<'r>) -> Self::Future<'a>
+    where
+        'r: 'a,
+    {
+        Box::pin(async move {
+            self.visited.push(handle.path().clone());
+
+            match handle.info().box_type() {
+                box_type if box_type == fourcc("ftyp") => {
+                    assert!(handle.info().lookup_context().is_quicktime_compatible());
+                    Ok(WalkControl::Continue)
+                }
+                box_type if box_type == fourcc("moov") => {
+                    assert!(handle.info().lookup_context().is_quicktime_compatible());
+                    Ok(WalkControl::Descend)
+                }
+                box_type if box_type == fourcc("meta") => {
+                    assert!(handle.info().lookup_context().is_quicktime_compatible());
+                    assert_eq!(
+                        handle.descendant_lookup_context(),
+                        BoxLookupContext::new().with_quicktime_compatible(true)
+                    );
+                    Ok(WalkControl::Descend)
+                }
+                box_type if box_type == fourcc("keys") => {
+                    let (payload, read) = handle.read_payload_async().await?;
+                    assert_eq!(read, 17);
+                    let keys = payload.as_ref().as_any().downcast_ref::<Keys>().unwrap();
+                    assert_eq!(keys.entry_count, 1);
+                    assert_eq!(
+                        handle.info().lookup_context().metadata_keys_entry_count(),
+                        1
+                    );
+                    Ok(WalkControl::Continue)
+                }
+                box_type if box_type == fourcc("ilst") => {
+                    assert_eq!(
+                        handle.info().lookup_context().metadata_keys_entry_count(),
+                        1
+                    );
+                    assert!(handle.descendant_lookup_context().under_ilst());
+                    Ok(WalkControl::Descend)
+                }
+                box_type if box_type == FourCc::from_u32(1) => {
+                    assert!(handle.is_supported_type());
+                    assert_eq!(
+                        handle.info().lookup_context().metadata_keys_entry_count(),
+                        1
+                    );
+                    assert!(handle.info().lookup_context().under_ilst());
+
+                    let (payload, read) = handle.read_payload_async().await?;
+                    assert_eq!(read, 21);
+                    let numbered = payload
+                        .as_ref()
+                        .as_any()
+                        .downcast_ref::<NumberedMetadataItem>()
+                        .unwrap();
+                    assert_eq!(numbered.item_name, fourcc("data"));
+                    assert_eq!(numbered.data.data_type, DATA_TYPE_STRING_UTF8);
+                    assert_eq!(numbered.data.data, b"1.0.0");
+                    Ok(WalkControl::Continue)
+                }
+                other => panic!("unexpected box {other}"),
+            }
+        })
+    }
+}
 
 #[test]
 fn walk_structure_carries_quicktime_brand_and_keys_context() {
@@ -105,6 +191,65 @@ fn walk_structure_carries_quicktime_brand_and_keys_context() {
         }
     })
     .unwrap();
+
+    assert_eq!(
+        visited,
+        vec![
+            BoxPath::from([fourcc("ftyp")]),
+            BoxPath::from([fourcc("moov")]),
+            BoxPath::from([fourcc("moov"), fourcc("meta")]),
+            BoxPath::from([fourcc("moov"), fourcc("meta"), fourcc("keys")]),
+            BoxPath::from([fourcc("moov"), fourcc("meta"), fourcc("ilst")]),
+            BoxPath::from([
+                fourcc("moov"),
+                fourcc("meta"),
+                fourcc("ilst"),
+                FourCc::from_u32(1)
+            ]),
+        ]
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_walk_structure_carries_quicktime_brand_and_keys_context() {
+    let qt = fourcc("qt  ");
+    let ftyp = Ftyp {
+        major_brand: qt,
+        minor_version: 0x0200,
+        compatible_brands: vec![qt],
+    };
+    let mut keys = Keys::default();
+    keys.entry_count = 1;
+    keys.entries = vec![Key {
+        key_size: 9,
+        key_namespace: fourcc("mdta"),
+        key_value: vec![b'x'],
+    }];
+
+    let mut numbered = NumberedMetadataItem::default();
+    numbered.set_box_type(FourCc::from_u32(1));
+    numbered.item_name = fourcc("data");
+    numbered.data = Data {
+        data_type: DATA_TYPE_STRING_UTF8,
+        data_lang: 0,
+        data: b"1.0.0".to_vec(),
+    };
+
+    let keys_box = encode_supported_box(&keys, &[]);
+    let numbered_box = encode_supported_box(&numbered, &[]);
+    let ilst_box = encode_supported_box(&Ilst, &numbered_box);
+    let meta_box = encode_supported_box(&Meta::default(), &[keys_box, ilst_box].concat());
+    let moov_box = encode_supported_box(&Moov, &meta_box);
+    let file = [encode_supported_box(&ftyp, &[]), moov_box].concat();
+
+    let mut visited = Vec::new();
+    let visitor = AsyncQuickTimeVisitor {
+        visited: &mut visited,
+    };
+    walk_structure_async(&mut Cursor::new(file), visitor)
+        .await
+        .unwrap();
 
     assert_eq!(
         visited,

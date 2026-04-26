@@ -16,15 +16,26 @@ use mp4forge::extract::{
     extract_box_payload_bytes, extract_box_with_payload, extract_boxes, extract_boxes_as_bytes,
     extract_boxes_bytes, extract_boxes_payload_bytes,
 };
+#[cfg(feature = "async")]
+use mp4forge::extract::{
+    extract_box_as_async, extract_box_async, extract_box_bytes_async,
+    extract_box_payload_bytes_async, extract_box_with_payload_async, extract_boxes_async,
+};
 use mp4forge::stringify::stringify;
 use mp4forge::walk::BoxPath;
 use mp4forge::{BoxInfo, FourCc};
 
 mod support;
 
+#[cfg(feature = "async")]
+use support::build_visual_sample_entry_box_with_trailing_bytes;
+#[cfg(feature = "async")]
+use support::write_temp_file;
 use support::{
     build_encrypted_fragmented_video_file, build_event_message_movie_file, fixture_path,
 };
+#[cfg(feature = "async")]
+use tokio::fs::File as TokioFile;
 
 #[test]
 fn extract_boxes_match_exact_wildcard_and_relative_paths() {
@@ -65,6 +76,54 @@ fn extract_boxes_match_exact_wildcard_and_relative_paths() {
         Some(&parent),
         BoxPath::from([fourcc("udta")]),
     )
+    .unwrap();
+    assert_eq!(box_types(&relative), vec![fourcc("udta")]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_boxes_match_exact_wildcard_and_relative_paths() {
+    let trak = encode_supported_box(&Trak, &[]);
+    let meta = encode_supported_box(&Meta::default(), &[]);
+    let udta = encode_supported_box(&Udta, &meta);
+    let moov = encode_supported_box(&Moov, &[trak, udta].concat());
+
+    let wildcard = extract_box_async(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([fourcc("moov"), FourCc::ANY]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(box_types(&wildcard), vec![fourcc("trak"), fourcc("udta")]);
+
+    let exact = extract_boxes_async(
+        &mut Cursor::new(moov.clone()),
+        None,
+        &[
+            BoxPath::from([fourcc("moov")]),
+            BoxPath::from([fourcc("moov"), fourcc("udta")]),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(box_types(&exact), vec![fourcc("moov"), fourcc("udta")]);
+
+    let parent = extract_box_async(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([fourcc("moov")]),
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    let relative = extract_box_async(
+        &mut Cursor::new(moov),
+        Some(&parent),
+        BoxPath::from([fourcc("udta")]),
+    )
+    .await
     .unwrap();
     assert_eq!(box_types(&relative), vec![fourcc("udta")]);
 }
@@ -133,6 +192,236 @@ fn extract_box_with_payload_uses_walked_lookup_context() {
     assert_eq!(numbered.data.data, b"1.0.0");
 }
 
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_with_payload_uses_walked_lookup_context() {
+    let qt = fourcc("qt  ");
+    let ftyp = Ftyp {
+        major_brand: qt,
+        minor_version: 0x0200,
+        compatible_brands: vec![qt],
+    };
+    let mut keys = Keys::default();
+    keys.entry_count = 1;
+    keys.entries = vec![Key {
+        key_size: 9,
+        key_namespace: fourcc("mdta"),
+        key_value: vec![b'x'],
+    }];
+
+    let mut numbered = NumberedMetadataItem::default();
+    numbered.set_box_type(FourCc::from_u32(1));
+    numbered.item_name = fourcc("data");
+    numbered.data = Data {
+        data_type: DATA_TYPE_STRING_UTF8,
+        data_lang: 0,
+        data: b"1.0.0".to_vec(),
+    };
+
+    let keys_box = encode_supported_box(&keys, &[]);
+    let numbered_box = encode_supported_box(&numbered, &[]);
+    let ilst_box = encode_supported_box(&Ilst, &numbered_box);
+    let meta_box = encode_supported_box(&Meta::default(), &[keys_box, ilst_box].concat());
+    let moov_box = encode_supported_box(&Moov, &meta_box);
+    let file = [encode_supported_box(&ftyp, &[]), moov_box].concat();
+
+    let extracted = extract_box_with_payload_async(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("meta"),
+            fourcc("ilst"),
+            FourCc::from_u32(1),
+        ]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    let extracted = &extracted[0];
+    assert_eq!(extracted.info.box_type(), FourCc::from_u32(1));
+    assert!(extracted.info.lookup_context().under_ilst());
+    assert_eq!(
+        extracted.info.lookup_context().metadata_keys_entry_count(),
+        1
+    );
+
+    let numbered = extracted
+        .payload
+        .as_ref()
+        .as_any()
+        .downcast_ref::<NumberedMetadataItem>()
+        .unwrap();
+    assert_eq!(numbered.item_name, fourcc("data"));
+    assert_eq!(numbered.data.data_type, DATA_TYPE_STRING_UTF8);
+    assert_eq!(numbered.data.data, b"1.0.0");
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_extract_helpers_can_run_on_tokio_worker_threads() {
+    let header_file = build_event_message_movie_file();
+    let header_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(header_file);
+        let matches = extract_box_async(
+            &mut reader,
+            None,
+            BoxPath::from([fourcc("moov"), fourcc("trak")]),
+        )
+        .await
+        .unwrap();
+        (matches.len(), matches[0].box_type())
+    });
+    assert_eq!(header_handle.await.unwrap(), (1, fourcc("trak")));
+
+    let typed_file = build_encrypted_fragmented_video_file();
+    let typed_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(typed_file);
+        let payloads = extract_box_as_async::<_, Senc>(
+            &mut reader,
+            None,
+            BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("senc")]),
+        )
+        .await
+        .unwrap();
+        (payloads.len(), payloads[0].sample_count)
+    });
+    assert_eq!(typed_handle.await.unwrap(), (1, 1));
+
+    let bytes_file = build_event_message_movie_file();
+    let bytes_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(bytes_file);
+        let boxes = extract_box_bytes_async(
+            &mut reader,
+            None,
+            BoxPath::from([
+                fourcc("moov"),
+                fourcc("trak"),
+                fourcc("mdia"),
+                fourcc("minf"),
+                fourcc("stbl"),
+                fourcc("stsd"),
+                fourcc("evte"),
+                fourcc("silb"),
+            ]),
+        )
+        .await
+        .unwrap();
+        boxes[0].len()
+    });
+    assert!(bytes_handle.await.unwrap() > 8);
+
+    let payload_file = build_event_message_movie_file();
+    let expected_payload_len = extract_box_payload_bytes(
+        &mut Cursor::new(payload_file.clone()),
+        None,
+        BoxPath::from([fourcc("emib")]),
+    )
+    .unwrap()[0]
+        .len();
+    let payload_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(payload_file);
+        let payloads =
+            extract_box_payload_bytes_async(&mut reader, None, BoxPath::from([fourcc("emib")]))
+                .await
+                .unwrap();
+        payloads[0].len()
+    });
+    assert_eq!(payload_handle.await.unwrap(), expected_payload_len);
+
+    let boxed_file = build_event_message_movie_file();
+    let boxed_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(boxed_file);
+        let extracted =
+            extract_box_with_payload_async(&mut reader, None, BoxPath::from([fourcc("emeb")]))
+                .await
+                .unwrap();
+        (extracted.len(), extracted[0].info.box_type())
+    });
+    assert_eq!(boxed_handle.await.unwrap(), (1, fourcc("emeb")));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_extract_independent_file_tasks_can_run_concurrently_on_tokio_worker_threads() {
+    let event_a = write_temp_file(
+        "async-extract-concurrency-event-a",
+        &build_event_message_movie_file(),
+    );
+    let event_b = write_temp_file(
+        "async-extract-concurrency-event-b",
+        &build_event_message_movie_file(),
+    );
+    let event_c = write_temp_file(
+        "async-extract-concurrency-event-c",
+        &build_event_message_movie_file(),
+    );
+    let encrypted = write_temp_file(
+        "async-extract-concurrency-encrypted",
+        &build_encrypted_fragmented_video_file(),
+    );
+
+    let header_handle = tokio::spawn(async move {
+        let mut reader = TokioFile::open(event_a).await.unwrap();
+        let matches = extract_box_async(
+            &mut reader,
+            None,
+            BoxPath::from([fourcc("moov"), fourcc("trak")]),
+        )
+        .await
+        .unwrap();
+        (matches.len(), matches[0].box_type())
+    });
+
+    let payload_handle = tokio::spawn(async move {
+        let mut reader = TokioFile::open(event_b).await.unwrap();
+        let payloads =
+            extract_box_payload_bytes_async(&mut reader, None, BoxPath::from([fourcc("emib")]))
+                .await
+                .unwrap();
+        payloads[0].len()
+    });
+
+    let typed_handle = tokio::spawn(async move {
+        let mut reader = TokioFile::open(encrypted).await.unwrap();
+        let payloads = extract_box_as_async::<_, Senc>(
+            &mut reader,
+            None,
+            BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("senc")]),
+        )
+        .await
+        .unwrap();
+        (payloads.len(), payloads[0].sample_count)
+    });
+
+    let bytes_handle = tokio::spawn(async move {
+        let mut reader = TokioFile::open(event_c).await.unwrap();
+        let boxes = extract_box_bytes_async(
+            &mut reader,
+            None,
+            BoxPath::from([
+                fourcc("moov"),
+                fourcc("trak"),
+                fourcc("mdia"),
+                fourcc("minf"),
+                fourcc("stbl"),
+                fourcc("stsd"),
+                fourcc("evte"),
+                fourcc("silb"),
+            ]),
+        )
+        .await
+        .unwrap();
+        boxes[0].len()
+    });
+
+    assert_eq!(header_handle.await.unwrap(), (1, fourcc("trak")));
+    assert!(payload_handle.await.unwrap() > 0);
+    assert_eq!(typed_handle.await.unwrap(), (1, 1));
+    assert!(bytes_handle.await.unwrap() > 8);
+}
+
 #[test]
 fn extract_box_as_returns_typed_payloads() {
     let mut tkhd_a = Tkhd::default();
@@ -148,6 +437,35 @@ fn extract_box_as_returns_typed_payloads() {
         None,
         BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
     )
+    .unwrap();
+
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(
+        extracted
+            .iter()
+            .map(|tkhd| tkhd.track_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_as_returns_typed_payloads() {
+    let mut tkhd_a = Tkhd::default();
+    tkhd_a.track_id = 1;
+    let mut tkhd_b = Tkhd::default();
+    tkhd_b.track_id = 2;
+    let trak_a = encode_supported_box(&Trak, &encode_supported_box(&tkhd_a, &[]));
+    let trak_b = encode_supported_box(&Trak, &encode_supported_box(&tkhd_b, &[]));
+    let moov = encode_supported_box(&Moov, &[trak_a, trak_b].concat());
+
+    let extracted = extract_box_as_async::<_, Tkhd>(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("tkhd")]),
+    )
+    .await
     .unwrap();
 
     assert_eq!(extracted.len(), 2);
@@ -185,6 +503,34 @@ fn extract_box_bytes_preserve_exact_leaf_box_bytes_for_relative_paths() {
     assert_eq!(extracted, vec![leaf]);
 }
 
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_bytes_preserve_exact_leaf_box_bytes_for_relative_paths() {
+    let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
+    let udta = encode_supported_box(&Udta, &leaf);
+    let moov = encode_supported_box(&Moov, &udta);
+
+    let parent = extract_box_async(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([fourcc("moov")]),
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+
+    let extracted = extract_box_bytes_async(
+        &mut Cursor::new(moov),
+        Some(&parent),
+        BoxPath::from([fourcc("udta"), fourcc("zzzz")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(extracted, vec![leaf]);
+}
+
 #[test]
 fn extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
     let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
@@ -199,6 +545,51 @@ fn extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
     .unwrap();
 
     assert_eq!(extracted, vec![leaf]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
+    let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
+    let udta = encode_supported_box(&Udta, &leaf);
+    let moov = encode_supported_box(&Moov, &udta);
+
+    let extracted = extract_box_payload_bytes_async(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("udta")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(extracted, vec![leaf]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_bytes_descends_visual_sample_entry_children_without_trailing_bytes() {
+    let file = build_visual_sample_entry_box_with_trailing_bytes();
+
+    let extracted = extract_box_bytes_async(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([fourcc("avc1"), fourcc("pasp")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(
+        extract_box_async(
+            &mut Cursor::new(extracted[0].clone()),
+            None,
+            BoxPath::from([fourcc("pasp")])
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
 }
 
 #[test]

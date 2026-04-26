@@ -3,10 +3,17 @@
 use std::io::{Cursor, SeekFrom, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::iso23001_7::{
     Senc, decode_senc_payload, encode_senc_payload, render_senc_samples_display,
 };
 use crate::boxes::{AnyTypeBox, BoxLookupContext, BoxRegistry};
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     ANY_VERSION, CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError,
     FieldValueRead, FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode,
@@ -5694,6 +5701,35 @@ impl MutableBox for Meta {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    fn before_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<(), CodecError>> {
+        Box::pin(async move {
+            self.quicktime_headerless = false;
+            if payload_size < 4 {
+                return Ok(());
+            }
+
+            // Headerless metadata starts directly with the first child box type instead of the
+            // full-box prefix.
+            let start = reader.stream_position().await?;
+            let mut prefix = [0_u8; 4];
+            reader.read_exact(&mut prefix).await?;
+            reader.seek(SeekFrom::Start(start)).await?;
+
+            if prefix.iter().any(|byte| *byte != 0) {
+                self.quicktime_headerless = true;
+                self.full_box.version = 0;
+                self.full_box.flags = 0;
+            }
+
+            Ok(())
+        })
     }
 }
 

@@ -4,6 +4,10 @@ use std::fs;
 
 use mp4forge::cli::probe as cli_probe;
 use mp4forge::probe::{TrackCodec, TrackCodecFamily, probe, probe_media_characteristics};
+#[cfg(feature = "async")]
+use mp4forge::probe::{probe_async, probe_media_characteristics_async};
+#[cfg(feature = "async")]
+use tokio::fs as tokio_fs;
 
 use support::fixture_path;
 
@@ -247,5 +251,33 @@ fn codec_family_name(value: TrackCodecFamily) -> &'static str {
         TrackCodecFamily::XmlSubtitle => "xml_subtitle",
         TrackCodecFamily::TextSubtitle => "text_subtitle",
         TrackCodecFamily::WebVtt => "webvtt",
+    }
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_fixture_probe_surfaces_match_sync_results_for_added_codec_families() {
+    for file_name in [
+        "vp9_opus.mp4",
+        "av1_opus.mp4",
+        "aac_audio.mp4",
+        "opus_audio.mp4",
+        "pcm_audio.mp4",
+    ] {
+        let path = fixture_path(file_name);
+
+        let expected_summary = probe(&mut fs::File::open(&path).unwrap()).unwrap();
+        let actual_summary = probe_async(&mut tokio_fs::File::open(&path).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(actual_summary, expected_summary, "fixture={file_name}");
+
+        let expected_media =
+            probe_media_characteristics(&mut fs::File::open(&path).unwrap()).unwrap();
+        let actual_media =
+            probe_media_characteristics_async(&mut tokio_fs::File::open(&path).await.unwrap())
+                .await
+                .unwrap();
+        assert_eq!(actual_media, expected_media, "fixture={file_name}");
     }
 }

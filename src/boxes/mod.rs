@@ -244,7 +244,7 @@ impl ResolvedRegistration {
 }
 
 /// Registry that maps box identifiers to descriptor-backed constructors.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BoxRegistry {
     entries: BTreeMap<FourCc, BoxRegistration>,
     contextual_entries: BTreeMap<FourCc, Vec<ContextualBoxRegistration>>,

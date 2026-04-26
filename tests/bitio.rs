@@ -1,5 +1,7 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
+#[cfg(feature = "async")]
+use mp4forge::bitio::{AsyncBitReader, AsyncBitWriter};
 use mp4forge::bitio::{BitReader, BitWriter, INVALID_ALIGNMENT_MESSAGE};
 
 #[test]
@@ -66,5 +68,52 @@ fn byte_writes_fail_when_writer_is_not_aligned() {
     writer.write_bits(&[0xda], 7).unwrap();
 
     let error = writer.write(&[0xa4, 0x6f]).unwrap_err();
+    assert_eq!(error.to_string(), INVALID_ALIGNMENT_MESSAGE);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_read_and_write_match_bit_packing_examples() {
+    let mut writer = AsyncBitWriter::new(Cursor::new(Vec::new()));
+    writer.write_bits(&[0xda], 7).await.unwrap();
+    writer.write_bits(&[0x07, 0x63, 0xd5], 17).await.unwrap();
+    writer.write_all(&[0xa4, 0x6f]).await.unwrap();
+    writer.write_bits(&[0x07, 0x69, 0xe3], 17).await.unwrap();
+    writer.write_bit(true).await.unwrap();
+    writer.write_bit(false).await.unwrap();
+    writer.write_bits(&[0xf7], 5).await.unwrap();
+
+    let encoded = writer.into_inner().unwrap().into_inner();
+    assert_eq!(encoded, [0xb5, 0x63, 0xd5, 0xa4, 0x6f, 0xb4, 0xf1, 0xd7]);
+
+    let mut reader = AsyncBitReader::new(Cursor::new(encoded));
+    assert_eq!(reader.read_bits(7).await.unwrap(), vec![0x5a]);
+    assert_eq!(reader.read_bits(17).await.unwrap(), vec![0x01, 0x63, 0xd5]);
+
+    let mut aligned = [0_u8; 2];
+    reader.read_exact(&mut aligned).await.unwrap();
+    assert_eq!(aligned, [0xa4, 0x6f]);
+
+    assert_eq!(reader.read_bits(17).await.unwrap(), vec![0x01, 0x69, 0xe3]);
+    assert!(reader.read_bit().await.unwrap());
+    assert!(!reader.read_bit().await.unwrap());
+    assert_eq!(reader.read_bits(5).await.unwrap(), vec![0x17]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_alignment_guards_match_sync_behavior() {
+    let mut reader = AsyncBitReader::new(Cursor::new(vec![0x6c, 0x82, 0x41, 0x35, 0x71]));
+    assert_eq!(reader.stream_position().await.unwrap(), 0);
+    assert_eq!(reader.read_bits(3).await.unwrap(), vec![0x03]);
+    let error = reader.stream_position().await.unwrap_err();
+    assert_eq!(error.to_string(), INVALID_ALIGNMENT_MESSAGE);
+    let error = reader.seek(SeekFrom::Current(1)).await.unwrap_err();
+    assert_eq!(error.to_string(), INVALID_ALIGNMENT_MESSAGE);
+
+    let mut writer = AsyncBitWriter::new(Cursor::new(Vec::new()));
+    writer.write_all(&[0xa4, 0x6f]).await.unwrap();
+    writer.write_bits(&[0xda], 7).await.unwrap();
+    let error = writer.write_all(&[0xa4, 0x6f]).await.unwrap_err();
     assert_eq!(error.to_string(), INVALID_ALIGNMENT_MESSAGE);
 }

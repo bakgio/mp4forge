@@ -10,6 +10,8 @@ use std::fmt;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::FourCc;
+#[cfg(feature = "async")]
+use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
 use crate::boxes::iso14496_12::{
     Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
 };
@@ -19,6 +21,8 @@ use crate::codec::{CodecBox, CodecError, marshal_dyn, unmarshal, unmarshal_any_w
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
 use crate::walk::{BoxPath, PathMatch};
 use crate::writer::{Writer, WriterError};
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const FTYP: FourCc = FourCc::from_bytes(*b"ftyp");
 const KEYS: FourCc = FourCc::from_bytes(*b"keys");
@@ -151,6 +155,129 @@ where
     Ok(rewritten_count)
 }
 
+/// Rewrites every payload at `path` through the additive Tokio-based async library surface by
+/// downcasting it to `T` and applying `edit`.
+///
+/// The edit closure runs once per matched box in depth-first order. The returned count is the
+/// number of payloads that were successfully rewritten. Unmatched boxes are copied through to the
+/// output verbatim.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn rewrite_box_as_async<R, W, T, F>(
+    reader: &mut R,
+    writer: W,
+    path: BoxPath,
+    edit: F,
+) -> Result<usize, RewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let paths = [path];
+    rewrite_boxes_as_async(reader, writer, &paths, edit).await
+}
+
+/// Rewrites every payload that matches any path in `paths` through the additive Tokio-based async
+/// library surface by downcasting it to `T` and applying `edit`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn rewrite_boxes_as_async<R, W, T, F>(
+    reader: &mut R,
+    writer: W,
+    paths: &[BoxPath],
+    edit: F,
+) -> Result<usize, RewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let registry = default_registry();
+    rewrite_boxes_as_with_registry_async(reader, writer, paths, &registry, edit).await
+}
+
+/// Rewrites every payload at `path` in an in-memory MP4 byte slice through the additive
+/// Tokio-based async library surface and returns the rewritten bytes.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn rewrite_box_as_bytes_async<T, F>(
+    input: &[u8],
+    path: BoxPath,
+    edit: F,
+) -> Result<Vec<u8>, RewriteError>
+where
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let paths = [path];
+    rewrite_boxes_as_bytes_async::<T, _>(input, &paths, edit).await
+}
+
+/// Rewrites every payload that matches any path in `paths` in an in-memory MP4 byte slice through
+/// the additive Tokio-based async library surface and returns the rewritten bytes.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn rewrite_boxes_as_bytes_async<T, F>(
+    input: &[u8],
+    paths: &[BoxPath],
+    edit: F,
+) -> Result<Vec<u8>, RewriteError>
+where
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let mut reader = Cursor::new(input);
+    let mut writer = Cursor::new(Vec::with_capacity(input.len()));
+    rewrite_boxes_as_async(&mut reader, &mut writer, paths, edit).await?;
+    Ok(writer.into_inner())
+}
+
+/// Rewrites every payload that matches any path in `paths` through the additive Tokio-based async
+/// library surface using `registry`, downcasts each match to `T`, and applies `edit`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn rewrite_boxes_as_with_registry_async<R, W, T, F>(
+    reader: &mut R,
+    writer: W,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+    mut edit: F,
+) -> Result<usize, RewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    validate_paths(paths)?;
+    reader.seek(SeekFrom::Start(0)).await?;
+
+    let mut writer = Writer::new(writer);
+    if paths.is_empty() {
+        tokio::io::copy(reader, &mut writer).await?;
+        return Ok(0);
+    }
+
+    let mut rewritten_count = 0;
+    let mut plan = RewritePlan {
+        paths,
+        edit: &mut edit,
+        rewritten_count: &mut rewritten_count,
+    };
+    rewrite_sequence_async::<R, W, T, F>(
+        reader,
+        &mut writer,
+        registry,
+        &mut plan,
+        RewriteFrame::root(),
+    )
+    .await?;
+    Ok(rewritten_count)
+}
+
 #[derive(Clone)]
 struct RewriteFrame {
     remaining_size: u64,
@@ -228,6 +355,71 @@ where
         info.set_lookup_context(frame.sibling_context);
         inspect_context_carriers(reader, &mut info, &frame.path)?;
         process_box::<R, W, T, F>(reader, writer, registry, plan, &frame, &info)?;
+
+        if info.lookup_context().is_quicktime_compatible() {
+            frame.sibling_context = frame.sibling_context.with_quicktime_compatible(true);
+        }
+        if info.box_type() == KEYS {
+            frame.sibling_context = frame
+                .sibling_context
+                .with_metadata_keys_entry_count(info.lookup_context().metadata_keys_entry_count());
+        }
+    }
+
+    if !frame.is_root
+        && frame.remaining_size != 0
+        && !frame.sibling_context.is_quicktime_compatible()
+    {
+        return Err(RewriteError::UnexpectedEof);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn rewrite_sequence_async<R, W, T, F>(
+    reader: &mut R,
+    writer: &mut Writer<W>,
+    registry: &BoxRegistry,
+    plan: &mut RewritePlan<'_, F>,
+    mut frame: RewriteFrame,
+) -> Result<(), RewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    loop {
+        if !frame.is_root && frame.remaining_size < SMALL_HEADER_SIZE {
+            break;
+        }
+
+        let start = reader.stream_position().await?;
+        let mut info = match BoxInfo::read_async(reader).await {
+            Ok(info) => info,
+            Err(HeaderError::Io(error))
+                if frame.is_root && clean_root_eof_async(reader, start, &error).await? =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        if !frame.is_root && info.size() > frame.remaining_size {
+            return Err(RewriteError::TooLargeBoxSize {
+                box_type: info.box_type(),
+                size: info.size(),
+                available_size: frame.remaining_size,
+            });
+        }
+        if !frame.is_root {
+            frame.remaining_size -= info.size();
+        }
+
+        info.set_lookup_context(frame.sibling_context);
+        inspect_context_carriers_async(reader, &mut info, &frame.path).await?;
+        process_box_async::<R, W, T, F>(reader, writer, registry, plan, &frame, &info).await?;
 
         if info.lookup_context().is_quicktime_compatible() {
             frame.sibling_context = frame.sibling_context.with_quicktime_compatible(true);
@@ -344,6 +536,121 @@ where
     Ok(())
 }
 
+#[cfg(feature = "async")]
+async fn process_box_async<R, W, T, F>(
+    reader: &mut R,
+    writer: &mut Writer<W>,
+    registry: &BoxRegistry,
+    plan: &mut RewritePlan<'_, F>,
+    frame: &RewriteFrame,
+    info: &BoxInfo,
+) -> Result<(), RewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+    T: CodecBox + 'static,
+    F: FnMut(&mut T),
+{
+    let current_path = child_path(&frame.path, info.box_type());
+    let path_match = match_paths(plan.paths, &current_path);
+    if !path_match.forward_match && !path_match.exact_match {
+        writer.copy_box_async(reader, info).await?;
+        return Ok(());
+    }
+
+    reader
+        .seek(SeekFrom::Start(info.offset() + info.header_size()))
+        .await?;
+    let payload_size = info.payload_size()?;
+    let mut payload_bytes = Vec::with_capacity(payload_size.try_into().unwrap_or(0));
+    let mut payload_reader = (&mut *reader).take(payload_size);
+    let payload_read = payload_reader.read_to_end(&mut payload_bytes).await? as u64;
+    if payload_read != payload_size {
+        return Err(RewriteError::UnexpectedEof);
+    }
+    let (encoded_payload, payload_read, is_visual_sample_entry) = {
+        let (mut payload, payload_read) = unmarshal_any_with_context(
+            &mut Cursor::new(payload_bytes.as_slice()),
+            payload_size,
+            info.box_type(),
+            registry,
+            info.lookup_context(),
+            None,
+        )
+        .map_err(|source| RewriteError::PayloadDecode {
+            path: current_path.clone(),
+            box_type: info.box_type(),
+            offset: info.offset(),
+            source,
+        })?;
+
+        if path_match.exact_match {
+            let typed = payload.as_any_mut().downcast_mut::<T>().ok_or_else(|| {
+                RewriteError::UnexpectedPayloadType {
+                    path: current_path.clone(),
+                    box_type: info.box_type(),
+                    offset: info.offset(),
+                    expected_type: type_name::<T>(),
+                }
+            })?;
+            (plan.edit)(typed);
+            *plan.rewritten_count += 1;
+        }
+
+        let is_visual_sample_entry = payload.as_any().is::<VisualSampleEntry>();
+        let mut encoded_payload = Vec::new();
+        marshal_dyn(&mut encoded_payload, payload.as_ref(), None).map_err(|source| {
+            RewriteError::PayloadEncode {
+                path: current_path.clone(),
+                box_type: info.box_type(),
+                offset: info.offset(),
+                source,
+            }
+        })?;
+        (encoded_payload, payload_read, is_visual_sample_entry)
+    };
+
+    let placeholder = BoxInfo::new(info.box_type(), info.header_size())
+        .with_header_size(info.header_size())
+        .with_lookup_context(info.lookup_context())
+        .with_extend_to_eof(info.extend_to_eof());
+    writer.start_box_async(placeholder).await?;
+    writer.write_all(&encoded_payload).await?;
+
+    let children_offset = info.offset() + info.header_size() + payload_read;
+    let (children_size, trailing_bytes) = if is_visual_sample_entry {
+        visual_sample_entry_children_layout_async(
+            reader,
+            children_offset,
+            payload_size.saturating_sub(payload_read),
+        )
+        .await?
+    } else {
+        (payload_size.saturating_sub(payload_read), Vec::new())
+    };
+    reader.seek(SeekFrom::Start(children_offset)).await?;
+    Box::pin(rewrite_sequence_async::<R, W, T, F>(
+        reader,
+        writer,
+        registry,
+        plan,
+        RewriteFrame::child(
+            children_size,
+            current_path,
+            info.lookup_context().enter(info.box_type()),
+        ),
+    ))
+    .await?;
+    if !trailing_bytes.is_empty() {
+        writer.write_all(&trailing_bytes).await?;
+    }
+    reader
+        .seek(SeekFrom::Start(info.offset() + info.size()))
+        .await?;
+    writer.end_box_async().await?;
+    Ok(())
+}
+
 fn inspect_context_carriers<R>(
     reader: &mut R,
     info: &mut BoxInfo,
@@ -370,6 +677,33 @@ where
     Ok(())
 }
 
+#[cfg(feature = "async")]
+async fn inspect_context_carriers_async<R>(
+    reader: &mut R,
+    info: &mut BoxInfo,
+    path: &BoxPath,
+) -> Result<(), RewriteError>
+where
+    R: AsyncReadSeek,
+{
+    if path.is_empty() && info.box_type() == FTYP {
+        let ftyp = decode_box_async::<_, Ftyp>(reader, info).await?;
+        if ftyp.has_compatible_brand(QT_BRAND) {
+            info.set_lookup_context(info.lookup_context().with_quicktime_compatible(true));
+        }
+    }
+
+    if info.box_type() == KEYS {
+        let keys = decode_box_async::<_, Keys>(reader, info).await?;
+        info.set_lookup_context(
+            info.lookup_context()
+                .with_metadata_keys_entry_count(keys.entry_count as usize),
+        );
+    }
+
+    Ok(())
+}
+
 fn visual_sample_entry_children_layout<R>(
     reader: &mut R,
     extension_offset: u64,
@@ -387,6 +721,24 @@ where
     Ok((child_len as u64, bytes[child_len..].to_vec()))
 }
 
+#[cfg(feature = "async")]
+async fn visual_sample_entry_children_layout_async<R>(
+    reader: &mut R,
+    extension_offset: u64,
+    extension_size: u64,
+) -> Result<(u64, Vec<u8>), RewriteError>
+where
+    R: AsyncReadSeek,
+{
+    let checkpoint = reader.stream_position().await?;
+    reader.seek(SeekFrom::Start(extension_offset)).await?;
+    let bytes = read_extension_bytes_async(reader, extension_size).await?;
+    reader.seek(SeekFrom::Start(checkpoint)).await?;
+
+    let child_len = split_box_children_with_optional_trailing_bytes(&bytes);
+    Ok((child_len as u64, bytes[child_len..].to_vec()))
+}
+
 fn read_extension_bytes<R>(reader: &mut R, extension_size: u64) -> Result<Vec<u8>, RewriteError>
 where
     R: Read,
@@ -396,6 +748,22 @@ where
     })?;
     let mut bytes = vec![0; extension_len];
     reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_extension_bytes_async<R>(
+    reader: &mut R,
+    extension_size: u64,
+) -> Result<Vec<u8>, RewriteError>
+where
+    R: AsyncReadSeek,
+{
+    let extension_len = usize::try_from(extension_size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload extension is too large")
+    })?;
+    let mut bytes = vec![0; extension_len];
+    reader.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
 
@@ -411,6 +779,19 @@ where
     Ok(decoded)
 }
 
+#[cfg(feature = "async")]
+async fn decode_box_async<R, B>(reader: &mut R, info: &BoxInfo) -> Result<B, RewriteError>
+where
+    R: AsyncReadSeek,
+    B: Default + CodecBox + Send,
+{
+    info.seek_to_payload_async(reader).await?;
+    let mut decoded = B::default();
+    crate::codec::unmarshal_async(reader, info.payload_size()?, &mut decoded, None).await?;
+    info.seek_to_payload_async(reader).await?;
+    Ok(decoded)
+}
+
 fn clean_root_eof<R>(reader: &mut R, start: u64, error: &io::Error) -> Result<bool, io::Error>
 where
     R: Seek,
@@ -420,6 +801,23 @@ where
     }
 
     let end = reader.seek(SeekFrom::End(0))?;
+    Ok(start == end)
+}
+
+#[cfg(feature = "async")]
+async fn clean_root_eof_async<R>(
+    reader: &mut R,
+    start: u64,
+    error: &io::Error,
+) -> Result<bool, io::Error>
+where
+    R: AsyncReadSeek,
+{
+    if error.kind() != io::ErrorKind::UnexpectedEof {
+        return Ok(false);
+    }
+
+    let end = reader.seek(SeekFrom::End(0)).await?;
     Ok(start == end)
 }
 
