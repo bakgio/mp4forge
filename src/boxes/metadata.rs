@@ -2,7 +2,11 @@
 
 use std::io::{SeekFrom, Write};
 
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::{AnyTypeBox, BoxLookupContext, BoxRegistry};
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
     FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
@@ -2273,6 +2277,16 @@ impl MutableBox for NumberedMetadataItem {
     ) -> Result<(), crate::codec::CodecError> {
         self.layout = NumberedMetadataLayout::InlineFields;
         Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    fn before_unmarshal_async<'a>(
+        &'a mut self,
+        _reader: &'a mut dyn AsyncReadSeek,
+        _payload_size: u64,
+    ) -> CodecFuture<'a, Result<(), crate::codec::CodecError>> {
+        self.layout = NumberedMetadataLayout::InlineFields;
+        Box::pin(async { Ok(()) })
     }
 }
 

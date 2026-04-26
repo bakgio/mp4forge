@@ -8,16 +8,27 @@ use std::any::type_name;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Cursor, Read, Seek};
+#[cfg(feature = "async")]
+use std::sync::{Arc, Mutex};
 
 use crate::BoxInfo;
 use crate::FourCc;
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::{BoxRegistry, default_registry};
 use crate::codec::{CodecBox, CodecError, DynCodecBox, unmarshal_any_with_context};
 use crate::header::HeaderError;
+#[cfg(feature = "async")]
+use crate::walk::{
+    AsyncWalkFuture, AsyncWalkHandle, AsyncWalkVisitor,
+    walk_structure_from_box_with_registry_async, walk_structure_with_registry_async,
+};
 use crate::walk::{
     BoxPath, PathMatch, WalkControl, WalkError, WalkHandle, walk_structure_from_box_with_registry,
     walk_structure_with_registry,
 };
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Header metadata paired with a decoded runtime box payload.
 ///
@@ -203,6 +214,352 @@ where
     extract_boxes_payload_bytes_with_registry(reader, parent, paths, &registry)
 }
 
+/// Extracts every box that matches `path` through the additive Tokio-based async surface and
+/// returns the matching header metadata.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_box_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<BoxInfo>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    extract_boxes_async(reader, parent.as_ref(), &paths).await
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface and returns the matching header metadata.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<BoxInfo>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    validate_paths(&paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths,
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, &parent, &registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, &registry, visitor).await?;
+    }
+
+    let matches = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+
+    Ok(matches.into_iter().map(|matched| matched.info).collect())
+}
+
+/// Extracts every box that matches `path` through the additive Tokio-based async surface and
+/// decodes the payloads.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_box_with_payload_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<ExtractedBox>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    extract_boxes_with_payload_async(reader, parent.as_ref(), &paths).await
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface and decodes the payloads.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_with_payload_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<ExtractedBox>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    validate_paths(&paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths,
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, &parent, &registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, &registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut staged = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        let payload_bytes =
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
+        staged.push((matched, payload_bytes));
+    }
+
+    let mut matches = Vec::with_capacity(staged.len());
+    for (matched, payload_bytes) in staged {
+        let payload = decode_payload_from_bytes(&matched, &registry, &payload_bytes)?;
+        matches.push(ExtractedBox {
+            info: matched.info,
+            payload,
+        });
+    }
+
+    Ok(matches)
+}
+
+/// Extracts every box that matches `path` through the additive Tokio-based async surface, decodes
+/// the payloads, and clones them as `T`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_box_as_async<R, T>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<T>, ExtractError>
+where
+    R: AsyncReadSeek,
+    T: CodecBox + Clone + 'static,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    extract_boxes_as_async(reader, parent.as_ref(), &paths).await
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface, decodes the payloads, and clones them as `T`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_as_async<R, T>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<T>, ExtractError>
+where
+    R: AsyncReadSeek,
+    T: CodecBox + Clone + 'static,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    validate_paths(&paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths,
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, &parent, &registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, &registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut staged = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        let payload_bytes =
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
+        staged.push((matched, payload_bytes));
+    }
+
+    let mut payloads = Vec::with_capacity(staged.len());
+    for (matched, payload_bytes) in staged {
+        let payload = decode_payload_from_bytes(&matched, &registry, &payload_bytes)?;
+        let typed = payload
+            .as_ref()
+            .as_any()
+            .downcast_ref::<T>()
+            .cloned()
+            .ok_or_else(|| ExtractError::UnexpectedPayloadType {
+                path: matched.path.clone(),
+                box_type: matched.info.box_type(),
+                offset: matched.info.offset(),
+                expected_type: type_name::<T>(),
+            })?;
+        payloads.push(typed);
+    }
+
+    Ok(payloads)
+}
+
+/// Extracts every box that matches `path` through the additive Tokio-based async surface and
+/// returns each match as exact serialized bytes, including the original box header.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_box_bytes_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    extract_boxes_bytes_async(reader, parent.as_ref(), &paths).await
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface and returns each match as exact serialized bytes, including the original box header.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_bytes_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    validate_paths(&paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths,
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, &parent, &registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, &registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut extracted = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        extracted.push(
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::FullBox).await?,
+        );
+    }
+
+    Ok(extracted)
+}
+
+/// Extracts every box that matches `path` through the additive Tokio-based async surface and
+/// returns each matched payload as exact on-disk bytes.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_box_payload_bytes_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    extract_boxes_payload_bytes_async(reader, parent.as_ref(), &paths).await
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface and returns each matched payload as exact on-disk bytes.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_payload_bytes_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    validate_paths(&paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths,
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, &parent, &registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, &registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut extracted = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        extracted.push(
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?,
+        );
+    }
+
+    Ok(extracted)
+}
+
 /// Extracts every box that matches `path`, decodes the payloads, and clones them as `T` from an
 /// in-memory MP4 byte slice.
 ///
@@ -346,9 +703,316 @@ where
     Ok(payloads)
 }
 
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface using `registry` and returns the matching header metadata.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_with_registry_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<BoxInfo>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    validate_paths(paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths: paths.to_vec(),
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, parent, registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, registry, visitor).await?;
+    }
+
+    let matches = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+
+    Ok(matches.into_iter().map(|matched| matched.info).collect())
+}
+
+/// Extracts every box that matches any path in `paths`, then decodes the payloads through the
+/// additive Tokio-based async surface with `registry`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_with_payload_with_registry_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<ExtractedBox>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    validate_paths(paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths: paths.to_vec(),
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, parent, registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut staged = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        let payload_bytes =
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
+        staged.push((matched, payload_bytes));
+    }
+
+    let mut matches = Vec::with_capacity(staged.len());
+    for (matched, payload_bytes) in staged {
+        let payload = decode_payload_from_bytes(&matched, registry, &payload_bytes)?;
+        matches.push(ExtractedBox {
+            info: matched.info,
+            payload,
+        });
+    }
+
+    Ok(matches)
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface using `registry` and returns each match as exact serialized bytes, including the
+/// original box header.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_bytes_with_registry_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    validate_paths(paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths: paths.to_vec(),
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, parent, registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut extracted = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        extracted.push(
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::FullBox).await?,
+        );
+    }
+
+    Ok(extracted)
+}
+
+/// Extracts every box that matches any path in `paths` through the additive Tokio-based async
+/// surface using `registry` and returns each matched payload as exact on-disk bytes.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_payload_bytes_with_registry_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<Vec<u8>>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    validate_paths(paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths: paths.to_vec(),
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, parent, registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut extracted = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        extracted.push(
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?,
+        );
+    }
+
+    Ok(extracted)
+}
+
+/// Extracts every box that matches any path in `paths`, decodes the payloads through the additive
+/// Tokio-based async surface with `registry`, and clones them as `T`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn extract_boxes_as_with_registry_async<R, T>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<T>, ExtractError>
+where
+    R: AsyncReadSeek,
+    T: CodecBox + Clone + 'static,
+{
+    validate_paths(paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths: paths.to_vec(),
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, parent, registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, registry, visitor).await?;
+    }
+
+    let matched_boxes = Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))?;
+    let mut staged = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        let payload_bytes =
+            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
+        staged.push((matched, payload_bytes));
+    }
+
+    let mut payloads = Vec::with_capacity(staged.len());
+    for (matched, payload_bytes) in staged {
+        let payload = decode_payload_from_bytes(&matched, registry, &payload_bytes)?;
+        let typed = payload
+            .as_ref()
+            .as_any()
+            .downcast_ref::<T>()
+            .cloned()
+            .ok_or_else(|| ExtractError::UnexpectedPayloadType {
+                path: matched.path.clone(),
+                box_type: matched.info.box_type(),
+                offset: matched.info.offset(),
+                expected_type: type_name::<T>(),
+            })?;
+        payloads.push(typed);
+    }
+
+    Ok(payloads)
+}
+
 struct MatchedBox {
     info: BoxInfo,
     path: BoxPath,
+}
+
+#[cfg(feature = "async")]
+struct AsyncMatchCollector {
+    has_parent: bool,
+    paths: Vec<BoxPath>,
+    matches: Arc<Mutex<Vec<MatchedBox>>>,
+}
+
+#[cfg(feature = "async")]
+impl<R> AsyncWalkVisitor<R> for AsyncMatchCollector
+where
+    R: AsyncReadSeek,
+{
+    type Future<'a>
+        = AsyncWalkFuture<'a>
+    where
+        Self: 'a,
+        R: 'a;
+
+    fn visit<'a, 'r>(&'a mut self, handle: &'a mut AsyncWalkHandle<'r, R>) -> Self::Future<'a>
+    where
+        'r: 'a,
+    {
+        Box::pin(async move {
+            if handle.info().box_type() == FourCc::ANY {
+                return Ok(WalkControl::Continue);
+            }
+
+            let relative_path = if self.has_parent {
+                BoxPath::from(handle.path().as_slice()[1..].to_vec())
+            } else {
+                handle.path().clone()
+            };
+
+            let PathMatch {
+                forward_match,
+                exact_match,
+            } = match_paths(&self.paths, &relative_path);
+            if exact_match {
+                self.matches
+                    .lock()
+                    .map_err(|_| WalkError::Io(io::Error::other("async match collector poisoned")))?
+                    .push(MatchedBox {
+                        info: *handle.info(),
+                        path: relative_path.clone(),
+                    });
+            }
+
+            Ok(if forward_match {
+                WalkControl::Descend
+            } else {
+                WalkControl::Continue
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -440,9 +1104,19 @@ where
 {
     matched.info.seek_to_payload(reader)?;
     let payload_size = matched.info.payload_size()?;
+    let payload_bytes = read_exact_bytes(reader, payload_size)?;
+    decode_payload_from_bytes(matched, registry, &payload_bytes)
+}
+
+fn decode_payload_from_bytes(
+    matched: &MatchedBox,
+    registry: &BoxRegistry,
+    payload_bytes: &[u8],
+) -> Result<Box<dyn DynCodecBox>, ExtractError> {
+    let mut payload_reader = Cursor::new(payload_bytes);
     let (payload, _) = unmarshal_any_with_context(
-        reader,
-        payload_size,
+        &mut payload_reader,
+        payload_bytes.len() as u64,
         matched.info.box_type(),
         registry,
         matched.info.lookup_context(),
@@ -478,6 +1152,30 @@ where
     read_exact_bytes(reader, len)
 }
 
+#[cfg(feature = "async")]
+async fn read_matched_bytes_async<R>(
+    reader: &mut R,
+    info: BoxInfo,
+    range: ExtractedByteRange,
+) -> Result<Vec<u8>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let len = match range {
+        ExtractedByteRange::FullBox => {
+            reader.seek(io::SeekFrom::Start(info.offset())).await?;
+            info.size()
+        }
+        ExtractedByteRange::Payload => {
+            reader
+                .seek(io::SeekFrom::Start(info.offset() + info.header_size()))
+                .await?;
+            info.payload_size()?
+        }
+    };
+    read_exact_bytes_async(reader, len).await
+}
+
 fn read_exact_bytes<R>(reader: &mut R, len: u64) -> Result<Vec<u8>, ExtractError>
 where
     R: Read,
@@ -490,6 +1188,24 @@ where
     // copied byte count must be checked explicitly to preserve exact-byte semantics.
     let mut limited = reader.take(len);
     let copied = limited.read_to_end(&mut bytes)? as u64;
+    if copied != len {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
+
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_exact_bytes_async<R>(reader: &mut R, len: u64) -> Result<Vec<u8>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    let mut bytes = usize::try_from(len)
+        .map(Vec::with_capacity)
+        .unwrap_or_else(|_| Vec::new());
+
+    let mut limited = (&mut *reader).take(len);
+    let copied = limited.read_to_end(&mut bytes).await? as u64;
     if copied != len {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
     }

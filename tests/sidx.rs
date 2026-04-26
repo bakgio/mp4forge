@@ -19,6 +19,8 @@ use mp4forge::sidx::{
     apply_top_level_sidx_plan, apply_top_level_sidx_plan_bytes, build_top_level_sidx_plan,
     plan_top_level_sidx_update, plan_top_level_sidx_update_bytes,
 };
+#[cfg(feature = "async")]
+use mp4forge::sidx::{apply_top_level_sidx_plan_async, plan_top_level_sidx_update_async};
 use mp4forge::walk::BoxPath;
 
 use support::{encode_raw_box, encode_supported_box, fixture_path, fourcc};
@@ -252,6 +254,32 @@ fn plan_top_level_sidx_update_builds_insert_plan_with_default_values() {
     assert!(plan.encoded_box_size >= 44);
 }
 
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_plan_top_level_sidx_update_builds_insert_plan_with_default_values() {
+    let input = build_styp_fragmented_single_track_file();
+
+    let async_plan = plan_top_level_sidx_update_async(
+        &mut Cursor::new(&input),
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: true,
+            non_zero_ept: false,
+        },
+    )
+    .await
+    .unwrap();
+    let sync_plan = plan_top_level_sidx_update_bytes(
+        &input,
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: true,
+            non_zero_ept: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(async_plan, sync_plan);
+}
+
 #[test]
 fn plan_top_level_sidx_update_builds_replace_plan_with_non_zero_ept() {
     let input = build_top_level_sidx_fragmented_single_track_file(false);
@@ -380,6 +408,44 @@ fn apply_top_level_sidx_plan_bytes_inserts_top_level_sidx_and_preserves_other_by
     );
 }
 
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_apply_top_level_sidx_plan_inserts_top_level_sidx_and_preserves_other_bytes() {
+    let input = build_styp_fragmented_single_track_file();
+    let plan = plan_top_level_sidx_update_async(
+        &mut Cursor::new(&input),
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: true,
+            non_zero_ept: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let mut output = Cursor::new(Vec::new());
+    let applied = apply_top_level_sidx_plan_async(&mut Cursor::new(&input), &mut output, &plan)
+        .await
+        .unwrap();
+    let output = output.into_inner();
+    let sidx = extract_box_as::<_, Sidx>(
+        &mut Cursor::new(&output),
+        None,
+        BoxPath::from([fourcc("sidx")]),
+    )
+    .unwrap();
+
+    assert_eq!(sidx.len(), 1);
+    assert_eq!(sidx[0], applied.sidx);
+    let insertion_offset = plan.insertion_box.offset() as usize;
+    let encoded_size = applied.info.size() as usize;
+    assert_eq!(&output[..insertion_offset], &input[..insertion_offset]);
+    assert_eq!(
+        &output[insertion_offset + encoded_size..],
+        &input[insertion_offset..]
+    );
+}
+
 #[test]
 fn apply_top_level_sidx_plan_replaces_existing_box_and_preserves_following_bytes() {
     let input = build_gapped_top_level_sidx_fragmented_single_track_file_v0();
@@ -400,6 +466,45 @@ fn apply_top_level_sidx_plan_replaces_existing_box_and_preserves_following_bytes
 
     let mut output = Vec::new();
     let applied = apply_top_level_sidx_plan(&mut Cursor::new(&input), &mut output, &plan).unwrap();
+
+    assert_eq!(applied.info.offset(), existing.info.offset());
+    assert_eq!(applied.sidx.version(), 1);
+    assert_eq!(applied.sidx.earliest_presentation_time(), 105);
+    assert_eq!(applied.sidx.first_offset(), segment_gap_box().len() as u64);
+    assert_eq!(
+        &output[..existing.info.offset() as usize],
+        &input[..existing.info.offset() as usize]
+    );
+    let new_end = (applied.info.offset() + applied.info.size()) as usize;
+    let old_end = (existing.info.offset() + existing.info.size()) as usize;
+    assert_eq!(&output[new_end..], &input[old_end..]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_apply_top_level_sidx_plan_replaces_existing_box_and_preserves_following_bytes() {
+    let input = build_gapped_top_level_sidx_fragmented_single_track_file_v0();
+    let plan = plan_top_level_sidx_update_async(
+        &mut Cursor::new(&input),
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: false,
+            non_zero_ept: true,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let existing = match &plan.action {
+        TopLevelSidxPlanAction::Replace { existing } => existing.clone(),
+        TopLevelSidxPlanAction::Insert => panic!("expected replace plan"),
+    };
+
+    let mut output = Cursor::new(Vec::new());
+    let applied = apply_top_level_sidx_plan_async(&mut Cursor::new(&input), &mut output, &plan)
+        .await
+        .unwrap();
+    let output = output.into_inner();
 
     assert_eq!(applied.info.offset(), existing.info.offset());
     assert_eq!(applied.sidx.version(), 1);
@@ -461,6 +566,82 @@ fn apply_top_level_sidx_plan_bytes_rejects_stale_input() {
             ..
         } if expected_type == fourcc("styp")
     ));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_apply_top_level_sidx_plan_rejects_stale_input() {
+    let input = build_styp_fragmented_single_track_file();
+    let stale_input = build_audio_first_fragmented_file();
+    let plan = plan_top_level_sidx_update_async(
+        &mut Cursor::new(&input),
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: true,
+            non_zero_ept: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let error = apply_top_level_sidx_plan_async(
+        &mut Cursor::new(&stale_input),
+        &mut Cursor::new(Vec::new()),
+        &plan,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SidxRewriteError::PlannedBoxMismatch {
+            expected_type,
+            ..
+        } if expected_type == fourcc("styp")
+    ));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_sidx_helpers_can_run_on_tokio_worker_threads() {
+    let input = build_styp_fragmented_single_track_file();
+    let plan_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(input);
+        plan_top_level_sidx_update_async(
+            &mut reader,
+            TopLevelSidxPlanOptions {
+                add_if_not_exists: true,
+                non_zero_ept: false,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    });
+    let plan = plan_handle.await.unwrap();
+    assert_eq!(plan.sidx.reference_count, 2);
+
+    let input = build_styp_fragmented_single_track_file();
+    let apply_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(input);
+        let mut writer = Cursor::new(Vec::new());
+        let applied = apply_top_level_sidx_plan_async(&mut reader, &mut writer, &plan)
+            .await
+            .unwrap();
+        (applied, writer.into_inner())
+    });
+    let (applied, bytes) = apply_handle.await.unwrap();
+    assert_eq!(applied.sidx.reference_count, 2);
+    assert_eq!(
+        extract_box_as::<_, Sidx>(
+            &mut Cursor::new(bytes),
+            None,
+            BoxPath::from([fourcc("sidx")])
+        )
+        .unwrap()
+        .len(),
+        1
+    );
 }
 
 #[test]

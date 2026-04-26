@@ -27,10 +27,11 @@
 
 ```toml
 [dependencies]
-mp4forge = "0.5.0"
+mp4forge = "0.6.0"
 
 # With optional features:
-# mp4forge = { version = "0.5.0", features = ["serde"] }
+# mp4forge = { version = "0.6.0", features = ["async"] }
+# mp4forge = { version = "0.6.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:
@@ -49,9 +50,14 @@ The published crate includes both the library and the `mp4forge` binary from `sr
 
 ## Feature Flags
 
-`mp4forge` keeps the default dependency surface minimal and currently exposes one optional public
-feature flag:
+`mp4forge` keeps the default dependency surface minimal and currently exposes these optional public
+feature flags:
 
+- `async`: enables the additive library-side async I/O surface for seekable readers and writers.
+  This rollout is Tokio-based, expects a Tokio runtime in the caller, targets seekable
+  `AsyncRead + AsyncSeek` and `AsyncWrite + AsyncSeek` inputs and outputs, supports normal
+  multithreaded `tokio::spawn` usage for the supported library paths, and keeps the current CLI on
+  the existing sync path.
 - `serde`: derives `Serialize` and `Deserialize` for the reusable public report structs under
   `mp4forge::cli::probe` and `mp4forge::cli::dump`, along with their nested public codec-detail,
   media-characteristics, `FieldValue`, and `FourCc` data. This is intended for library-side report
@@ -101,7 +107,7 @@ field-order hints. Pass `-detail light` for a lighter-weight probe that skips pe
 per-chunk, bitrate, and IDR aggregation, or use `mp4forge::probe::ProbeOptions` from the library
 when you need the same control programmatically.
 
-> See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage patterns.
+> See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage patterns, including the Tokio-based async library example behind the optional `async` feature.
 
 ## License
 

@@ -1,3 +1,10 @@
+# 0.6.0 (April 26, 2026)
+
+- Added an additive Tokio-based `async` feature for the library, covering seekable async traversal, extraction, typed codec decode and encode, writer flows, rewrite flows, probe surfaces, and top-level `sidx` helpers while keeping the CLI on the established synchronous path
+- Strengthened the async rollout so the supported library paths are multithread-safe under normal `tokio::spawn` use for independent-file workloads, with dedicated worker-thread and concurrent-file parity coverage
+- Added a focused Tokio async example, updated crate and README guidance for the supported async scope, and preserved the default sync build without changing the existing non-async public API
+- Expanded regression and comparison-backed parity coverage to lock sync-versus-async behavior across shared MP4, fragmented, encrypted, and metadata-rich fixture sets
+
 # 0.5.0 (April 25, 2026)
 
 - Added first-class encrypted metadata coverage for typed `senc`, typed `sgpd(seig)`, resolved sample-encryption helpers, and broader encrypted fragmented fixture coverage across extraction, rewrite, and probe flows

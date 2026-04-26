@@ -3,9 +3,21 @@
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
+#[cfg(feature = "async")]
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+#[cfg(feature = "async")]
+use std::io::Cursor;
+#[cfg(feature = "async")]
+use std::pin::Pin;
+
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
 use crate::FourCc;
+#[cfg(feature = "async")]
+use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
 use crate::bitio::{BitReader, BitWriter};
 use crate::boxes::{BoxLookupContext, BoxRegistry};
 
@@ -19,6 +31,11 @@ const MAX_UNTRUSTED_PREALLOC: usize = 64 * 1024;
 pub trait ReadSeek: Read + Seek {}
 
 impl<T> ReadSeek for T where T: Read + Seek {}
+
+/// Boxed future used by the additive Tokio-based codec hook surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub type CodecFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub(crate) fn untrusted_prealloc_hint(count: usize) -> usize {
     count.min(MAX_UNTRUSTED_PREALLOC)
@@ -34,6 +51,26 @@ where
     while remaining != 0 {
         let to_read = remaining.min(chunk.len());
         reader.read_exact(&mut chunk[..to_read])?;
+        data.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
+    Ok(data)
+}
+
+#[cfg(feature = "async")]
+pub(crate) async fn read_exact_vec_untrusted_async<R>(
+    reader: &mut R,
+    len: usize,
+) -> io::Result<Vec<u8>>
+where
+    R: AsyncReadSeek + ?Sized,
+{
+    let mut data = Vec::with_capacity(untrusted_prealloc_hint(len));
+    let mut chunk = [0_u8; 4096];
+    let mut remaining = len;
+    while remaining != 0 {
+        let to_read = remaining.min(chunk.len());
+        reader.read_exact(&mut chunk[..to_read]).await?;
         data.extend_from_slice(&chunk[..to_read]);
         remaining -= to_read;
     }
@@ -120,6 +157,18 @@ pub trait MutableBox: ImmutableBox {
         _payload_size: u64,
     ) -> Result<(), CodecError> {
         Ok(())
+    }
+
+    /// Runs before descriptor-driven decode on the Tokio-based async surface for boxes that must
+    /// inspect payload bytes first.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn before_unmarshal_async<'a>(
+        &'a mut self,
+        _reader: &'a mut dyn AsyncReadSeek,
+        _payload_size: u64,
+    ) -> CodecFuture<'a, Result<(), CodecError>> {
+        Box::pin(async { Ok(()) })
     }
 
     /// Sets `flag` in the stored flag word.
@@ -625,6 +674,11 @@ fn select_hooks<'a>(
     hooks.unwrap_or(owner)
 }
 
+#[cfg(feature = "async")]
+fn erase_sync_hooks(hooks: Option<&(dyn FieldHooks + Sync)>) -> Option<&dyn FieldHooks> {
+    hooks.map(|hooks| hooks as &dyn FieldHooks)
+}
+
 /// Owned field value transferred between descriptor code and concrete boxes.
 #[cfg_attr(
     feature = "serde",
@@ -740,6 +794,29 @@ pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite {
     ) -> Result<Option<u64>, CodecError> {
         Ok(None)
     }
+
+    /// Encodes the full payload manually through the additive Tokio-based async codec surface when
+    /// the generic descriptor path is not expressive enough.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn custom_marshal_async<'a>(
+        &'a self,
+        _writer: &'a mut dyn AsyncWriteSeek,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Decodes the full payload manually through the additive Tokio-based async codec surface when
+    /// the generic descriptor path is not expressive enough.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        _reader: &'a mut dyn AsyncReadSeek,
+        _payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Object-safe view of the descriptor-backed box surface.
@@ -762,6 +839,38 @@ pub trait CodecDescription: MutableBox + FieldValueRead + FieldValueWrite {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError>;
+
+    /// Runs before descriptor-driven decode on the Tokio-based async surface for boxes that must
+    /// inspect payload bytes first.
+    #[cfg(feature = "async")]
+    fn before_unmarshal_async<'a>(
+        &'a mut self,
+        _reader: &'a mut dyn AsyncReadSeek,
+        _payload_size: u64,
+    ) -> CodecFuture<'a, Result<(), CodecError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Encodes the full payload manually through the additive Tokio-based async codec surface when
+    /// the generic descriptor path is not expressive enough.
+    #[cfg(feature = "async")]
+    fn custom_marshal_async<'a>(
+        &'a self,
+        _writer: &'a mut dyn AsyncWriteSeek,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Decodes the full payload manually through the additive Tokio-based async codec surface when
+    /// the generic descriptor path is not expressive enough.
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        _reader: &'a mut dyn AsyncReadSeek,
+        _payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl<T> CodecDescription for T
@@ -790,6 +899,32 @@ where
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
         <T as CodecBox>::custom_unmarshal(self, reader, payload_size)
+    }
+
+    #[cfg(feature = "async")]
+    fn before_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<(), CodecError>> {
+        <T as MutableBox>::before_unmarshal_async(self, reader, payload_size)
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_marshal_async<'a>(
+        &'a self,
+        writer: &'a mut dyn AsyncWriteSeek,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        <T as CodecBox>::custom_marshal_async(self, writer)
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        <T as CodecBox>::custom_unmarshal_async(self, reader, payload_size)
     }
 }
 
@@ -1036,6 +1171,21 @@ where
     marshal_codec(writer, src, hooks)
 }
 
+/// Encodes a concrete box payload through the additive Tokio-based async codec surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn marshal_async<W, B>(
+    writer: &mut W,
+    src: &B,
+    hooks: Option<&(dyn FieldHooks + Sync)>,
+) -> Result<u64, CodecError>
+where
+    W: AsyncWriteSeek,
+    B: CodecBox + Sync,
+{
+    marshal_codec_async_typed(writer, src, hooks).await
+}
+
 /// Encodes a runtime-erased descriptor-backed box payload into `writer`.
 pub fn marshal_dyn<W>(
     writer: W,
@@ -1046,6 +1196,21 @@ where
     W: Write,
 {
     marshal_codec(writer, src, hooks)
+}
+
+/// Encodes a runtime-erased descriptor-backed box payload through the additive Tokio-based async
+/// codec surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn marshal_dyn_async<W>(
+    writer: &mut W,
+    src: &dyn CodecDescription,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<u64, CodecError>
+where
+    W: AsyncWriteSeek,
+{
+    marshal_codec_async(writer, src, hooks).await
 }
 
 fn marshal_codec<W>(
@@ -1077,6 +1242,45 @@ where
     Ok(encoder.written_bits / 8)
 }
 
+#[cfg(feature = "async")]
+async fn marshal_codec_async_typed<W, B>(
+    writer: &mut W,
+    src: &B,
+    hooks: Option<&(dyn FieldHooks + Sync)>,
+) -> Result<u64, CodecError>
+where
+    W: AsyncWriteSeek,
+    B: CodecBox + Sync,
+{
+    if let Some(written) = src.custom_marshal_async(writer).await? {
+        return Ok(written);
+    }
+
+    let mut payload = Vec::new();
+    let written = marshal_codec(&mut payload, src, erase_sync_hooks(hooks))?;
+    writer.write_all(&payload).await?;
+    Ok(written)
+}
+
+#[cfg(feature = "async")]
+async fn marshal_codec_async<W>(
+    writer: &mut W,
+    src: &dyn CodecDescription,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<u64, CodecError>
+where
+    W: AsyncWriteSeek,
+{
+    if let Some(written) = src.custom_marshal_async(writer).await? {
+        return Ok(written);
+    }
+
+    let mut payload = Vec::new();
+    let written = marshal_codec(&mut payload, src, hooks)?;
+    writer.write_all(&payload).await?;
+    Ok(written)
+}
+
 /// Decodes a concrete box payload from `reader`.
 pub fn unmarshal<R, B>(
     reader: &mut R,
@@ -1091,6 +1295,22 @@ where
     unmarshal_codec(reader, payload_size, dst, hooks)
 }
 
+/// Decodes a concrete box payload through the additive Tokio-based async codec surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn unmarshal_async<R, B>(
+    reader: &mut R,
+    payload_size: u64,
+    dst: &mut B,
+    hooks: Option<&(dyn FieldHooks + Sync)>,
+) -> Result<u64, CodecError>
+where
+    R: AsyncReadSeek,
+    B: CodecBox + Send,
+{
+    unmarshal_codec_async_typed(reader, payload_size, dst, hooks).await
+}
+
 /// Decodes a runtime-erased descriptor-backed box payload from `reader`.
 pub fn unmarshal_dyn<R>(
     reader: &mut R,
@@ -1102,6 +1322,22 @@ where
     R: Read + Seek,
 {
     unmarshal_codec(reader, payload_size, dst, hooks)
+}
+
+/// Decodes a runtime-erased descriptor-backed box payload through the additive Tokio-based async
+/// codec surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn unmarshal_dyn_async<R>(
+    reader: &mut R,
+    payload_size: u64,
+    dst: &mut dyn CodecDescription,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<u64, CodecError>
+where
+    R: AsyncReadSeek,
+{
+    unmarshal_codec_async(reader, payload_size, dst, hooks).await
 }
 
 /// Constructs and decodes a box using the registry entry for `box_type`.
@@ -1125,6 +1361,31 @@ where
     )
 }
 
+/// Constructs and decodes a box through the additive Tokio-based async codec surface using the
+/// registry entry for `box_type`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn unmarshal_any_async<R>(
+    reader: &mut R,
+    payload_size: u64,
+    box_type: FourCc,
+    registry: &BoxRegistry,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<(Box<dyn DynCodecBox>, u64), CodecError>
+where
+    R: AsyncReadSeek,
+{
+    unmarshal_any_with_context_async(
+        reader,
+        payload_size,
+        box_type,
+        registry,
+        BoxLookupContext::new(),
+        hooks,
+    )
+    .await
+}
+
 /// Constructs and decodes a box using the registration active for `box_type` in `context`.
 pub fn unmarshal_any_with_context<R>(
     reader: &mut R,
@@ -1141,6 +1402,35 @@ where
         .new_box_with_context(box_type, context)
         .ok_or(CodecError::UnknownBoxType { box_type })?;
     let read = unmarshal_dyn(reader, payload_size, boxed.as_mut(), hooks)?;
+    Ok((boxed, read))
+}
+
+/// Constructs and decodes a box through the additive Tokio-based async codec surface using the
+/// registration active for `box_type` in `context`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn unmarshal_any_with_context_async<R>(
+    reader: &mut R,
+    payload_size: u64,
+    box_type: FourCc,
+    registry: &BoxRegistry,
+    context: BoxLookupContext,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<(Box<dyn DynCodecBox>, u64), CodecError>
+where
+    R: AsyncReadSeek,
+{
+    let payload = read_exact_vec_untrusted_async(
+        reader,
+        usize::try_from(payload_size).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
+    )
+    .await?;
+
+    let mut boxed = registry
+        .new_box_with_context(box_type, context)
+        .ok_or(CodecError::UnknownBoxType { box_type })?;
+    let mut payload_reader = Cursor::new(payload);
+    let read = unmarshal_dyn(&mut payload_reader, payload_size, boxed.as_mut(), hooks)?;
     Ok((boxed, read))
 }
 
@@ -1172,6 +1462,167 @@ where
         Ok(read_bytes) => Ok(read_bytes),
         Err(error @ CodecError::UnsupportedVersion { .. }) => {
             reader.seek(SeekFrom::Start(start))?;
+            dst.set_version(original_version);
+            dst.set_flags(original_flags);
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn unmarshal_codec_async_typed<R, B>(
+    reader: &mut R,
+    payload_size: u64,
+    dst: &mut B,
+    hooks: Option<&(dyn FieldHooks + Sync)>,
+) -> Result<u64, CodecError>
+where
+    R: AsyncReadSeek,
+    B: CodecBox + Send,
+{
+    let start = reader.stream_position().await?;
+    let original_version = dst.version();
+    let original_flags = dst.flags();
+    dst.set_version(ANY_VERSION);
+    dst.before_unmarshal_async(reader, payload_size).await?;
+
+    let result = if let Some(read) = dst.custom_unmarshal_async(reader, payload_size).await? {
+        Ok(read)
+    } else {
+        reader.seek(SeekFrom::Start(start)).await?;
+        let payload = read_exact_vec_untrusted_async(
+            reader,
+            usize::try_from(payload_size)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
+        )
+        .await?;
+        let mut payload_reader = Cursor::new(payload);
+        let result = if let Some(read) = dst.custom_unmarshal(&mut payload_reader, payload_size)? {
+            Ok(read)
+        } else {
+            let mut decoder = Decoder::new(&mut payload_reader, payload_size, dst.box_type());
+            decoder
+                .decode_box(dst, erase_sync_hooks(hooks))
+                .map(|read_bits| read_bits / 8)
+        };
+
+        let consumed = Seek::stream_position(&mut payload_reader)?;
+        match result {
+            Ok(read_bytes) => {
+                let next = start.checked_add(consumed).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "async payload offset overflowed u64",
+                    )
+                })?;
+                reader.seek(SeekFrom::Start(next)).await?;
+                Ok(read_bytes)
+            }
+            Err(error @ CodecError::UnsupportedVersion { .. }) => {
+                reader.seek(SeekFrom::Start(start)).await?;
+                dst.set_version(original_version);
+                dst.set_flags(original_flags);
+                Err(error)
+            }
+            Err(error) => {
+                let next = start.checked_add(consumed).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "async payload offset overflowed u64",
+                    )
+                })?;
+                reader.seek(SeekFrom::Start(next)).await?;
+                Err(error)
+            }
+        }
+    };
+
+    match result {
+        Ok(read_bytes) => Ok(read_bytes),
+        Err(error @ CodecError::UnsupportedVersion { .. }) => {
+            reader.seek(SeekFrom::Start(start)).await?;
+            dst.set_version(original_version);
+            dst.set_flags(original_flags);
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn unmarshal_codec_async<R>(
+    reader: &mut R,
+    payload_size: u64,
+    dst: &mut dyn CodecDescription,
+    hooks: Option<&dyn FieldHooks>,
+) -> Result<u64, CodecError>
+where
+    R: AsyncReadSeek,
+{
+    let start = reader.stream_position().await?;
+    let original_version = dst.version();
+    let original_flags = dst.flags();
+    dst.set_version(ANY_VERSION);
+    CodecDescription::before_unmarshal_async(dst, reader, payload_size).await?;
+
+    let result = if let Some(read) = dst.custom_unmarshal_async(reader, payload_size).await? {
+        Ok(read)
+    } else {
+        // The first async codec landing keeps the existing descriptor logic intact by decoding from
+        // an in-memory cursor after the async pre-decode hook has inspected the payload.
+        reader.seek(SeekFrom::Start(start)).await?;
+        let payload = read_exact_vec_untrusted_async(
+            reader,
+            usize::try_from(payload_size)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
+        )
+        .await?;
+        let mut payload_reader = Cursor::new(payload);
+        let result = if let Some(read) = dst.custom_unmarshal(&mut payload_reader, payload_size)? {
+            Ok(read)
+        } else {
+            let mut decoder = Decoder::new(&mut payload_reader, payload_size, dst.box_type());
+            decoder
+                .decode_box(dst, hooks)
+                .map(|read_bits| read_bits / 8)
+        };
+
+        let consumed = Seek::stream_position(&mut payload_reader)?;
+        match result {
+            Ok(read_bytes) => {
+                let next = start.checked_add(consumed).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "async payload offset overflowed u64",
+                    )
+                })?;
+                reader.seek(SeekFrom::Start(next)).await?;
+                Ok(read_bytes)
+            }
+            Err(error @ CodecError::UnsupportedVersion { .. }) => {
+                reader.seek(SeekFrom::Start(start)).await?;
+                dst.set_version(original_version);
+                dst.set_flags(original_flags);
+                Err(error)
+            }
+            Err(error) => {
+                let next = start.checked_add(consumed).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "async payload offset overflowed u64",
+                    )
+                })?;
+                reader.seek(SeekFrom::Start(next)).await?;
+                Err(error)
+            }
+        }
+    };
+
+    match result {
+        Ok(read_bytes) => Ok(read_bytes),
+        Err(error @ CodecError::UnsupportedVersion { .. }) => {
+            reader.seek(SeekFrom::Start(start)).await?;
             dst.set_version(original_version);
             dst.set_flags(original_flags);
             Err(error)

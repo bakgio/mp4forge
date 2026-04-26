@@ -1,5 +1,15 @@
 //! MP4 and ISOBMFF toolkit with low-level building blocks and thin ergonomic helpers.
+//!
+//! The default surface is synchronous. Enable the optional `async` feature when you want the
+//! additive Tokio-based library companions for seekable readers and writers. That async surface is
+//! intended for supported seekable Tokio I/O such as `tokio::fs::File` and seekable in-memory
+//! cursors, and it supports normal multithreaded `tokio::spawn` use for independent-file library
+//! work. The CLI remains on the synchronous path.
 
+/// Tokio-based async I/O traits for the additive library-side async surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub mod async_io;
 /// Bit-level reader and writer helpers used by the codec layer.
 pub mod bitio;
 /// Box definitions and registry helpers.

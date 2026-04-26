@@ -12,10 +12,14 @@ use mp4forge::probe::{
     ProbeError, ProbeOptions, TrackCodec, average_sample_bitrate, average_segment_bitrate,
     find_idr_frames, max_sample_bitrate, max_segment_bitrate, probe, probe_with_options,
 };
+#[cfg(feature = "async")]
+use mp4forge::probe::{find_idr_frames_async, probe_async, probe_with_options_async};
 use mp4forge::sidx::{
     TopLevelSidxPlanOptions, apply_top_level_sidx_plan_bytes, plan_top_level_sidx_update_bytes,
 };
 use mp4forge::walk::BoxPath;
+#[cfg(feature = "async")]
+use tokio::fs as tokio_fs;
 
 use support::{fixture_path, read_golden, read_text, temp_output_dir, write_temp_file};
 
@@ -357,6 +361,77 @@ fn lightweight_probe_report_matches_library_summary_across_representative_fixtur
             assert_eq!(report_track.max_bitrate, None);
         }
     }
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_probe_surfaces_match_sync_summaries_across_shared_fixtures() {
+    for file_name in ["sample.mp4", "sample_fragmented.mp4", "sample_qt.mp4"] {
+        let path = fixture_path(file_name);
+
+        let expected = probe(&mut std::fs::File::open(&path).unwrap()).unwrap();
+        let actual = probe_async(&mut tokio_fs::File::open(&path).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(actual, expected, "fixture={file_name}");
+
+        let expected_lightweight = probe_with_options(
+            &mut std::fs::File::open(&path).unwrap(),
+            ProbeOptions::lightweight(),
+        )
+        .unwrap();
+        let actual_lightweight = probe_with_options_async(
+            &mut tokio_fs::File::open(&path).await.unwrap(),
+            ProbeOptions::lightweight(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actual_lightweight, expected_lightweight,
+            "fixture={file_name}"
+        );
+    }
+
+    let sample_path = fixture_path("sample.mp4");
+    let summary = probe(&mut std::fs::File::open(&sample_path).unwrap()).unwrap();
+    let video_track = &summary.tracks[0];
+
+    let expected_idr =
+        find_idr_frames(&mut std::fs::File::open(&sample_path).unwrap(), video_track).unwrap();
+    let actual_idr = find_idr_frames_async(
+        &mut tokio_fs::File::open(&sample_path).await.unwrap(),
+        video_track,
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual_idr, expected_idr);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_probe_file_helpers_can_run_on_tokio_worker_threads() {
+    let sample_path = fixture_path("sample.mp4");
+    let fragmented_path = fixture_path("sample_fragmented.mp4");
+    let expected_summary = probe(&mut std::fs::File::open(&sample_path).unwrap()).unwrap();
+    let expected_fragmented = probe_with_options(
+        &mut std::fs::File::open(&fragmented_path).unwrap(),
+        ProbeOptions::lightweight(),
+    )
+    .unwrap();
+
+    let summary_handle = tokio::spawn(async move {
+        let mut file = tokio_fs::File::open(&sample_path).await.unwrap();
+        probe_async(&mut file).await.unwrap()
+    });
+    let fragmented_handle = tokio::spawn(async move {
+        let mut file = tokio_fs::File::open(&fragmented_path).await.unwrap();
+        probe_with_options_async(&mut file, ProbeOptions::lightweight())
+            .await
+            .unwrap()
+    });
+
+    assert_eq!(summary_handle.await.unwrap(), expected_summary);
+    assert_eq!(fragmented_handle.await.unwrap(), expected_fragmented);
 }
 
 #[test]

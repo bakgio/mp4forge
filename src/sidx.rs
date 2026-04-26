@@ -9,6 +9,8 @@ use std::fmt;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::FourCc;
+#[cfg(feature = "async")]
+use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
 use crate::boxes::iso14496_12::{
     Mdhd, Sidx, SidxReference, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
     TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT, Tfdt, Tfhd, Tkhd,
@@ -18,6 +20,8 @@ use crate::codec::{CodecBox, CodecError, ImmutableBox, MutableBox, marshal, unma
 use crate::extract::{ExtractError, extract_box_as, extract_boxes};
 use crate::header::{BoxInfo, HeaderError, LARGE_HEADER_SIZE, SMALL_HEADER_SIZE};
 use crate::walk::BoxPath;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const MOOV: FourCc = FourCc::from_bytes(*b"moov");
 const MOOF: FourCc = FourCc::from_bytes(*b"moof");
@@ -812,6 +816,20 @@ pub fn analyze_top_level_sidx_update_bytes(
     analyze_top_level_sidx_update(&mut reader)
 }
 
+/// Analyzes a fragmented file through the additive Tokio-based async library surface and returns
+/// the default inputs for a top-level `sidx` refresh.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn analyze_top_level_sidx_update_async<R>(
+    reader: &mut R,
+) -> Result<TopLevelSidxUpdateAnalysis, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let input = read_all_bytes_async(reader).await?;
+    analyze_top_level_sidx_update_bytes(&input)
+}
+
 /// Builds a deterministic top-level `sidx` refresh plan from analyzed file data.
 ///
 /// Returns `Ok(None)` when the file does not currently contain a top-level `sidx` and
@@ -950,6 +968,24 @@ pub fn plan_top_level_sidx_update_bytes(
     plan_top_level_sidx_update(&mut reader, options)
 }
 
+/// Analyzes a fragmented file through the additive Tokio-based async library surface and builds
+/// the deterministic top-level `sidx` refresh plan.
+///
+/// Returns `Ok(None)` when `add_if_not_exists` is `false` and no file-level top-level `sidx`
+/// exists yet.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn plan_top_level_sidx_update_async<R>(
+    reader: &mut R,
+    options: TopLevelSidxPlanOptions,
+) -> Result<Option<TopLevelSidxPlan>, SidxPlanError>
+where
+    R: AsyncReadSeek,
+{
+    let analysis = analyze_top_level_sidx_update_async(reader).await?;
+    build_top_level_sidx_plan(&analysis, options)
+}
+
 /// Applies a deterministic top-level `sidx` plan to a fragmented file and writes the updated bytes
 /// to `writer`.
 ///
@@ -1002,6 +1038,50 @@ pub fn apply_top_level_sidx_plan_bytes(
     let mut writer = Vec::with_capacity(input.len().saturating_add(plan.encoded_box_size as usize));
     apply_top_level_sidx_plan(&mut reader, &mut writer, plan)?;
     Ok(writer)
+}
+
+/// Applies a deterministic top-level `sidx` plan through the additive Tokio-based async library
+/// surface and writes the updated bytes to `writer`.
+///
+/// The helper only rewrites the planned top-level `sidx` span. All other bytes are copied through
+/// verbatim.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn apply_top_level_sidx_plan_async<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    plan: &TopLevelSidxPlan,
+) -> Result<AppliedTopLevelSidx, SidxRewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+{
+    validate_rewrite_plan(plan)?;
+
+    validate_root_box_async(reader, &plan.insertion_box).await?;
+    let (write_offset, removed_size) = match &plan.action {
+        TopLevelSidxPlanAction::Insert => (plan.insertion_box.offset(), 0),
+        TopLevelSidxPlanAction::Replace { existing } => {
+            validate_root_box_async(reader, &existing.info).await?;
+            (existing.info.offset(), existing.info.size())
+        }
+    };
+
+    let rewritten = build_rewritten_sidx(plan, write_offset, removed_size)?;
+    let input_end = reader.seek(SeekFrom::End(0)).await?;
+    let removed_end = checked_add_rewrite(write_offset, removed_size, "planned removed span end")?;
+    let trailing_size =
+        input_end
+            .checked_sub(removed_end)
+            .ok_or(SidxRewriteError::NumericOverflow {
+                field_name: "trailing rewrite bytes",
+            })?;
+
+    copy_range_exact_async(reader, writer, 0, write_offset).await?;
+    writer.write_all(&rewritten.bytes).await?;
+    copy_range_exact_async(reader, writer, removed_end, trailing_size).await?;
+
+    Ok(rewritten.applied)
 }
 
 fn scan_root_boxes<R>(reader: &mut R) -> Result<Vec<BoxInfo>, SidxAnalysisError>
@@ -1510,6 +1590,18 @@ fn checked_add(lhs: u64, rhs: u64, field_name: &'static str) -> Result<u64, Sidx
         .ok_or(SidxAnalysisError::NumericOverflow { field_name })
 }
 
+#[cfg(feature = "async")]
+async fn read_all_bytes_async<R>(reader: &mut R) -> Result<Vec<u8>, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    reader.seek(SeekFrom::Start(0)).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    reader.seek(SeekFrom::Start(0)).await?;
+    Ok(bytes)
+}
+
 fn encoded_payload_size(sidx: &Sidx) -> Result<u64, CodecError> {
     let mut payload = Vec::new();
     marshal(&mut payload, sidx, None)?;
@@ -1556,6 +1648,30 @@ where
 {
     reader.seek(SeekFrom::Start(expected.offset()))?;
     let actual = BoxInfo::read(reader)?;
+    if actual.box_type() != expected.box_type() || actual.size() != expected.size() {
+        return Err(SidxRewriteError::PlannedBoxMismatch {
+            expected_type: expected.box_type(),
+            expected_offset: expected.offset(),
+            expected_size: expected.size(),
+            actual_type: actual.box_type(),
+            actual_offset: actual.offset(),
+            actual_size: actual.size(),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn validate_root_box_async<R>(
+    reader: &mut R,
+    expected: &BoxInfo,
+) -> Result<(), SidxRewriteError>
+where
+    R: AsyncReadSeek,
+{
+    reader.seek(SeekFrom::Start(expected.offset())).await?;
+    let actual = BoxInfo::read_async(reader).await?;
     if actual.box_type() != expected.box_type() || actual.size() != expected.size() {
         return Err(SidxRewriteError::PlannedBoxMismatch {
             expected_type: expected.box_type(),
@@ -1724,6 +1840,34 @@ where
     reader.seek(SeekFrom::Start(start))?;
     let mut limited = reader.take(len);
     let copied = io::copy(&mut limited, writer)?;
+    if copied != len {
+        return Err(SidxRewriteError::IncompleteCopy {
+            expected_size: len,
+            actual_size: copied,
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn copy_range_exact_async<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    start: u64,
+    len: u64,
+) -> Result<(), SidxRewriteError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+{
+    if len == 0 {
+        return Ok(());
+    }
+
+    reader.seek(SeekFrom::Start(start)).await?;
+    let mut limited = (&mut *reader).take(len);
+    let copied = tokio::io::copy(&mut limited, writer).await?;
     if copied != len {
         return Err(SidxRewriteError::IncompleteCopy {
             expected_size: len,

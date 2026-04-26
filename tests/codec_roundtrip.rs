@@ -5,6 +5,8 @@ use mp4forge::codec::{
     ANY_VERSION, CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError,
     FieldValueRead, FieldValueWrite, ImmutableBox, MutableBox, StringFieldMode, marshal, unmarshal,
 };
+#[cfg(feature = "async")]
+use mp4forge::codec::{marshal_async, unmarshal_async};
 use mp4forge::{FourCc, codec_field};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -398,6 +400,63 @@ fn unsupported_version_rolls_back_stream_position_and_state() {
     dst.set_flags(0x000111);
 
     let error = unmarshal(&mut cursor, payload.len() as u64, &mut dst, None).unwrap_err();
+
+    match error {
+        CodecError::UnsupportedVersion { box_type, version } => {
+            assert_eq!(box_type, FourCc::from_bytes(*b"test"));
+            assert_eq!(version, 3);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    assert_eq!(cursor.stream_position().unwrap(), 0);
+    assert_eq!(dst.version(), 0);
+    assert_eq!(dst.flags(), 0x000111);
+    assert_eq!(dst.counter, 0);
+    assert!(dst.name.is_empty());
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_marshal_and_unmarshal_descriptor_driven_box() {
+    let src = sample_box();
+    let expected = vec![
+        0x01, 0x00, 0x02, 0x03, 0x77, 0x12, 0x34, 0xff, 0xfe, 0x80, 0x80, 0x80, 0xa4, 0x34, b'r',
+        b'u', b's', b't', 0x00, b'f', b'o', b'r', b'g', b'e', 0x00, b'A', b'B', b'C', b'D', 0x00,
+        0x01, 0x12, 0x34,
+    ];
+
+    let mut encoded = Cursor::new(Vec::new());
+    let written = marshal_async(&mut encoded, &src, None).await.unwrap();
+    assert_eq!(written, expected.len() as u64);
+    assert_eq!(encoded.into_inner(), expected);
+
+    let mut decoded = SampleBox {
+        hooks: src.hooks.clone(),
+        ..SampleBox::default()
+    };
+    let mut cursor = Cursor::new(expected);
+    let payload_len = cursor.get_ref().len() as u64;
+    let read = unmarshal_async(&mut cursor, payload_len, &mut decoded, None)
+        .await
+        .unwrap();
+    assert_eq!(read, payload_len);
+    assert_eq!(decoded, src);
+    assert_eq!(cursor.stream_position().unwrap(), payload_len);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_unsupported_version_rolls_back_stream_position_and_state() {
+    let payload = vec![0x03, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc];
+    let mut cursor = Cursor::new(payload.clone());
+    let mut dst = SampleBox::default();
+    dst.set_version(0);
+    dst.set_flags(0x000111);
+
+    let error = unmarshal_async(&mut cursor, payload.len() as u64, &mut dst, None)
+        .await
+        .unwrap_err();
 
     match error {
         CodecError::UnsupportedVersion { box_type, version } => {

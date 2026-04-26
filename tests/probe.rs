@@ -1,5 +1,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
+#[cfg(feature = "async")]
+use std::fs;
 use std::io::Cursor;
 
 use mp4forge::boxes::AnyTypeBox;
@@ -47,10 +49,25 @@ use mp4forge::probe::{
     probe_media_characteristics_bytes_with_options, probe_media_characteristics_with_options,
     probe_with_options,
 };
+#[cfg(feature = "async")]
+use mp4forge::probe::{
+    find_idr_frames_async, probe_async, probe_codec_detailed_async,
+    probe_codec_detailed_with_options_async, probe_detailed_async,
+    probe_detailed_with_options_async, probe_extended_media_characteristics_async,
+    probe_extended_media_characteristics_with_options,
+    probe_extended_media_characteristics_with_options_async, probe_fra_async,
+    probe_fra_codec_detailed_async, probe_fra_detailed_async, probe_fra_media_characteristics,
+    probe_fra_media_characteristics_async, probe_media_characteristics_async,
+    probe_media_characteristics_with_options_async, probe_with_options_async,
+};
 use mp4forge::{BoxInfo, FourCc};
+#[cfg(feature = "async")]
+use tokio::fs::File as TokioFile;
 
 mod support;
 
+#[cfg(feature = "async")]
+use support::fixture_path;
 use support::{build_encrypted_fragmented_video_file, build_event_message_movie_file};
 
 #[test]
@@ -157,6 +174,227 @@ fn probe_bytes_matches_cursor_based_probe() {
     let expected = probe(&mut Cursor::new(file.clone())).unwrap();
     let actual = probe_bytes(&file).unwrap();
     assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_probe_surfaces_match_sync_cursor_probe_surfaces() {
+    let movie_file = build_movie_file();
+    let expected_probe = probe(&mut Cursor::new(movie_file.clone())).unwrap();
+    let actual_probe = probe_async(&mut Cursor::new(movie_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_probe, expected_probe);
+
+    let expected_lightweight = probe_with_options(
+        &mut Cursor::new(movie_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .unwrap();
+    let actual_lightweight = probe_with_options_async(
+        &mut Cursor::new(movie_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual_lightweight, expected_lightweight);
+
+    let expected_detailed = probe_detailed(&mut Cursor::new(movie_file.clone())).unwrap();
+    let actual_detailed = probe_detailed_async(&mut Cursor::new(movie_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_detailed, expected_detailed);
+
+    let expected_detailed_lightweight = probe_detailed_with_options(
+        &mut Cursor::new(movie_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .unwrap();
+    let actual_detailed_lightweight = probe_detailed_with_options_async(
+        &mut Cursor::new(movie_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual_detailed_lightweight, expected_detailed_lightweight);
+
+    let video_track = expected_probe.tracks.first().unwrap();
+    let expected_idr = find_idr_frames(&mut Cursor::new(movie_file.clone()), video_track).unwrap();
+    let actual_idr = find_idr_frames_async(&mut Cursor::new(movie_file), video_track)
+        .await
+        .unwrap();
+    assert_eq!(actual_idr, expected_idr);
+
+    let hevc_file = build_hevc_movie_file();
+    let expected_codec = probe_codec_detailed(&mut Cursor::new(hevc_file.clone())).unwrap();
+    let actual_codec = probe_codec_detailed_async(&mut Cursor::new(hevc_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_codec, expected_codec);
+
+    let expected_codec_lightweight = probe_codec_detailed_with_options(
+        &mut Cursor::new(hevc_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .unwrap();
+    let actual_codec_lightweight = probe_codec_detailed_with_options_async(
+        &mut Cursor::new(hevc_file),
+        ProbeOptions::lightweight(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual_codec_lightweight, expected_codec_lightweight);
+
+    let media_file = build_media_characteristics_movie_file();
+    let expected_media = probe_media_characteristics(&mut Cursor::new(media_file.clone())).unwrap();
+    let actual_media = probe_media_characteristics_async(&mut Cursor::new(media_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_media, expected_media);
+
+    let expected_media_lightweight = probe_media_characteristics_with_options(
+        &mut Cursor::new(media_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .unwrap();
+    let actual_media_lightweight = probe_media_characteristics_with_options_async(
+        &mut Cursor::new(media_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual_media_lightweight, expected_media_lightweight);
+
+    let expected_extended =
+        probe_extended_media_characteristics(&mut Cursor::new(media_file.clone())).unwrap();
+    let actual_extended =
+        probe_extended_media_characteristics_async(&mut Cursor::new(media_file.clone()))
+            .await
+            .unwrap();
+    assert_eq!(actual_extended, expected_extended);
+
+    let expected_extended_lightweight = probe_extended_media_characteristics_with_options(
+        &mut Cursor::new(media_file.clone()),
+        ProbeOptions::lightweight(),
+    )
+    .unwrap();
+    let actual_extended_lightweight = probe_extended_media_characteristics_with_options_async(
+        &mut Cursor::new(media_file),
+        ProbeOptions::lightweight(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual_extended_lightweight, expected_extended_lightweight);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_probe_helpers_can_run_on_tokio_worker_threads() {
+    let movie_file = build_movie_file();
+    let summary_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(movie_file);
+        let summary = probe_async(&mut reader).await.unwrap();
+        (summary.tracks.len(), summary.tracks[0].track_id)
+    });
+    assert_eq!(summary_handle.await.unwrap(), (2, 1));
+
+    let media_file = build_media_characteristics_movie_file();
+    let expected_media =
+        probe_extended_media_characteristics(&mut Cursor::new(media_file.clone())).unwrap();
+    let media_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(media_file);
+        let summary = probe_extended_media_characteristics_async(&mut reader)
+            .await
+            .unwrap();
+        (
+            summary.tracks.len(),
+            summary.tracks[0].summary.summary.track_id,
+        )
+    });
+    assert_eq!(
+        media_handle.await.unwrap(),
+        (
+            expected_media.tracks.len(),
+            expected_media.tracks[0].summary.summary.track_id,
+        )
+    );
+
+    let hevc_file = build_hevc_movie_file();
+    let expected_codec = probe_codec_detailed(&mut Cursor::new(hevc_file.clone())).unwrap();
+    let codec_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(hevc_file);
+        let summary = probe_codec_detailed_async(&mut reader).await.unwrap();
+        (
+            summary.tracks.len(),
+            summary.tracks[0].summary.summary.track_id,
+        )
+    });
+    assert_eq!(
+        codec_handle.await.unwrap(),
+        (
+            expected_codec.tracks.len(),
+            expected_codec.tracks[0].summary.summary.track_id,
+        )
+    );
+
+    let idr_file = build_movie_file();
+    let mut sync_summary = probe(&mut Cursor::new(idr_file.clone())).unwrap();
+    let track = sync_summary.tracks.remove(0);
+    let idr_handle = tokio::spawn(async move {
+        let mut reader = Cursor::new(idr_file);
+        find_idr_frames_async(&mut reader, &track).await.unwrap()
+    });
+    assert_eq!(idr_handle.await.unwrap(), vec![0]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_probe_independent_file_tasks_can_run_concurrently_on_tokio_worker_threads() {
+    let sample_path = fixture_path("sample.mp4");
+    let fragmented_path = fixture_path("sample_fragmented.mp4");
+    let qt_path = fixture_path("sample_qt.mp4");
+
+    let expected_sample = probe(&mut Cursor::new(fs::read(&sample_path).unwrap())).unwrap();
+    let expected_fragmented =
+        probe_detailed(&mut Cursor::new(fs::read(&fragmented_path).unwrap())).unwrap();
+    let expected_qt = probe_fra(&mut Cursor::new(fs::read(&qt_path).unwrap())).unwrap();
+
+    let sample_handle = tokio::spawn(async move {
+        let mut file = TokioFile::open(sample_path).await.unwrap();
+        let summary = probe_async(&mut file).await.unwrap();
+        (summary.tracks.len(), summary.tracks[0].track_id)
+    });
+
+    let fragmented_handle = tokio::spawn(async move {
+        let mut file = TokioFile::open(fragmented_path).await.unwrap();
+        let summary = probe_detailed_async(&mut file).await.unwrap();
+        (summary.tracks.len(), summary.tracks[0].summary.track_id)
+    });
+
+    let qt_handle = tokio::spawn(async move {
+        let mut file = TokioFile::open(qt_path).await.unwrap();
+        let summary = probe_fra_async(&mut file).await.unwrap();
+        (summary.tracks.len(), summary.tracks[0].track_id)
+    });
+
+    assert_eq!(
+        sample_handle.await.unwrap(),
+        (
+            expected_sample.tracks.len(),
+            expected_sample.tracks[0].track_id
+        )
+    );
+    assert_eq!(
+        fragmented_handle.await.unwrap(),
+        (
+            expected_fragmented.tracks.len(),
+            expected_fragmented.tracks[0].summary.track_id,
+        )
+    );
+    assert_eq!(
+        qt_handle.await.unwrap(),
+        (expected_qt.tracks.len(), expected_qt.tracks[0].track_id)
+    );
 }
 
 #[test]
@@ -449,6 +687,59 @@ fn probe_fra_bytes_matches_cursor_based_probe_fra() {
     let expected = probe_fra(&mut Cursor::new(file.clone())).unwrap();
     let actual = probe_fra_bytes(&file).unwrap();
     assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_fragment_probe_surfaces_match_sync_cursor_probe_surfaces() {
+    let fragment_file = build_fragment_file_with_prft();
+    let expected_probe = probe(&mut Cursor::new(fragment_file.clone())).unwrap();
+    let actual_probe = probe_async(&mut Cursor::new(fragment_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_probe, expected_probe);
+
+    let expected_fra = probe_fra(&mut Cursor::new(fragment_file.clone())).unwrap();
+    let actual_fra = probe_fra_async(&mut Cursor::new(fragment_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_fra, expected_fra);
+
+    let expected_fra_detailed =
+        probe_fra_detailed(&mut Cursor::new(fragment_file.clone())).unwrap();
+    let actual_fra_detailed = probe_fra_detailed_async(&mut Cursor::new(fragment_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_fra_detailed, expected_fra_detailed);
+
+    let expected_fra_codec =
+        probe_fra_codec_detailed(&mut Cursor::new(fragment_file.clone())).unwrap();
+    let actual_fra_codec = probe_fra_codec_detailed_async(&mut Cursor::new(fragment_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_fra_codec, expected_fra_codec);
+
+    let expected_fra_media =
+        probe_fra_media_characteristics(&mut Cursor::new(fragment_file.clone())).unwrap();
+    let actual_fra_media = probe_fra_media_characteristics_async(&mut Cursor::new(fragment_file))
+        .await
+        .unwrap();
+    assert_eq!(actual_fra_media, expected_fra_media);
+
+    let encrypted_fragment_file = build_encrypted_fragmented_video_file();
+    let expected_encrypted =
+        probe_detailed(&mut Cursor::new(encrypted_fragment_file.clone())).unwrap();
+    let actual_encrypted = probe_detailed_async(&mut Cursor::new(encrypted_fragment_file.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual_encrypted, expected_encrypted);
+
+    let event_file = build_event_message_movie_file();
+    let expected_event = probe_media_characteristics(&mut Cursor::new(event_file.clone())).unwrap();
+    let actual_event = probe_media_characteristics_async(&mut Cursor::new(event_file))
+        .await
+        .unwrap();
+    assert_eq!(actual_event, expected_event);
 }
 
 #[test]

@@ -7,6 +7,8 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use crate::BoxInfo;
 use crate::FourCc;
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::bitio::BitReader;
 use crate::boxes::av1::AV1CodecConfiguration;
 use crate::boxes::etsi_ts_102_366::Dac3;
@@ -24,8 +26,12 @@ use crate::boxes::opus::DOps;
 use crate::boxes::vp::VpCodecConfiguration;
 use crate::codec::{CodecBox, CodecError, ImmutableBox, unmarshal};
 use crate::extract::{ExtractError, ExtractedBox, extract_boxes, extract_boxes_with_payload};
+#[cfg(feature = "async")]
+use crate::extract::{extract_boxes_async, extract_boxes_with_payload_async};
 use crate::header::HeaderError;
 use crate::walk::BoxPath;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const FTYP: FourCc = FourCc::from_bytes(*b"ftyp");
 const MOOV: FourCc = FourCc::from_bytes(*b"moov");
@@ -1048,6 +1054,20 @@ where
     probe_with_options(reader, ProbeOptions::default())
 }
 
+/// Probes a file through the additive Tokio-based async surface and returns the
+/// backwards-compatible coarse movie, track, and fragment summary.
+///
+/// For richer sample-entry, handler, language, and protection metadata, use
+/// [`probe_detailed_async`].
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_async<R>(reader: &mut R) -> Result<ProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_with_options_async(reader, ProbeOptions::default()).await
+}
+
 /// Probes a file with additive expansion controls and returns the backwards-compatible coarse
 /// movie, track, and fragment summary.
 pub fn probe_with_options<R>(reader: &mut R, options: ProbeOptions) -> Result<ProbeInfo, ProbeError>
@@ -1059,12 +1079,39 @@ where
     )?))
 }
 
+/// Probes a file through the additive Tokio-based async surface with expansion controls and
+/// returns the backwards-compatible coarse movie, track, and fragment summary.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_with_options_async<R>(
+    reader: &mut R,
+    options: ProbeOptions,
+) -> Result<ProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    Ok(strip_probe_details(
+        probe_detailed_with_options_async(reader, options).await?,
+    ))
+}
+
 /// Probes a file and returns an additive detailed movie, track, and fragment summary.
 pub fn probe_detailed<R>(reader: &mut R) -> Result<DetailedProbeInfo, ProbeError>
 where
     R: Read + Seek,
 {
     probe_detailed_with_options(reader, ProbeOptions::default())
+}
+
+/// Probes a file through the additive Tokio-based async surface and returns an additive detailed
+/// movie, track, and fragment summary.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_detailed_async<R>(reader: &mut R) -> Result<DetailedProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_detailed_with_options_async(reader, ProbeOptions::default()).await
 }
 
 /// Probes a file with additive expansion controls and returns the detailed movie, track, and
@@ -1081,6 +1128,22 @@ where
     )?))
 }
 
+/// Probes a file through the additive Tokio-based async surface with expansion controls and
+/// returns the detailed movie, track, and fragment summary.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_detailed_with_options_async<R>(
+    reader: &mut R,
+    options: ProbeOptions,
+) -> Result<DetailedProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    Ok(strip_codec_details(
+        probe_codec_detailed_with_options_async(reader, options).await?,
+    ))
+}
+
 /// Probes a file and returns an additive detailed summary with parsed codec-specific
 /// configuration when it is available.
 pub fn probe_codec_detailed<R>(reader: &mut R) -> Result<CodecDetailedProbeInfo, ProbeError>
@@ -1088,6 +1151,19 @@ where
     R: Read + Seek,
 {
     probe_codec_detailed_with_options(reader, ProbeOptions::default())
+}
+
+/// Probes a file through the additive Tokio-based async surface and returns an additive detailed
+/// summary with parsed codec-specific configuration when it is available.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_codec_detailed_async<R>(
+    reader: &mut R,
+) -> Result<CodecDetailedProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_codec_detailed_with_options_async(reader, ProbeOptions::default()).await
 }
 
 /// Probes a file with additive expansion controls and returns the codec-detailed summary.
@@ -1138,6 +1214,59 @@ where
     Ok(summary)
 }
 
+/// Probes a file through the additive Tokio-based async surface with expansion controls and
+/// returns the codec-detailed summary.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_codec_detailed_with_options_async<R>(
+    reader: &mut R,
+    options: ProbeOptions,
+) -> Result<CodecDetailedProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let paths = root_probe_box_paths(options);
+    let infos = extract_boxes_async(reader, None, &paths).await?;
+
+    let mut summary = CodecDetailedProbeInfo::default();
+    let mut mdat_appeared = false;
+
+    for info in infos {
+        match info.box_type() {
+            FTYP => {
+                let ftyp =
+                    read_payload_as_async::<_, crate::boxes::iso14496_12::Ftyp>(reader, info)
+                        .await?;
+                summary.major_brand = ftyp.major_brand;
+                summary.minor_version = ftyp.minor_version;
+                summary.compatible_brands = ftyp.compatible_brands;
+            }
+            MOOV => {
+                summary.fast_start = !mdat_appeared;
+            }
+            MVHD => {
+                let mvhd = read_payload_as_async::<_, Mvhd>(reader, info).await?;
+                summary.timescale = mvhd.timescale;
+                summary.duration = mvhd.duration();
+            }
+            TRAK => {
+                summary
+                    .tracks
+                    .push(probe_trak_codec_detailed_async(reader, info, options).await?);
+            }
+            MOOF if options.include_segments => {
+                summary.segments.push(probe_moof_async(reader, info).await?);
+            }
+            MDAT => {
+                mdat_appeared = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
+}
+
 /// Probes a file and returns an additive summary with parsed codec and media characteristics.
 pub fn probe_media_characteristics<R>(
     reader: &mut R,
@@ -1146,6 +1275,19 @@ where
     R: Read + Seek,
 {
     probe_media_characteristics_with_options(reader, ProbeOptions::default())
+}
+
+/// Probes a file through the additive Tokio-based async surface and returns an additive summary
+/// with parsed codec and media characteristics.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_media_characteristics_async<R>(
+    reader: &mut R,
+) -> Result<MediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_media_characteristics_with_options_async(reader, ProbeOptions::default()).await
 }
 
 /// Probes a file with additive expansion controls and returns the media-characteristics summary.
@@ -1196,6 +1338,59 @@ where
     Ok(summary)
 }
 
+/// Probes a file through the additive Tokio-based async surface with expansion controls and
+/// returns the media-characteristics summary.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_media_characteristics_with_options_async<R>(
+    reader: &mut R,
+    options: ProbeOptions,
+) -> Result<MediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let paths = root_probe_box_paths(options);
+    let infos = extract_boxes_async(reader, None, &paths).await?;
+
+    let mut summary = MediaCharacteristicsProbeInfo::default();
+    let mut mdat_appeared = false;
+
+    for info in infos {
+        match info.box_type() {
+            FTYP => {
+                let ftyp =
+                    read_payload_as_async::<_, crate::boxes::iso14496_12::Ftyp>(reader, info)
+                        .await?;
+                summary.major_brand = ftyp.major_brand;
+                summary.minor_version = ftyp.minor_version;
+                summary.compatible_brands = ftyp.compatible_brands;
+            }
+            MOOV => {
+                summary.fast_start = !mdat_appeared;
+            }
+            MVHD => {
+                let mvhd = read_payload_as_async::<_, Mvhd>(reader, info).await?;
+                summary.timescale = mvhd.timescale;
+                summary.duration = mvhd.duration();
+            }
+            TRAK => {
+                summary
+                    .tracks
+                    .push(probe_trak_media_characteristics_async(reader, info, options).await?);
+            }
+            MOOF if options.include_segments => {
+                summary.segments.push(probe_moof_async(reader, info).await?);
+            }
+            MDAT => {
+                mdat_appeared = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
+}
+
 /// Probes a file and returns an additive summary with parsed codec, media characteristics, and
 /// extra typed visual sample-entry metadata.
 pub fn probe_extended_media_characteristics<R>(
@@ -1205,6 +1400,19 @@ where
     R: Read + Seek,
 {
     probe_extended_media_characteristics_with_options(reader, ProbeOptions::default())
+}
+
+/// Probes a file through the additive Tokio-based async surface and returns an additive summary
+/// with parsed codec, media characteristics, and extra typed visual sample-entry metadata.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_extended_media_characteristics_async<R>(
+    reader: &mut R,
+) -> Result<ExtendedMediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_extended_media_characteristics_with_options_async(reader, ProbeOptions::default()).await
 }
 
 /// Probes a file with additive expansion controls and returns the extended
@@ -1247,6 +1455,59 @@ where
             }
             MOOF if options.include_segments => {
                 summary.segments.push(probe_moof(reader, &info)?);
+            }
+            MDAT => {
+                mdat_appeared = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Probes a file through the additive Tokio-based async surface with expansion controls and
+/// returns the extended media-characteristics summary.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_extended_media_characteristics_with_options_async<R>(
+    reader: &mut R,
+    options: ProbeOptions,
+) -> Result<ExtendedMediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let paths = root_probe_box_paths(options);
+    let infos = extract_boxes_async(reader, None, &paths).await?;
+
+    let mut summary = ExtendedMediaCharacteristicsProbeInfo::default();
+    let mut mdat_appeared = false;
+
+    for info in infos {
+        match info.box_type() {
+            FTYP => {
+                let ftyp =
+                    read_payload_as_async::<_, crate::boxes::iso14496_12::Ftyp>(reader, info)
+                        .await?;
+                summary.major_brand = ftyp.major_brand;
+                summary.minor_version = ftyp.minor_version;
+                summary.compatible_brands = ftyp.compatible_brands;
+            }
+            MOOV => {
+                summary.fast_start = !mdat_appeared;
+            }
+            MVHD => {
+                let mvhd = read_payload_as_async::<_, Mvhd>(reader, info).await?;
+                summary.timescale = mvhd.timescale;
+                summary.duration = mvhd.duration();
+            }
+            TRAK => {
+                summary.tracks.push(
+                    probe_trak_extended_media_characteristics_async(reader, info, options).await?,
+                );
+            }
+            MOOF if options.include_segments => {
+                summary.segments.push(probe_moof_async(reader, info).await?);
             }
             MDAT => {
                 mdat_appeared = true;
@@ -1361,12 +1622,33 @@ where
     probe(reader)
 }
 
+/// Legacy fragmented-file probe entry point through the additive Tokio-based async surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_fra_async<R>(reader: &mut R) -> Result<ProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_async(reader).await
+}
+
 /// Legacy fragmented-file detailed probe entry point that currently aliases [`probe_detailed`].
 pub fn probe_fra_detailed<R>(reader: &mut R) -> Result<DetailedProbeInfo, ProbeError>
 where
     R: Read + Seek,
 {
     probe_detailed(reader)
+}
+
+/// Legacy fragmented-file detailed probe entry point through the additive Tokio-based async
+/// surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_fra_detailed_async<R>(reader: &mut R) -> Result<DetailedProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_detailed_async(reader).await
 }
 
 /// Legacy fragmented-file codec-detailed probe entry point that currently aliases
@@ -1378,6 +1660,19 @@ where
     probe_codec_detailed(reader)
 }
 
+/// Legacy fragmented-file codec-detailed probe entry point through the additive Tokio-based async
+/// surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_fra_codec_detailed_async<R>(
+    reader: &mut R,
+) -> Result<CodecDetailedProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_codec_detailed_async(reader).await
+}
+
 /// Legacy fragmented-file media-characteristics probe entry point that currently aliases
 /// [`probe_media_characteristics`].
 pub fn probe_fra_media_characteristics<R>(
@@ -1387,6 +1682,19 @@ where
     R: Read + Seek,
 {
     probe_media_characteristics(reader)
+}
+
+/// Legacy fragmented-file media-characteristics probe entry point through the additive Tokio-based
+/// async surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn probe_fra_media_characteristics_async<R>(
+    reader: &mut R,
+) -> Result<MediaCharacteristicsProbeInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    probe_media_characteristics_async(reader).await
 }
 
 /// Legacy fragmented-file probe entry point for in-memory MP4 bytes.
@@ -1525,6 +1833,61 @@ where
                     reader.seek(SeekFrom::Start(data_offset + u64::from(nal_offset)))?;
                     let mut data = vec![0_u8; length_size as usize + 1];
                     reader.read_exact(&mut data)?;
+
+                    let mut nal_length = 0_u32;
+                    for byte in &data[..length_size as usize] {
+                        nal_length = (nal_length << 8) | u32::from(*byte);
+                    }
+                    if data[length_size as usize] & 0x1f == 5 {
+                        indices.push(sample_index);
+                        break;
+                    }
+
+                    nal_offset = nal_offset
+                        .saturating_add(length_size)
+                        .saturating_add(nal_length);
+                }
+            }
+
+            data_offset = data_offset.saturating_add(u64::from(sample.size));
+            sample_index += 1;
+        }
+    }
+
+    Ok(indices)
+}
+
+/// Finds sample indices whose AVC payload contains an IDR NAL unit through the additive Tokio-
+/// based async surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn find_idr_frames_async<R>(
+    reader: &mut R,
+    track: &TrackInfo,
+) -> Result<Vec<usize>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let Some(avc) = track.avc.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let length_size = u32::from(avc.length_size);
+
+    let mut sample_index = 0usize;
+    let mut indices = Vec::new();
+    for chunk in &track.chunks {
+        let end = sample_index.saturating_add(chunk.samples_per_chunk as usize);
+        let mut data_offset = chunk.data_offset;
+        while sample_index < end && sample_index < track.samples.len() {
+            let sample = &track.samples[sample_index];
+            if sample.size != 0 {
+                let mut nal_offset = 0_u32;
+                while nal_offset.saturating_add(length_size).saturating_add(1) <= sample.size {
+                    reader
+                        .seek(SeekFrom::Start(data_offset + u64::from(nal_offset)))
+                        .await?;
+                    let mut data = vec![0_u8; length_size as usize + 1];
+                    reader.read_exact(&mut data).await?;
 
                     let mut nal_length = 0_u32;
                     for byte in &data[..length_size as usize] {
@@ -1818,6 +2181,22 @@ where
     })
 }
 
+#[cfg(feature = "async")]
+async fn probe_trak_codec_detailed_async<R>(
+    reader: &mut R,
+    parent: BoxInfo,
+    options: ProbeOptions,
+) -> Result<CodecDetailedTrackInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let track = probe_trak_rich_details_async(reader, parent, options).await?;
+    Ok(CodecDetailedTrackInfo {
+        summary: track.summary,
+        codec_details: track.codec_details,
+    })
+}
+
 fn probe_trak_media_characteristics<R>(
     reader: &mut R,
     parent: &BoxInfo,
@@ -1827,6 +2206,23 @@ where
     R: Read + Seek,
 {
     let track = probe_trak_rich_details(reader, parent, options)?;
+    Ok(MediaCharacteristicsTrackInfo {
+        summary: track.summary,
+        codec_details: track.codec_details,
+        media_characteristics: track.media_characteristics,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn probe_trak_media_characteristics_async<R>(
+    reader: &mut R,
+    parent: BoxInfo,
+    options: ProbeOptions,
+) -> Result<MediaCharacteristicsTrackInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let track = probe_trak_rich_details_async(reader, parent, options).await?;
     Ok(MediaCharacteristicsTrackInfo {
         summary: track.summary,
         codec_details: track.codec_details,
@@ -1851,6 +2247,24 @@ where
     })
 }
 
+#[cfg(feature = "async")]
+async fn probe_trak_extended_media_characteristics_async<R>(
+    reader: &mut R,
+    parent: BoxInfo,
+    options: ProbeOptions,
+) -> Result<ExtendedMediaCharacteristicsTrackInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let track = probe_trak_rich_details_async(reader, parent, options).await?;
+    Ok(ExtendedMediaCharacteristicsTrackInfo {
+        summary: track.summary,
+        codec_details: track.codec_details,
+        media_characteristics: track.media_characteristics,
+        visual_metadata: track.visual_metadata,
+    })
+}
+
 fn probe_trak_rich_details<R>(
     reader: &mut R,
     parent: &BoxInfo,
@@ -1861,7 +2275,27 @@ where
 {
     let paths = track_probe_box_paths(options);
     let boxes = extract_boxes_with_payload(reader, Some(parent), &paths)?;
+    parse_trak_rich_details(boxes, options)
+}
 
+#[cfg(feature = "async")]
+async fn probe_trak_rich_details_async<R>(
+    reader: &mut R,
+    parent: BoxInfo,
+    options: ProbeOptions,
+) -> Result<ParsedRichTrackInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let paths = track_probe_box_paths(options);
+    let boxes = extract_boxes_with_payload_async(reader, Some(&parent), &paths).await?;
+    parse_trak_rich_details(boxes, options)
+}
+
+fn parse_trak_rich_details(
+    boxes: Vec<ExtractedBox>,
+    options: ProbeOptions,
+) -> Result<ParsedRichTrackInfo, ProbeError> {
     let mut track = DetailedTrackInfo::default();
     let mut tkhd = None;
     let mut mdhd = None;
@@ -2633,7 +3067,31 @@ where
             BoxPath::from([TRAF, TRUN]),
         ],
     )?;
+    parse_moof_segment(boxes, parent.offset())
+}
 
+#[cfg(feature = "async")]
+async fn probe_moof_async<R>(reader: &mut R, parent: BoxInfo) -> Result<SegmentInfo, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let boxes = extract_boxes_with_payload_async(
+        reader,
+        Some(&parent),
+        &[
+            BoxPath::from([TRAF, TFHD]),
+            BoxPath::from([TRAF, TFDT]),
+            BoxPath::from([TRAF, TRUN]),
+        ],
+    )
+    .await?;
+    parse_moof_segment(boxes, parent.offset())
+}
+
+fn parse_moof_segment(
+    boxes: Vec<ExtractedBox>,
+    moof_offset: u64,
+) -> Result<SegmentInfo, ProbeError> {
     let mut tfhd = None;
     let mut tfdt = None;
     let mut trun = None;
@@ -2649,7 +3107,7 @@ where
     let tfhd = tfhd.ok_or(ProbeError::MissingRequiredBox("tfhd"))?;
     let mut segment = SegmentInfo {
         track_id: tfhd.track_id,
-        moof_offset: parent.offset(),
+        moof_offset,
         default_sample_duration: tfhd.default_sample_duration,
         ..SegmentInfo::default()
     };
@@ -2717,6 +3175,32 @@ where
     info.seek_to_payload(reader)?;
     let mut decoded = B::default();
     unmarshal(reader, info.payload_size()?, &mut decoded, None)?;
+    Ok(decoded)
+}
+
+#[cfg(feature = "async")]
+async fn read_payload_as_async<R, B>(reader: &mut R, info: BoxInfo) -> Result<B, ProbeError>
+where
+    R: AsyncReadSeek,
+    B: CodecBox + Default + Send,
+{
+    reader
+        .seek(SeekFrom::Start(info.offset() + info.header_size()))
+        .await?;
+    let mut payload_bytes = Vec::with_capacity(info.payload_size()?.try_into().unwrap_or(0));
+    let mut payload_reader = (&mut *reader).take(info.payload_size()?);
+    let payload_read = payload_reader.read_to_end(&mut payload_bytes).await? as u64;
+    if payload_read != info.payload_size()? {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
+
+    let mut decoded = B::default();
+    unmarshal(
+        &mut Cursor::new(payload_bytes.as_slice()),
+        info.payload_size()?,
+        &mut decoded,
+        None,
+    )?;
     Ok(decoded)
 }
 

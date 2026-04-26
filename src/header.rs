@@ -4,6 +4,11 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+#[cfg(feature = "async")]
+use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
 use crate::boxes::BoxLookupContext;
 use crate::fourcc::FourCc;
 
@@ -184,6 +189,36 @@ impl BoxInfo {
         })
     }
 
+    /// Writes the header through the additive Tokio-based async library surface and returns
+    /// normalized metadata that reflects the written form.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    pub async fn write_async<W>(&self, writer: &mut W) -> Result<Self, HeaderError>
+    where
+        W: AsyncWriteSeek,
+    {
+        let offset = writer.stream_position().await?;
+        let encoded = self.encode();
+        writer.write_all(&encoded).await?;
+
+        let prior_payload =
+            self.size
+                .checked_sub(self.header_size)
+                .ok_or(HeaderError::SizeUnderflow {
+                    size: self.size,
+                    header_size: self.header_size,
+                })?;
+
+        Ok(Self {
+            offset,
+            size: prior_payload + encoded.len() as u64,
+            header_size: encoded.len() as u64,
+            box_type: self.box_type,
+            extend_to_eof: self.extend_to_eof,
+            lookup_context: self.lookup_context,
+        })
+    }
+
     /// Reads a header from the current stream position.
     pub fn read<R>(reader: &mut R) -> Result<Self, HeaderError>
     where
@@ -237,6 +272,60 @@ impl BoxInfo {
         Ok(info)
     }
 
+    /// Reads a header from the current stream position through the additive Tokio-based async
+    /// library surface.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    pub async fn read_async<R>(reader: &mut R) -> Result<Self, HeaderError>
+    where
+        R: AsyncReadSeek,
+    {
+        let offset = reader.stream_position().await?;
+
+        let mut small_header = [0_u8; SMALL_HEADER_SIZE as usize];
+        reader.read_exact(&mut small_header).await?;
+
+        let size = u32::from_be_bytes([
+            small_header[0],
+            small_header[1],
+            small_header[2],
+            small_header[3],
+        ]) as u64;
+        let box_type = FourCc::from_bytes([
+            small_header[4],
+            small_header[5],
+            small_header[6],
+            small_header[7],
+        ]);
+
+        let mut info = Self::new(box_type, size).with_offset(offset);
+
+        if size == 0 {
+            let end = reader.seek(SeekFrom::End(0)).await?;
+            info.size = end - offset;
+            info.extend_to_eof = true;
+            info.seek_to_payload_async(reader).await?;
+        } else if size == 1 {
+            let mut large_size = [0_u8; 8];
+            reader.read_exact(&mut large_size).await?;
+            info.header_size = LARGE_HEADER_SIZE;
+            info.size = u64::from_be_bytes(large_size);
+        }
+
+        if info.size == 0 {
+            return Err(HeaderError::InvalidSize);
+        }
+
+        if info.size < info.header_size {
+            return Err(HeaderError::SizeUnderflow {
+                size: info.size,
+                header_size: info.header_size,
+            });
+        }
+
+        Ok(info)
+    }
+
     pub(crate) fn set_lookup_context(&mut self, lookup_context: BoxLookupContext) {
         self.lookup_context = lookup_context;
     }
@@ -246,14 +335,49 @@ impl BoxInfo {
         seeker.seek(SeekFrom::Start(self.offset))
     }
 
+    /// Seeks to the beginning of the box header through the additive Tokio-based async library
+    /// surface.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    pub async fn seek_to_start_async<S>(&self, seeker: &mut S) -> io::Result<u64>
+    where
+        S: AsyncReadSeek,
+    {
+        seeker.seek(SeekFrom::Start(self.offset)).await
+    }
+
     /// Seeks to the start of the box payload.
     pub fn seek_to_payload<S: Seek>(&self, seeker: &mut S) -> io::Result<u64> {
         seeker.seek(SeekFrom::Start(self.offset + self.header_size))
     }
 
+    /// Seeks to the start of the box payload through the additive Tokio-based async library
+    /// surface.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    pub async fn seek_to_payload_async<S>(&self, seeker: &mut S) -> io::Result<u64>
+    where
+        S: AsyncReadSeek,
+    {
+        seeker
+            .seek(SeekFrom::Start(self.offset + self.header_size))
+            .await
+    }
+
     /// Seeks to the byte immediately after the end of the box.
     pub fn seek_to_end<S: Seek>(&self, seeker: &mut S) -> io::Result<u64> {
         seeker.seek(SeekFrom::Start(self.offset + self.size))
+    }
+
+    /// Seeks to the byte immediately after the end of the box through the additive Tokio-based
+    /// async library surface.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    pub async fn seek_to_end_async<S>(&self, seeker: &mut S) -> io::Result<u64>
+    where
+        S: AsyncReadSeek,
+    {
+        seeker.seek(SeekFrom::Start(self.offset + self.size)).await
     }
 }
 

@@ -32,6 +32,8 @@ use mp4forge::boxes::{AnyTypeBox, default_registry};
 use mp4forge::codec::{
     CodecBox, CodecError, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any,
 };
+#[cfg(feature = "async")]
+use mp4forge::codec::{marshal_async, unmarshal_any_async, unmarshal_async};
 use mp4forge::stringify::stringify;
 
 fn assert_box_roundtrip<T>(src: T, payload: &[u8], expected: &str)
@@ -2316,6 +2318,63 @@ fn elng_preserves_payloads_without_full_box_header_bytes() {
     let written = marshal(&mut encoded, &decoded, None).unwrap();
     assert_eq!(written, payload.len() as u64);
     assert_eq!(encoded, payload);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_meta_and_prft_roundtrips_preserve_typed_behavior() {
+    let meta_payload = [
+        0x00, 0x00, 0x01, 0x00, b'h', b'd', b'l', b'r', 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut meta = Meta::default();
+    let mut meta_reader = Cursor::new(meta_payload);
+    let meta_read = unmarshal_async(&mut meta_reader, meta_payload.len() as u64, &mut meta, None)
+        .await
+        .unwrap();
+    assert_eq!(meta_read, 0);
+    assert_eq!(meta_reader.position(), 0);
+    assert!(meta.is_quicktime_headerless());
+    assert_eq!(meta.version(), 0);
+    assert_eq!(meta.flags(), 0);
+
+    let mut prft = Prft::default();
+    prft.set_version(1);
+    prft.set_flags(PRFT_TIME_MOOF_WRITTEN);
+    prft.reference_track_id = 7;
+    prft.ntp_timestamp = 0x0123_4567_89ab_cdef;
+    prft.media_time_v1 = 0x0fed_cba9_8765_4321;
+
+    let expected = vec![
+        0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x07, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef, 0x0f, 0xed, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21,
+    ];
+
+    let mut encoded = Cursor::new(Vec::new());
+    let written = marshal_async(&mut encoded, &prft, None).await.unwrap();
+    assert_eq!(written, expected.len() as u64);
+    assert_eq!(encoded.into_inner(), expected);
+
+    let mut decoded = Prft::default();
+    let mut reader = Cursor::new(expected.clone());
+    let read = unmarshal_async(&mut reader, expected.len() as u64, &mut decoded, None)
+        .await
+        .unwrap();
+    assert_eq!(read, expected.len() as u64);
+    assert_eq!(decoded, prft);
+
+    let registry = default_registry();
+    let mut any_reader = Cursor::new(expected);
+    let (any_box, any_read) = unmarshal_any_async(
+        &mut any_reader,
+        24,
+        FourCc::from_bytes(*b"prft"),
+        &registry,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(any_read, 24);
+    assert_eq!(any_box.as_any().downcast_ref::<Prft>().unwrap(), &prft);
 }
 
 #[test]

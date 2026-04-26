@@ -1,6 +1,6 @@
 [package]
 name = "mp4forge"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["bakgio"]
@@ -18,11 +18,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
+async = ["dep:tokio"]
 serde = ["dep:serde"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 terminal_size = "0.4"
+tokio = { version = "1.52.1", features = ["fs", "io-util", "rt", "rt-multi-thread", "macros"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"
