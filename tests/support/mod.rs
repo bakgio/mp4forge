@@ -26,7 +26,9 @@ use mp4forge::boxes::iso14496_12::{
 #[cfg(feature = "decrypt")]
 use mp4forge::boxes::iso14496_12::{StscEntry, UUID_SAMPLE_ENCRYPTION, Uuid, UuidPayload};
 #[cfg(feature = "decrypt")]
-use mp4forge::boxes::iso14496_12::{TFHD_DEFAULT_BASE_IS_MOOF, TRUN_DATA_OFFSET_PRESENT};
+use mp4forge::boxes::iso14496_12::{
+    TFHD_DEFAULT_BASE_IS_MOOF, TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT, TRUN_DATA_OFFSET_PRESENT,
+};
 #[cfg(feature = "decrypt")]
 use mp4forge::boxes::iso14496_14::Iods;
 use mp4forge::boxes::iso23001_7::{
@@ -1473,6 +1475,29 @@ pub struct DecryptRewriteFixture {
 }
 
 #[cfg(feature = "decrypt")]
+pub struct MultiSampleEntryDecryptFixture {
+    pub init_segment: Vec<u8>,
+    pub media_segment: Vec<u8>,
+    pub single_file: Vec<u8>,
+    pub decrypted_init_segment: Vec<u8>,
+    pub decrypted_media_segment: Vec<u8>,
+    pub decrypted_single_file: Vec<u8>,
+    pub all_keys: Vec<DecryptionKey>,
+    pub ambiguous_track_id_keys: Vec<DecryptionKey>,
+}
+
+#[cfg(feature = "decrypt")]
+pub struct ZeroKidMultiSampleEntryDecryptFixture {
+    pub init_segment: Vec<u8>,
+    pub media_segment: Vec<u8>,
+    pub single_file: Vec<u8>,
+    pub decrypted_init_segment: Vec<u8>,
+    pub decrypted_media_segment: Vec<u8>,
+    pub decrypted_single_file: Vec<u8>,
+    pub ordered_track_id_keys: Vec<DecryptionKey>,
+}
+
+#[cfg(feature = "decrypt")]
 pub fn build_decrypt_rewrite_fixture() -> DecryptRewriteFixture {
     build_decrypt_rewrite_fixture_with_mode(DecryptFixtureLayout::CommonEncryption)
 }
@@ -1480,6 +1505,285 @@ pub fn build_decrypt_rewrite_fixture() -> DecryptRewriteFixture {
 #[cfg(feature = "decrypt")]
 pub fn build_piff_decrypt_rewrite_fixture() -> DecryptRewriteFixture {
     build_decrypt_rewrite_fixture_with_mode(DecryptFixtureLayout::PiffCompatibility)
+}
+
+#[cfg(feature = "decrypt")]
+pub fn build_multi_sample_entry_decrypt_fixture() -> MultiSampleEntryDecryptFixture {
+    let first_spec = DecryptFixtureTrackSpec {
+        track_id: 1,
+        width: 320,
+        height: 180,
+        scheme_type: fourcc("cbcs"),
+        native_scheme: NativeCommonEncryptionScheme::Cbcs,
+        key: [0x31; 16],
+        kid: [0xc1; 16],
+        initialization_vector: vec![],
+        constant_iv: Some(vec![
+            0x01, 0x13, 0x25, 0x37, 0x49, 0x5b, 0x6d, 0x7f, 0x80, 0x92, 0xa4, 0xb6, 0xc8, 0xda,
+            0xec, 0xfe,
+        ]),
+        per_sample_iv_size: None,
+        crypt_byte_block: 1,
+        skip_byte_block: 1,
+        subsamples: vec![
+            SencSubsample {
+                bytes_of_clear_data: 4,
+                bytes_of_protected_data: 32,
+            },
+            SencSubsample {
+                bytes_of_clear_data: 2,
+                bytes_of_protected_data: 16,
+            },
+        ],
+        plaintext: (0u8..54).map(|value| value ^ 0x41).collect(),
+        use_fragment_group: false,
+        layout: DecryptFixtureLayout::CommonEncryption,
+    };
+    let second_spec = DecryptFixtureTrackSpec {
+        track_id: 1,
+        width: 320,
+        height: 180,
+        scheme_type: fourcc("cbcs"),
+        native_scheme: NativeCommonEncryptionScheme::Cbcs,
+        key: [0x42; 16],
+        kid: [0xd2; 16],
+        initialization_vector: vec![],
+        constant_iv: Some(vec![
+            0xfe, 0xec, 0xda, 0xc8, 0xb6, 0xa4, 0x92, 0x80, 0x7f, 0x6d, 0x5b, 0x49, 0x37, 0x25,
+            0x13, 0x01,
+        ]),
+        per_sample_iv_size: None,
+        crypt_byte_block: 1,
+        skip_byte_block: 1,
+        subsamples: vec![
+            SencSubsample {
+                bytes_of_clear_data: 6,
+                bytes_of_protected_data: 24,
+            },
+            SencSubsample {
+                bytes_of_clear_data: 0,
+                bytes_of_protected_data: 24,
+            },
+        ],
+        plaintext: (0u8..54)
+            .map(|value| value.wrapping_mul(5) ^ 0x22)
+            .collect(),
+        use_fragment_group: false,
+        layout: DecryptFixtureLayout::CommonEncryption,
+    };
+
+    let encrypted_sample_entries = vec![
+        build_fragmented_track_sample_entry(&first_spec, true),
+        build_fragmented_track_sample_entry(&second_spec, true),
+    ];
+    let clear_sample_entries = vec![
+        build_fragmented_track_sample_entry(&first_spec, false),
+        build_fragmented_track_sample_entry(&second_spec, false),
+    ];
+    let init_segment = build_multi_sample_entry_init_segment(&encrypted_sample_entries);
+    let decrypted_init_segment = build_multi_sample_entry_init_segment(&clear_sample_entries);
+
+    let first_ciphertext = encrypt_fixture_sample(&first_spec);
+    let second_ciphertext = encrypt_fixture_sample(&second_spec);
+    let media_segment = build_multi_sample_entry_media_segment(
+        [
+            MultiSampleEntryFragmentSpec {
+                track_spec: &first_spec,
+                payload: &first_ciphertext,
+                sample_description_index: None,
+                base_media_decode_time: 0,
+                sequence_number: 1,
+            },
+            MultiSampleEntryFragmentSpec {
+                track_spec: &second_spec,
+                payload: &second_ciphertext,
+                sample_description_index: Some(2),
+                base_media_decode_time: 1_000,
+                sequence_number: 2,
+            },
+        ],
+        true,
+    );
+    let decrypted_media_segment = build_multi_sample_entry_media_segment(
+        [
+            MultiSampleEntryFragmentSpec {
+                track_spec: &first_spec,
+                payload: &first_spec.plaintext,
+                sample_description_index: None,
+                base_media_decode_time: 0,
+                sequence_number: 1,
+            },
+            MultiSampleEntryFragmentSpec {
+                track_spec: &second_spec,
+                payload: &second_spec.plaintext,
+                sample_description_index: Some(2),
+                base_media_decode_time: 1_000,
+                sequence_number: 2,
+            },
+        ],
+        false,
+    );
+    let single_file = [init_segment.clone(), media_segment.clone()].concat();
+    let decrypted_single_file = [
+        decrypted_init_segment.clone(),
+        decrypted_media_segment.clone(),
+    ]
+    .concat();
+
+    MultiSampleEntryDecryptFixture {
+        init_segment,
+        media_segment,
+        single_file,
+        decrypted_init_segment,
+        decrypted_media_segment,
+        decrypted_single_file,
+        all_keys: vec![
+            DecryptionKey::kid(first_spec.kid, first_spec.key),
+            DecryptionKey::kid(second_spec.kid, second_spec.key),
+        ],
+        ambiguous_track_id_keys: vec![
+            DecryptionKey::track(first_spec.track_id, first_spec.key),
+            DecryptionKey::track(second_spec.track_id, second_spec.key),
+        ],
+    }
+}
+
+#[cfg(feature = "decrypt")]
+pub fn build_zero_kid_multi_sample_entry_decrypt_fixture() -> ZeroKidMultiSampleEntryDecryptFixture
+{
+    let first_spec = DecryptFixtureTrackSpec {
+        track_id: 1,
+        width: 320,
+        height: 180,
+        scheme_type: fourcc("cbcs"),
+        native_scheme: NativeCommonEncryptionScheme::Cbcs,
+        key: [0x31; 16],
+        kid: [0; 16],
+        initialization_vector: vec![],
+        constant_iv: Some(vec![
+            0x01, 0x13, 0x25, 0x37, 0x49, 0x5b, 0x6d, 0x7f, 0x80, 0x92, 0xa4, 0xb6, 0xc8, 0xda,
+            0xec, 0xfe,
+        ]),
+        per_sample_iv_size: None,
+        crypt_byte_block: 1,
+        skip_byte_block: 1,
+        subsamples: vec![
+            SencSubsample {
+                bytes_of_clear_data: 4,
+                bytes_of_protected_data: 32,
+            },
+            SencSubsample {
+                bytes_of_clear_data: 2,
+                bytes_of_protected_data: 16,
+            },
+        ],
+        plaintext: (0u8..54).map(|value| value ^ 0x41).collect(),
+        use_fragment_group: false,
+        layout: DecryptFixtureLayout::CommonEncryption,
+    };
+    let second_spec = DecryptFixtureTrackSpec {
+        track_id: 1,
+        width: 320,
+        height: 180,
+        scheme_type: fourcc("cbcs"),
+        native_scheme: NativeCommonEncryptionScheme::Cbcs,
+        key: [0x42; 16],
+        kid: [0; 16],
+        initialization_vector: vec![],
+        constant_iv: Some(vec![
+            0xfe, 0xec, 0xda, 0xc8, 0xb6, 0xa4, 0x92, 0x80, 0x7f, 0x6d, 0x5b, 0x49, 0x37, 0x25,
+            0x13, 0x01,
+        ]),
+        per_sample_iv_size: None,
+        crypt_byte_block: 1,
+        skip_byte_block: 1,
+        subsamples: vec![
+            SencSubsample {
+                bytes_of_clear_data: 6,
+                bytes_of_protected_data: 24,
+            },
+            SencSubsample {
+                bytes_of_clear_data: 0,
+                bytes_of_protected_data: 24,
+            },
+        ],
+        plaintext: (0u8..54)
+            .map(|value| value.wrapping_mul(5) ^ 0x22)
+            .collect(),
+        use_fragment_group: false,
+        layout: DecryptFixtureLayout::CommonEncryption,
+    };
+
+    let encrypted_sample_entries = vec![
+        build_fragmented_track_sample_entry(&first_spec, true),
+        build_fragmented_track_sample_entry(&second_spec, true),
+    ];
+    let clear_sample_entries = vec![
+        build_fragmented_track_sample_entry(&first_spec, false),
+        build_fragmented_track_sample_entry(&second_spec, false),
+    ];
+    let init_segment = build_multi_sample_entry_init_segment(&encrypted_sample_entries);
+    let decrypted_init_segment = build_multi_sample_entry_init_segment(&clear_sample_entries);
+
+    let first_ciphertext = encrypt_fixture_sample(&first_spec);
+    let second_ciphertext = encrypt_fixture_sample(&second_spec);
+    let media_segment = build_multi_sample_entry_media_segment(
+        [
+            MultiSampleEntryFragmentSpec {
+                track_spec: &first_spec,
+                payload: &first_ciphertext,
+                sample_description_index: None,
+                base_media_decode_time: 0,
+                sequence_number: 1,
+            },
+            MultiSampleEntryFragmentSpec {
+                track_spec: &second_spec,
+                payload: &second_ciphertext,
+                sample_description_index: Some(2),
+                base_media_decode_time: 1_000,
+                sequence_number: 2,
+            },
+        ],
+        true,
+    );
+    let decrypted_media_segment = build_multi_sample_entry_media_segment(
+        [
+            MultiSampleEntryFragmentSpec {
+                track_spec: &first_spec,
+                payload: &first_spec.plaintext,
+                sample_description_index: None,
+                base_media_decode_time: 0,
+                sequence_number: 1,
+            },
+            MultiSampleEntryFragmentSpec {
+                track_spec: &second_spec,
+                payload: &second_spec.plaintext,
+                sample_description_index: Some(2),
+                base_media_decode_time: 1_000,
+                sequence_number: 2,
+            },
+        ],
+        false,
+    );
+    let single_file = [init_segment.clone(), media_segment.clone()].concat();
+    let decrypted_single_file = [
+        decrypted_init_segment.clone(),
+        decrypted_media_segment.clone(),
+    ]
+    .concat();
+
+    ZeroKidMultiSampleEntryDecryptFixture {
+        init_segment,
+        media_segment,
+        single_file,
+        decrypted_init_segment,
+        decrypted_media_segment,
+        decrypted_single_file,
+        ordered_track_id_keys: vec![
+            DecryptionKey::track(first_spec.track_id, first_spec.key),
+            DecryptionKey::track(second_spec.track_id, second_spec.key),
+        ],
+    }
 }
 
 #[cfg(feature = "decrypt")]
@@ -1843,6 +2147,210 @@ fn build_decrypt_fixture_trex(spec: &DecryptFixtureTrackSpec) -> Vec<u8> {
 }
 
 #[cfg(feature = "decrypt")]
+struct MultiSampleEntryFragmentSpec<'a> {
+    track_spec: &'a DecryptFixtureTrackSpec,
+    payload: &'a [u8],
+    sample_description_index: Option<u32>,
+    base_media_decode_time: u64,
+    sequence_number: u32,
+}
+
+#[cfg(feature = "decrypt")]
+fn build_fragmented_track_sample_entry(spec: &DecryptFixtureTrackSpec, protected: bool) -> Vec<u8> {
+    if protected {
+        return encode_supported_box(
+            &video_sample_entry_with_type("encv", spec.width, spec.height),
+            &[
+                encode_supported_box(&avc_config(), &[]),
+                build_decrypt_fixture_sinf(spec),
+            ]
+            .concat(),
+        );
+    }
+
+    encode_supported_box(
+        &video_sample_entry_with_type("avc1", spec.width, spec.height),
+        &encode_supported_box(&avc_config(), &[]),
+    )
+}
+
+#[cfg(feature = "decrypt")]
+fn build_multi_sample_entry_init_segment(sample_entries: &[Vec<u8>]) -> Vec<u8> {
+    let ftyp = encode_supported_box(
+        &Ftyp {
+            major_brand: fourcc("iso6"),
+            minor_version: 0,
+            compatible_brands: vec![fourcc("iso6"), fourcc("isom"), fourcc("dash")],
+        },
+        &[],
+    );
+
+    let mut mvhd = Mvhd::default();
+    mvhd.timescale = 1_000;
+    mvhd.duration_v0 = 2_000;
+    mvhd.rate = 1 << 16;
+    mvhd.volume = 1 << 8;
+    mvhd.next_track_id = 2;
+    let mvhd = encode_supported_box(&mvhd, &[]);
+
+    let mut trex = Trex::default();
+    trex.track_id = 1;
+    trex.default_sample_description_index = 1;
+    trex.default_sample_duration = 1_000;
+    trex.default_sample_size = 54;
+    let mvex = encode_supported_box(&Mvex, &encode_supported_box(&trex, &[]));
+    let moov = encode_supported_box(
+        &Moov,
+        &[
+            mvhd,
+            build_fragmented_track_with_sample_entries(1, 320, 180, sample_entries),
+            mvex,
+        ]
+        .concat(),
+    );
+
+    [ftyp, moov].concat()
+}
+
+#[cfg(feature = "decrypt")]
+fn build_fragmented_track_with_sample_entries(
+    track_id: u32,
+    width: u16,
+    height: u16,
+    sample_entries: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut tkhd = mp4forge::boxes::iso14496_12::Tkhd::default();
+    tkhd.track_id = track_id;
+    tkhd.width = u32::from(width) << 16;
+    tkhd.height = u32::from(height) << 16;
+    let tkhd = encode_supported_box(&tkhd, &[]);
+
+    let mut mdhd = Mdhd::default();
+    mdhd.timescale = 1_000;
+    mdhd.language = [5, 14, 7];
+    let mdhd = encode_supported_box(&mdhd, &[]);
+
+    let mut stsd = Stsd::default();
+    stsd.entry_count = u32::try_from(sample_entries.len()).unwrap();
+    let stsd = encode_supported_box(&stsd, &sample_entries.concat());
+
+    let mut stco = Stco::default();
+    stco.entry_count = 0;
+    let stco = encode_supported_box(&stco, &[]);
+
+    let mut stts = Stts::default();
+    stts.entry_count = 0;
+    let stts = encode_supported_box(&stts, &[]);
+
+    let mut stsc = Stsc::default();
+    stsc.entry_count = 0;
+    let stsc = encode_supported_box(&stsc, &[]);
+
+    let mut stsz = Stsz::default();
+    stsz.sample_count = 0;
+    let stsz = encode_supported_box(&stsz, &[]);
+
+    let stbl = encode_supported_box(&Stbl, &[stsd, stco, stts, stsc, stsz].concat());
+    let minf = encode_supported_box(&Minf, &stbl);
+    let mdia = encode_supported_box(
+        &Mdia,
+        &[mdhd, handler_box("vide", "VideoHandler"), minf].concat(),
+    );
+    encode_supported_box(&Trak, &[tkhd, mdia].concat())
+}
+
+#[cfg(feature = "decrypt")]
+fn build_multi_sample_entry_media_segment(
+    fragments: [MultiSampleEntryFragmentSpec<'_>; 2],
+    encrypted: bool,
+) -> Vec<u8> {
+    let styp = encode_supported_box(
+        &Ftyp {
+            major_brand: fourcc("msdh"),
+            minor_version: 0,
+            compatible_brands: vec![fourcc("msdh"), fourcc("msix")],
+        },
+        &[],
+    );
+    let mut output = styp;
+    for fragment in fragments {
+        let moof_placeholder = build_multi_sample_entry_fragment_moof(&fragment, 0, encrypted);
+        let data_offset = i32::try_from(moof_placeholder.len() + 8).unwrap();
+        let moof = build_multi_sample_entry_fragment_moof(&fragment, data_offset, encrypted);
+        let mdat = encode_raw_box(fourcc("mdat"), fragment.payload);
+        output.extend_from_slice(&moof);
+        output.extend_from_slice(&mdat);
+    }
+    output
+}
+
+#[cfg(feature = "decrypt")]
+fn build_multi_sample_entry_fragment_moof(
+    fragment: &MultiSampleEntryFragmentSpec<'_>,
+    data_offset: i32,
+    encrypted: bool,
+) -> Vec<u8> {
+    let mut mfhd = Mfhd::default();
+    mfhd.sequence_number = fragment.sequence_number;
+    let mfhd = encode_supported_box(&mfhd, &[]);
+    let traf = if encrypted {
+        build_decrypt_fixture_traf_with_options(
+            fragment.track_spec,
+            data_offset,
+            fragment.sample_description_index,
+            fragment.base_media_decode_time,
+        )
+    } else {
+        build_clear_fragment_traf(
+            fragment.track_spec.track_id,
+            u32::try_from(fragment.payload.len()).unwrap(),
+            data_offset,
+            fragment.sample_description_index,
+            fragment.base_media_decode_time,
+        )
+    };
+    encode_supported_box(&Moof, &[mfhd, traf].concat())
+}
+
+#[cfg(feature = "decrypt")]
+fn build_clear_fragment_traf(
+    track_id: u32,
+    sample_size: u32,
+    data_offset: i32,
+    sample_description_index: Option<u32>,
+    base_media_decode_time: u64,
+) -> Vec<u8> {
+    let mut tfhd = Tfhd::default();
+    let mut tfhd_flags = TFHD_DEFAULT_BASE_IS_MOOF
+        | TFHD_DEFAULT_SAMPLE_DURATION_PRESENT
+        | TFHD_DEFAULT_SAMPLE_SIZE_PRESENT;
+    if sample_description_index.is_some() {
+        tfhd_flags |= TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT;
+    }
+    tfhd.set_flags(tfhd_flags);
+    tfhd.track_id = track_id;
+    tfhd.default_sample_duration = 1_000;
+    tfhd.default_sample_size = sample_size;
+    if let Some(sample_description_index) = sample_description_index {
+        tfhd.sample_description_index = sample_description_index;
+    }
+    let tfhd = encode_supported_box(&tfhd, &[]);
+
+    let mut tfdt = Tfdt::default();
+    tfdt.set_version(1);
+    tfdt.base_media_decode_time_v1 = base_media_decode_time;
+    let tfdt = encode_supported_box(&tfdt, &[]);
+
+    let mut trun = Trun::default();
+    trun.set_flags(TRUN_DATA_OFFSET_PRESENT);
+    trun.sample_count = 1;
+    trun.data_offset = data_offset;
+    let trun = encode_supported_box(&trun, &[]);
+
+    encode_supported_box(&Traf, &[tfhd, tfdt, trun].concat())
+}
+
+#[cfg(feature = "decrypt")]
 fn build_decrypt_fixture_media_segment(
     first_spec: &DecryptFixtureTrackSpec,
     second_spec: &DecryptFixtureTrackSpec,
@@ -1891,20 +2399,35 @@ fn build_decrypt_fixture_moof(
 
 #[cfg(feature = "decrypt")]
 fn build_decrypt_fixture_traf(spec: &DecryptFixtureTrackSpec, data_offset: i32) -> Vec<u8> {
+    build_decrypt_fixture_traf_with_options(spec, data_offset, None, 0)
+}
+
+#[cfg(feature = "decrypt")]
+fn build_decrypt_fixture_traf_with_options(
+    spec: &DecryptFixtureTrackSpec,
+    data_offset: i32,
+    sample_description_index: Option<u32>,
+    base_media_decode_time: u64,
+) -> Vec<u8> {
     let mut tfhd = Tfhd::default();
-    tfhd.set_flags(
-        TFHD_DEFAULT_BASE_IS_MOOF
-            | TFHD_DEFAULT_SAMPLE_DURATION_PRESENT
-            | TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
-    );
+    let mut tfhd_flags = TFHD_DEFAULT_BASE_IS_MOOF
+        | TFHD_DEFAULT_SAMPLE_DURATION_PRESENT
+        | TFHD_DEFAULT_SAMPLE_SIZE_PRESENT;
+    if sample_description_index.is_some() {
+        tfhd_flags |= TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT;
+    }
+    tfhd.set_flags(tfhd_flags);
     tfhd.track_id = spec.track_id;
     tfhd.default_sample_duration = 1_000;
     tfhd.default_sample_size = u32::try_from(spec.plaintext.len()).unwrap();
+    if let Some(sample_description_index) = sample_description_index {
+        tfhd.sample_description_index = sample_description_index;
+    }
     let tfhd = encode_supported_box(&tfhd, &[]);
 
     let mut tfdt = Tfdt::default();
     tfdt.set_version(1);
-    tfdt.base_media_decode_time_v1 = 0;
+    tfdt.base_media_decode_time_v1 = base_media_decode_time;
     let tfdt = encode_supported_box(&tfdt, &[]);
 
     let mut trun = Trun::default();

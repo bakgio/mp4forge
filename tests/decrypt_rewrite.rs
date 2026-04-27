@@ -17,8 +17,9 @@ use mp4forge::rewrite::rewrite_box_as_bytes;
 use mp4forge::walk::BoxPath;
 
 use support::{
-    RetainedDecryptFileFixture, build_decrypt_rewrite_fixture, fourcc, piff_cbc_fixture,
-    piff_cbc_segment_fixture, piff_ctr_fixture, piff_ctr_segment_fixture,
+    RetainedDecryptFileFixture, build_decrypt_rewrite_fixture,
+    build_multi_sample_entry_decrypt_fixture, fourcc, piff_cbc_fixture, piff_cbc_segment_fixture,
+    piff_ctr_fixture, piff_ctr_segment_fixture,
 };
 
 #[test]
@@ -84,6 +85,51 @@ fn decrypt_common_encryption_init_bytes_clears_keyed_sample_entry_protection_sta
 }
 
 #[test]
+fn decrypt_common_encryption_init_bytes_supports_multi_sample_entry_tracks() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+
+    let output =
+        decrypt_common_encryption_init_bytes(&fixture.init_segment, &fixture.all_keys).unwrap();
+
+    assert_eq!(output, fixture.decrypted_init_segment);
+    assert!(
+        extract_box(
+            &mut Cursor::new(output.clone()),
+            None,
+            BoxPath::from([
+                fourcc("moov"),
+                fourcc("trak"),
+                fourcc("mdia"),
+                fourcc("minf"),
+                fourcc("stbl"),
+                fourcc("stsd"),
+                fourcc("encv")
+            ]),
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(
+        extract_box(
+            &mut Cursor::new(output),
+            None,
+            BoxPath::from([
+                fourcc("moov"),
+                fourcc("trak"),
+                fourcc("mdia"),
+                fourcc("minf"),
+                fourcc("stbl"),
+                fourcc("stsd"),
+                fourcc("avc1")
+            ]),
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+}
+
+#[test]
 fn decrypt_common_encryption_media_segment_bytes_decrypts_samples_and_removes_fragment_boxes() {
     let fixture = build_decrypt_rewrite_fixture();
 
@@ -123,6 +169,20 @@ fn decrypt_common_encryption_media_segment_bytes_decrypts_samples_and_removes_fr
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn decrypt_common_encryption_media_segment_bytes_supports_sample_description_switching() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+
+    let output = decrypt_common_encryption_media_segment_bytes(
+        &fixture.init_segment,
+        &fixture.media_segment,
+        &fixture.all_keys,
+    )
+    .unwrap();
+
+    assert_eq!(output, fixture.decrypted_media_segment);
 }
 
 #[test]
@@ -185,6 +245,24 @@ fn decrypt_common_encryption_file_bytes_matches_split_outputs() {
         assert!(track.original_format.is_none());
         assert!(track.protection_scheme.is_none());
     }
+}
+
+#[test]
+fn decrypt_common_encryption_file_bytes_supports_sample_description_switching() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+
+    let output =
+        decrypt_common_encryption_file_bytes(&fixture.single_file, &fixture.all_keys).unwrap();
+
+    assert_eq!(output, fixture.decrypted_single_file);
+
+    let detailed = probe_detailed(&mut Cursor::new(output)).unwrap();
+    assert_eq!(detailed.tracks.len(), 1);
+    let track = &detailed.tracks[0];
+    assert!(!track.summary.encrypted);
+    assert_eq!(track.sample_entry_type, Some(fourcc("avc1")));
+    assert!(track.original_format.is_none());
+    assert!(track.protection_scheme.is_none());
 }
 
 #[test]

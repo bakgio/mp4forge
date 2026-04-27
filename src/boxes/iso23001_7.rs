@@ -202,6 +202,49 @@ pub(crate) fn decode_senc_payload(payload: &[u8]) -> Result<Senc, CodecError> {
     Ok(senc)
 }
 
+#[cfg(feature = "decrypt")]
+pub(crate) fn decode_senc_payload_with_iv_size(
+    payload: &[u8],
+    iv_size: usize,
+) -> Result<Senc, CodecError> {
+    if payload.len() < 8 {
+        return Err(invalid_value("Payload", "payload is too short").into());
+    }
+
+    let version = payload[0];
+    let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+    let mut senc = Senc::default();
+    if !senc.is_supported_version(version) {
+        return Err(CodecError::UnsupportedVersion {
+            box_type: senc.box_type(),
+            version,
+        });
+    }
+    validate_senc_flags(flags)?;
+
+    let sample_count = read_u32(payload, 4);
+    let sample_count_usize = usize::try_from(sample_count)
+        .map_err(|_| invalid_value("SampleCount", "sample count does not fit in usize"))?;
+    let samples = try_parse_senc_samples_with_iv_size(
+        &payload[8..],
+        sample_count_usize,
+        iv_size,
+        flags & SENC_USE_SUBSAMPLE_ENCRYPTION != 0,
+    )
+    .ok_or_else(|| {
+        invalid_value(
+            "Samples",
+            "payload does not match the forced sample IV size",
+        )
+    })?;
+
+    senc.set_version(version);
+    senc.set_flags(flags);
+    senc.sample_count = sample_count;
+    senc.samples = samples;
+    Ok(senc)
+}
+
 fn resolve_senc_iv_size(
     field_name: &'static str,
     samples: &[SencSample],

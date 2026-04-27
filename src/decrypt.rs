@@ -26,11 +26,11 @@ use crate::boxes::isma_cryp::{Isfm, Islt};
 use crate::boxes::iso14496_12::{
     Co64, Frma, Ftyp, Mfro, Mpod, Saio, Saiz, Sbgp, Schm, Sgpd, Sidx, Stco, Stsc, Stsz,
     TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_BASE_IS_MOOF, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
-    TRUN_DATA_OFFSET_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, Tfhd, Tfra, Tkhd, Trex, Trun,
-    UUID_SAMPLE_ENCRYPTION, Uuid, UuidPayload,
+    TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT, TRUN_DATA_OFFSET_PRESENT, TRUN_SAMPLE_SIZE_PRESENT,
+    Tfhd, Tfra, Tkhd, Trex, Trun, UUID_SAMPLE_ENCRYPTION, Uuid, UuidPayload,
 };
 use crate::boxes::iso14496_14::{DescriptorCommand, Iods, parse_descriptor_commands};
-use crate::boxes::iso23001_7::{Senc, Tenc};
+use crate::boxes::iso23001_7::{Senc, Tenc, decode_senc_payload_with_iv_size};
 use crate::boxes::marlin::{
     MARLIN_BRAND_MGSV, MARLIN_IPMPS_TYPE_MGSV, MarlinShortSchm, MarlinStyp,
 };
@@ -44,7 +44,7 @@ use crate::encryption::{
     ResolveSampleEncryptionError, ResolvedSampleEncryptionSample, SampleEncryptionContext,
     resolve_sample_encryption,
 };
-use crate::extract::{ExtractError, extract_box, extract_box_as};
+use crate::extract::{ExtractError, extract_box, extract_box_as, extract_box_payload_bytes};
 use crate::sidx::{
     TopLevelSidxPlan, TopLevelSidxPlanAction, TopLevelSidxPlanOptions,
     apply_top_level_sidx_plan_bytes, plan_top_level_sidx_update_bytes,
@@ -833,7 +833,7 @@ fn decrypt_sample_for_active_track(
     sample: &ResolvedSampleEncryptionSample<'_>,
     encrypted_sample: &[u8],
 ) -> Result<Vec<u8>, CommonEncryptionDecryptError> {
-    if active.track.scheme_type == PIFF {
+    if active.sample_entry.scheme_type == PIFF {
         return Ok(encrypted_sample.to_vec());
     }
 
@@ -873,18 +873,19 @@ fn decrypt_common_encryption_init_bytes_legacy(
     let context = analyze_init_segment(init_segment)?;
     let mut output = init_segment.to_vec();
     for track in &context.tracks {
-        let Some(active) = activate_track(track, keys)? else {
-            continue;
-        };
-        if active.track.scheme_type == PIFF {
-            continue;
+        for sample_entry in &track.protected_sample_entries {
+            if resolve_key_for_sample_entry(track, sample_entry, keys)?.is_none()
+                || sample_entry.scheme_type == PIFF
+            {
+                continue;
+            }
+            patch_sample_entry_type(
+                &mut output,
+                sample_entry.sample_entry_info,
+                sample_entry.original_format,
+            )?;
+            replace_box_with_free(&mut output, sample_entry.sinf_info)?;
         }
-        patch_sample_entry_type(
-            &mut output,
-            active.track.sample_entry_info,
-            active.track.original_format,
-        )?;
-        replace_box_with_free(&mut output, active.track.sinf_info)?;
     }
     Ok(output)
 }
@@ -1047,13 +1048,19 @@ struct ProtectedTrackState {
     minf_info: BoxInfo,
     stbl_info: BoxInfo,
     stsd_info: BoxInfo,
+    protected_sample_entries: Vec<ProtectedSampleEntryState>,
+    trex: Option<Trex>,
+}
+
+#[derive(Clone)]
+struct ProtectedSampleEntryState {
+    sample_description_index: u32,
     sample_entry_info: BoxInfo,
     original_format: FourCc,
     scheme_type: FourCc,
     sinf_info: BoxInfo,
     tenc: Tenc,
     piff_protection_mode: Option<u8>,
-    trex: Option<Trex>,
 }
 
 #[derive(Clone)]
@@ -1205,6 +1212,7 @@ struct MovieTrackRewritePlan {
 #[derive(Clone, Copy)]
 struct ActiveTrackDecryption<'a> {
     track: &'a ProtectedTrackState,
+    sample_entry: &'a ProtectedSampleEntryState,
     scheme: NativeCommonEncryptionScheme,
     key: [u8; 16],
 }
@@ -4557,56 +4565,6 @@ fn analyze_protected_track(
         "trak/tkhd",
     )?;
 
-    let mut reader = Cursor::new(input);
-    let encv_infos = extract_box(
-        &mut reader,
-        Some(trak_info),
-        BoxPath::from([MDIA, MINF, STBL, STSD, ENCV]),
-    )?;
-    let mut reader = Cursor::new(input);
-    let enca_infos = extract_box(
-        &mut reader,
-        Some(trak_info),
-        BoxPath::from([MDIA, MINF, STBL, STSD, ENCA]),
-    )?;
-
-    let (sample_entry_info, sample_entry_type) =
-        match (encv_infos.as_slice(), enca_infos.as_slice()) {
-            ([], []) => return Ok(None),
-            ([info], []) => (*info, ENCV),
-            ([], [info]) => (*info, ENCA),
-            _ => {
-                return Err(invalid_layout(format!(
-                    "track {} has an unsupported protected sample-entry count",
-                    tkhd.track_id
-                )));
-            }
-        };
-
-    let protected_prefix = BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry_type]);
-    let protected_sinf_prefix = child_path(&protected_prefix, SINF);
-    let original_format = {
-        let mut reader = Cursor::new(input);
-        extract_single_as::<_, Frma>(
-            &mut reader,
-            Some(trak_info),
-            child_path(&protected_sinf_prefix, FRMA),
-            "frma",
-        )?
-        .data_format
-    };
-    let scheme_type = {
-        let mut reader = Cursor::new(input);
-        extract_single_as::<_, Schm>(
-            &mut reader,
-            Some(trak_info),
-            child_path(&protected_sinf_prefix, SCHM),
-            "schm",
-        )?
-        .scheme_type
-    };
-    let (tenc, piff_protection_mode) =
-        extract_track_encryption_box(input, trak_info, sample_entry_type)?;
     let mdia_info = {
         let mut reader = Cursor::new(input);
         extract_single_info(&mut reader, Some(trak_info), BoxPath::from([MDIA]), "mdia")?
@@ -4638,10 +4596,11 @@ fn analyze_protected_track(
             "stsd",
         )?
     };
-    let sinf_info = {
-        let mut reader = Cursor::new(input);
-        extract_single_info(&mut reader, Some(trak_info), protected_sinf_prefix, "sinf")?
-    };
+    let protected_sample_entries =
+        analyze_protected_sample_entries(input, tkhd.track_id, stsd_info)?;
+    if protected_sample_entries.is_empty() {
+        return Ok(None);
+    }
 
     Ok(Some(ProtectedTrackState {
         track_id: tkhd.track_id,
@@ -4650,32 +4609,109 @@ fn analyze_protected_track(
         minf_info,
         stbl_info,
         stsd_info,
-        sample_entry_info,
-        original_format,
-        scheme_type,
-        sinf_info,
-        tenc,
-        piff_protection_mode,
+        protected_sample_entries,
         trex: trex_by_track.get(&tkhd.track_id).cloned(),
     }))
 }
 
+fn analyze_protected_sample_entries(
+    input: &[u8],
+    track_id: u32,
+    stsd_info: BoxInfo,
+) -> Result<Vec<ProtectedSampleEntryState>, DecryptRewriteError> {
+    let mut reader = Cursor::new(input);
+    let sample_entry_infos =
+        extract_box(&mut reader, Some(&stsd_info), BoxPath::from([FourCc::ANY]))?;
+    let mut protected_sample_entries = Vec::new();
+
+    for (index, sample_entry_info) in sample_entry_infos.iter().copied().enumerate() {
+        let sample_entry_type = sample_entry_info.box_type();
+        if sample_entry_type != ENCV && sample_entry_type != ENCA {
+            continue;
+        }
+
+        let sample_description_index = u32::try_from(index + 1).map_err(|_| {
+            invalid_layout(format!(
+                "track {track_id} sample-description index does not fit in u32"
+            ))
+        })?;
+        let original_format = {
+            let mut reader = Cursor::new(input);
+            extract_single_as::<_, Frma>(
+                &mut reader,
+                Some(&sample_entry_info),
+                BoxPath::from([SINF, FRMA]),
+                "frma",
+            )?
+            .data_format
+        };
+        let scheme_type = {
+            let mut reader = Cursor::new(input);
+            extract_single_as::<_, Schm>(
+                &mut reader,
+                Some(&sample_entry_info),
+                BoxPath::from([SINF, SCHM]),
+                "schm",
+            )?
+            .scheme_type
+        };
+        let sinf_info = {
+            let mut reader = Cursor::new(input);
+            extract_single_info(
+                &mut reader,
+                Some(&sample_entry_info),
+                BoxPath::from([SINF]),
+                "sinf",
+            )?
+        };
+        let (tenc, piff_protection_mode) = extract_track_encryption_box(input, &sample_entry_info)?;
+
+        protected_sample_entries.push(ProtectedSampleEntryState {
+            sample_description_index,
+            sample_entry_info,
+            original_format,
+            scheme_type,
+            sinf_info,
+            tenc,
+            piff_protection_mode,
+        });
+    }
+
+    if protected_sample_entries.len() > 1 {
+        let incompatible_types = protected_sample_entries.iter().any(|entry| {
+            entry.sample_entry_info.box_type()
+                != protected_sample_entries[0].sample_entry_info.box_type()
+        });
+        if incompatible_types {
+            return Err(invalid_layout(format!(
+                "track {track_id} mixes incompatible protected sample-entry types under one stsd"
+            )));
+        }
+    }
+
+    Ok(protected_sample_entries)
+}
+
 fn extract_track_encryption_box(
     input: &[u8],
-    trak_info: &BoxInfo,
-    sample_entry_type: FourCc,
+    sample_entry_info: &BoxInfo,
 ) -> Result<(Tenc, Option<u8>), DecryptRewriteError> {
-    let tenc_path = BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry_type, SINF, SCHI, TENC]);
     let mut reader = Cursor::new(input);
-    if let Some(tenc) =
-        extract_optional_single_as::<_, Tenc>(&mut reader, Some(trak_info), tenc_path, "tenc")?
-    {
+    if let Some(tenc) = extract_optional_single_as::<_, Tenc>(
+        &mut reader,
+        Some(sample_entry_info),
+        BoxPath::from([SINF, SCHI, TENC]),
+        "tenc",
+    )? {
         return Ok((tenc, None));
     }
 
-    let uuid_path = BoxPath::from([MDIA, MINF, STBL, STSD, sample_entry_type, SINF, SCHI, UUID]);
     let mut reader = Cursor::new(input);
-    let uuid_boxes = extract_box_as::<_, Uuid>(&mut reader, Some(trak_info), uuid_path)?;
+    let uuid_boxes = extract_box_as::<_, Uuid>(
+        &mut reader,
+        Some(sample_entry_info),
+        BoxPath::from([SINF, SCHI, UUID]),
+    )?;
     let mut matches = uuid_boxes
         .into_iter()
         .filter(|uuid| uuid.user_type == PIFF_TRACK_ENCRYPTION_USER_TYPE);
@@ -4852,27 +4888,37 @@ fn patch_box_type_bytes(bytes: &mut [u8], box_type: FourCc) -> Result<(), Decryp
     Ok(())
 }
 
-fn rebuild_common_encryption_track(
+fn build_common_encryption_track_replacement(
     input: &[u8],
     track: &ProtectedTrackState,
-) -> Result<Vec<u8>, DecryptRewriteError> {
-    let mut sample_entry_bytes = rebuild_box_with_child_edits(
-        input,
-        track.sample_entry_info,
-        &[DirectChildEdit {
-            child_info: track.sinf_info,
-            replacement: None,
-        }],
-    )?;
-    patch_box_type_bytes(&mut sample_entry_bytes, track.original_format)?;
+    keys: &[DecryptionKey],
+) -> Result<Option<Vec<u8>>, DecryptRewriteError> {
+    let mut sample_entry_replacements = BTreeMap::new();
+    for sample_entry in &track.protected_sample_entries {
+        if resolve_key_for_sample_entry(track, sample_entry, keys)?.is_none()
+            || sample_entry.scheme_type == PIFF
+        {
+            continue;
+        }
+        sample_entry_replacements.insert(
+            sample_entry.sample_entry_info.offset(),
+            Some(build_clear_sample_entry_bytes(
+                input,
+                sample_entry.sample_entry_info,
+                sample_entry.original_format,
+                sample_entry.sinf_info,
+            )?),
+        );
+    }
+    if sample_entry_replacements.is_empty() {
+        return Ok(None);
+    }
 
-    let stsd_bytes = rebuild_box_with_child_edits(
+    let stsd_bytes = rebuild_box_with_child_replacements(
         input,
         track.stsd_info,
-        &[DirectChildEdit {
-            child_info: track.sample_entry_info,
-            replacement: Some(sample_entry_bytes),
-        }],
+        &sample_entry_replacements,
+        None,
     )?;
     let stbl_bytes = rebuild_box_with_child_edits(
         input,
@@ -4906,6 +4952,7 @@ fn rebuild_common_encryption_track(
             replacement: Some(mdia_bytes),
         }],
     )
+    .map(Some)
 }
 
 fn rebuild_common_encryption_moov(
@@ -4915,16 +4962,12 @@ fn rebuild_common_encryption_moov(
 ) -> Result<Vec<u8>, DecryptRewriteError> {
     let mut track_edits = Vec::new();
     for track in &context.tracks {
-        let Some(active) = activate_track(track, keys)? else {
-            continue;
-        };
-        if active.track.scheme_type == PIFF {
-            continue;
+        if let Some(replacement) = build_common_encryption_track_replacement(input, track, keys)? {
+            track_edits.push(DirectChildEdit {
+                child_info: track.trak_info,
+                replacement: Some(replacement),
+            });
         }
-        track_edits.push(DirectChildEdit {
-            child_info: track.trak_info,
-            replacement: Some(rebuild_common_encryption_track(input, track)?),
-        });
     }
     rebuild_box_with_child_edits(input, context.moov_info, &track_edits)
 }
@@ -5178,118 +5221,131 @@ fn build_common_encryption_fragment_replacements(
         }
 
         let mut remove_infos = Vec::new();
-        if let Some(track) = track_by_id.get(&tfhd.track_id).copied()
-            && let Some(active) = activate_track(track, keys)?
-        {
-            let (senc, senc_info) = extract_fragment_sample_encryption_box(input, &traf_info)?;
+        if let Some(track) = track_by_id.get(&tfhd.track_id).copied() {
+            let sample_description_index = resolve_fragment_sample_description_index(track, &tfhd)?;
+            if let Some(active) =
+                activate_track_sample_entry(track, sample_description_index, keys)?
+            {
+                let (senc, senc_info) = extract_fragment_sample_encryption_box(
+                    input,
+                    &traf_info,
+                    &active.sample_entry.tenc,
+                )?;
 
-            let mut reader = Cursor::new(input);
-            let saiz = extract_optional_single_as::<_, Saiz>(
-                &mut reader,
-                Some(&traf_info),
-                BoxPath::from([SAIZ]),
-                "saiz",
-            )?;
-            let mut reader = Cursor::new(input);
-            let saio = extract_optional_single_as::<_, Saio>(
-                &mut reader,
-                Some(&traf_info),
-                BoxPath::from([SAIO]),
-                "saio",
-            )?;
-            let mut reader = Cursor::new(input);
-            let sgpd_entries =
-                extract_box_as::<_, Sgpd>(&mut reader, Some(&traf_info), BoxPath::from([SGPD]))?;
-            let mut reader = Cursor::new(input);
-            let sgpd_infos = extract_box(&mut reader, Some(&traf_info), BoxPath::from([SGPD]))?;
-            let mut reader = Cursor::new(input);
-            let sbgp_entries =
-                extract_box_as::<_, Sbgp>(&mut reader, Some(&traf_info), BoxPath::from([SBGP]))?;
-            let mut reader = Cursor::new(input);
-            let sbgp_infos = extract_box(&mut reader, Some(&traf_info), BoxPath::from([SBGP]))?;
+                let mut reader = Cursor::new(input);
+                let saiz = extract_optional_single_as::<_, Saiz>(
+                    &mut reader,
+                    Some(&traf_info),
+                    BoxPath::from([SAIZ]),
+                    "saiz",
+                )?;
+                let mut reader = Cursor::new(input);
+                let saio = extract_optional_single_as::<_, Saio>(
+                    &mut reader,
+                    Some(&traf_info),
+                    BoxPath::from([SAIO]),
+                    "saio",
+                )?;
+                let mut reader = Cursor::new(input);
+                let sgpd_entries = extract_box_as::<_, Sgpd>(
+                    &mut reader,
+                    Some(&traf_info),
+                    BoxPath::from([SGPD]),
+                )?;
+                let mut reader = Cursor::new(input);
+                let sgpd_infos = extract_box(&mut reader, Some(&traf_info), BoxPath::from([SGPD]))?;
+                let mut reader = Cursor::new(input);
+                let sbgp_entries = extract_box_as::<_, Sbgp>(
+                    &mut reader,
+                    Some(&traf_info),
+                    BoxPath::from([SBGP]),
+                )?;
+                let mut reader = Cursor::new(input);
+                let sbgp_infos = extract_box(&mut reader, Some(&traf_info), BoxPath::from([SBGP]))?;
 
-            let sgpd = select_seig_sgpd(&sgpd_entries);
-            let sbgp = select_seig_sbgp(&sbgp_entries);
-            let resolved = resolve_sample_encryption(
-                &senc,
-                SampleEncryptionContext {
-                    tenc: Some(&active.track.tenc),
-                    sgpd,
-                    sbgp,
-                    saiz: saiz.as_ref(),
-                },
-            )?;
-
-            let sample_spans = compute_sample_spans(
-                &tfhd,
-                active.track.trex.as_ref(),
-                moof_info.offset(),
-                &truns,
-                &trun_infos,
-            )?;
-            if sample_spans.len() != resolved.samples.len() {
-                return Err(invalid_layout(format!(
-                    "track {} resolved {} encrypted sample records but {} sample span(s)",
-                    active.track.track_id,
-                    resolved.samples.len(),
-                    sample_spans.len()
-                )));
-            }
-
-            for (sample, span) in resolved.samples.iter().zip(sample_spans.iter()) {
-                let encrypted = read_sample_range(input, &mdat_ranges, span.offset, span.size)
-                    .ok_or(DecryptRewriteError::SampleDataRangeNotFound {
-                        track_id: active.track.track_id,
-                        sample_index: sample.sample_index,
-                        absolute_offset: span.offset,
-                        sample_size: span.size,
-                    })?;
-                let clear = decrypt_sample_for_active_track(&active, sample, encrypted)?;
-                write_sample_range(decrypted, &mdat_ranges, span.offset, &clear).ok_or(
-                    DecryptRewriteError::SampleDataRangeNotFound {
-                        track_id: active.track.track_id,
-                        sample_index: sample.sample_index,
-                        absolute_offset: span.offset,
-                        sample_size: span.size,
+                let sgpd = select_seig_sgpd(&sgpd_entries);
+                let sbgp = select_seig_sbgp(&sbgp_entries);
+                let resolved = resolve_sample_encryption(
+                    &senc,
+                    SampleEncryptionContext {
+                        tenc: Some(&active.sample_entry.tenc),
+                        sgpd,
+                        sbgp,
+                        saiz: saiz.as_ref(),
                     },
                 )?;
-            }
 
-            if active.track.scheme_type == PIFF {
-                plans.push(TrafRewritePlan {
-                    moof_info,
-                    traf_info,
-                    tfhd_flags: tfhd.flags(),
-                    trun_infos,
-                    truns,
-                    remove_infos,
-                });
-                continue;
-            }
-
-            remove_infos.push(senc_info);
-            if let Some(saiz_info) =
-                extract_optional_single_info_from_infos(&traf_info, SAIZ, input)?
-            {
-                remove_infos.push(saiz_info);
-            }
-            if let Some(saio_info) =
-                extract_optional_single_info_from_infos(&traf_info, SAIO, input)?
-                && saio.as_ref().is_none_or(|saio| {
-                    saio.aux_info_type == FourCc::ANY
-                        || saio.aux_info_type == active.track.scheme_type
-                })
-            {
-                remove_infos.push(saio_info);
-            }
-            for (entry, info) in sbgp_entries.iter().zip(sbgp_infos.iter().copied()) {
-                if entry.grouping_type == u32::from_be_bytes(*b"seig") {
-                    remove_infos.push(info);
+                let sample_spans = compute_sample_spans(
+                    &tfhd,
+                    active.track.trex.as_ref(),
+                    moof_info.offset(),
+                    &truns,
+                    &trun_infos,
+                )?;
+                if sample_spans.len() != resolved.samples.len() {
+                    return Err(invalid_layout(format!(
+                        "track {} resolved {} encrypted sample records but {} sample span(s)",
+                        active.track.track_id,
+                        resolved.samples.len(),
+                        sample_spans.len()
+                    )));
                 }
-            }
-            for (entry, info) in sgpd_entries.iter().zip(sgpd_infos.iter().copied()) {
-                if entry.grouping_type == SEIG {
-                    remove_infos.push(info);
+
+                for (sample, span) in resolved.samples.iter().zip(sample_spans.iter()) {
+                    let encrypted = read_sample_range(input, &mdat_ranges, span.offset, span.size)
+                        .ok_or(DecryptRewriteError::SampleDataRangeNotFound {
+                            track_id: active.track.track_id,
+                            sample_index: sample.sample_index,
+                            absolute_offset: span.offset,
+                            sample_size: span.size,
+                        })?;
+                    let clear = decrypt_sample_for_active_track(&active, sample, encrypted)?;
+                    write_sample_range(decrypted, &mdat_ranges, span.offset, &clear).ok_or(
+                        DecryptRewriteError::SampleDataRangeNotFound {
+                            track_id: active.track.track_id,
+                            sample_index: sample.sample_index,
+                            absolute_offset: span.offset,
+                            sample_size: span.size,
+                        },
+                    )?;
+                }
+
+                if active.sample_entry.scheme_type == PIFF {
+                    plans.push(TrafRewritePlan {
+                        moof_info,
+                        traf_info,
+                        tfhd_flags: tfhd.flags(),
+                        trun_infos,
+                        truns,
+                        remove_infos,
+                    });
+                    continue;
+                }
+
+                remove_infos.push(senc_info);
+                if let Some(saiz_info) =
+                    extract_optional_single_info_from_infos(&traf_info, SAIZ, input)?
+                {
+                    remove_infos.push(saiz_info);
+                }
+                if let Some(saio_info) =
+                    extract_optional_single_info_from_infos(&traf_info, SAIO, input)?
+                    && saio.as_ref().is_none_or(|saio| {
+                        saio.aux_info_type == FourCc::ANY
+                            || saio.aux_info_type == active.sample_entry.scheme_type
+                    })
+                {
+                    remove_infos.push(saio_info);
+                }
+                for (entry, info) in sbgp_entries.iter().zip(sbgp_infos.iter().copied()) {
+                    if entry.grouping_type == u32::from_be_bytes(*b"seig") {
+                        remove_infos.push(info);
+                    }
+                }
+                for (entry, info) in sgpd_entries.iter().zip(sgpd_infos.iter().copied()) {
+                    if entry.grouping_type == SEIG {
+                        remove_infos.push(info);
+                    }
                 }
             }
         }
@@ -5616,7 +5672,9 @@ fn decrypt_media_bytes_in_place_legacy(
         let Some(track) = track_by_id.get(&tfhd.track_id).copied() else {
             continue;
         };
-        let Some(active) = activate_track(track, keys)? else {
+        let sample_description_index = resolve_fragment_sample_description_index(track, &tfhd)?;
+        let Some(active) = activate_track_sample_entry(track, sample_description_index, keys)?
+        else {
             continue;
         };
 
@@ -5632,7 +5690,8 @@ fn decrypt_media_bytes_in_place_legacy(
             )));
         }
 
-        let (senc, senc_info) = extract_fragment_sample_encryption_box(input, &traf_info)?;
+        let (senc, senc_info) =
+            extract_fragment_sample_encryption_box(input, &traf_info, &active.sample_entry.tenc)?;
 
         let mut reader = Cursor::new(input);
         let saiz = extract_optional_single_as::<_, Saiz>(
@@ -5664,7 +5723,7 @@ fn decrypt_media_bytes_in_place_legacy(
         let resolved = resolve_sample_encryption(
             &senc,
             SampleEncryptionContext {
-                tenc: Some(&active.track.tenc),
+                tenc: Some(&active.sample_entry.tenc),
                 sgpd,
                 sbgp,
                 saiz: saiz.as_ref(),
@@ -5707,7 +5766,7 @@ fn decrypt_media_bytes_in_place_legacy(
             )?;
         }
 
-        if active.track.scheme_type == PIFF {
+        if active.sample_entry.scheme_type == PIFF {
             continue;
         }
 
@@ -5717,7 +5776,8 @@ fn decrypt_media_bytes_in_place_legacy(
         }
         if let Some(saio_info) = extract_optional_single_info_from_infos(&traf_info, SAIO, input)?
             && saio.as_ref().is_none_or(|saio| {
-                saio.aux_info_type == FourCc::ANY || saio.aux_info_type == active.track.scheme_type
+                saio.aux_info_type == FourCc::ANY
+                    || saio.aux_info_type == active.sample_entry.scheme_type
             })
         {
             replace_box_with_free(output, saio_info)?;
@@ -5812,70 +5872,173 @@ fn compute_sample_spans(
     Ok(sample_spans)
 }
 
-fn activate_track<'a>(
+fn activate_track_sample_entry<'a>(
     track: &'a ProtectedTrackState,
+    sample_description_index: u32,
     keys: &[DecryptionKey],
 ) -> Result<Option<ActiveTrackDecryption<'a>>, DecryptRewriteError> {
-    let key = keys
+    let Some(sample_entry) = resolve_protected_sample_entry(track, sample_description_index)?
+    else {
+        return Ok(None);
+    };
+    let Some(key) = resolve_key_for_sample_entry(track, sample_entry, keys)? else {
+        return Ok(None);
+    };
+    let scheme = resolve_sample_entry_scheme(track.track_id, sample_entry)?;
+
+    Ok(Some(ActiveTrackDecryption {
+        track,
+        sample_entry,
+        scheme,
+        key,
+    }))
+}
+
+fn resolve_protected_sample_entry(
+    track: &ProtectedTrackState,
+    sample_description_index: u32,
+) -> Result<Option<&ProtectedSampleEntryState>, DecryptRewriteError> {
+    if sample_description_index == 0 {
+        return Err(invalid_layout(format!(
+            "track {} uses invalid sample-description index 0",
+            track.track_id
+        )));
+    }
+    Ok(track
+        .protected_sample_entries
         .iter()
-        .find_map(|entry| match entry.id {
+        .find(|entry| entry.sample_description_index == sample_description_index))
+}
+
+fn resolve_fragment_sample_description_index(
+    track: &ProtectedTrackState,
+    tfhd: &Tfhd,
+) -> Result<u32, DecryptRewriteError> {
+    if tfhd.flags() & TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT != 0 {
+        return Ok(tfhd.sample_description_index);
+    }
+    if let Some(trex) = track.trex.as_ref() {
+        return Ok(trex.default_sample_description_index);
+    }
+    if track.protected_sample_entries.len() == 1 {
+        return Ok(track.protected_sample_entries[0].sample_description_index);
+    }
+
+    Err(invalid_layout(format!(
+        "track {} requires tfhd or trex sample-description defaults when multiple protected sample entries are present",
+        track.track_id
+    )))
+}
+
+fn resolve_key_for_sample_entry(
+    track: &ProtectedTrackState,
+    sample_entry: &ProtectedSampleEntryState,
+    keys: &[DecryptionKey],
+) -> Result<Option<[u8; 16]>, DecryptRewriteError> {
+    if let Some(key) = keys.iter().find_map(|entry| match entry.id {
+        DecryptionKeyId::Kid(candidate) if candidate == sample_entry.tenc.default_kid => {
+            Some(entry.key)
+        }
+        _ => None,
+    }) {
+        return Ok(Some(key));
+    }
+
+    let track_keys = keys
+        .iter()
+        .filter_map(|entry| match entry.id {
             DecryptionKeyId::TrackId(candidate) if candidate == track.track_id => Some(entry.key),
             _ => None,
         })
-        .or_else(|| {
-            keys.iter().find_map(|entry| match entry.id {
-                DecryptionKeyId::Kid(candidate) if candidate == track.tenc.default_kid => {
-                    Some(entry.key)
-                }
-                _ => None,
-            })
-        });
-
-    let Some(key) = key else {
-        return Ok(None);
-    };
-    let scheme = resolve_track_scheme(track)?;
-
-    Ok(Some(ActiveTrackDecryption { track, scheme, key }))
+        .collect::<Vec<_>>();
+    let ordered_zero_kid_track_key =
+        resolve_ordered_track_key_for_zero_kid_sample_entry(track, sample_entry, &track_keys);
+    match track_keys.as_slice() {
+        [] => Ok(None),
+        [key] => Ok(Some(*key)),
+        [first, ..] if track.protected_sample_entries.len() == 1 => Ok(Some(*first)),
+        _ if ordered_zero_kid_track_key.is_some() => Ok(ordered_zero_kid_track_key),
+        _ => Err(invalid_layout(format!(
+            "track {} has multiple track-ID keys but sample-description {} needs per-entry key selection; use KID-addressed keys or provide one ordered track-ID key per zero-KID protected sample entry",
+            track.track_id, sample_entry.sample_description_index
+        ))),
+    }
 }
 
-fn resolve_track_scheme(
+fn resolve_ordered_track_key_for_zero_kid_sample_entry(
     track: &ProtectedTrackState,
+    sample_entry: &ProtectedSampleEntryState,
+    track_keys: &[[u8; 16]],
+) -> Option<[u8; 16]> {
+    if sample_entry.tenc.default_kid != [0; 16] {
+        return None;
+    }
+
+    let zero_kid_entries = track
+        .protected_sample_entries
+        .iter()
+        .filter(|entry| entry.tenc.default_kid == [0; 16])
+        .collect::<Vec<_>>();
+    if zero_kid_entries.len() != track_keys.len() {
+        return None;
+    }
+
+    zero_kid_entries
+        .iter()
+        .position(|entry| entry.sample_description_index == sample_entry.sample_description_index)
+        .map(|ordinal| track_keys[ordinal])
+}
+
+fn resolve_sample_entry_scheme(
+    track_id: u32,
+    sample_entry: &ProtectedSampleEntryState,
 ) -> Result<NativeCommonEncryptionScheme, DecryptRewriteError> {
-    if let Some(scheme) = NativeCommonEncryptionScheme::from_scheme_type(track.scheme_type) {
+    if let Some(scheme) = NativeCommonEncryptionScheme::from_scheme_type(sample_entry.scheme_type) {
         return Ok(scheme);
     }
-    if track.scheme_type == PIFF {
-        return match track
+    if sample_entry.scheme_type == PIFF {
+        return match sample_entry
             .piff_protection_mode
-            .unwrap_or(track.tenc.default_is_protected)
+            .unwrap_or(sample_entry.tenc.default_is_protected)
         {
             1 => Ok(NativeCommonEncryptionScheme::Cenc),
             2 => Ok(NativeCommonEncryptionScheme::Cbc1),
             mode => Err(invalid_layout(format!(
                 "track {} uses unsupported PIFF protection mode {}",
-                track.track_id, mode
+                track_id, mode
             ))),
         };
     }
 
     Err(DecryptRewriteError::UnsupportedTrackSchemeType {
-        track_id: track.track_id,
-        scheme_type: track.scheme_type,
+        track_id,
+        scheme_type: sample_entry.scheme_type,
     })
 }
 
 fn extract_fragment_sample_encryption_box(
     input: &[u8],
     traf_info: &BoxInfo,
+    tenc: &Tenc,
 ) -> Result<(Senc, BoxInfo), DecryptRewriteError> {
     let mut reader = Cursor::new(input);
-    let senc_boxes =
-        extract_box_as::<_, Senc>(&mut reader, Some(traf_info), BoxPath::from([SENC]))?;
-    let mut reader = Cursor::new(input);
     let senc_infos = extract_box(&mut reader, Some(traf_info), BoxPath::from([SENC]))?;
-    match (senc_boxes.len(), senc_infos.len()) {
-        (1, 1) => return Ok((senc_boxes.into_iter().next().unwrap(), senc_infos[0])),
+    let mut reader = Cursor::new(input);
+    let senc_payloads =
+        extract_box_payload_bytes(&mut reader, Some(traf_info), BoxPath::from([SENC]))?;
+    match (senc_payloads.len(), senc_infos.len()) {
+        (1, 1) => {
+            let senc = decode_senc_payload_with_iv_size(
+                &senc_payloads[0],
+                usize::from(tenc.default_per_sample_iv_size),
+            )
+            .map_err(|error| {
+                invalid_layout(format!(
+                    "failed to decode sample encryption box with the selected track defaults: {error}"
+                ))
+            })?;
+            return Ok((senc, senc_infos[0]));
+        }
         (0, 0) => {}
         _ => {
             return Err(invalid_layout(

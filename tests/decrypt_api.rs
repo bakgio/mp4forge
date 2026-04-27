@@ -6,8 +6,9 @@ use std::fs;
 use std::io::Cursor;
 
 use mp4forge::decrypt::{
-    DecryptError, DecryptOptions, DecryptProgress, DecryptProgressPhase, DecryptionKey,
-    DecryptionKeyId, decrypt_bytes, decrypt_bytes_with_progress, decrypt_file_with_progress,
+    DecryptError, DecryptOptions, DecryptProgress, DecryptProgressPhase, DecryptRewriteError,
+    DecryptionKey, DecryptionKeyId, decrypt_bytes, decrypt_bytes_with_progress,
+    decrypt_file_with_progress,
 };
 use mp4forge::extract::extract_box_payload_bytes;
 use mp4forge::probe::probe_detailed;
@@ -17,7 +18,8 @@ use support::{
     ProtectedMovieTopologyFixture, RetainedDecryptFileFixture, RetainedFragmentedDecryptFixture,
     build_decrypt_rewrite_fixture, build_iaec_broader_movie_fixture,
     build_marlin_ipmp_acbc_broader_movie_fixture, build_marlin_ipmp_acgk_broader_movie_fixture,
-    build_oma_dcf_broader_movie_fixture, common_encryption_fragment_fixture,
+    build_multi_sample_entry_decrypt_fixture, build_oma_dcf_broader_movie_fixture,
+    build_zero_kid_multi_sample_entry_decrypt_fixture, common_encryption_fragment_fixture,
     common_encryption_multi_track_fixture, common_encryption_single_key_fixture_keys, fourcc,
     isma_iaec_fixture, marlin_ipmp_acbc_fixture, marlin_ipmp_acgk_fixture, oma_dcf_cbc_fixture,
     oma_dcf_cbc_grpi_fixture, oma_dcf_ctr_fixture, oma_dcf_ctr_grpi_fixture, piff_cbc_fixture,
@@ -439,6 +441,58 @@ fn decrypt_file_with_progress_supports_retained_common_encryption_multi_track_fi
         &common_encryption_multi_track_fixture(),
         "decrypt-api-cenc-multi-track-output",
     );
+}
+
+#[test]
+fn decrypt_bytes_supports_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+    let output =
+        decrypt_bytes(&fixture.single_file, &options_with_keys(&fixture.all_keys)).unwrap();
+    assert_eq!(output, fixture.decrypted_single_file);
+}
+
+#[test]
+fn decrypt_file_with_progress_supports_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+    let input_path = write_temp_file("decrypt-api-multi-entry-input", &fixture.single_file);
+    let output_path = write_temp_file("decrypt-api-multi-entry-output", &[]);
+
+    decrypt_file_with_progress(
+        &input_path,
+        &output_path,
+        &options_with_keys(&fixture.all_keys),
+        |_| {},
+    )
+    .unwrap();
+
+    let output = fs::read(&output_path).unwrap();
+    assert_eq!(output, fixture.decrypted_single_file);
+}
+
+#[test]
+fn decrypt_bytes_supports_zero_kid_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_zero_kid_multi_sample_entry_decrypt_fixture();
+    let output = decrypt_bytes(
+        &fixture.single_file,
+        &options_with_keys(&fixture.ordered_track_id_keys),
+    )
+    .unwrap();
+    assert_eq!(output, fixture.decrypted_single_file);
+}
+
+#[test]
+fn decrypt_bytes_rejects_ambiguous_track_id_keys_for_multi_sample_entry_tracks() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+    let error = decrypt_bytes(
+        &fixture.single_file,
+        &options_with_keys(&fixture.ambiguous_track_id_keys),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        DecryptError::Rewrite(DecryptRewriteError::InvalidLayout { .. })
+    ));
 }
 
 common_encryption_fragment_bytes_case!(

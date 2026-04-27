@@ -17,7 +17,8 @@ use support::{
     ProtectedMovieTopologyFixture, RetainedDecryptFileFixture, RetainedFragmentedDecryptFixture,
     build_decrypt_rewrite_fixture, build_iaec_broader_movie_fixture,
     build_marlin_ipmp_acbc_broader_movie_fixture, build_marlin_ipmp_acgk_broader_movie_fixture,
-    build_oma_dcf_broader_movie_fixture, common_encryption_fragment_fixture,
+    build_multi_sample_entry_decrypt_fixture, build_oma_dcf_broader_movie_fixture,
+    build_zero_kid_multi_sample_entry_decrypt_fixture, common_encryption_fragment_fixture,
     common_encryption_multi_track_fixture, fourcc, isma_iaec_fixture, marlin_ipmp_acbc_fixture,
     marlin_ipmp_acgk_fixture, oma_dcf_cbc_fixture, oma_dcf_cbc_grpi_fixture, oma_dcf_ctr_fixture,
     oma_dcf_ctr_grpi_fixture, piff_cbc_fixture, piff_cbc_segment_fixture, piff_ctr_fixture,
@@ -377,6 +378,45 @@ async fn async_decrypt_file_supports_retained_common_encryption_multi_track_file
         "decrypt-async-cenc-multi-track-output",
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_supports_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+    let input_path = write_temp_file("decrypt-async-multi-entry-input", &fixture.single_file);
+    let output_path = write_temp_file("decrypt-async-multi-entry-output", &[]);
+
+    decrypt_file_async(
+        &input_path,
+        &output_path,
+        &options_with_keys(&fixture.all_keys),
+    )
+    .await
+    .unwrap();
+
+    let output = fs::read(&output_path).unwrap();
+    assert_eq!(output, fixture.decrypted_single_file);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_supports_zero_kid_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_zero_kid_multi_sample_entry_decrypt_fixture();
+    let input_path = write_temp_file(
+        "decrypt-async-zero-kid-multi-entry-input",
+        &fixture.single_file,
+    );
+    let output_path = write_temp_file("decrypt-async-zero-kid-multi-entry-output", &[]);
+
+    decrypt_file_async(
+        &input_path,
+        &output_path,
+        &options_with_keys(&fixture.ordered_track_id_keys),
+    )
+    .await
+    .unwrap();
+
+    let output = fs::read(&output_path).unwrap();
+    assert_eq!(output, fixture.decrypted_single_file);
 }
 
 common_encryption_fragment_async_case!(

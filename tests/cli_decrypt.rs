@@ -15,7 +15,8 @@ use support::{
     ProtectedMovieTopologyFixture, RetainedDecryptFileFixture, RetainedFragmentedDecryptFixture,
     build_decrypt_rewrite_fixture, build_iaec_broader_movie_fixture,
     build_marlin_ipmp_acbc_broader_movie_fixture, build_marlin_ipmp_acgk_broader_movie_fixture,
-    build_oma_dcf_broader_movie_fixture, common_encryption_fragment_fixture,
+    build_multi_sample_entry_decrypt_fixture, build_oma_dcf_broader_movie_fixture,
+    build_zero_kid_multi_sample_entry_decrypt_fixture, common_encryption_fragment_fixture,
     common_encryption_multi_track_fixture, fourcc, isma_iaec_fixture, marlin_ipmp_acbc_fixture,
     marlin_ipmp_acgk_fixture, oma_dcf_cbc_fixture, oma_dcf_cbc_grpi_fixture, oma_dcf_ctr_fixture,
     oma_dcf_ctr_grpi_fixture, piff_cbc_fixture, piff_cbc_segment_fixture, piff_ctr_fixture,
@@ -411,6 +412,61 @@ fn decrypt_command_supports_retained_common_encryption_multi_track_files() {
         &common_encryption_multi_track_fixture(),
         "cli-decrypt-cenc-multi-track-output",
     );
+}
+
+#[test]
+fn decrypt_command_supports_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_multi_sample_entry_decrypt_fixture();
+    let input_path = write_temp_file("cli-decrypt-multi-entry-input", &fixture.single_file);
+    let output_path = write_temp_file("cli-decrypt-multi-entry-output", &[]);
+    let mut args = vec!["decrypt".to_string()];
+    for key in &fixture.all_keys {
+        args.push("--key".to_string());
+        args.push(key.to_spec());
+    }
+    args.push(input_path.to_string_lossy().into_owned());
+    args.push(output_path.to_string_lossy().into_owned());
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+
+    let output = fs::read(&output_path).unwrap();
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(output, fixture.decrypted_single_file);
+}
+
+#[test]
+fn decrypt_command_supports_zero_kid_multi_sample_entry_fragmented_tracks() {
+    let fixture = build_zero_kid_multi_sample_entry_decrypt_fixture();
+    let input_path = write_temp_file(
+        "cli-decrypt-zero-kid-multi-entry-input",
+        &fixture.single_file,
+    );
+    let output_path = write_temp_file("cli-decrypt-zero-kid-multi-entry-output", &[]);
+    let mut args = vec!["decrypt".to_string()];
+    for key in &fixture.ordered_track_id_keys {
+        args.push("--key".to_string());
+        args.push(key.to_spec());
+    }
+    args.push(input_path.to_string_lossy().into_owned());
+    args.push(output_path.to_string_lossy().into_owned());
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+
+    let output = fs::read(&output_path).unwrap();
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(output, fixture.decrypted_single_file);
 }
 
 common_encryption_fragment_cli_case!(
