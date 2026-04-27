@@ -28,13 +28,13 @@
 
 ```toml
 [dependencies]
-mp4forge = "0.6.0"
+mp4forge = "0.7.0"
 
 # With optional features:
-# mp4forge = { version = "0.6.0", features = ["async"] }
-# mp4forge = { version = "0.6.0", features = ["decrypt"] }
-# mp4forge = { version = "0.6.0", features = ["decrypt", "async"] }
-# mp4forge = { version = "0.6.0", features = ["serde"] }
+# mp4forge = { version = "0.7.0", features = ["async"] }
+# mp4forge = { version = "0.7.0", features = ["decrypt"] }
+# mp4forge = { version = "0.7.0", features = ["decrypt", "async"] }
+# mp4forge = { version = "0.7.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:

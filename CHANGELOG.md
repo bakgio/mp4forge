@@ -1,12 +1,21 @@
-# Unreleased
+# 0.7.0 (April 28, 2026)
 
-- Added a feature-gated decryption surface with sync library APIs, Tokio async file-backed
-  companions, and a sync-only `decrypt` CLI covering Common Encryption, PIFF compatibility, OMA
-  DCF, Marlin IPMP ACBC and ACGK, and the retained IAEC protected-movie path
+- Added the feature-gated decryption release surface across sync library helpers, Tokio async
+  file-backed companions, and the sync-only `decrypt` CLI, covering the Common Encryption family,
+  PIFF compatibility, OMA DCF, Marlin IPMP ACBC and ACGK, and the retained IAEC protected-movie
+  path
 - Added the typed OMA DCF, Marlin, ISMA-IAEC, and descriptor-command box or descriptor support
   needed to drive the broader protected-format decryption paths without opaque byte-only shortcuts
-- Added retained real Marlin and OMA decrypt fixtures plus broader sync-versus-async and
-  file-versus-memory parity coverage for the landed protected-format paths
+- Expanded retained decrypt fixtures, parity harnesses, and cross-surface regression coverage so
+  sync, async, CLI, fragmented, protected-movie, and broader-format decrypt behavior are locked
+  against stable checked-in assets and comparison-backed expectations
+- Extended the fragmented decrypt path to support multi-sample-entry track layouts with
+  per-fragment sample-description switching and ordered zero-KID track-key binding, and verified
+  the resulting clear fragmented output against the existing rebuild workflow
+- Closed the older non-fragmented `sample_description_index` gap by preserving chunk-level sample
+  description identity in shared layout helpers, positively covering valid Marlin layouts above
+  `1`, and making the retained first-description-only OMA and IAEC protected-movie limit explicit
+  where the reviewed higher-level behavior still keeps that scope
 
 # 0.6.0 (April 26, 2026)
 
