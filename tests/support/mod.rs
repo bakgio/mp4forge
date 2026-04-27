@@ -396,6 +396,23 @@ struct RetainedMarlinTrackLayout {
     mdia_info: BoxInfo,
     minf_info: BoxInfo,
     stbl_info: BoxInfo,
+    stsd_info: BoxInfo,
+    stsc_info: BoxInfo,
+    stsc: Stsc,
+    stsz_info: BoxInfo,
+    stsz: Stsz,
+    chunk_offsets: RetainedTrackChunkOffsetState,
+}
+
+#[cfg(feature = "decrypt")]
+struct GeneratedProtectedMovieTrackLayout {
+    track_id: u32,
+    trak_info: BoxInfo,
+    mdia_info: BoxInfo,
+    minf_info: BoxInfo,
+    stbl_info: BoxInfo,
+    stsd_info: BoxInfo,
+    stsc_info: BoxInfo,
     stsz_info: BoxInfo,
     stsz: Stsz,
     chunk_offsets: RetainedTrackChunkOffsetState,
@@ -412,6 +429,18 @@ pub fn build_marlin_ipmp_acgk_broader_movie_fixture() -> ProtectedMovieTopologyF
 }
 
 #[cfg(feature = "decrypt")]
+pub fn build_marlin_ipmp_acbc_sample_description_index_movie_fixture()
+-> ProtectedMovieTopologyFixture {
+    build_sample_description_index_marlin_movie_fixture(&marlin_ipmp_acbc_fixture())
+}
+
+#[cfg(feature = "decrypt")]
+pub fn build_marlin_ipmp_acgk_sample_description_index_movie_fixture()
+-> ProtectedMovieTopologyFixture {
+    build_sample_description_index_marlin_movie_fixture(&marlin_ipmp_acgk_fixture())
+}
+
+#[cfg(feature = "decrypt")]
 fn build_broader_marlin_movie_fixture(
     retained: &RetainedDecryptFileFixture,
 ) -> ProtectedMovieTopologyFixture {
@@ -423,6 +452,18 @@ fn build_broader_marlin_movie_fixture(
         encrypted: broaden_retained_marlin_movie_bytes(&encrypted, &trailing_free),
         decrypted: insert_root_box_before_single_mdat_and_shift_offsets(&decrypted, &trailing_free),
         keys: retained.keys.clone(),
+    }
+}
+
+#[cfg(feature = "decrypt")]
+fn build_sample_description_index_marlin_movie_fixture(
+    retained: &RetainedDecryptFileFixture,
+) -> ProtectedMovieTopologyFixture {
+    let broader = build_broader_marlin_movie_fixture(retained);
+    ProtectedMovieTopologyFixture {
+        encrypted: patch_marlin_od_track_sample_description_index(&broader.encrypted),
+        decrypted: broader.decrypted,
+        keys: broader.keys,
     }
 }
 
@@ -484,6 +525,8 @@ fn broaden_retained_marlin_movie_bytes(input: &[u8], trailing_root_box: &[u8]) -
             0,
             Some(appended_sample_offset),
         ),
+        None,
+        None,
     );
     let placeholder_moov = rebuild_container_box_with_replacements(
         input,
@@ -507,6 +550,8 @@ fn broaden_retained_marlin_movie_bytes(input: &[u8], trailing_root_box: &[u8]) -
             track,
             stsz,
             patch_retained_track_chunk_offsets(&track.chunk_offsets, moov_shift, extra_offset),
+            None,
+            None,
         );
         moov_replacements.insert(track.trak_info.offset(), rebuilt_trak);
     }
@@ -532,6 +577,112 @@ fn broaden_retained_marlin_movie_bytes(input: &[u8], trailing_root_box: &[u8]) -
         }
     }
     output.extend_from_slice(trailing_root_box);
+    output
+}
+
+#[cfg(feature = "decrypt")]
+fn patch_marlin_od_track_sample_description_index(input: &[u8]) -> Vec<u8> {
+    let root_boxes = read_root_box_infos(input);
+    let moov_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == fourcc("moov"))
+        .unwrap();
+
+    let iods = extract_single_as_from_bytes::<Iods>(
+        input,
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("iods")]),
+    );
+    let od_track_id = iods
+        .initial_object_descriptor()
+        .unwrap()
+        .sub_descriptors
+        .iter()
+        .find_map(|descriptor| descriptor.es_id_inc_descriptor())
+        .unwrap()
+        .track_id;
+
+    let trak_infos =
+        extract_infos_from_bytes(input, None, BoxPath::from([fourcc("moov"), fourcc("trak")]));
+    let track_layouts = trak_infos
+        .into_iter()
+        .map(|trak_info| analyze_retained_marlin_track_layout(input, trak_info))
+        .collect::<Vec<_>>();
+
+    let placeholder_replacements = track_layouts
+        .iter()
+        .map(|track| {
+            let (stsd_replacement, stsc_replacement) = if track.track_id == od_track_id {
+                (
+                    Some(duplicate_retained_marlin_od_track_sample_entry(
+                        input, track,
+                    )),
+                    Some(patch_retained_track_stsc_sample_description_index(
+                        &track.stsc,
+                        2,
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            (
+                track.trak_info.offset(),
+                rebuild_retained_marlin_track(
+                    input,
+                    track,
+                    track.stsz.clone(),
+                    patch_retained_track_chunk_offsets(&track.chunk_offsets, 0, None),
+                    stsd_replacement,
+                    stsc_replacement,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let placeholder_moov =
+        rebuild_container_box_with_replacements(input, moov_info, &Moov, &placeholder_replacements);
+    let moov_shift = u64::try_from(placeholder_moov.len()).unwrap() - moov_info.size();
+
+    let moov_replacements = track_layouts
+        .iter()
+        .map(|track| {
+            let (stsd_replacement, stsc_replacement) = if track.track_id == od_track_id {
+                (
+                    Some(duplicate_retained_marlin_od_track_sample_entry(
+                        input, track,
+                    )),
+                    Some(patch_retained_track_stsc_sample_description_index(
+                        &track.stsc,
+                        2,
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            (
+                track.trak_info.offset(),
+                rebuild_retained_marlin_track(
+                    input,
+                    track,
+                    track.stsz.clone(),
+                    patch_retained_track_chunk_offsets(&track.chunk_offsets, moov_shift, None),
+                    stsd_replacement,
+                    stsc_replacement,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rebuilt_moov =
+        rebuild_container_box_with_replacements(input, moov_info, &Moov, &moov_replacements);
+
+    let mut output = Vec::new();
+    for root_info in root_boxes {
+        if root_info.offset() == moov_info.offset() {
+            output.extend_from_slice(&rebuilt_moov);
+        } else {
+            output.extend_from_slice(slice_box_bytes(input, root_info));
+        }
+    }
     output
 }
 
@@ -606,6 +757,36 @@ fn analyze_retained_marlin_track_layout(
         input,
         Some(&trak_info),
         BoxPath::from([fourcc("mdia"), fourcc("minf"), fourcc("stbl")]),
+    );
+    let stsd_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+        ]),
+    );
+    let stsc_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsc"),
+        ]),
+    );
+    let stsc = extract_single_as_from_bytes::<Stsc>(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsc"),
+        ]),
     );
     let stsz_info = extract_single_info_from_bytes(
         input,
@@ -686,6 +867,9 @@ fn analyze_retained_marlin_track_layout(
         mdia_info,
         minf_info,
         stbl_info,
+        stsd_info,
+        stsc_info,
+        stsc,
         stsz_info,
         stsz,
         chunk_offsets,
@@ -755,20 +939,25 @@ fn rebuild_retained_marlin_track(
     track: &RetainedMarlinTrackLayout,
     stsz: Stsz,
     chunk_offset_box: Vec<u8>,
+    stsd_box: Option<Vec<u8>>,
+    stsc_box: Option<Vec<u8>>,
 ) -> Vec<u8> {
     let chunk_offset_info = match track.chunk_offsets {
         RetainedTrackChunkOffsetState::Stco { info, .. }
         | RetainedTrackChunkOffsetState::Co64 { info, .. } => info,
     };
-    let stbl = rebuild_container_box_with_replacements(
-        input,
-        track.stbl_info,
-        &Stbl,
-        &BTreeMap::from([
-            (track.stsz_info.offset(), encode_supported_box(&stsz, &[])),
-            (chunk_offset_info.offset(), chunk_offset_box),
-        ]),
-    );
+    let mut stbl_replacements = BTreeMap::from([
+        (track.stsz_info.offset(), encode_supported_box(&stsz, &[])),
+        (chunk_offset_info.offset(), chunk_offset_box),
+    ]);
+    if let Some(stsd_box) = stsd_box {
+        stbl_replacements.insert(track.stsd_info.offset(), stsd_box);
+    }
+    if let Some(stsc_box) = stsc_box {
+        stbl_replacements.insert(track.stsc_info.offset(), stsc_box);
+    }
+    let stbl =
+        rebuild_container_box_with_replacements(input, track.stbl_info, &Stbl, &stbl_replacements);
     let minf = rebuild_container_box_with_replacements(
         input,
         track.minf_info,
@@ -787,6 +976,321 @@ fn rebuild_retained_marlin_track(
         &Trak,
         &BTreeMap::from([(track.mdia_info.offset(), mdia)]),
     )
+}
+
+#[cfg(feature = "decrypt")]
+fn analyze_generated_protected_movie_track_layout(
+    input: &[u8],
+    trak_info: BoxInfo,
+) -> GeneratedProtectedMovieTrackLayout {
+    let tkhd = extract_single_as_from_bytes::<mp4forge::boxes::iso14496_12::Tkhd>(
+        input,
+        Some(&trak_info),
+        BoxPath::from([fourcc("tkhd")]),
+    );
+    let mdia_info =
+        extract_single_info_from_bytes(input, Some(&trak_info), BoxPath::from([fourcc("mdia")]));
+    let minf_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([fourcc("mdia"), fourcc("minf")]),
+    );
+    let stbl_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([fourcc("mdia"), fourcc("minf"), fourcc("stbl")]),
+    );
+    let stsd_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+        ]),
+    );
+    let stsc_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsc"),
+        ]),
+    );
+    let stsz_info = extract_single_info_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsz"),
+        ]),
+    );
+    let stsz = extract_single_as_from_bytes::<Stsz>(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsz"),
+        ]),
+    );
+    let stco_infos = extract_infos_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stco"),
+        ]),
+    );
+    let co64_infos = extract_infos_from_bytes(
+        input,
+        Some(&trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("co64"),
+        ]),
+    );
+    let chunk_offsets = if !stco_infos.is_empty() {
+        let stco = extract_single_as_from_bytes::<Stco>(
+            input,
+            Some(&trak_info),
+            BoxPath::from([
+                fourcc("mdia"),
+                fourcc("minf"),
+                fourcc("stbl"),
+                fourcc("stco"),
+            ]),
+        );
+        RetainedTrackChunkOffsetState::Stco {
+            info: stco_infos[0],
+            box_value: stco,
+        }
+    } else {
+        let co64 = extract_single_as_from_bytes::<mp4forge::boxes::iso14496_12::Co64>(
+            input,
+            Some(&trak_info),
+            BoxPath::from([
+                fourcc("mdia"),
+                fourcc("minf"),
+                fourcc("stbl"),
+                fourcc("co64"),
+            ]),
+        );
+        RetainedTrackChunkOffsetState::Co64 {
+            info: co64_infos[0],
+            box_value: co64,
+        }
+    };
+
+    GeneratedProtectedMovieTrackLayout {
+        track_id: tkhd.track_id,
+        trak_info,
+        mdia_info,
+        minf_info,
+        stbl_info,
+        stsd_info,
+        stsc_info,
+        stsz_info,
+        stsz,
+        chunk_offsets,
+    }
+}
+
+#[cfg(feature = "decrypt")]
+fn rebuild_generated_protected_movie_track(
+    input: &[u8],
+    track: &GeneratedProtectedMovieTrackLayout,
+    chunk_offset_box: Vec<u8>,
+    stsd_box: Option<Vec<u8>>,
+    stsc_box: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let chunk_offset_info = match track.chunk_offsets {
+        RetainedTrackChunkOffsetState::Stco { info, .. }
+        | RetainedTrackChunkOffsetState::Co64 { info, .. } => info,
+    };
+    let mut stbl_replacements = BTreeMap::from([
+        (
+            track.stsz_info.offset(),
+            encode_supported_box(&track.stsz, &[]),
+        ),
+        (chunk_offset_info.offset(), chunk_offset_box),
+    ]);
+    if let Some(stsd_box) = stsd_box {
+        stbl_replacements.insert(track.stsd_info.offset(), stsd_box);
+    }
+    if let Some(stsc_box) = stsc_box {
+        stbl_replacements.insert(track.stsc_info.offset(), stsc_box);
+    }
+    let stbl =
+        rebuild_container_box_with_replacements(input, track.stbl_info, &Stbl, &stbl_replacements);
+    let minf = rebuild_container_box_with_replacements(
+        input,
+        track.minf_info,
+        &Minf,
+        &BTreeMap::from([(track.stbl_info.offset(), stbl)]),
+    );
+    let mdia = rebuild_container_box_with_replacements(
+        input,
+        track.mdia_info,
+        &Mdia,
+        &BTreeMap::from([(track.minf_info.offset(), minf)]),
+    );
+    rebuild_container_box_with_replacements(
+        input,
+        track.trak_info,
+        &Trak,
+        &BTreeMap::from([(track.mdia_info.offset(), mdia)]),
+    )
+}
+
+#[cfg(feature = "decrypt")]
+fn duplicate_retained_marlin_od_track_sample_entry(
+    input: &[u8],
+    track: &RetainedMarlinTrackLayout,
+) -> Vec<u8> {
+    let mut stsd = extract_single_as_from_bytes::<Stsd>(
+        input,
+        Some(&track.trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+        ]),
+    );
+    let sample_entry_infos =
+        extract_infos_from_bytes(input, Some(&track.stsd_info), BoxPath::from([FourCc::ANY]));
+    assert_eq!(sample_entry_infos.len(), 1);
+    let sample_entry = slice_box_bytes(input, sample_entry_infos[0]).to_vec();
+    stsd.entry_count = 2;
+    encode_supported_box(&stsd, &[sample_entry.clone(), sample_entry].concat())
+}
+
+#[cfg(feature = "decrypt")]
+fn append_generated_protected_movie_second_sample_entry(
+    input: &[u8],
+    track: &GeneratedProtectedMovieTrackLayout,
+) -> Vec<u8> {
+    let mut stsd = extract_single_as_from_bytes::<Stsd>(
+        input,
+        Some(&track.trak_info),
+        BoxPath::from([
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+        ]),
+    );
+    let sample_entry_infos =
+        extract_infos_from_bytes(input, Some(&track.stsd_info), BoxPath::from([FourCc::ANY]));
+    assert_eq!(sample_entry_infos.len(), 1);
+    stsd.entry_count = 2;
+    encode_supported_box(
+        &stsd,
+        &[
+            slice_box_bytes(input, sample_entry_infos[0]).to_vec(),
+            build_clear_avc1_sample_entry(320, 180),
+        ]
+        .concat(),
+    )
+}
+
+#[cfg(feature = "decrypt")]
+fn patch_retained_track_stsc_sample_description_index(
+    stsc: &Stsc,
+    sample_description_index: u32,
+) -> Vec<u8> {
+    let mut patched = stsc.clone();
+    for entry in &mut patched.entries {
+        entry.sample_description_index = sample_description_index;
+    }
+    encode_supported_box(&patched, &[])
+}
+
+#[cfg(feature = "decrypt")]
+fn patch_standard_protected_movie_track_sample_description_index(
+    input: &[u8],
+    protected_track_id: u32,
+) -> Vec<u8> {
+    let root_boxes = read_root_box_infos(input);
+    let moov_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == fourcc("moov"))
+        .unwrap();
+    let trak_infos =
+        extract_infos_from_bytes(input, None, BoxPath::from([fourcc("moov"), fourcc("trak")]));
+    let track_layouts = trak_infos
+        .into_iter()
+        .map(|trak_info| analyze_generated_protected_movie_track_layout(input, trak_info))
+        .collect::<Vec<_>>();
+
+    let build_replacement = |track: &GeneratedProtectedMovieTrackLayout, shift: u64| {
+        let (stsd_replacement, stsc_replacement) = if track.track_id == protected_track_id {
+            let stsc = extract_single_as_from_bytes::<Stsc>(
+                input,
+                Some(&track.trak_info),
+                BoxPath::from([
+                    fourcc("mdia"),
+                    fourcc("minf"),
+                    fourcc("stbl"),
+                    fourcc("stsc"),
+                ]),
+            );
+            (
+                Some(append_generated_protected_movie_second_sample_entry(
+                    input, track,
+                )),
+                Some(patch_retained_track_stsc_sample_description_index(&stsc, 2)),
+            )
+        } else {
+            (None, None)
+        };
+        rebuild_generated_protected_movie_track(
+            input,
+            track,
+            patch_retained_track_chunk_offsets(&track.chunk_offsets, shift, None),
+            stsd_replacement,
+            stsc_replacement,
+        )
+    };
+
+    let placeholder_replacements = track_layouts
+        .iter()
+        .map(|track| (track.trak_info.offset(), build_replacement(track, 0)))
+        .collect::<BTreeMap<_, _>>();
+    let placeholder_moov =
+        rebuild_container_box_with_replacements(input, moov_info, &Moov, &placeholder_replacements);
+    let moov_shift =
+        i64::try_from(placeholder_moov.len()).unwrap() - i64::try_from(moov_info.size()).unwrap();
+    let shift = u64::try_from(moov_shift).unwrap();
+
+    let moov_replacements = track_layouts
+        .iter()
+        .map(|track| (track.trak_info.offset(), build_replacement(track, shift)))
+        .collect::<BTreeMap<_, _>>();
+    let moov = rebuild_container_box_with_replacements(input, moov_info, &Moov, &moov_replacements);
+
+    let mut output = Vec::new();
+    for root_info in root_boxes {
+        if root_info.offset() == moov_info.offset() {
+            output.extend_from_slice(&moov);
+        } else {
+            output.extend_from_slice(slice_box_bytes(input, root_info));
+        }
+    }
+
+    output
 }
 
 #[cfg(feature = "decrypt")]
@@ -822,6 +1326,8 @@ fn insert_root_box_before_single_mdat_and_shift_offsets(
                     track,
                     track.stsz.clone(),
                     patch_retained_track_chunk_offsets(&track.chunk_offsets, shift, None),
+                    None,
+                    None,
                 ),
             )
         })
@@ -967,6 +1473,15 @@ pub fn build_oma_dcf_broader_movie_fixture() -> ProtectedMovieTopologyFixture {
 }
 
 #[cfg(feature = "decrypt")]
+pub fn build_oma_dcf_sample_description_index_unsupported_movie_fixture()
+-> ProtectedMovieTopologyFixture {
+    build_sample_description_index_unsupported_protected_movie_fixture(
+        build_oma_dcf_broader_movie_fixture(),
+        1,
+    )
+}
+
+#[cfg(feature = "decrypt")]
 pub fn build_iaec_broader_movie_fixture() -> ProtectedMovieTopologyFixture {
     let protected_track_id = 1;
     let clear_track_id = 2;
@@ -1038,6 +1553,30 @@ pub fn build_iaec_broader_movie_fixture() -> ProtectedMovieTopologyFixture {
         encrypted,
         decrypted,
         keys: vec![DecryptionKey::track(protected_track_id, key)],
+    }
+}
+
+#[cfg(feature = "decrypt")]
+pub fn build_iaec_sample_description_index_unsupported_movie_fixture()
+-> ProtectedMovieTopologyFixture {
+    build_sample_description_index_unsupported_protected_movie_fixture(
+        build_iaec_broader_movie_fixture(),
+        1,
+    )
+}
+
+#[cfg(feature = "decrypt")]
+fn build_sample_description_index_unsupported_protected_movie_fixture(
+    fixture: ProtectedMovieTopologyFixture,
+    protected_track_id: u32,
+) -> ProtectedMovieTopologyFixture {
+    ProtectedMovieTopologyFixture {
+        encrypted: patch_standard_protected_movie_track_sample_description_index(
+            &fixture.encrypted,
+            protected_track_id,
+        ),
+        decrypted: fixture.decrypted,
+        keys: fixture.keys,
     }
 }
 

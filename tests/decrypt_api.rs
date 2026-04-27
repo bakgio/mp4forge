@@ -17,8 +17,13 @@ use mp4forge::walk::BoxPath;
 use support::{
     ProtectedMovieTopologyFixture, RetainedDecryptFileFixture, RetainedFragmentedDecryptFixture,
     build_decrypt_rewrite_fixture, build_iaec_broader_movie_fixture,
-    build_marlin_ipmp_acbc_broader_movie_fixture, build_marlin_ipmp_acgk_broader_movie_fixture,
+    build_iaec_sample_description_index_unsupported_movie_fixture,
+    build_marlin_ipmp_acbc_broader_movie_fixture,
+    build_marlin_ipmp_acbc_sample_description_index_movie_fixture,
+    build_marlin_ipmp_acgk_broader_movie_fixture,
+    build_marlin_ipmp_acgk_sample_description_index_movie_fixture,
     build_multi_sample_entry_decrypt_fixture, build_oma_dcf_broader_movie_fixture,
+    build_oma_dcf_sample_description_index_unsupported_movie_fixture,
     build_zero_kid_multi_sample_entry_decrypt_fixture, common_encryption_fragment_fixture,
     common_encryption_multi_track_fixture, common_encryption_single_key_fixture_keys, fourcc,
     isma_iaec_fixture, marlin_ipmp_acbc_fixture, marlin_ipmp_acgk_fixture, oma_dcf_cbc_fixture,
@@ -241,6 +246,22 @@ fn assert_generated_topology_fixture_decrypts_with_progress(
     assert_eq!(phases(&progress), expected_file_progress_phases());
 }
 
+fn assert_generated_topology_fixture_rejects_first_sample_description_limit(
+    fixture: ProtectedMovieTopologyFixture,
+) {
+    let error = decrypt_bytes(&fixture.encrypted, &options_with_keys(&fixture.keys)).unwrap_err();
+
+    match error {
+        DecryptError::Rewrite(DecryptRewriteError::InvalidLayout { reason }) => {
+            assert!(
+                reason.contains("only supports the first protected sample description"),
+                "unexpected invalid-layout reason: {reason}"
+            );
+        }
+        other => panic!("expected invalid-layout rejection, got {other}"),
+    }
+}
+
 macro_rules! common_encryption_fragment_bytes_case {
     ($test_name:ident, $directory:literal, $track:literal) => {
         #[test]
@@ -266,6 +287,13 @@ fn decrypt_file_with_progress_supports_broader_oma_dcf_movie_layouts() {
     assert_generated_topology_fixture_decrypts_with_progress(
         build_oma_dcf_broader_movie_fixture(),
         "decrypt-api-oma-broader-input",
+    );
+}
+
+#[test]
+fn decrypt_bytes_rejects_oma_dcf_movie_sample_description_indices_beyond_the_first_entry() {
+    assert_generated_topology_fixture_rejects_first_sample_description_limit(
+        build_oma_dcf_sample_description_index_unsupported_movie_fixture(),
     );
 }
 
@@ -371,6 +399,13 @@ fn decrypt_file_with_progress_supports_broader_iaec_movie_layouts() {
 }
 
 #[test]
+fn decrypt_bytes_rejects_iaec_movie_sample_description_indices_beyond_the_first_entry() {
+    assert_generated_topology_fixture_rejects_first_sample_description_limit(
+        build_iaec_sample_description_index_unsupported_movie_fixture(),
+    );
+}
+
+#[test]
 fn decrypt_file_with_progress_supports_retained_isma_iaec_movie_files() {
     assert_retained_file_fixture_decrypts_with_progress(
         &isma_iaec_fixture(),
@@ -405,6 +440,21 @@ fn decrypt_file_with_progress_supports_broader_marlin_ipmp_acbc_movie_layouts() 
 }
 
 #[test]
+fn decrypt_bytes_supports_marlin_ipmp_acbc_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_decrypts_bytes(
+        build_marlin_ipmp_acbc_sample_description_index_movie_fixture(),
+    );
+}
+
+#[test]
+fn decrypt_file_with_progress_supports_marlin_ipmp_acbc_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_decrypts_with_progress(
+        build_marlin_ipmp_acbc_sample_description_index_movie_fixture(),
+        "decrypt-api-marlin-acbc-stsc-input",
+    );
+}
+
+#[test]
 fn decrypt_bytes_supports_retained_marlin_ipmp_acgk_movie_files() {
     assert_retained_file_fixture_decrypts_bytes(&marlin_ipmp_acgk_fixture());
 }
@@ -427,6 +477,21 @@ fn decrypt_file_with_progress_supports_broader_marlin_ipmp_acgk_movie_layouts() 
     assert_generated_topology_fixture_decrypts_with_progress(
         build_marlin_ipmp_acgk_broader_movie_fixture(),
         "decrypt-api-marlin-acgk-broader-input",
+    );
+}
+
+#[test]
+fn decrypt_bytes_supports_marlin_ipmp_acgk_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_decrypts_bytes(
+        build_marlin_ipmp_acgk_sample_description_index_movie_fixture(),
+    );
+}
+
+#[test]
+fn decrypt_file_with_progress_supports_marlin_ipmp_acgk_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_decrypts_with_progress(
+        build_marlin_ipmp_acgk_sample_description_index_movie_fixture(),
+        "decrypt-api-marlin-acgk-stsc-input",
     );
 }
 

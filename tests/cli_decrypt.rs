@@ -14,8 +14,13 @@ use mp4forge::walk::BoxPath;
 use support::{
     ProtectedMovieTopologyFixture, RetainedDecryptFileFixture, RetainedFragmentedDecryptFixture,
     build_decrypt_rewrite_fixture, build_iaec_broader_movie_fixture,
-    build_marlin_ipmp_acbc_broader_movie_fixture, build_marlin_ipmp_acgk_broader_movie_fixture,
+    build_iaec_sample_description_index_unsupported_movie_fixture,
+    build_marlin_ipmp_acbc_broader_movie_fixture,
+    build_marlin_ipmp_acbc_sample_description_index_movie_fixture,
+    build_marlin_ipmp_acgk_broader_movie_fixture,
+    build_marlin_ipmp_acgk_sample_description_index_movie_fixture,
     build_multi_sample_entry_decrypt_fixture, build_oma_dcf_broader_movie_fixture,
+    build_oma_dcf_sample_description_index_unsupported_movie_fixture,
     build_zero_kid_multi_sample_entry_decrypt_fixture, common_encryption_fragment_fixture,
     common_encryption_multi_track_fixture, fourcc, isma_iaec_fixture, marlin_ipmp_acbc_fixture,
     marlin_ipmp_acgk_fixture, oma_dcf_cbc_fixture, oma_dcf_cbc_grpi_fixture, oma_dcf_ctr_fixture,
@@ -291,6 +296,36 @@ fn assert_generated_topology_fixture_cli_decrypts(
     assert_eq!(output, fixture.decrypted);
 }
 
+fn assert_generated_topology_fixture_cli_rejects_first_sample_description_limit(
+    fixture: ProtectedMovieTopologyFixture,
+    temp_prefix: &str,
+) {
+    let input_path = write_temp_file(temp_prefix, &fixture.encrypted);
+    let output_path = write_temp_file(&format!("{temp_prefix}-output"), &[]);
+    let mut args = vec!["decrypt".to_string()];
+    for key in &fixture.keys {
+        args.push("--key".to_string());
+        args.push(key.to_spec());
+    }
+    args.push(input_path.to_string_lossy().into_owned());
+    args.push(output_path.to_string_lossy().into_owned());
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
+    let stderr_text = String::from_utf8(stderr).unwrap();
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(exit_code, 1, "stderr={stderr_text}");
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert!(
+        stderr_text.contains("only supports the first protected sample description"),
+        "unexpected stderr: {stderr_text}"
+    );
+}
+
 macro_rules! common_encryption_fragment_cli_case {
     ($test_name:ident, $directory:literal, $track:literal, $prefix:literal) => {
         #[test]
@@ -311,6 +346,14 @@ fn decrypt_command_supports_broader_oma_dcf_movie_layouts() {
     assert_generated_topology_fixture_cli_decrypts(
         build_oma_dcf_broader_movie_fixture(),
         "cli-decrypt-oma-broader-input",
+    );
+}
+
+#[test]
+fn decrypt_command_rejects_oma_dcf_movie_sample_description_indices_beyond_the_first_entry() {
+    assert_generated_topology_fixture_cli_rejects_first_sample_description_limit(
+        build_oma_dcf_sample_description_index_unsupported_movie_fixture(),
+        "cli-decrypt-oma-sample-description-index-input",
     );
 }
 
@@ -367,6 +410,14 @@ fn decrypt_command_supports_retained_isma_iaec_movie_files() {
 }
 
 #[test]
+fn decrypt_command_rejects_iaec_movie_sample_description_indices_beyond_the_first_entry() {
+    assert_generated_topology_fixture_cli_rejects_first_sample_description_limit(
+        build_iaec_sample_description_index_unsupported_movie_fixture(),
+        "cli-decrypt-iaec-sample-description-index-input",
+    );
+}
+
+#[test]
 fn decrypt_command_supports_broader_iaec_movie_layouts() {
     assert_generated_topology_fixture_cli_decrypts(
         build_iaec_broader_movie_fixture(),
@@ -391,6 +442,14 @@ fn decrypt_command_supports_broader_marlin_ipmp_acbc_movie_layouts() {
 }
 
 #[test]
+fn decrypt_command_supports_marlin_ipmp_acbc_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_cli_decrypts(
+        build_marlin_ipmp_acbc_sample_description_index_movie_fixture(),
+        "cli-decrypt-marlin-acbc-stsc-input",
+    );
+}
+
+#[test]
 fn decrypt_command_supports_retained_marlin_ipmp_acgk_movie_files() {
     assert_retained_file_fixture_cli_decrypts(
         &marlin_ipmp_acgk_fixture(),
@@ -403,6 +462,14 @@ fn decrypt_command_supports_broader_marlin_ipmp_acgk_movie_layouts() {
     assert_generated_topology_fixture_cli_decrypts(
         build_marlin_ipmp_acgk_broader_movie_fixture(),
         "cli-decrypt-marlin-acgk-broader-input",
+    );
+}
+
+#[test]
+fn decrypt_command_supports_marlin_ipmp_acgk_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_cli_decrypts(
+        build_marlin_ipmp_acgk_sample_description_index_movie_fixture(),
+        "cli-decrypt-marlin-acgk-stsc-input",
     );
 }
 

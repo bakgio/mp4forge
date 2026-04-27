@@ -24,7 +24,7 @@ use crate::BoxInfo;
 use crate::FourCc;
 use crate::boxes::isma_cryp::{Isfm, Islt};
 use crate::boxes::iso14496_12::{
-    Co64, Frma, Ftyp, Mfro, Mpod, Saio, Saiz, Sbgp, Schm, Sgpd, Sidx, Stco, Stsc, Stsz,
+    Co64, Frma, Ftyp, Mfro, Mpod, Saio, Saiz, Sbgp, Schm, Sgpd, Sidx, Stco, Stsc, Stsd, Stsz,
     TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_BASE_IS_MOOF, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
     TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT, TRUN_DATA_OFFSET_PRESENT, TRUN_SAMPLE_SIZE_PRESENT,
     Tfhd, Tfra, Tkhd, Trex, Trun, UUID_SAMPLE_ENCRYPTION, Uuid, UuidPayload,
@@ -2763,18 +2763,26 @@ fn analyze_marlin_movie_track(
     })
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TrackChunkLayout {
     offset: u64,
     sample_sizes: Vec<u32>,
+    // MP4 stores the selected sample description as a 1-based stsd index in stsc.
+    sample_description_index: u32,
 }
 
-fn compute_chunk_sample_counts(
+#[derive(Clone, Copy)]
+struct ChunkLayoutMapping {
+    sample_count: u32,
+    sample_description_index: u32,
+}
+
+fn compute_chunk_layout_mappings(
     stsc: &Stsc,
     chunk_count: usize,
     sample_count: usize,
     track_id: u32,
-) -> Result<Vec<u32>, DecryptRewriteError> {
+) -> Result<Vec<ChunkLayoutMapping>, DecryptRewriteError> {
     if chunk_count == 0 {
         return Ok(Vec::new());
     }
@@ -2793,10 +2801,10 @@ fn compute_chunk_sample_counts(
                 track_id
             )));
         }
-        if entry.sample_description_index != 1 {
+        if entry.sample_description_index == 0 {
             return Err(invalid_layout(format!(
-                "track {} uses unsupported stsc sample-description index {}",
-                track_id, entry.sample_description_index
+                "track {} has an stsc entry with sample-description index 0",
+                track_id
             )));
         }
         let next_first_chunk = stsc
@@ -2814,7 +2822,10 @@ fn compute_chunk_sample_counts(
         }
 
         for _ in entry.first_chunk..next_first_chunk {
-            counts.push(entry.samples_per_chunk);
+            counts.push(ChunkLayoutMapping {
+                sample_count: entry.samples_per_chunk,
+                sample_description_index: entry.sample_description_index,
+            });
         }
     }
 
@@ -2828,7 +2839,7 @@ fn compute_chunk_sample_counts(
     }
     let resolved_sample_count = counts.iter().try_fold(0usize, |total, count| {
         total
-            .checked_add(usize::try_from(*count).map_err(|_| {
+            .checked_add(usize::try_from(count.sample_count).map_err(|_| {
                 invalid_layout("stsc samples-per-chunk value does not fit in usize".to_owned())
             })?)
             .ok_or_else(|| {
@@ -2859,13 +2870,13 @@ fn compute_track_chunks(
     sample_sizes: &[u32],
 ) -> Result<Vec<TrackChunkLayout>, DecryptRewriteError> {
     let chunk_offsets = chunk_offsets_values(chunk_offsets);
-    let chunk_sample_counts =
-        compute_chunk_sample_counts(stsc, chunk_offsets.len(), sample_sizes.len(), track_id)?;
+    let chunk_layouts =
+        compute_chunk_layout_mappings(stsc, chunk_offsets.len(), sample_sizes.len(), track_id)?;
 
     let mut sample_index = 0usize;
     let mut chunks = Vec::with_capacity(chunk_offsets.len());
-    for (offset, sample_count) in chunk_offsets.into_iter().zip(chunk_sample_counts) {
-        let sample_count = usize::try_from(sample_count)
+    for (offset, chunk_layout) in chunk_offsets.into_iter().zip(chunk_layouts) {
+        let sample_count = usize::try_from(chunk_layout.sample_count)
             .map_err(|_| invalid_layout("chunk sample count does not fit in usize".to_owned()))?;
         let end = sample_index
             .checked_add(sample_count)
@@ -2879,6 +2890,7 @@ fn compute_track_chunks(
         chunks.push(TrackChunkLayout {
             offset,
             sample_sizes: sample_sizes.to_vec(),
+            sample_description_index: chunk_layout.sample_description_index,
         });
         sample_index = end;
     }
@@ -3311,6 +3323,15 @@ fn analyze_oma_dcf_movie_track(
     trak_info: &BoxInfo,
 ) -> Result<Option<OmaProtectedMovieTrackState>, DecryptRewriteError> {
     let track_layout = analyze_movie_chunk_track(input, trak_info)?;
+    let stsd = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Stsd>(
+            &mut reader,
+            Some(trak_info),
+            BoxPath::from([MDIA, MINF, STBL, STSD]),
+            "stsd",
+        )?
+    };
     let stsd_info = {
         let mut reader = Cursor::new(input);
         extract_single_info(
@@ -3397,6 +3418,13 @@ fn analyze_oma_dcf_movie_track(
     if !is_oma {
         return Ok(None);
     }
+
+    ensure_standard_protected_movie_uses_first_sample_description(
+        track_layout.track_id,
+        "OMA DCF",
+        &stsd,
+        &track_layout.stsc,
+    )?;
 
     let odaf = {
         let mut reader = Cursor::new(input);
@@ -3731,7 +3759,8 @@ where
             && chunk.offset < previous_chunk_end
         {
             return Err(invalid_layout(format!(
-                "track {track_id} has overlapping chunk ranges in the protected movie layout"
+                "track {track_id} has overlapping chunk ranges in the protected movie layout at sample-description index {}",
+                chunk.sample_description_index
             )));
         }
         previous_chunk_end = Some(
@@ -4271,6 +4300,15 @@ fn analyze_iaec_movie_track(
     trak_info: &BoxInfo,
 ) -> Result<Option<IaecProtectedMovieTrackState>, DecryptRewriteError> {
     let track_layout = analyze_movie_chunk_track(input, trak_info)?;
+    let stsd = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Stsd>(
+            &mut reader,
+            Some(trak_info),
+            BoxPath::from([MDIA, MINF, STBL, STSD]),
+            "stsd",
+        )?
+    };
     let stsd_info = {
         let mut reader = Cursor::new(input);
         extract_single_info(
@@ -4341,6 +4379,13 @@ fn analyze_iaec_movie_track(
         return Ok(None);
     }
 
+    ensure_standard_protected_movie_uses_first_sample_description(
+        track_layout.track_id,
+        "IAEC",
+        &stsd,
+        &track_layout.stsc,
+    )?;
+
     let schi_prefix = child_path(&protected_sinf_prefix, SCHI);
     let isfm = {
         let mut reader = Cursor::new(input);
@@ -4401,6 +4446,32 @@ fn analyze_iaec_movie_track(
         isfm,
         islt,
     }))
+}
+
+fn ensure_standard_protected_movie_uses_first_sample_description(
+    track_id: u32,
+    family_label: &str,
+    stsd: &Stsd,
+    stsc: &Stsc,
+) -> Result<(), DecryptRewriteError> {
+    if stsd.entry_count != 1 {
+        return Err(invalid_layout(format!(
+            "track {track_id} uses {family_label} protected-movie sample-description layouts beyond the first entry, but the current {family_label} protected-movie path only supports the first protected sample description"
+        )));
+    }
+
+    if let Some(entry) = stsc
+        .entries
+        .iter()
+        .find(|entry| entry.sample_description_index != 1)
+    {
+        return Err(invalid_layout(format!(
+            "track {track_id} uses {family_label} protected-movie chunk groups that reference sample description {}, but the current {family_label} protected-movie path only supports the first protected sample description",
+            entry.sample_description_index
+        )));
+    }
+
+    Ok(())
 }
 
 fn decrypt_iaec_sample_entry_payload(
@@ -6541,4 +6612,72 @@ fn compute_ctr_counter_block(iv: &[u8; 16], stream_offset: u64) -> Block<Aes128>
     }
 
     counter_block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boxes::iso14496_12::StscEntry;
+
+    #[test]
+    fn compute_track_chunks_preserves_non_default_sample_description_indices() {
+        let mut stsc = Stsc::default();
+        stsc.entry_count = 2;
+        stsc.entries = vec![
+            StscEntry {
+                first_chunk: 1,
+                samples_per_chunk: 2,
+                sample_description_index: 1,
+            },
+            StscEntry {
+                first_chunk: 2,
+                samples_per_chunk: 1,
+                sample_description_index: 2,
+            },
+        ];
+
+        let mut stco = Stco::default();
+        stco.entry_count = 2;
+        stco.chunk_offset = vec![100, 200];
+        let chunk_offsets = ChunkOffsetBoxState::Stco {
+            info: BoxInfo::new(STCO, 16),
+            box_value: stco,
+        };
+
+        let chunks = compute_track_chunks(7, &stsc, &chunk_offsets, &[11, 12, 13]).unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].offset, 100);
+        assert_eq!(chunks[0].sample_sizes, vec![11, 12]);
+        assert_eq!(chunks[0].sample_description_index, 1);
+        assert_eq!(chunks[1].offset, 200);
+        assert_eq!(chunks[1].sample_sizes, vec![13]);
+        assert_eq!(chunks[1].sample_description_index, 2);
+    }
+
+    #[test]
+    fn compute_track_chunks_rejects_zero_sample_description_index() {
+        let mut stsc = Stsc::default();
+        stsc.entry_count = 1;
+        stsc.entries = vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 1,
+            sample_description_index: 0,
+        }];
+
+        let mut stco = Stco::default();
+        stco.entry_count = 1;
+        stco.chunk_offset = vec![100];
+        let chunk_offsets = ChunkOffsetBoxState::Stco {
+            info: BoxInfo::new(STCO, 12),
+            box_value: stco,
+        };
+
+        let error = compute_track_chunks(7, &stsc, &chunk_offsets, &[11]).unwrap_err();
+
+        assert!(
+            error.to_string().contains("sample-description index 0"),
+            "unexpected error: {error}"
+        );
+    }
 }

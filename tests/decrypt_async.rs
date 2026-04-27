@@ -16,8 +16,13 @@ use mp4forge::walk::BoxPath;
 use support::{
     ProtectedMovieTopologyFixture, RetainedDecryptFileFixture, RetainedFragmentedDecryptFixture,
     build_decrypt_rewrite_fixture, build_iaec_broader_movie_fixture,
-    build_marlin_ipmp_acbc_broader_movie_fixture, build_marlin_ipmp_acgk_broader_movie_fixture,
+    build_iaec_sample_description_index_unsupported_movie_fixture,
+    build_marlin_ipmp_acbc_broader_movie_fixture,
+    build_marlin_ipmp_acbc_sample_description_index_movie_fixture,
+    build_marlin_ipmp_acgk_broader_movie_fixture,
+    build_marlin_ipmp_acgk_sample_description_index_movie_fixture,
     build_multi_sample_entry_decrypt_fixture, build_oma_dcf_broader_movie_fixture,
+    build_oma_dcf_sample_description_index_unsupported_movie_fixture,
     build_zero_kid_multi_sample_entry_decrypt_fixture, common_encryption_fragment_fixture,
     common_encryption_multi_track_fixture, fourcc, isma_iaec_fixture, marlin_ipmp_acbc_fixture,
     marlin_ipmp_acgk_fixture, oma_dcf_cbc_fixture, oma_dcf_cbc_grpi_fixture, oma_dcf_ctr_fixture,
@@ -229,6 +234,23 @@ async fn assert_generated_topology_fixture_decrypts_async(
     assert_eq!(output, fixture.decrypted);
 }
 
+async fn assert_generated_topology_fixture_rejects_first_sample_description_limit_async(
+    fixture: ProtectedMovieTopologyFixture,
+    temp_prefix: &str,
+) {
+    let input_path = write_temp_file(temp_prefix, &fixture.encrypted);
+    let output_path = write_temp_file(&format!("{temp_prefix}-output"), &[]);
+
+    let error = decrypt_file_async(&input_path, &output_path, &options_with_keys(&fixture.keys))
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("only supports the first protected sample description"),
+        "unexpected rejection message: {message}"
+    );
+}
+
 macro_rules! common_encryption_fragment_async_case {
     ($test_name:ident, $directory:literal, $track:literal, $prefix:literal) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -253,6 +275,16 @@ async fn async_decrypt_file_supports_broader_oma_dcf_movie_layouts() {
     assert_generated_topology_fixture_decrypts_async(
         build_oma_dcf_broader_movie_fixture(),
         "decrypt-async-oma-broader-input",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_rejects_oma_dcf_movie_sample_description_indices_beyond_the_first_entry()
+ {
+    assert_generated_topology_fixture_rejects_first_sample_description_limit_async(
+        build_oma_dcf_sample_description_index_unsupported_movie_fixture(),
+        "decrypt-async-oma-sample-description-index-input",
     )
     .await;
 }
@@ -336,6 +368,15 @@ async fn async_decrypt_file_supports_broader_iaec_movie_layouts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_rejects_iaec_movie_sample_description_indices_beyond_the_first_entry() {
+    assert_generated_topology_fixture_rejects_first_sample_description_limit_async(
+        build_iaec_sample_description_index_unsupported_movie_fixture(),
+        "decrypt-async-iaec-sample-description-index-input",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_decrypt_file_supports_retained_marlin_ipmp_acbc_movie_files() {
     assert_retained_file_fixture_decrypts_async(
         &marlin_ipmp_acbc_fixture(),
@@ -354,6 +395,15 @@ async fn async_decrypt_file_supports_broader_marlin_ipmp_acbc_movie_layouts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_supports_marlin_ipmp_acbc_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_decrypts_async(
+        build_marlin_ipmp_acbc_sample_description_index_movie_fixture(),
+        "decrypt-async-marlin-acbc-stsc-input",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_decrypt_file_supports_retained_marlin_ipmp_acgk_movie_files() {
     assert_retained_file_fixture_decrypts_async(
         &marlin_ipmp_acgk_fixture(),
@@ -367,6 +417,15 @@ async fn async_decrypt_file_supports_broader_marlin_ipmp_acgk_movie_layouts() {
     assert_generated_topology_fixture_decrypts_async(
         build_marlin_ipmp_acgk_broader_movie_fixture(),
         "decrypt-async-marlin-acgk-broader-input",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_supports_marlin_ipmp_acgk_od_track_sample_description_indices() {
+    assert_generated_topology_fixture_decrypts_async(
+        build_marlin_ipmp_acgk_sample_description_index_movie_fixture(),
+        "decrypt-async-marlin-acgk-stsc-input",
     )
     .await;
 }
