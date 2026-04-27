@@ -19,12 +19,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = []
 async = ["dep:tokio"]
+decrypt = ["dep:aes"]
 serde = ["dep:serde"]
 
 [dependencies]
+aes = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 terminal_size = "0.4"
 tokio = { version = "1.52.1", features = ["fs", "io-util", "rt", "rt-multi-thread", "macros"], optional = true }
 
 [dev-dependencies]
+aes = "0.8"
 serde_json = "1"

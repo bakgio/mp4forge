@@ -6,20 +6,7 @@ fn dispatch_prints_usage_for_empty_or_unknown_commands() {
     let mut stderr = Vec::new();
     assert_eq!(cli::dispatch(&[], &mut stdout, &mut stderr), 1);
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
-    assert_eq!(
-        String::from_utf8(stderr).unwrap(),
-        concat!(
-            "USAGE: mp4forge COMMAND [ARGS]\n",
-            "\n",
-            "COMMAND:\n",
-            "  divide       split a fragmented MP4 into track playlists\n",
-            "  dump         display the MP4 box tree\n",
-            "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type or path\n",
-            "  psshdump     summarize pssh boxes\n",
-            "  probe        summarize an MP4 file\n"
-        )
-    );
+    assert_eq!(String::from_utf8(stderr).unwrap(), top_level_usage());
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -28,20 +15,7 @@ fn dispatch_prints_usage_for_empty_or_unknown_commands() {
         1
     );
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
-    assert_eq!(
-        String::from_utf8(stderr).unwrap(),
-        concat!(
-            "USAGE: mp4forge COMMAND [ARGS]\n",
-            "\n",
-            "COMMAND:\n",
-            "  divide       split a fragmented MP4 into track playlists\n",
-            "  dump         display the MP4 box tree\n",
-            "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type or path\n",
-            "  psshdump     summarize pssh boxes\n",
-            "  probe        summarize an MP4 file\n"
-        )
-    );
+    assert_eq!(String::from_utf8(stderr).unwrap(), top_level_usage());
 }
 
 #[test]
@@ -53,8 +27,40 @@ fn dispatch_handles_help() {
         0
     );
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(String::from_utf8(stderr).unwrap(), top_level_usage());
+}
+
+#[cfg(not(feature = "decrypt"))]
+#[test]
+fn dispatch_keeps_decrypt_unavailable_without_feature() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     assert_eq!(
-        String::from_utf8(stderr).unwrap(),
+        cli::dispatch(&["decrypt".to_string()], &mut stdout, &mut stderr),
+        1
+    );
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(String::from_utf8(stderr).unwrap(), top_level_usage());
+}
+
+fn top_level_usage() -> &'static str {
+    #[cfg(feature = "decrypt")]
+    {
+        concat!(
+            "USAGE: mp4forge COMMAND [ARGS]\n",
+            "\n",
+            "COMMAND:\n",
+            "  divide       split a fragmented MP4 into track playlists\n",
+            "  decrypt      decrypt protected MP4-family content\n",
+            "  dump         display the MP4 box tree\n",
+            "  edit         rewrite selected boxes\n",
+            "  extract      extract raw boxes by type or path\n",
+            "  psshdump     summarize pssh boxes\n",
+            "  probe        summarize an MP4 file\n"
+        )
+    }
+    #[cfg(not(feature = "decrypt"))]
+    {
         concat!(
             "USAGE: mp4forge COMMAND [ARGS]\n",
             "\n",
@@ -66,5 +72,5 @@ fn dispatch_handles_help() {
             "  psshdump     summarize pssh boxes\n",
             "  probe        summarize an MP4 file\n"
         )
-    );
+    }
 }

@@ -1284,6 +1284,13 @@ where
                     let decoded = read_payload_as::<_, Sidx>(reader, info)?;
                     let internal = analyze_existing_top_level_sidx(info, &decoded)?;
                     existing_top_level_sidxs.push(internal);
+                } else if previous_box_type == Some(STYP)
+                    && segments.last().is_some_and(is_pending_styp_prelude_segment)
+                {
+                    let decoded = read_payload_as::<_, Sidx>(reader, info)?;
+                    let internal = analyze_existing_top_level_sidx(info, &decoded)?;
+                    existing_top_level_sidxs.push(internal);
+                    segments.pop();
                 } else if previous_box_type == Some(MDAT) {
                     start_segment(&mut segments, *info);
                     let segment = segments.last_mut().unwrap();
@@ -1320,6 +1327,13 @@ where
     }
 
     Ok((segments, existing_top_level_sidxs))
+}
+
+fn is_pending_styp_prelude_segment(segment: &SegmentAccumulator) -> bool {
+    segment.first_box.box_type() == STYP
+        && segment.moofs.is_empty()
+        && segment.segment_sidx_count == 0
+        && segment.size == segment.first_box.size()
 }
 
 fn start_segment(segments: &mut Vec<SegmentAccumulator>, first_box: BoxInfo) {

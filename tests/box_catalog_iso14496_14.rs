@@ -6,7 +6,11 @@ use mp4forge::FourCc;
 use mp4forge::boxes::default_registry;
 use mp4forge::boxes::iso14496_14::{
     DECODER_CONFIG_DESCRIPTOR_TAG, DECODER_SPECIFIC_INFO_TAG, DecoderConfigDescriptor, Descriptor,
-    ES_DESCRIPTOR_TAG, EsDescriptor, Esds, SL_CONFIG_DESCRIPTOR_TAG,
+    DescriptorCommand, DescriptorUpdateCommand, ES_DESCRIPTOR_TAG, EsDescriptor, EsIdIncDescriptor,
+    EsIdRefDescriptor, Esds, IPMP_DESCRIPTOR_UPDATE_COMMAND_TAG, InitialObjectDescriptor, Iods,
+    IpmpDescriptor, IpmpDescriptorPointer, OBJECT_DESCRIPTOR_UPDATE_COMMAND_TAG,
+    SL_CONFIG_DESCRIPTOR_TAG, UnknownDescriptorCommand, encode_descriptor_commands,
+    parse_descriptor_commands,
 };
 use mp4forge::codec::{CodecBox, MutableBox, marshal, unmarshal, unmarshal_any};
 use mp4forge::stringify::stringify;
@@ -132,6 +136,50 @@ fn descriptor_catalog_roundtrips() {
 }
 
 #[test]
+fn iods_catalog_roundtrips() {
+    let mut iods = Iods::default();
+    iods.set_version(0);
+    iods.descriptor = Some(
+        Descriptor::from_initial_object_descriptor(InitialObjectDescriptor {
+            object_descriptor_id: 18,
+            include_inline_profile_level_flag: true,
+            od_profile_level_indication: 0x11,
+            scene_profile_level_indication: 0x22,
+            audio_profile_level_indication: 0x33,
+            visual_profile_level_indication: 0x44,
+            graphics_profile_level_indication: 0x55,
+            sub_descriptors: vec![
+                Descriptor::from_es_id_inc_descriptor(EsIdIncDescriptor { track_id: 2 }),
+                Descriptor::from_es_id_ref_descriptor(EsIdRefDescriptor { ref_index: 3 }),
+                Descriptor::from_ipmp_descriptor_pointer(IpmpDescriptorPointer {
+                    descriptor_id: 1,
+                    ..IpmpDescriptorPointer::default()
+                }),
+                Descriptor::from_ipmp_descriptor(IpmpDescriptor {
+                    descriptor_id: 1,
+                    ipmps_type: 0xa551,
+                    data: vec![0xaa, 0xbb],
+                    ..IpmpDescriptor::default()
+                }),
+            ],
+            ..InitialObjectDescriptor::default()
+        })
+        .unwrap(),
+    );
+
+    assert_box_roundtrip(
+        iods,
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x80, 0x80, 0x80, 0x27, 0x04, 0x9f, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x0e, 0x80, 0x80, 0x80, 0x04, 0x00, 0x00, 0x00, 0x02, 0x0f, 0x80, 0x80,
+            0x80, 0x02, 0x00, 0x03, 0x0a, 0x80, 0x80, 0x80, 0x01, 0x01, 0x0b, 0x80, 0x80, 0x80,
+            0x05, 0x01, 0xa5, 0x51, 0xaa, 0xbb,
+        ],
+        "Version=0 Flags=0x000000 Descriptor={Tag=MP4InitialObjectDescr Size=39 ObjectDescriptorID=18 UrlFlag=false IncludeInlineProfileLevelFlag=true ODProfileLevelIndication=0x11 SceneProfileLevelIndication=0x22 AudioProfileLevelIndication=0x33 VisualProfileLevelIndication=0x44 GraphicsProfileLevelIndication=0x55 SubDescriptors=[{Tag=ES_ID_Inc Size=4 TrackID=2}, {Tag=ES_ID_Ref Size=2 RefIndex=3}, {Tag=IPMPDescrPointer Size=1 DescriptorID=0x1}, {Tag=IPMPDescr Size=5 DescriptorID=0x1 IPMPSType=0xa551 Data=[0xaa, 0xbb]}]}",
+    );
+}
+
+#[test]
 fn built_in_registry_reports_supported_versions_for_landed_descriptor_types() {
     let registry = default_registry();
 
@@ -139,7 +187,12 @@ fn built_in_registry_reports_supported_versions_for_landed_descriptor_types() {
         registry.supported_versions(FourCc::from_bytes(*b"esds")),
         Some(&[0][..])
     );
+    assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"iods")),
+        Some(&[0][..])
+    );
     assert!(registry.is_registered(FourCc::from_bytes(*b"esds")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"iods")));
 }
 
 #[test]
@@ -176,6 +229,31 @@ fn esds_helpers_surface_decoder_config_and_specific_info() {
 }
 
 #[test]
+fn iods_helpers_surface_initial_object_descriptor() {
+    let mut iods = Iods::default();
+    iods.descriptor = Some(
+        Descriptor::from_initial_object_descriptor(InitialObjectDescriptor {
+            object_descriptor_id: 7,
+            sub_descriptors: vec![Descriptor::from_es_id_inc_descriptor(EsIdIncDescriptor {
+                track_id: 33,
+            })],
+            ..InitialObjectDescriptor::default()
+        })
+        .unwrap(),
+    );
+
+    let initial = iods.initial_object_descriptor().unwrap();
+    assert_eq!(initial.object_descriptor_id, 7);
+    assert_eq!(
+        initial.sub_descriptors[0]
+            .es_id_inc_descriptor()
+            .unwrap()
+            .track_id,
+        33
+    );
+}
+
+#[test]
 fn esds_rejects_data_descriptor_size_mismatch_during_marshal() {
     let mut esds = Esds::default();
     esds.descriptors = vec![Descriptor {
@@ -189,5 +267,94 @@ fn esds_rejects_data_descriptor_size_mismatch_during_marshal() {
     assert_eq!(
         error.to_string(),
         "invalid field value for Data: value length does not match Size"
+    );
+}
+
+#[test]
+fn descriptor_command_helpers_roundtrip_known_update_streams() {
+    let commands = vec![
+        DescriptorCommand::DescriptorUpdate(DescriptorUpdateCommand::object_descriptor_update(
+            vec![
+                Descriptor::from_object_descriptor(
+                    mp4forge::boxes::iso14496_14::ObjectDescriptor {
+                        object_descriptor_id: 0x12,
+                        sub_descriptors: vec![
+                            Descriptor::from_es_id_ref_descriptor(EsIdRefDescriptor {
+                                ref_index: 1,
+                            }),
+                            Descriptor::from_ipmp_descriptor_pointer(IpmpDescriptorPointer {
+                                descriptor_id: 7,
+                                ..IpmpDescriptorPointer::default()
+                            }),
+                        ],
+                        ..mp4forge::boxes::iso14496_14::ObjectDescriptor::default()
+                    },
+                )
+                .unwrap(),
+            ],
+        )),
+        DescriptorCommand::DescriptorUpdate(DescriptorUpdateCommand::ipmp_descriptor_update(vec![
+            Descriptor::from_ipmp_descriptor(IpmpDescriptor {
+                descriptor_id: 7,
+                ipmps_type: 0xa551,
+                data: vec![0xaa, 0xbb, 0xcc],
+                ..IpmpDescriptor::default()
+            }),
+        ])),
+    ];
+
+    let encoded = encode_descriptor_commands(&commands).unwrap();
+    let decoded = parse_descriptor_commands(&encoded).unwrap();
+
+    assert_eq!(decoded, commands);
+    assert_eq!(decoded[0].tag(), OBJECT_DESCRIPTOR_UPDATE_COMMAND_TAG);
+    assert_eq!(decoded[0].tag_name(), Some("ObjectDescriptorUpdate"));
+    assert_eq!(
+        decoded[0].descriptor_update().unwrap().descriptors[0]
+            .object_descriptor()
+            .unwrap()
+            .sub_descriptors[0]
+            .es_id_ref_descriptor()
+            .unwrap()
+            .ref_index,
+        1
+    );
+    assert_eq!(decoded[1].tag(), IPMP_DESCRIPTOR_UPDATE_COMMAND_TAG);
+    assert_eq!(decoded[1].tag_name(), Some("IPMPDescriptorUpdate"));
+    assert_eq!(
+        decoded[1].descriptor_update().unwrap().descriptors[0]
+            .ipmp_descriptor()
+            .unwrap()
+            .ipmps_type,
+        0xa551
+    );
+}
+
+#[test]
+fn descriptor_command_helpers_preserve_unknown_commands_as_raw_payloads() {
+    let commands = vec![
+        DescriptorCommand::Unknown(UnknownDescriptorCommand {
+            tag: 0x08,
+            data: vec![0x11, 0x22, 0x33, 0x44],
+        }),
+        DescriptorCommand::DescriptorUpdate(DescriptorUpdateCommand::ipmp_descriptor_update(vec![
+            Descriptor::from_ipmp_descriptor(IpmpDescriptor {
+                descriptor_id: 1,
+                ipmps_type: 0xa551,
+                data: vec![0x77],
+                ..IpmpDescriptor::default()
+            }),
+        ])),
+    ];
+
+    let encoded = encode_descriptor_commands(&commands).unwrap();
+    let decoded = parse_descriptor_commands(&encoded).unwrap();
+
+    assert_eq!(decoded, commands);
+    assert_eq!(decoded[0].tag(), 0x08);
+    assert!(decoded[0].tag_name().is_none());
+    assert_eq!(
+        decoded[0].unknown().unwrap().data,
+        vec![0x11, 0x22, 0x33, 0x44]
     );
 }

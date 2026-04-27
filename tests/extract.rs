@@ -3,12 +3,17 @@ use std::io::Cursor;
 use mp4forge::boxes::AnyTypeBox;
 use mp4forge::boxes::iso14496_12::{
     Cdsc, Elng, Emeb, Emib, EventMessageSampleEntry, Ftyp, Leva, LevaLevel, Mdia, Meta, Minf, Moov,
-    Mvex, Saio, Saiz, Sbgp, Sgpd, Silb, Ssix, SsixRange, SsixSubsegment, Stbl, Subs, SubsEntry,
-    SubsSample, Tkhd, Trak, Tref, Trep, Udta,
+    Mvex, Saio, Saiz, Sbgp, Schi, Sgpd, Silb, Sinf, Ssix, SsixRange, SsixSubsegment, Stbl, Subs,
+    SubsEntry, SubsSample, Tkhd, Trak, Tref, Trep, Udta,
 };
+use mp4forge::boxes::iso14496_14::{Descriptor, EsIdIncDescriptor, InitialObjectDescriptor, Iods};
 use mp4forge::boxes::iso23001_7::{Senc, Tenc};
 use mp4forge::boxes::metadata::{
     DATA_TYPE_STRING_UTF8, Data, Ilst, Key, Keys, NumberedMetadataItem,
+};
+use mp4forge::boxes::oma_dcf::{
+    Grpi, OHDR_ENCRYPTION_METHOD_AES_CTR, OHDR_PADDING_SCHEME_NONE, Odaf, Odda, Odhe, Odkm, Odrm,
+    Ohdr,
 };
 use mp4forge::codec::{CodecBox, marshal};
 use mp4forge::extract::{
@@ -27,6 +32,8 @@ use mp4forge::{BoxInfo, FourCc};
 
 mod support;
 
+#[cfg(feature = "decrypt")]
+use mp4forge::boxes::isma_cryp::{Ikms, Isfm, Islt};
 #[cfg(feature = "async")]
 use support::build_visual_sample_entry_box_with_trailing_bytes;
 #[cfg(feature = "async")]
@@ -34,6 +41,8 @@ use support::write_temp_file;
 use support::{
     build_encrypted_fragmented_video_file, build_event_message_movie_file, fixture_path,
 };
+#[cfg(feature = "decrypt")]
+use support::{isma_iaec_fixture, oma_dcf_ctr_fixture};
 #[cfg(feature = "async")]
 use tokio::fs::File as TokioFile;
 
@@ -446,6 +455,591 @@ fn extract_box_as_returns_typed_payloads() {
             .map(|tkhd| tkhd.track_id)
             .collect::<Vec<_>>(),
         vec![1, 2]
+    );
+}
+
+#[test]
+fn extract_box_as_decodes_oma_dcf_layout_boxes() {
+    let mut grpi_box = Grpi::default();
+    grpi_box.key_encryption_method = 1;
+    grpi_box.group_id = "group-a".into();
+    grpi_box.group_key = vec![0x10, 0x20, 0x30, 0x40];
+    let grpi = encode_supported_box(&grpi_box, &[]);
+    let mut ohdr_top_box = Ohdr::default();
+    ohdr_top_box.encryption_method = OHDR_ENCRYPTION_METHOD_AES_CTR;
+    ohdr_top_box.padding_scheme = OHDR_PADDING_SCHEME_NONE;
+    ohdr_top_box.plaintext_length = 0x1234;
+    ohdr_top_box.content_id = "cid-top".into();
+    ohdr_top_box.rights_issuer_url = "https://issuer.example".into();
+    ohdr_top_box.textual_headers = b"Header: 1".to_vec();
+    let ohdr_top = encode_supported_box(&ohdr_top_box, &grpi);
+    let mut odhe_box = Odhe::default();
+    odhe_box.content_type = "video/mp4".into();
+    let odhe = encode_supported_box(&odhe_box, &ohdr_top);
+    let mut odda_box = Odda::default();
+    odda_box.encrypted_payload = vec![0xaa, 0xbb, 0xcc, 0xdd];
+    let odda = encode_supported_box(&odda_box, &[]);
+    let odrm = encode_supported_box(&Odrm, &[odhe, odda].concat());
+
+    let mut odaf_box = Odaf::default();
+    odaf_box.selective_encryption = true;
+    odaf_box.key_indicator_length = 0;
+    odaf_box.iv_length = 16;
+    let odaf = encode_supported_box(&odaf_box, &[]);
+    let mut ohdr_entry_box = Ohdr::default();
+    ohdr_entry_box.encryption_method = OHDR_ENCRYPTION_METHOD_AES_CTR;
+    ohdr_entry_box.padding_scheme = OHDR_PADDING_SCHEME_NONE;
+    ohdr_entry_box.plaintext_length = 0x5678;
+    ohdr_entry_box.content_id = "cid-entry".into();
+    ohdr_entry_box.rights_issuer_url = "https://entry.example".into();
+    ohdr_entry_box.textual_headers = b"Entry: 1".to_vec();
+    let ohdr_entry = encode_supported_box(&ohdr_entry_box, &[]);
+    let odkm = encode_supported_box(&Odkm::default(), &[odaf, ohdr_entry].concat());
+    let schi = encode_supported_box(&Schi, &odkm);
+    let sinf = encode_supported_box(&Sinf, &schi);
+    let trak = encode_supported_box(&Trak, &sinf);
+    let moov = encode_supported_box(&Moov, &trak);
+    let file = [odrm, moov].concat();
+
+    let extracted_ohdr = extract_box_as::<_, Ohdr>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("odrm"), fourcc("odhe"), fourcc("ohdr")]),
+    )
+    .unwrap();
+    assert_eq!(extracted_ohdr.len(), 1);
+    assert_eq!(extracted_ohdr[0].content_id, "cid-top");
+    assert_eq!(extracted_ohdr[0].plaintext_length, 0x1234);
+
+    let extracted_grpi = extract_box_as::<_, Grpi>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("odrm"),
+            fourcc("odhe"),
+            fourcc("ohdr"),
+            fourcc("grpi"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_grpi.len(), 1);
+    assert_eq!(extracted_grpi[0].group_id, "group-a");
+    assert_eq!(extracted_grpi[0].group_key, vec![0x10, 0x20, 0x30, 0x40]);
+
+    let extracted_odda = extract_box_as::<_, Odda>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("odrm"), fourcc("odda")]),
+    )
+    .unwrap();
+    assert_eq!(extracted_odda.len(), 1);
+    assert_eq!(
+        extracted_odda[0].encrypted_payload,
+        vec![0xaa, 0xbb, 0xcc, 0xdd]
+    );
+
+    let extracted_odaf = extract_box_as::<_, Odaf>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("odaf"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_odaf.len(), 1);
+    assert!(extracted_odaf[0].selective_encryption);
+    assert_eq!(extracted_odaf[0].iv_length, 16);
+
+    let extracted_entry_ohdr = extract_box_as::<_, Ohdr>(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("ohdr"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_entry_ohdr.len(), 1);
+    assert_eq!(extracted_entry_ohdr[0].content_id, "cid-entry");
+}
+
+#[cfg(feature = "decrypt")]
+#[test]
+fn extract_box_as_decodes_retained_oma_dcf_movie_layout_boxes() {
+    let fixture = oma_dcf_ctr_fixture();
+    let input = std::fs::read(&fixture.encrypted_path).unwrap();
+
+    let extracted_odaf = extract_box_as::<_, Odaf>(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("odaf"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_odaf.len(), 1);
+    assert!(extracted_odaf[0].selective_encryption);
+    assert_eq!(extracted_odaf[0].iv_length, 16);
+
+    let extracted_ohdr = extract_box_as::<_, Ohdr>(
+        &mut Cursor::new(input),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("ohdr"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_ohdr.len(), 1);
+    assert_eq!(
+        extracted_ohdr[0].encryption_method,
+        OHDR_ENCRYPTION_METHOD_AES_CTR
+    );
+    assert_eq!(extracted_ohdr[0].plaintext_length, 0);
+    assert_eq!(extracted_ohdr[0].content_id, "oma-ctr-aac");
+    assert_eq!(
+        extracted_ohdr[0].rights_issuer_url,
+        "https://rights.example/oma-ctr"
+    );
+}
+
+#[cfg(feature = "decrypt")]
+#[test]
+fn extract_box_as_decodes_iaec_layout_boxes() {
+    let fixture = isma_iaec_fixture();
+    let input = std::fs::read(&fixture.encrypted_path).unwrap();
+
+    let extracted_ikms = extract_box_as::<_, Ikms>(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("iKMS"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_ikms.len(), 1);
+    assert_eq!(extracted_ikms[0].kms_uri, "https://kms.example/iaec");
+    assert_eq!(extracted_ikms[0].kms_version, 0);
+
+    let extracted_isfm = extract_box_as::<_, Isfm>(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("iSFM"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_isfm.len(), 1);
+    assert!(!extracted_isfm[0].selective_encryption);
+    assert_eq!(extracted_isfm[0].iv_length, 8);
+    assert_eq!(extracted_isfm[0].key_indicator_length, 0);
+
+    let extracted_islt = extract_box_as::<_, Islt>(
+        &mut Cursor::new(input),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("iSLT"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(extracted_islt.len(), 1);
+    assert_eq!(
+        extracted_islt[0].salt,
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    );
+}
+
+#[test]
+fn extract_box_as_decodes_iods_initial_object_descriptors() {
+    let mut iods = Iods::default();
+    iods.descriptor = Some(
+        Descriptor::from_initial_object_descriptor(InitialObjectDescriptor {
+            object_descriptor_id: 4,
+            include_inline_profile_level_flag: true,
+            od_profile_level_indication: 0x11,
+            scene_profile_level_indication: 0x22,
+            audio_profile_level_indication: 0x33,
+            visual_profile_level_indication: 0x44,
+            graphics_profile_level_indication: 0x55,
+            sub_descriptors: vec![Descriptor::from_es_id_inc_descriptor(EsIdIncDescriptor {
+                track_id: 0x0102_0304,
+            })],
+            ..InitialObjectDescriptor::default()
+        })
+        .unwrap(),
+    );
+    let moov = encode_supported_box(&Moov, &encode_supported_box(&iods, &[]));
+
+    let extracted = extract_box_as::<_, Iods>(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("iods")]),
+    )
+    .unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    let initial = extracted[0].initial_object_descriptor().unwrap();
+    assert_eq!(initial.object_descriptor_id, 4);
+    assert_eq!(
+        initial.sub_descriptors[0]
+            .es_id_inc_descriptor()
+            .unwrap()
+            .track_id,
+        0x0102_0304
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_as_decodes_oma_dcf_layout_boxes() {
+    let mut grpi_box = Grpi::default();
+    grpi_box.key_encryption_method = 1;
+    grpi_box.group_id = "group-a".into();
+    grpi_box.group_key = vec![0x10, 0x20, 0x30, 0x40];
+    let grpi = encode_supported_box(&grpi_box, &[]);
+    let mut ohdr_top_box = Ohdr::default();
+    ohdr_top_box.encryption_method = OHDR_ENCRYPTION_METHOD_AES_CTR;
+    ohdr_top_box.padding_scheme = OHDR_PADDING_SCHEME_NONE;
+    ohdr_top_box.plaintext_length = 0x1234;
+    ohdr_top_box.content_id = "cid-top".into();
+    ohdr_top_box.rights_issuer_url = "https://issuer.example".into();
+    ohdr_top_box.textual_headers = b"Header: 1".to_vec();
+    let ohdr_top = encode_supported_box(&ohdr_top_box, &grpi);
+    let mut odhe_box = Odhe::default();
+    odhe_box.content_type = "video/mp4".into();
+    let odhe = encode_supported_box(&odhe_box, &ohdr_top);
+    let mut odda_box = Odda::default();
+    odda_box.encrypted_payload = vec![0xaa, 0xbb, 0xcc, 0xdd];
+    let odda = encode_supported_box(&odda_box, &[]);
+    let odrm = encode_supported_box(&Odrm, &[odhe, odda].concat());
+
+    let mut odaf_box = Odaf::default();
+    odaf_box.selective_encryption = true;
+    odaf_box.key_indicator_length = 0;
+    odaf_box.iv_length = 16;
+    let odaf = encode_supported_box(&odaf_box, &[]);
+    let mut ohdr_entry_box = Ohdr::default();
+    ohdr_entry_box.encryption_method = OHDR_ENCRYPTION_METHOD_AES_CTR;
+    ohdr_entry_box.padding_scheme = OHDR_PADDING_SCHEME_NONE;
+    ohdr_entry_box.plaintext_length = 0x5678;
+    ohdr_entry_box.content_id = "cid-entry".into();
+    ohdr_entry_box.rights_issuer_url = "https://entry.example".into();
+    ohdr_entry_box.textual_headers = b"Entry: 1".to_vec();
+    let ohdr_entry = encode_supported_box(&ohdr_entry_box, &[]);
+    let odkm = encode_supported_box(&Odkm::default(), &[odaf, ohdr_entry].concat());
+    let schi = encode_supported_box(&Schi, &odkm);
+    let sinf = encode_supported_box(&Sinf, &schi);
+    let trak = encode_supported_box(&Trak, &sinf);
+    let moov = encode_supported_box(&Moov, &trak);
+    let file = [odrm, moov].concat();
+
+    let extracted_ohdr = extract_box_as_async::<_, Ohdr>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("odrm"), fourcc("odhe"), fourcc("ohdr")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_ohdr.len(), 1);
+    assert_eq!(extracted_ohdr[0].content_id, "cid-top");
+    assert_eq!(extracted_ohdr[0].plaintext_length, 0x1234);
+
+    let extracted_grpi = extract_box_as_async::<_, Grpi>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("odrm"),
+            fourcc("odhe"),
+            fourcc("ohdr"),
+            fourcc("grpi"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_grpi.len(), 1);
+    assert_eq!(extracted_grpi[0].group_id, "group-a");
+    assert_eq!(extracted_grpi[0].group_key, vec![0x10, 0x20, 0x30, 0x40]);
+
+    let extracted_odda = extract_box_as_async::<_, Odda>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([fourcc("odrm"), fourcc("odda")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_odda.len(), 1);
+    assert_eq!(
+        extracted_odda[0].encrypted_payload,
+        vec![0xaa, 0xbb, 0xcc, 0xdd]
+    );
+
+    let extracted_odaf = extract_box_as_async::<_, Odaf>(
+        &mut Cursor::new(file.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("odaf"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_odaf.len(), 1);
+    assert!(extracted_odaf[0].selective_encryption);
+    assert_eq!(extracted_odaf[0].iv_length, 16);
+
+    let extracted_entry_ohdr = extract_box_as_async::<_, Ohdr>(
+        &mut Cursor::new(file),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("ohdr"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_entry_ohdr.len(), 1);
+    assert_eq!(extracted_entry_ohdr[0].content_id, "cid-entry");
+}
+
+#[cfg(all(feature = "decrypt", feature = "async"))]
+#[tokio::test]
+async fn async_extract_box_as_decodes_retained_oma_dcf_movie_layout_boxes() {
+    let fixture = oma_dcf_ctr_fixture();
+    let input = std::fs::read(&fixture.encrypted_path).unwrap();
+
+    let extracted_odaf = extract_box_as_async::<_, Odaf>(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("odaf"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_odaf.len(), 1);
+    assert!(extracted_odaf[0].selective_encryption);
+    assert_eq!(extracted_odaf[0].iv_length, 16);
+
+    let extracted_ohdr = extract_box_as_async::<_, Ohdr>(
+        &mut Cursor::new(input),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("odkm"),
+            fourcc("ohdr"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_ohdr.len(), 1);
+    assert_eq!(
+        extracted_ohdr[0].encryption_method,
+        OHDR_ENCRYPTION_METHOD_AES_CTR
+    );
+    assert_eq!(extracted_ohdr[0].plaintext_length, 0);
+    assert_eq!(extracted_ohdr[0].content_id, "oma-ctr-aac");
+    assert_eq!(
+        extracted_ohdr[0].rights_issuer_url,
+        "https://rights.example/oma-ctr"
+    );
+}
+
+#[cfg(all(feature = "decrypt", feature = "async"))]
+#[tokio::test]
+async fn async_extract_box_as_decodes_iaec_layout_boxes() {
+    let fixture = isma_iaec_fixture();
+    let input = std::fs::read(&fixture.encrypted_path).unwrap();
+
+    let extracted_ikms = extract_box_as_async::<_, Ikms>(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("iKMS"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_ikms.len(), 1);
+    assert_eq!(extracted_ikms[0].kms_uri, "https://kms.example/iaec");
+    assert_eq!(extracted_ikms[0].kms_version, 0);
+
+    let extracted_isfm = extract_box_as_async::<_, Isfm>(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("iSFM"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_isfm.len(), 1);
+    assert!(!extracted_isfm[0].selective_encryption);
+    assert_eq!(extracted_isfm[0].iv_length, 8);
+    assert_eq!(extracted_isfm[0].key_indicator_length, 0);
+
+    let extracted_islt = extract_box_as_async::<_, Islt>(
+        &mut Cursor::new(input),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("enca"),
+            fourcc("sinf"),
+            fourcc("schi"),
+            fourcc("iSLT"),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(extracted_islt.len(), 1);
+    assert_eq!(
+        extracted_islt[0].salt,
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_extract_box_as_decodes_iods_initial_object_descriptors() {
+    let mut iods = Iods::default();
+    iods.descriptor = Some(
+        Descriptor::from_initial_object_descriptor(InitialObjectDescriptor {
+            object_descriptor_id: 4,
+            include_inline_profile_level_flag: true,
+            od_profile_level_indication: 0x11,
+            scene_profile_level_indication: 0x22,
+            audio_profile_level_indication: 0x33,
+            visual_profile_level_indication: 0x44,
+            graphics_profile_level_indication: 0x55,
+            sub_descriptors: vec![Descriptor::from_es_id_inc_descriptor(EsIdIncDescriptor {
+                track_id: 0x0102_0304,
+            })],
+            ..InitialObjectDescriptor::default()
+        })
+        .unwrap(),
+    );
+    let moov = encode_supported_box(&Moov, &encode_supported_box(&iods, &[]));
+
+    let extracted = extract_box_as_async::<_, Iods>(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("iods")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    let initial = extracted[0].initial_object_descriptor().unwrap();
+    assert_eq!(initial.object_descriptor_id, 4);
+    assert_eq!(
+        initial.sub_descriptors[0]
+            .es_id_inc_descriptor()
+            .unwrap()
+            .track_id,
+        0x0102_0304
     );
 }
 

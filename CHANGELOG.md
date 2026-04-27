@@ -1,3 +1,13 @@
+# Unreleased
+
+- Added a feature-gated decryption surface with sync library APIs, Tokio async file-backed
+  companions, and a sync-only `decrypt` CLI covering Common Encryption, PIFF compatibility, OMA
+  DCF, Marlin IPMP ACBC and ACGK, and the retained IAEC protected-movie path
+- Added the typed OMA DCF, Marlin, ISMA-IAEC, and descriptor-command box or descriptor support
+  needed to drive the broader protected-format decryption paths without opaque byte-only shortcuts
+- Added retained real Marlin and OMA decrypt fixtures plus broader sync-versus-async and
+  file-versus-memory parity coverage for the landed protected-format paths
+
 # 0.6.0 (April 26, 2026)
 
 - Added an additive Tokio-based `async` feature for the library, covering seekable async traversal, extraction, typed codec decode and encode, writer flows, rewrite flows, probe surfaces, and top-level `sidx` helpers while keeping the CLI on the established synchronous path

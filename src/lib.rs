@@ -5,6 +5,13 @@
 //! intended for supported seekable Tokio I/O such as `tokio::fs::File` and seekable in-memory
 //! cursors, and it supports normal multithreaded `tokio::spawn` use for independent-file library
 //! work. The CLI remains on the synchronous path.
+//!
+//! Enable the optional `decrypt` feature when you want the additive decryption input and
+//! progress types plus the feature-gated decryption surface. That landed surface covers the
+//! Common Encryption family, PIFF compatibility, OMA DCF, Marlin IPMP, and the retained IAEC
+//! protected-movie path while keeping the CLI on the synchronous path. Enable both `decrypt` and
+//! `async` when you want the additive file-backed async decrypt companions on top of the existing
+//! synchronous in-memory decrypt helpers.
 
 /// Tokio-based async I/O traits for the additive library-side async surface.
 #[cfg(feature = "async")]
@@ -18,6 +25,10 @@ pub mod boxes;
 pub mod cli;
 /// Descriptor-driven binary codec primitives.
 pub mod codec;
+/// Feature-gated synchronous decryption types and helpers.
+#[cfg(feature = "decrypt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "decrypt")))]
+pub mod decrypt;
 /// Resolved common-encryption metadata helpers built on typed box models.
 pub mod encryption;
 /// Path-based box extraction helpers, including typed convenience reads.
