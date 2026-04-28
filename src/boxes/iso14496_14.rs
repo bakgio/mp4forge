@@ -17,6 +17,22 @@ pub const DECODER_CONFIG_DESCRIPTOR_TAG: u8 = 0x04;
 pub const DECODER_SPECIFIC_INFO_TAG: u8 = 0x05;
 /// Descriptor tag used by the sync-layer configuration descriptor record.
 pub const SL_CONFIG_DESCRIPTOR_TAG: u8 = 0x06;
+/// Descriptor tag used by the IPMP descriptor-pointer record.
+pub const IPMP_DESCRIPTOR_POINTER_TAG: u8 = 0x0A;
+/// Descriptor tag used by the IPMP descriptor record.
+pub const IPMP_DESCRIPTOR_TAG: u8 = 0x0B;
+/// Descriptor tag used by the ES-ID-increment descriptor record.
+pub const ES_ID_INC_DESCRIPTOR_TAG: u8 = 0x0E;
+/// Descriptor tag used by the ES-ID-reference descriptor record.
+pub const ES_ID_REF_DESCRIPTOR_TAG: u8 = 0x0F;
+/// Descriptor tag used by the MP4 initial-object descriptor record.
+pub const MP4_INITIAL_OBJECT_DESCRIPTOR_TAG: u8 = 0x10;
+/// Descriptor tag used by the MP4 object-descriptor record.
+pub const MP4_OBJECT_DESCRIPTOR_TAG: u8 = 0x11;
+/// Command tag used by the object-descriptor-update command record.
+pub const OBJECT_DESCRIPTOR_UPDATE_COMMAND_TAG: u8 = 0x01;
+/// Command tag used by the IPMP-descriptor-update command record.
+pub const IPMP_DESCRIPTOR_UPDATE_COMMAND_TAG: u8 = 0x05;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FullBoxState {
@@ -164,10 +180,16 @@ fn write_uvarint(
 
 fn descriptor_tag_name(tag: u8) -> Option<&'static str> {
     match tag {
+        MP4_OBJECT_DESCRIPTOR_TAG => Some("MP4ObjectDescr"),
+        MP4_INITIAL_OBJECT_DESCRIPTOR_TAG => Some("MP4InitialObjectDescr"),
         ES_DESCRIPTOR_TAG => Some("ESDescr"),
         DECODER_CONFIG_DESCRIPTOR_TAG => Some("DecoderConfigDescr"),
         DECODER_SPECIFIC_INFO_TAG => Some("DecSpecificInfo"),
         SL_CONFIG_DESCRIPTOR_TAG => Some("SLConfigDescr"),
+        IPMP_DESCRIPTOR_POINTER_TAG => Some("IPMPDescrPointer"),
+        IPMP_DESCRIPTOR_TAG => Some("IPMPDescr"),
+        ES_ID_INC_DESCRIPTOR_TAG => Some("ES_ID_Inc"),
+        ES_ID_REF_DESCRIPTOR_TAG => Some("ES_ID_Ref"),
         _ => None,
     }
 }
@@ -176,6 +198,14 @@ fn render_descriptor_tag(tag: u8) -> String {
     descriptor_tag_name(tag)
         .map(str::to_owned)
         .unwrap_or_else(|| format!("0x{tag:x}"))
+}
+
+fn command_tag_name(tag: u8) -> Option<&'static str> {
+    match tag {
+        OBJECT_DESCRIPTOR_UPDATE_COMMAND_TAG => Some("ObjectDescriptorUpdate"),
+        IPMP_DESCRIPTOR_UPDATE_COMMAND_TAG => Some("IPMPDescriptorUpdate"),
+        _ => None,
+    }
 }
 
 fn encode_es_descriptor(
@@ -247,6 +277,108 @@ fn encode_decoder_config_descriptor(
     Ok(buffer)
 }
 
+fn encode_object_descriptor(
+    field_name: &'static str,
+    descriptor: &ObjectDescriptor,
+) -> Result<Vec<u8>, FieldValueError> {
+    if descriptor.object_descriptor_id > 0x03ff {
+        return Err(invalid_value(
+            field_name,
+            "object descriptor id must fit in 10 bits",
+        ));
+    }
+    if descriptor.url_flag && usize::from(descriptor.url_length) != descriptor.url_string.len() {
+        return Err(invalid_value(
+            "URLString",
+            "value length does not match URLLength",
+        ));
+    }
+
+    let mut buffer = Vec::new();
+    write_u16(
+        &mut buffer,
+        (descriptor.object_descriptor_id << 6) | (u16::from(descriptor.url_flag) << 5) | 0x001f,
+    );
+    if descriptor.url_flag {
+        buffer.push(descriptor.url_length);
+        buffer.extend_from_slice(&descriptor.url_string);
+    }
+    buffer.extend_from_slice(&encode_descriptor_stream(&descriptor.sub_descriptors)?);
+    Ok(buffer)
+}
+
+fn encode_initial_object_descriptor(
+    field_name: &'static str,
+    descriptor: &InitialObjectDescriptor,
+) -> Result<Vec<u8>, FieldValueError> {
+    if descriptor.object_descriptor_id > 0x03ff {
+        return Err(invalid_value(
+            field_name,
+            "object descriptor id must fit in 10 bits",
+        ));
+    }
+    if descriptor.url_flag && usize::from(descriptor.url_length) != descriptor.url_string.len() {
+        return Err(invalid_value(
+            "URLString",
+            "value length does not match URLLength",
+        ));
+    }
+
+    let mut buffer = Vec::new();
+    write_u16(
+        &mut buffer,
+        (descriptor.object_descriptor_id << 6)
+            | (u16::from(descriptor.url_flag) << 5)
+            | (u16::from(descriptor.include_inline_profile_level_flag) << 4)
+            | 0x000f,
+    );
+    if descriptor.url_flag {
+        buffer.push(descriptor.url_length);
+        buffer.extend_from_slice(&descriptor.url_string);
+    } else {
+        buffer.extend_from_slice(&[
+            descriptor.od_profile_level_indication,
+            descriptor.scene_profile_level_indication,
+            descriptor.audio_profile_level_indication,
+            descriptor.visual_profile_level_indication,
+            descriptor.graphics_profile_level_indication,
+        ]);
+    }
+    buffer.extend_from_slice(&encode_descriptor_stream(&descriptor.sub_descriptors)?);
+    Ok(buffer)
+}
+
+fn encode_ipmp_descriptor_pointer(descriptor: &IpmpDescriptorPointer) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    buffer.push(descriptor.descriptor_id);
+    if descriptor.descriptor_id == 0xff {
+        write_u16(&mut buffer, descriptor.descriptor_id_ex);
+        write_u16(&mut buffer, descriptor.es_id);
+    }
+    buffer
+}
+
+fn encode_ipmp_descriptor(descriptor: &IpmpDescriptor) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    buffer.push(descriptor.descriptor_id);
+    write_u16(&mut buffer, descriptor.ipmps_type);
+    if descriptor.descriptor_id == 0xff && descriptor.ipmps_type == 0xffff {
+        write_u16(&mut buffer, descriptor.descriptor_id_ex);
+        buffer.extend_from_slice(&descriptor.tool_id);
+        buffer.push(descriptor.control_point_code);
+        if descriptor.control_point_code > 0 {
+            buffer.push(descriptor.sequence_code);
+        }
+        buffer.extend_from_slice(&descriptor.data);
+    } else if descriptor.ipmps_type == 0 {
+        buffer.extend_from_slice(&descriptor.url_string);
+        buffer.push(0);
+    } else {
+        buffer.extend_from_slice(&descriptor.data);
+    }
+    buffer
+}
+
 fn encode_descriptor_stream(descriptors: &[Descriptor]) -> Result<Vec<u8>, FieldValueError> {
     let mut buffer = Vec::new();
     for descriptor in descriptors {
@@ -280,6 +412,15 @@ fn encode_descriptor_stream(descriptors: &[Descriptor]) -> Result<Vec<u8>, Field
         }
     }
     Ok(buffer)
+}
+
+fn encode_command_payload(command: &DescriptorCommand) -> Result<(u8, Vec<u8>), FieldValueError> {
+    match command {
+        DescriptorCommand::DescriptorUpdate(command) => {
+            Ok((command.tag, encode_descriptor_stream(&command.descriptors)?))
+        }
+        DescriptorCommand::Unknown(command) => Ok((command.tag, command.data.clone())),
+    }
 }
 
 fn parse_es_descriptor(
@@ -348,6 +489,179 @@ fn parse_decoder_config_descriptor(
     })
 }
 
+fn parse_object_descriptor_payload(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<ObjectDescriptor, FieldValueError> {
+    let mut reader = Cursor::new(payload);
+    let bits = read_u16(&mut reader, field_name)?;
+    let object_descriptor_id = bits >> 6;
+    let url_flag = bits & (1 << 5) != 0;
+    let (url_length, url_string) = if url_flag {
+        let url_length = read_u8(&mut reader, field_name)?;
+        let url_string = read_exact_bytes(&mut reader, usize::from(url_length), field_name)?;
+        (url_length, url_string)
+    } else {
+        (0, Vec::new())
+    };
+    let sub_descriptors =
+        parse_descriptor_stream(field_name, &payload[reader.position() as usize..])?;
+
+    Ok(ObjectDescriptor {
+        object_descriptor_id,
+        url_flag,
+        url_length,
+        url_string,
+        sub_descriptors,
+    })
+}
+
+fn parse_initial_object_descriptor_payload(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<InitialObjectDescriptor, FieldValueError> {
+    let mut reader = Cursor::new(payload);
+    let bits = read_u16(&mut reader, field_name)?;
+    let object_descriptor_id = bits >> 6;
+    let url_flag = bits & (1 << 5) != 0;
+    let include_inline_profile_level_flag = bits & (1 << 4) != 0;
+    let (url_length, url_string) = if url_flag {
+        let url_length = read_u8(&mut reader, field_name)?;
+        let url_string = read_exact_bytes(&mut reader, usize::from(url_length), field_name)?;
+        (url_length, url_string)
+    } else {
+        (0, Vec::new())
+    };
+    let (
+        od_profile_level_indication,
+        scene_profile_level_indication,
+        audio_profile_level_indication,
+        visual_profile_level_indication,
+        graphics_profile_level_indication,
+    ) = if url_flag {
+        (0, 0, 0, 0, 0)
+    } else {
+        (
+            read_u8(&mut reader, field_name)?,
+            read_u8(&mut reader, field_name)?,
+            read_u8(&mut reader, field_name)?,
+            read_u8(&mut reader, field_name)?,
+            read_u8(&mut reader, field_name)?,
+        )
+    };
+    let sub_descriptors =
+        parse_descriptor_stream(field_name, &payload[reader.position() as usize..])?;
+
+    Ok(InitialObjectDescriptor {
+        object_descriptor_id,
+        url_flag,
+        include_inline_profile_level_flag,
+        url_length,
+        url_string,
+        od_profile_level_indication,
+        scene_profile_level_indication,
+        audio_profile_level_indication,
+        visual_profile_level_indication,
+        graphics_profile_level_indication,
+        sub_descriptors,
+    })
+}
+
+fn parse_ipmp_descriptor_pointer_payload(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<IpmpDescriptorPointer, FieldValueError> {
+    let mut reader = Cursor::new(payload);
+    let descriptor_id = read_u8(&mut reader, field_name)?;
+    let (descriptor_id_ex, es_id) = if descriptor_id == 0xff {
+        (
+            read_u16(&mut reader, field_name)?,
+            read_u16(&mut reader, field_name)?,
+        )
+    } else {
+        (0, 0)
+    };
+    Ok(IpmpDescriptorPointer {
+        descriptor_id,
+        descriptor_id_ex,
+        es_id,
+    })
+}
+
+fn parse_ipmp_descriptor_payload(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<IpmpDescriptor, FieldValueError> {
+    let mut reader = Cursor::new(payload);
+    let descriptor_id = read_u8(&mut reader, field_name)?;
+    let ipmps_type = read_u16(&mut reader, field_name)?;
+    let mut tool_id = [0_u8; 16];
+    let (descriptor_id_ex, control_point_code, sequence_code, url_string, data) =
+        if descriptor_id == 0xff && ipmps_type == 0xffff {
+            let descriptor_id_ex = read_u16(&mut reader, field_name)?;
+            let tool_id_bytes = read_exact_bytes(&mut reader, 16, field_name)?;
+            tool_id.copy_from_slice(&tool_id_bytes);
+            let control_point_code = read_u8(&mut reader, field_name)?;
+            let sequence_code = if control_point_code > 0 {
+                read_u8(&mut reader, field_name)?
+            } else {
+                0
+            };
+            (
+                descriptor_id_ex,
+                control_point_code,
+                sequence_code,
+                Vec::new(),
+                payload[reader.position() as usize..].to_vec(),
+            )
+        } else if ipmps_type == 0 {
+            let mut url_string = payload[reader.position() as usize..].to_vec();
+            if url_string.last().copied() == Some(0) {
+                url_string.pop();
+            }
+            (0, 0, 0, url_string, Vec::new())
+        } else {
+            (
+                0,
+                0,
+                0,
+                Vec::new(),
+                payload[reader.position() as usize..].to_vec(),
+            )
+        };
+
+    Ok(IpmpDescriptor {
+        descriptor_id,
+        ipmps_type,
+        descriptor_id_ex,
+        tool_id,
+        control_point_code,
+        sequence_code,
+        url_string,
+        data,
+    })
+}
+
+fn parse_es_id_inc_descriptor_payload(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<EsIdIncDescriptor, FieldValueError> {
+    let mut reader = Cursor::new(payload);
+    Ok(EsIdIncDescriptor {
+        track_id: read_u32(&mut reader, field_name)?,
+    })
+}
+
+fn parse_es_id_ref_descriptor_payload(
+    field_name: &'static str,
+    payload: &[u8],
+) -> Result<EsIdRefDescriptor, FieldValueError> {
+    let mut reader = Cursor::new(payload);
+    Ok(EsIdRefDescriptor {
+        ref_index: read_u16(&mut reader, field_name)?,
+    })
+}
+
 fn parse_descriptor_stream(
     field_name: &'static str,
     bytes: &[u8],
@@ -365,6 +679,17 @@ fn parse_descriptor_stream(
         };
 
         match tag {
+            MP4_OBJECT_DESCRIPTOR_TAG => {
+                descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
+                parse_object_descriptor_payload("ObjectDescriptor", &descriptor.data)?;
+            }
+            MP4_INITIAL_OBJECT_DESCRIPTOR_TAG => {
+                descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
+                parse_initial_object_descriptor_payload(
+                    "InitialObjectDescriptor",
+                    &descriptor.data,
+                )?;
+            }
             ES_DESCRIPTOR_TAG => {
                 descriptor.es_descriptor = Some(parse_es_descriptor("ESDescriptor", &mut reader)?);
             }
@@ -373,6 +698,22 @@ fn parse_descriptor_stream(
                     "DecoderConfigDescriptor",
                     &mut reader,
                 )?);
+            }
+            ES_ID_INC_DESCRIPTOR_TAG => {
+                descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
+                parse_es_id_inc_descriptor_payload("EsIdIncDescriptor", &descriptor.data)?;
+            }
+            ES_ID_REF_DESCRIPTOR_TAG => {
+                descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
+                parse_es_id_ref_descriptor_payload("EsIdRefDescriptor", &descriptor.data)?;
+            }
+            IPMP_DESCRIPTOR_POINTER_TAG => {
+                descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
+                parse_ipmp_descriptor_pointer_payload("IpmpDescriptorPointer", &descriptor.data)?;
+            }
+            IPMP_DESCRIPTOR_TAG => {
+                descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
+                parse_ipmp_descriptor_payload("IpmpDescriptor", &descriptor.data)?;
             }
             _ => {
                 descriptor.data = read_exact_bytes(&mut reader, size as usize, field_name)?;
@@ -383,6 +724,50 @@ fn parse_descriptor_stream(
     }
 
     Ok(descriptors)
+}
+
+/// Decodes one OD-stream command payload into additive typed command records.
+///
+/// The helper currently recognizes the object-descriptor-update and IPMP-descriptor-update
+/// command families and preserves any other command tags as raw payload bytes.
+pub fn parse_descriptor_commands(bytes: &[u8]) -> Result<Vec<DescriptorCommand>, FieldValueError> {
+    let mut reader = Cursor::new(bytes);
+    let mut commands = Vec::new();
+    while (reader.position() as usize) < bytes.len() {
+        let tag = read_u8(&mut reader, "CommandTag")?;
+        let size = read_uvarint(&mut reader, "CommandSize")?;
+        let data = read_exact_bytes(&mut reader, size as usize, "CommandData")?;
+        match tag {
+            OBJECT_DESCRIPTOR_UPDATE_COMMAND_TAG | IPMP_DESCRIPTOR_UPDATE_COMMAND_TAG => {
+                commands.push(DescriptorCommand::DescriptorUpdate(
+                    DescriptorUpdateCommand {
+                        tag,
+                        descriptors: parse_descriptor_stream("Descriptors", &data)?,
+                    },
+                ));
+            }
+            _ => commands.push(DescriptorCommand::Unknown(UnknownDescriptorCommand {
+                tag,
+                data,
+            })),
+        }
+    }
+
+    Ok(commands)
+}
+
+/// Encodes additive OD-stream command records into one contiguous command payload.
+pub fn encode_descriptor_commands(
+    commands: &[DescriptorCommand],
+) -> Result<Vec<u8>, FieldValueError> {
+    let mut buffer = Vec::new();
+    for command in commands {
+        let (tag, data) = encode_command_payload(command)?;
+        buffer.push(tag);
+        write_uvarint(&mut buffer, "CommandSize", data.len() as u32)?;
+        buffer.extend_from_slice(&data);
+    }
+    Ok(buffer)
 }
 
 fn render_es_descriptor(descriptor: &EsDescriptor) -> String {
@@ -424,6 +809,110 @@ fn render_decoder_config_descriptor(descriptor: &DecoderConfigDescriptor) -> Str
     .join(" ")
 }
 
+fn render_object_descriptor(descriptor: &ObjectDescriptor) -> String {
+    let mut fields = vec![
+        format!("ObjectDescriptorID={}", descriptor.object_descriptor_id),
+        format!("UrlFlag={}", descriptor.url_flag),
+    ];
+    if descriptor.url_flag {
+        fields.push(format!("URLLength=0x{:x}", descriptor.url_length));
+        fields.push(format!("URLString={}", quote_bytes(&descriptor.url_string)));
+    }
+    if !descriptor.sub_descriptors.is_empty() {
+        fields.push(format!(
+            "SubDescriptors={}",
+            render_descriptors(&descriptor.sub_descriptors)
+        ));
+    }
+    fields.join(" ")
+}
+
+fn render_initial_object_descriptor(descriptor: &InitialObjectDescriptor) -> String {
+    let mut fields = vec![
+        format!("ObjectDescriptorID={}", descriptor.object_descriptor_id),
+        format!("UrlFlag={}", descriptor.url_flag),
+        format!(
+            "IncludeInlineProfileLevelFlag={}",
+            descriptor.include_inline_profile_level_flag
+        ),
+    ];
+    if descriptor.url_flag {
+        fields.push(format!("URLLength=0x{:x}", descriptor.url_length));
+        fields.push(format!("URLString={}", quote_bytes(&descriptor.url_string)));
+    } else {
+        fields.extend([
+            format!(
+                "ODProfileLevelIndication=0x{:x}",
+                descriptor.od_profile_level_indication
+            ),
+            format!(
+                "SceneProfileLevelIndication=0x{:x}",
+                descriptor.scene_profile_level_indication
+            ),
+            format!(
+                "AudioProfileLevelIndication=0x{:x}",
+                descriptor.audio_profile_level_indication
+            ),
+            format!(
+                "VisualProfileLevelIndication=0x{:x}",
+                descriptor.visual_profile_level_indication
+            ),
+            format!(
+                "GraphicsProfileLevelIndication=0x{:x}",
+                descriptor.graphics_profile_level_indication
+            ),
+        ]);
+    }
+    if !descriptor.sub_descriptors.is_empty() {
+        fields.push(format!(
+            "SubDescriptors={}",
+            render_descriptors(&descriptor.sub_descriptors)
+        ));
+    }
+    fields.join(" ")
+}
+
+fn render_ipmp_descriptor_pointer(descriptor: &IpmpDescriptorPointer) -> String {
+    let mut fields = vec![format!("DescriptorID=0x{:x}", descriptor.descriptor_id)];
+    if descriptor.descriptor_id == 0xff {
+        fields.push(format!(
+            "DescriptorIDEx=0x{:x}",
+            descriptor.descriptor_id_ex
+        ));
+        fields.push(format!("ESID={}", descriptor.es_id));
+    }
+    fields.join(" ")
+}
+
+fn render_ipmp_descriptor(descriptor: &IpmpDescriptor) -> String {
+    let mut fields = vec![
+        format!("DescriptorID=0x{:x}", descriptor.descriptor_id),
+        format!("IPMPSType=0x{:x}", descriptor.ipmps_type),
+    ];
+    if descriptor.descriptor_id == 0xff && descriptor.ipmps_type == 0xffff {
+        fields.push(format!(
+            "DescriptorIDEx=0x{:x}",
+            descriptor.descriptor_id_ex
+        ));
+        fields.push(format!("ToolID={}", render_hex_bytes(&descriptor.tool_id)));
+        fields.push(format!(
+            "ControlPointCode={}",
+            descriptor.control_point_code
+        ));
+        if descriptor.control_point_code > 0 {
+            fields.push(format!("SequenceCode={}", descriptor.sequence_code));
+        }
+        if !descriptor.data.is_empty() {
+            fields.push(format!("Data={}", render_hex_bytes(&descriptor.data)));
+        }
+    } else if descriptor.ipmps_type == 0 {
+        fields.push(format!("URLString={}", quote_bytes(&descriptor.url_string)));
+    } else if !descriptor.data.is_empty() {
+        fields.push(format!("Data={}", render_hex_bytes(&descriptor.data)));
+    }
+    fields.join(" ")
+}
+
 fn render_descriptor(descriptor: &Descriptor) -> String {
     let mut fields = vec![
         format!("Tag={}", render_descriptor_tag(descriptor.tag)),
@@ -431,6 +920,16 @@ fn render_descriptor(descriptor: &Descriptor) -> String {
     ];
 
     match descriptor.tag {
+        MP4_OBJECT_DESCRIPTOR_TAG => {
+            if let Some(nested) = descriptor.object_descriptor() {
+                fields.push(render_object_descriptor(&nested));
+            }
+        }
+        MP4_INITIAL_OBJECT_DESCRIPTOR_TAG => {
+            if let Some(nested) = descriptor.initial_object_descriptor() {
+                fields.push(render_initial_object_descriptor(&nested));
+            }
+        }
         ES_DESCRIPTOR_TAG => {
             if let Some(nested) = descriptor.es_descriptor.as_ref() {
                 fields.push(render_es_descriptor(nested));
@@ -439,6 +938,26 @@ fn render_descriptor(descriptor: &Descriptor) -> String {
         DECODER_CONFIG_DESCRIPTOR_TAG => {
             if let Some(nested) = descriptor.decoder_config_descriptor.as_ref() {
                 fields.push(render_decoder_config_descriptor(nested));
+            }
+        }
+        ES_ID_INC_DESCRIPTOR_TAG => {
+            if let Some(nested) = descriptor.es_id_inc_descriptor() {
+                fields.push(format!("TrackID={}", nested.track_id));
+            }
+        }
+        ES_ID_REF_DESCRIPTOR_TAG => {
+            if let Some(nested) = descriptor.es_id_ref_descriptor() {
+                fields.push(format!("RefIndex={}", nested.ref_index));
+            }
+        }
+        IPMP_DESCRIPTOR_POINTER_TAG => {
+            if let Some(nested) = descriptor.ipmp_descriptor_pointer() {
+                fields.push(render_ipmp_descriptor_pointer(&nested));
+            }
+        }
+        IPMP_DESCRIPTOR_TAG => {
+            if let Some(nested) = descriptor.ipmp_descriptor() {
+                fields.push(render_ipmp_descriptor(&nested));
             }
         }
         _ => {
@@ -556,6 +1075,107 @@ impl CodecBox for Esds {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
 
+/// Initial-object descriptor box carried under `moov`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Iods {
+    full_box: FullBoxState,
+    pub descriptor: Option<Descriptor>,
+}
+
+impl FieldHooks for Iods {
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "Descriptor" => self.descriptor.as_ref().map(render_descriptor),
+            _ => None,
+        }
+    }
+}
+
+impl ImmutableBox for Iods {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"iods")
+    }
+
+    fn version(&self) -> u8 {
+        self.full_box.version
+    }
+
+    fn flags(&self) -> u32 {
+        self.full_box.flags
+    }
+}
+
+impl MutableBox for Iods {
+    fn set_version(&mut self, version: u8) {
+        self.full_box.version = version;
+    }
+
+    fn set_flags(&mut self, flags: u32) {
+        self.full_box.flags = flags;
+    }
+}
+
+impl Iods {
+    /// Returns the typed descriptor carried by the box when present.
+    pub fn descriptor(&self) -> Option<&Descriptor> {
+        self.descriptor.as_ref()
+    }
+
+    /// Returns the initial-object descriptor payload when the carried descriptor uses that tag.
+    pub fn initial_object_descriptor(&self) -> Option<InitialObjectDescriptor> {
+        self.descriptor
+            .as_ref()
+            .and_then(Descriptor::initial_object_descriptor)
+    }
+}
+
+impl FieldValueRead for Iods {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Descriptor" => {
+                let descriptors = self.descriptor.iter().cloned().collect::<Vec<_>>();
+                Ok(FieldValue::Bytes(encode_descriptor_stream(&descriptors)?))
+            }
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Iods {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Descriptor", FieldValue::Bytes(bytes)) => {
+                let descriptors = parse_descriptor_stream(field_name, &bytes)?;
+                self.descriptor = match descriptors.len() {
+                    0 => None,
+                    1 => Some(descriptors.into_iter().next().unwrap()),
+                    _ => {
+                        return Err(invalid_value(
+                            field_name,
+                            "iods may carry at most one descriptor",
+                        ));
+                    }
+                };
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Iods {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("Descriptor", 2, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+}
+
 /// One tag-sized record within the `esds` descriptor stream.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Descriptor {
@@ -571,6 +1191,195 @@ impl Descriptor {
     pub fn tag_name(&self) -> Option<&'static str> {
         descriptor_tag_name(self.tag)
     }
+
+    /// Builds a typed MP4 object-descriptor record.
+    pub fn from_object_descriptor(descriptor: ObjectDescriptor) -> Result<Self, FieldValueError> {
+        let data = encode_object_descriptor("ObjectDescriptor", &descriptor)?;
+        Ok(Self {
+            tag: MP4_OBJECT_DESCRIPTOR_TAG,
+            size: data.len() as u32,
+            data,
+            ..Self::default()
+        })
+    }
+
+    /// Builds a typed MP4 initial-object-descriptor record.
+    pub fn from_initial_object_descriptor(
+        descriptor: InitialObjectDescriptor,
+    ) -> Result<Self, FieldValueError> {
+        let data = encode_initial_object_descriptor("InitialObjectDescriptor", &descriptor)?;
+        Ok(Self {
+            tag: MP4_INITIAL_OBJECT_DESCRIPTOR_TAG,
+            size: data.len() as u32,
+            data,
+            ..Self::default()
+        })
+    }
+
+    /// Builds a typed ES-ID-increment descriptor record.
+    pub fn from_es_id_inc_descriptor(descriptor: EsIdIncDescriptor) -> Self {
+        let mut data = Vec::new();
+        write_u32(&mut data, descriptor.track_id);
+        Self {
+            tag: ES_ID_INC_DESCRIPTOR_TAG,
+            size: data.len() as u32,
+            data,
+            ..Self::default()
+        }
+    }
+
+    /// Builds a typed ES-ID-reference descriptor record.
+    pub fn from_es_id_ref_descriptor(descriptor: EsIdRefDescriptor) -> Self {
+        let mut data = Vec::new();
+        write_u16(&mut data, descriptor.ref_index);
+        Self {
+            tag: ES_ID_REF_DESCRIPTOR_TAG,
+            size: data.len() as u32,
+            data,
+            ..Self::default()
+        }
+    }
+
+    /// Builds a typed IPMP descriptor-pointer record.
+    pub fn from_ipmp_descriptor_pointer(descriptor: IpmpDescriptorPointer) -> Self {
+        let data = encode_ipmp_descriptor_pointer(&descriptor);
+        Self {
+            tag: IPMP_DESCRIPTOR_POINTER_TAG,
+            size: data.len() as u32,
+            data,
+            ..Self::default()
+        }
+    }
+
+    /// Builds a typed IPMP descriptor record.
+    pub fn from_ipmp_descriptor(descriptor: IpmpDescriptor) -> Self {
+        let data = encode_ipmp_descriptor(&descriptor);
+        Self {
+            tag: IPMP_DESCRIPTOR_TAG,
+            size: data.len() as u32,
+            data,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the typed MP4 object-descriptor payload when the tag matches.
+    pub fn object_descriptor(&self) -> Option<ObjectDescriptor> {
+        (self.tag == MP4_OBJECT_DESCRIPTOR_TAG)
+            .then(|| parse_object_descriptor_payload("ObjectDescriptor", &self.data))
+            .and_then(Result::ok)
+    }
+
+    /// Returns the typed MP4 initial-object-descriptor payload when the tag matches.
+    pub fn initial_object_descriptor(&self) -> Option<InitialObjectDescriptor> {
+        (self.tag == MP4_INITIAL_OBJECT_DESCRIPTOR_TAG)
+            .then(|| parse_initial_object_descriptor_payload("InitialObjectDescriptor", &self.data))
+            .and_then(Result::ok)
+    }
+
+    /// Returns the typed ES-ID-increment payload when the tag matches.
+    pub fn es_id_inc_descriptor(&self) -> Option<EsIdIncDescriptor> {
+        (self.tag == ES_ID_INC_DESCRIPTOR_TAG)
+            .then(|| parse_es_id_inc_descriptor_payload("EsIdIncDescriptor", &self.data))
+            .and_then(Result::ok)
+    }
+
+    /// Returns the typed ES-ID-reference payload when the tag matches.
+    pub fn es_id_ref_descriptor(&self) -> Option<EsIdRefDescriptor> {
+        (self.tag == ES_ID_REF_DESCRIPTOR_TAG)
+            .then(|| parse_es_id_ref_descriptor_payload("EsIdRefDescriptor", &self.data))
+            .and_then(Result::ok)
+    }
+
+    /// Returns the typed IPMP descriptor-pointer payload when the tag matches.
+    pub fn ipmp_descriptor_pointer(&self) -> Option<IpmpDescriptorPointer> {
+        (self.tag == IPMP_DESCRIPTOR_POINTER_TAG)
+            .then(|| parse_ipmp_descriptor_pointer_payload("IpmpDescriptorPointer", &self.data))
+            .and_then(Result::ok)
+    }
+
+    /// Returns the typed IPMP descriptor payload when the tag matches.
+    pub fn ipmp_descriptor(&self) -> Option<IpmpDescriptor> {
+        (self.tag == IPMP_DESCRIPTOR_TAG)
+            .then(|| parse_ipmp_descriptor_payload("IpmpDescriptor", &self.data))
+            .and_then(Result::ok)
+    }
+}
+
+/// One parsed OD-stream command record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DescriptorCommand {
+    /// A typed object-descriptor-update or IPMP-descriptor-update command.
+    DescriptorUpdate(DescriptorUpdateCommand),
+    /// A command tag that the current crate does not model yet.
+    Unknown(UnknownDescriptorCommand),
+}
+
+impl DescriptorCommand {
+    /// Returns the raw command tag.
+    pub fn tag(&self) -> u8 {
+        match self {
+            Self::DescriptorUpdate(command) => command.tag,
+            Self::Unknown(command) => command.tag,
+        }
+    }
+
+    /// Returns the standard command name for the current tag when one is known.
+    pub fn tag_name(&self) -> Option<&'static str> {
+        command_tag_name(self.tag())
+    }
+
+    /// Returns the typed descriptor-update payload when this command carries one.
+    pub fn descriptor_update(&self) -> Option<&DescriptorUpdateCommand> {
+        match self {
+            Self::DescriptorUpdate(command) => Some(command),
+            Self::Unknown(_) => None,
+        }
+    }
+
+    /// Returns the raw unknown-command payload when this command is not yet modeled.
+    pub fn unknown(&self) -> Option<&UnknownDescriptorCommand> {
+        match self {
+            Self::DescriptorUpdate(_) => None,
+            Self::Unknown(command) => Some(command),
+        }
+    }
+}
+
+/// A typed object-descriptor-update or IPMP-descriptor-update command payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DescriptorUpdateCommand {
+    pub tag: u8,
+    pub descriptors: Vec<Descriptor>,
+}
+
+impl DescriptorUpdateCommand {
+    /// Builds an object-descriptor-update command.
+    pub fn object_descriptor_update(descriptors: Vec<Descriptor>) -> Self {
+        Self {
+            tag: OBJECT_DESCRIPTOR_UPDATE_COMMAND_TAG,
+            descriptors,
+        }
+    }
+
+    /// Builds an IPMP-descriptor-update command.
+    pub fn ipmp_descriptor_update(descriptors: Vec<Descriptor>) -> Self {
+        Self {
+            tag: IPMP_DESCRIPTOR_UPDATE_COMMAND_TAG,
+            descriptors,
+        }
+    }
+
+    /// Returns the standard command name for the current tag when one is known.
+    pub fn tag_name(&self) -> Option<&'static str> {
+        command_tag_name(self.tag)
+    }
+}
+
+/// One raw OD-stream command tag that the current crate does not model yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnknownDescriptorCommand {
+    pub tag: u8,
+    pub data: Vec<u8>,
 }
 
 /// Elementary-stream descriptor payload selected by tag `0x03`.
@@ -599,7 +1408,67 @@ pub struct DecoderConfigDescriptor {
     pub avg_bitrate: u32,
 }
 
+/// MP4 object descriptor payload selected by tag `0x11`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectDescriptor {
+    pub object_descriptor_id: u16,
+    pub url_flag: bool,
+    pub url_length: u8,
+    pub url_string: Vec<u8>,
+    pub sub_descriptors: Vec<Descriptor>,
+}
+
+/// MP4 initial-object descriptor payload selected by tag `0x10`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InitialObjectDescriptor {
+    pub object_descriptor_id: u16,
+    pub url_flag: bool,
+    pub include_inline_profile_level_flag: bool,
+    pub url_length: u8,
+    pub url_string: Vec<u8>,
+    pub od_profile_level_indication: u8,
+    pub scene_profile_level_indication: u8,
+    pub audio_profile_level_indication: u8,
+    pub visual_profile_level_indication: u8,
+    pub graphics_profile_level_indication: u8,
+    pub sub_descriptors: Vec<Descriptor>,
+}
+
+/// ES-ID-increment descriptor payload selected by tag `0x0e`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EsIdIncDescriptor {
+    pub track_id: u32,
+}
+
+/// ES-ID-reference descriptor payload selected by tag `0x0f`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EsIdRefDescriptor {
+    pub ref_index: u16,
+}
+
+/// IPMP descriptor-pointer payload selected by tag `0x0a`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpmpDescriptorPointer {
+    pub descriptor_id: u8,
+    pub descriptor_id_ex: u16,
+    pub es_id: u16,
+}
+
+/// IPMP descriptor payload selected by tag `0x0b`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpmpDescriptor {
+    pub descriptor_id: u8,
+    pub ipmps_type: u16,
+    pub descriptor_id_ex: u16,
+    pub tool_id: [u8; 16],
+    pub control_point_code: u8,
+    pub sequence_code: u8,
+    pub url_string: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
 /// Registers the currently implemented ISO/IEC 14496-14 boxes in `registry`.
 pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Esds>(FourCc::from_bytes(*b"esds"));
+    registry.register::<Iods>(FourCc::from_bytes(*b"iods"));
 }

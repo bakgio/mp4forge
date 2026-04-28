@@ -2,6 +2,8 @@
 
 use std::io::{self, Write};
 
+#[cfg(feature = "decrypt")]
+pub mod decrypt;
 pub mod divide;
 pub mod dump;
 pub mod edit;
@@ -26,6 +28,8 @@ where
             let _ = write_usage(stderr);
             0
         }
+        #[cfg(feature = "decrypt")]
+        "decrypt" => decrypt::run(&args[1..], stderr),
         "divide" => divide::run_with_output(&args[1..], stdout, stderr),
         "dump" => dump::run(&args[1..], stdout, stderr),
         "edit" => edit::run(&args[1..], stderr),
@@ -50,6 +54,11 @@ where
     writeln!(
         writer,
         "  divide       split a fragmented MP4 into track playlists"
+    )?;
+    #[cfg(feature = "decrypt")]
+    writeln!(
+        writer,
+        "  decrypt      decrypt protected MP4-family content"
     )?;
     writeln!(writer, "  dump         display the MP4 box tree")?;
     writeln!(writer, "  edit         rewrite selected boxes")?;

@@ -134,6 +134,51 @@ fn analyze_top_level_sidx_update_uses_existing_top_level_sidx_boundaries() {
 }
 
 #[test]
+fn analyze_top_level_sidx_update_uses_existing_top_level_sidx_after_leading_styp() {
+    let input = build_styp_prefixed_top_level_sidx_fragmented_single_track_file(false);
+    let analysis = analyze_top_level_sidx_update_bytes(&input).unwrap();
+
+    let styps = extract_box(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([fourcc("styp")]),
+    )
+    .unwrap();
+    let sidx = extract_box(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([fourcc("sidx")]),
+    )
+    .unwrap();
+    let moofs = extract_box(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([fourcc("moof")]),
+    )
+    .unwrap();
+    let mdats = extract_box(
+        &mut Cursor::new(input),
+        None,
+        BoxPath::from([fourcc("mdat")]),
+    )
+    .unwrap();
+
+    assert_eq!(styps.len(), 1);
+    assert_eq!(analysis.placement.insertion_box, moofs[0]);
+    assert_eq!(analysis.placement.existing_top_level_sidxs.len(), 1);
+    assert_eq!(analysis.placement.existing_top_level_sidxs[0].info, sidx[0]);
+    assert_eq!(
+        analysis.placement.existing_top_level_sidxs[0].segment_starts,
+        moofs.iter().map(|info| info.offset()).collect::<Vec<_>>()
+    );
+    assert_eq!(analysis.segments.len(), 2);
+    assert_eq!(analysis.segments[0].first_box, moofs[0]);
+    assert_eq!(analysis.segments[0].size, moofs[0].size() + mdats[0].size());
+    assert_eq!(analysis.segments[1].first_box, moofs[1]);
+    assert_eq!(analysis.segments[1].size, moofs[1].size() + mdats[1].size());
+}
+
+#[test]
 fn analyze_top_level_sidx_update_matches_interleaved_fixture_grouping() {
     let input = fs::read(fixture_path("sample_fragmented.mp4")).unwrap();
     let analysis = analyze_top_level_sidx_update(&mut Cursor::new(&input)).unwrap();
@@ -313,6 +358,63 @@ fn plan_top_level_sidx_update_builds_replace_plan_with_non_zero_ept() {
     assert_eq!(plan.sidx.reference_count, 2);
     assert_eq!(plan.sidx.references[0].subsegment_duration, 60);
     assert_eq!(plan.sidx.references[1].subsegment_duration, 40);
+}
+
+#[test]
+fn plan_top_level_sidx_update_replaces_existing_top_level_sidx_after_leading_styp() {
+    let input = build_styp_prefixed_top_level_sidx_fragmented_single_track_file(false);
+
+    let plan = plan_top_level_sidx_update(
+        &mut Cursor::new(&input),
+        TopLevelSidxPlanOptions {
+            add_if_not_exists: false,
+            non_zero_ept: false,
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    let styps = extract_box(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([fourcc("styp")]),
+    )
+    .unwrap();
+    let sidx = extract_box(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([fourcc("sidx")]),
+    )
+    .unwrap();
+    let moofs = extract_box(
+        &mut Cursor::new(input.clone()),
+        None,
+        BoxPath::from([fourcc("moof")]),
+    )
+    .unwrap();
+    let mdats = extract_box(
+        &mut Cursor::new(input),
+        None,
+        BoxPath::from([fourcc("mdat")]),
+    )
+    .unwrap();
+
+    assert_eq!(styps.len(), 1);
+    match &plan.action {
+        TopLevelSidxPlanAction::Replace { existing } => assert_eq!(existing.info, sidx[0]),
+        TopLevelSidxPlanAction::Insert => panic!("expected replace plan"),
+    }
+    assert_eq!(plan.insertion_box, moofs[0]);
+    assert_eq!(plan.entries[0].start_offset, moofs[0].offset());
+    assert_eq!(
+        plan.entries[0].target_size,
+        u32::try_from(moofs[0].size() + mdats[0].size()).unwrap()
+    );
+    assert_eq!(plan.entries[1].start_offset, moofs[1].offset());
+    assert_eq!(
+        plan.entries[1].target_size,
+        u32::try_from(moofs[1].size() + mdats[1].size()).unwrap()
+    );
 }
 
 #[test]
@@ -801,6 +903,66 @@ fn build_top_level_sidx_fragmented_single_track_file(indirect_first_entry: bool)
     let sidx = encode_supported_box(&sidx, &[]);
 
     [ftyp, moov, sidx, moof1, mdat1, moof2, mdat2].concat()
+}
+
+fn build_styp_prefixed_top_level_sidx_fragmented_single_track_file(
+    indirect_first_entry: bool,
+) -> Vec<u8> {
+    let ftyp = fragmented_ftyp();
+    let moov = build_fragmented_moov(&[TrackSpec {
+        track_id: 1,
+        handler_type: "vide",
+        timescale: 1_000,
+    }]);
+    let styp = segment_styp();
+    let moof1 = build_moof(&[TrafSpec {
+        track_id: 1,
+        base_decode_time: 100,
+        default_sample_duration: None,
+        sample_durations: &[30, 30],
+        sample_sizes: &[4, 4],
+        composition_offsets: &[5, 0],
+    }]);
+    let mdat1 = encode_raw_box(fourcc("mdat"), &[0; 8]);
+    let moof2 = build_moof(&[TrafSpec {
+        track_id: 1,
+        base_decode_time: 160,
+        default_sample_duration: None,
+        sample_durations: &[40],
+        sample_sizes: &[6],
+        composition_offsets: &[0],
+    }]);
+    let mdat2 = encode_raw_box(fourcc("mdat"), &[0; 6]);
+
+    let first_segment_size = u32::try_from(moof1.len() + mdat1.len()).unwrap();
+    let second_segment_size = u32::try_from(moof2.len() + mdat2.len()).unwrap();
+
+    let mut sidx = Sidx::default();
+    sidx.set_version(1);
+    sidx.reference_id = 1;
+    sidx.timescale = 1_000;
+    sidx.reference_count = 2;
+    sidx.references = vec![
+        SidxReference {
+            reference_type: indirect_first_entry,
+            referenced_size: first_segment_size,
+            subsegment_duration: 60,
+            starts_with_sap: true,
+            sap_type: 1,
+            sap_delta_time: 0,
+        },
+        SidxReference {
+            reference_type: false,
+            referenced_size: second_segment_size,
+            subsegment_duration: 40,
+            starts_with_sap: true,
+            sap_type: 1,
+            sap_delta_time: 0,
+        },
+    ];
+    let sidx = encode_supported_box(&sidx, &[]);
+
+    [ftyp, moov, styp, sidx, moof1, mdat1, moof2, mdat2].concat()
 }
 
 fn build_gapped_top_level_sidx_fragmented_single_track_file_v0() -> Vec<u8> {

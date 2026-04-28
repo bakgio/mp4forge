@@ -20,18 +20,21 @@
 - Low-level traversal, extraction, stringify, probe, and writer APIs
 - Thin typed path-based helpers and byte-slice convenience wrappers for common extraction, rewrite, and probe flows
 - Fragmented top-level `sidx` analysis, planning, and rewrite APIs for supported layouts
-- Built-in CLI for `dump`, `extract`, `probe`, `psshdump`, `edit`, and `divide`
+- Feature-gated decryption APIs and a sync-only `decrypt` CLI for the supported protected MP4 families
+- Built-in CLI for `decrypt`, `dump`, `extract`, `probe`, `psshdump`, `edit`, and `divide`
 - Shared-fixture coverage for regular MP4, fragmented MP4, encrypted init segments, QuickTime-style metadata cases, and derived real codec fixtures for additional codec-family coverage
 
 ## Installation
 
 ```toml
 [dependencies]
-mp4forge = "0.6.0"
+mp4forge = "0.7.0"
 
 # With optional features:
-# mp4forge = { version = "0.6.0", features = ["async"] }
-# mp4forge = { version = "0.6.0", features = ["serde"] }
+# mp4forge = { version = "0.7.0", features = ["async"] }
+# mp4forge = { version = "0.7.0", features = ["decrypt"] }
+# mp4forge = { version = "0.7.0", features = ["decrypt", "async"] }
+# mp4forge = { version = "0.7.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:
@@ -58,6 +61,13 @@ feature flags:
   `AsyncRead + AsyncSeek` and `AsyncWrite + AsyncSeek` inputs and outputs, supports normal
   multithreaded `tokio::spawn` usage for the supported library paths, and keeps the current CLI on
   the existing sync path.
+- `decrypt`: enables the additive decryption input, progress, and support-matrix types that fix
+  the public shape for the decryption surface while keeping the default build unchanged. The
+  landed sync library path covers the Common Encryption family (`cenc`, `cens`, `cbc1`, `cbcs`),
+  PIFF-triggered compatibility behavior, OMA DCF atom files and protected movie layouts, Marlin
+  IPMP ACBC and ACGK OD-track movies, and the retained IAEC protected-movie path. When combined
+  with `async`, it also enables the additive file-backed Tokio async decrypt companions, while the
+  CLI remains on the synchronous path.
 - `serde`: derives `Serialize` and `Deserialize` for the reusable public report structs under
   `mp4forge::cli::probe` and `mp4forge::cli::dump`, along with their nested public codec-detail,
   media-characteristics, `FieldValue`, and `FourCc` data. This is intended for library-side report
@@ -70,6 +80,7 @@ feature flags:
 USAGE: mp4forge COMMAND [ARGS]
 
 COMMAND:
+  decrypt      decrypt a protected MP4 file
   divide       split a fragmented MP4 into track playlists
   dump         display the MP4 box tree
   edit         rewrite selected boxes
@@ -77,6 +88,11 @@ COMMAND:
   psshdump     summarize pssh boxes
   probe        summarize an MP4 file
 ```
+
+`decrypt` is available when the crate is built with `--features decrypt`. The CLI stays
+sync-only, accepts repeated `--key ID:KEY`, optional `--fragments-info FILE`, and optional
+`--show-progress`, and reuses the same library decryption surface that backs the feature-gated
+sync and async APIs.
 
 `divide` currently targets fragmented inputs with up to one AVC video track and one MP4A audio
 track, including encrypted wrappers that preserve those original sample-entry formats. Pass
@@ -107,7 +123,9 @@ field-order hints. Pass `-detail light` for a lighter-weight probe that skips pe
 per-chunk, bitrate, and IDR aggregation, or use `mp4forge::probe::ProbeOptions` from the library
 when you need the same control programmatically.
 
-> See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage patterns, including the Tokio-based async library example behind the optional `async` feature.
+> See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage
+> patterns, including the feature-gated decrypt example and the Tokio-based async library example
+> behind the optional `async` feature.
 
 ## License
 

@@ -15,6 +15,8 @@ pub mod etsi_ts_102_366;
 pub mod etsi_ts_103_190;
 /// FLAC sample-entry and decoder-configuration box definitions.
 pub mod flac;
+/// ISMA Cryp protection-related box definitions.
+pub mod isma_cryp;
 /// ISO/IEC 14496-12 box definitions and codec support.
 pub mod iso14496_12;
 /// ISO/IEC 14496-14 ES descriptor box definitions and codec support.
@@ -27,10 +29,14 @@ pub mod iso14496_30;
 pub mod iso23001_5;
 /// ISO/IEC 23001-7 common-encryption box definitions and codec support.
 pub mod iso23001_7;
+/// Marlin IPMP protection-related box definitions and payload helpers.
+pub mod marlin;
 /// Item-list metadata and key-table box definitions.
 pub mod metadata;
 /// MPEG-H sample-entry and decoder-configuration box definitions.
 pub mod mpeg_h;
+/// OMA DCF decryption-related box definitions.
+pub mod oma_dcf;
 /// Opus sample-entry and decoder-configuration box definitions.
 pub mod opus;
 /// 3GPP `udta`-scoped metadata string box definitions and codec support.
@@ -430,7 +436,10 @@ pub fn default_registry() -> BoxRegistry {
     iso14496_12::register_boxes(&mut registry);
     iso14496_14::register_boxes(&mut registry);
     iso14496_30::register_boxes(&mut registry);
+    isma_cryp::register_boxes(&mut registry);
+    marlin::register_boxes(&mut registry);
     metadata::register_boxes(&mut registry);
+    oma_dcf::register_boxes(&mut registry);
     threegpp::register_boxes(&mut registry);
     av1::register_boxes(&mut registry);
     avs3::register_boxes(&mut registry);
