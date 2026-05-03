@@ -2,13 +2,12 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::decrypt::{
     DecryptError, DecryptOptions, DecryptProgress, DecryptProgressPhase, ParseDecryptionKeyError,
-    decrypt_file, decrypt_file_with_progress,
+    decrypt_file_with_optional_progress_and_fragments_info_path,
 };
 
 /// Runs the decrypt subcommand with `args`, writing progress and failures to `stderr`.
@@ -134,14 +133,23 @@ where
         options.add_key_spec(key_spec)?;
     }
 
-    if let Some(path) = &parsed.fragments_info {
-        options.set_fragments_info_bytes(fs::read(path)?);
-    }
-
     if parsed.show_progress {
-        decrypt_file_with_cli_progress(&parsed.input, &parsed.output, &options, stderr)
+        decrypt_file_with_cli_progress(
+            &parsed.input,
+            &parsed.output,
+            parsed.fragments_info.as_deref(),
+            &options,
+            stderr,
+        )
     } else {
-        decrypt_file(&parsed.input, &parsed.output, &options).map_err(Into::into)
+        decrypt_file_with_optional_progress_and_fragments_info_path(
+            &parsed.input,
+            &parsed.output,
+            parsed.fragments_info.as_deref(),
+            &options,
+            None::<fn(DecryptProgress)>,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -215,6 +223,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, DecryptCliError> {
 fn decrypt_file_with_cli_progress<E>(
     input: &Path,
     output: &Path,
+    fragments_info: Option<&Path>,
     options: &DecryptOptions,
     stderr: &mut E,
 ) -> Result<(), DecryptCliError>
@@ -222,13 +231,19 @@ where
     E: Write,
 {
     let mut progress_write_error = None;
-    decrypt_file_with_progress(input, output, options, |snapshot| {
-        if progress_write_error.is_none()
-            && let Err(error) = write_progress_snapshot(stderr, snapshot)
-        {
-            progress_write_error = Some(error);
-        }
-    })?;
+    decrypt_file_with_optional_progress_and_fragments_info_path(
+        input,
+        output,
+        fragments_info,
+        options,
+        Some(|snapshot| {
+            if progress_write_error.is_none()
+                && let Err(error) = write_progress_snapshot(stderr, snapshot)
+            {
+                progress_write_error = Some(error);
+            }
+        }),
+    )?;
 
     if let Some(error) = progress_write_error {
         return Err(DecryptCliError::Io(error));

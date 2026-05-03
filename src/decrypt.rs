@@ -11,17 +11,20 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::Cursor;
-use std::io::Seek;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use aes::Aes128;
 use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
 #[cfg(feature = "async")]
 use tokio::fs as tokio_fs;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::BoxInfo;
 use crate::FourCc;
+#[cfg(feature = "async")]
+use crate::async_io::{AsyncReadSeek, AsyncWrite, AsyncWriteSeek};
 use crate::boxes::isma_cryp::{Isfm, Islt};
 use crate::boxes::iso14496_12::{
     Co64, Frma, Ftyp, Mfro, Mpod, Saio, Saiz, Sbgp, Schm, Sgpd, Sidx, Stco, Stsc, Stsd, Stsz,
@@ -39,10 +42,11 @@ use crate::boxes::oma_dcf::{
     OHDR_ENCRYPTION_METHOD_NULL, OHDR_PADDING_SCHEME_NONE, OHDR_PADDING_SCHEME_RFC_2630, Odaf,
     Odda, Odhe, Ohdr,
 };
+use crate::codec::ReadSeek as SyncReadSeek;
 use crate::codec::{ImmutableBox, MutableBox, marshal, unmarshal};
 use crate::encryption::{
-    ResolveSampleEncryptionError, ResolvedSampleEncryptionSample, SampleEncryptionContext,
-    resolve_sample_encryption,
+    ResolveSampleEncryptionError, ResolvedSampleEncryptionSample, ResolvedSampleEncryptionSource,
+    SampleEncryptionContext, resolve_sample_encryption,
 };
 use crate::extract::{ExtractError, extract_box, extract_box_as, extract_box_payload_bytes};
 use crate::sidx::{
@@ -961,9 +965,10 @@ pub fn decrypt_file(
     output_path: impl AsRef<Path>,
     options: &DecryptOptions,
 ) -> Result<(), DecryptError> {
-    decrypt_file_with_optional_progress(
+    decrypt_file_with_optional_progress_and_fragments_info_path(
         input_path.as_ref(),
         output_path.as_ref(),
+        None,
         options,
         None::<fn(DecryptProgress)>,
     )
@@ -980,9 +985,10 @@ pub fn decrypt_file_with_progress<F>(
 where
     F: FnMut(DecryptProgress),
 {
-    decrypt_file_with_optional_progress(
+    decrypt_file_with_optional_progress_and_fragments_info_path(
         input_path.as_ref(),
         output_path.as_ref(),
+        None,
         options,
         Some(progress),
     )
@@ -991,11 +997,11 @@ where
 /// Decrypts one encrypted file path into a clear output file through the additive Tokio-based
 /// async library surface.
 ///
-/// The async decrypt rollout stays file-backed for now. Pure in-memory decrypt entry points remain
-/// on the synchronous path because the native transform core itself does not perform asynchronous
-/// I/O. The supported file-backed layouts are the same as the synchronous path, including
-/// top-level OMA DCF atom files and the currently supported protected-sample-entry OMA DCF movie
-/// layout.
+/// The async decrypt rollout stays file-backed for now and uses a seekable incremental reader or
+/// writer path instead of whole-input file slurps. Pure in-memory decrypt entry points remain on
+/// the synchronous path, while the async companions target supported seekable Tokio file handles.
+/// The supported file-backed layouts are the same as the synchronous path, including top-level OMA
+/// DCF atom files and the currently supported protected-sample-entry OMA DCF movie layout.
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub async fn decrypt_file_async(
@@ -1238,6 +1244,124 @@ struct ProgressReporter<F> {
     callback: Option<F>,
 }
 
+struct SyncStreamDecryptPlan {
+    execution: SyncStreamDecryptExecution,
+}
+
+enum SyncStreamDecryptExecution {
+    RootRewrite(RootRewriteStreamPlan),
+    CommonEncryption(CommonEncryptionStreamPlan),
+    Movie(MovieRewriteStreamPlan),
+}
+
+struct RootRewriteStreamPlan {
+    root_boxes: Vec<BoxInfo>,
+    replacements: BTreeMap<u64, Vec<u8>>,
+}
+
+struct CommonEncryptionStreamPlan {
+    root_boxes: Vec<BoxInfo>,
+    moov_replacement: Option<(u64, Vec<u8>)>,
+    moof_replacements: BTreeMap<u64, Vec<u8>>,
+    extra_root_replacements: BTreeMap<u64, Vec<u8>>,
+    mdat_edits: BTreeMap<u64, Vec<CommonEncryptionSampleEdit>>,
+}
+
+type CommonEncryptionStreamRewrites = (
+    BTreeMap<u64, Vec<u8>>,
+    BTreeMap<u64, Vec<CommonEncryptionSampleEdit>>,
+);
+
+struct MovieRewriteStreamPlan {
+    root_boxes: Vec<BoxInfo>,
+    root_replacements: BTreeMap<u64, Vec<u8>>,
+    clear_mdat_header: Vec<u8>,
+    sample_edits: Vec<MovieSampleEdit>,
+}
+
+#[derive(Clone)]
+enum MovieSampleProcessKind {
+    Copy,
+    Marlin {
+        key: [u8; 16],
+    },
+    Oma {
+        odaf: Odaf,
+        ohdr: Ohdr,
+        key: [u8; 16],
+    },
+    Iaec {
+        isfm: Isfm,
+        islt: Option<Islt>,
+        key: [u8; 16],
+    },
+}
+
+#[derive(Clone)]
+struct MovieSampleEdit {
+    absolute_offset: u64,
+    sample_size: u32,
+    process: MovieSampleProcessKind,
+}
+
+struct CommonEncryptionSampleEdit {
+    absolute_offset: u64,
+    sample_size: u32,
+    track_id: u32,
+    scheme_type: FourCc,
+    content_key: [u8; 16],
+    sample: OwnedResolvedSampleEncryptionSample,
+}
+
+#[derive(Clone)]
+struct OwnedResolvedSampleEncryptionSample {
+    sample_index: u32,
+    metadata_source: ResolvedSampleEncryptionSource,
+    is_protected: bool,
+    crypt_byte_block: u8,
+    skip_byte_block: u8,
+    per_sample_iv_size: Option<u8>,
+    initialization_vector: Vec<u8>,
+    constant_iv: Option<Vec<u8>>,
+    kid: [u8; 16],
+    subsamples: Vec<crate::boxes::iso23001_7::SencSubsample>,
+    auxiliary_info_size: u32,
+}
+
+impl OwnedResolvedSampleEncryptionSample {
+    fn from_resolved(sample: &ResolvedSampleEncryptionSample<'_>) -> Self {
+        Self {
+            sample_index: sample.sample_index,
+            metadata_source: sample.metadata_source,
+            is_protected: sample.is_protected,
+            crypt_byte_block: sample.crypt_byte_block,
+            skip_byte_block: sample.skip_byte_block,
+            per_sample_iv_size: sample.per_sample_iv_size,
+            initialization_vector: sample.initialization_vector.to_vec(),
+            constant_iv: sample.constant_iv.map(<[u8]>::to_vec),
+            kid: sample.kid,
+            subsamples: sample.subsamples.to_vec(),
+            auxiliary_info_size: sample.auxiliary_info_size,
+        }
+    }
+
+    fn as_borrowed(&self) -> ResolvedSampleEncryptionSample<'_> {
+        ResolvedSampleEncryptionSample {
+            sample_index: self.sample_index,
+            metadata_source: self.metadata_source,
+            is_protected: self.is_protected,
+            crypt_byte_block: self.crypt_byte_block,
+            skip_byte_block: self.skip_byte_block,
+            per_sample_iv_size: self.per_sample_iv_size,
+            initialization_vector: &self.initialization_vector,
+            constant_iv: self.constant_iv.as_deref(),
+            kid: self.kid,
+            subsamples: &self.subsamples,
+            auxiliary_info_size: self.auxiliary_info_size,
+        }
+    }
+}
+
 impl<F> ProgressReporter<F>
 where
     F: FnMut(DecryptProgress),
@@ -1250,6 +1374,2265 @@ where
         if let Some(callback) = self.callback.as_mut() {
             callback(DecryptProgress::new(phase, completed, total));
         }
+    }
+}
+
+fn decrypt_sync_stream_with_optional_progress<R, W, F>(
+    input: &mut R,
+    output: &mut W,
+    fragments_info_reader: Option<&mut dyn SyncReadSeek>,
+    options: &DecryptOptions,
+    reporter: &mut ProgressReporter<F>,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+    F: FnMut(DecryptProgress),
+{
+    reporter.report(DecryptProgressPhase::InspectStructure, 0, Some(1));
+    let plan = plan_sync_stream_decrypt(input, fragments_info_reader, options, reporter)?;
+    reporter.report(DecryptProgressPhase::InspectStructure, 1, Some(1));
+    reporter.report(DecryptProgressPhase::ProcessSamples, 0, Some(1));
+    execute_sync_stream_decrypt_plan(input, output, &plan)?;
+    reporter.report(DecryptProgressPhase::ProcessSamples, 1, Some(1));
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn decrypt_async_stream_with_optional_progress<R, W, F>(
+    input: &mut R,
+    output: &mut W,
+    fragments_info_reader: Option<&mut dyn AsyncReadSeek>,
+    options: &DecryptOptions,
+    reporter: &mut ProgressReporter<F>,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+    F: FnMut(DecryptProgress),
+{
+    reporter.report(DecryptProgressPhase::InspectStructure, 0, Some(1));
+    let plan = plan_async_stream_decrypt(input, fragments_info_reader, options, reporter).await?;
+    reporter.report(DecryptProgressPhase::InspectStructure, 1, Some(1));
+    reporter.report(DecryptProgressPhase::ProcessSamples, 0, Some(1));
+    execute_async_stream_decrypt_plan(input, output, &plan).await?;
+    reporter.report(DecryptProgressPhase::ProcessSamples, 1, Some(1));
+    Ok(())
+}
+
+fn plan_sync_stream_decrypt<R, F>(
+    input: &mut R,
+    mut fragments_info_reader: Option<&mut dyn SyncReadSeek>,
+    options: &DecryptOptions,
+    reporter: &mut ProgressReporter<F>,
+) -> Result<SyncStreamDecryptPlan, DecryptError>
+where
+    R: Read + Seek,
+    F: FnMut(DecryptProgress),
+{
+    let root_boxes = read_root_box_infos_from_reader(input)?;
+    let layout = classify_decrypt_input_from_reader(input, &root_boxes)?;
+
+    let execution = match layout {
+        DecryptInputLayout::InitSegment => SyncStreamDecryptExecution::RootRewrite(
+            build_common_encryption_init_stream_plan(input, &root_boxes, options.keys())?,
+        ),
+        DecryptInputLayout::FragmentedFile | DecryptInputLayout::MediaSegment => {
+            let fragments_info_bytes = if layout == DecryptInputLayout::MediaSegment {
+                reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 0, Some(1));
+                let fragments_info_bytes =
+                    resolve_stream_fragments_info_bytes(fragments_info_reader.take(), options)?;
+                reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 1, Some(1));
+                Some(fragments_info_bytes)
+            } else {
+                None
+            };
+
+            SyncStreamDecryptExecution::CommonEncryption(build_common_encryption_stream_plan(
+                input,
+                &root_boxes,
+                layout,
+                options.keys(),
+                fragments_info_bytes.as_deref(),
+            )?)
+        }
+        DecryptInputLayout::MarlinIpmpFile => SyncStreamDecryptExecution::Movie(
+            build_marlin_movie_stream_plan(input, &root_boxes, options.keys())?,
+        ),
+        DecryptInputLayout::OmaDcfProtectedMovieFile => SyncStreamDecryptExecution::Movie(
+            build_oma_dcf_movie_stream_plan(input, &root_boxes, options.keys())?,
+        ),
+        DecryptInputLayout::IaecProtectedMovieFile => SyncStreamDecryptExecution::Movie(
+            build_iaec_movie_stream_plan(input, &root_boxes, options.keys())?,
+        ),
+        DecryptInputLayout::OmaDcfAtomFile => SyncStreamDecryptExecution::RootRewrite(
+            build_oma_dcf_atom_stream_plan(input, &root_boxes, options.keys())?,
+        ),
+    };
+
+    Ok(SyncStreamDecryptPlan { execution })
+}
+
+#[cfg(feature = "async")]
+async fn plan_async_stream_decrypt<R, F>(
+    input: &mut R,
+    mut fragments_info_reader: Option<&mut dyn AsyncReadSeek>,
+    options: &DecryptOptions,
+    reporter: &mut ProgressReporter<F>,
+) -> Result<SyncStreamDecryptPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+    F: FnMut(DecryptProgress),
+{
+    let root_boxes = read_root_box_infos_from_async_reader(input).await?;
+    let layout = classify_decrypt_input_from_async_reader(input, &root_boxes).await?;
+
+    let execution = match layout {
+        DecryptInputLayout::InitSegment => SyncStreamDecryptExecution::RootRewrite(
+            build_common_encryption_init_stream_plan_async(input, &root_boxes, options.keys())
+                .await?,
+        ),
+        DecryptInputLayout::FragmentedFile | DecryptInputLayout::MediaSegment => {
+            let fragments_info_bytes = if layout == DecryptInputLayout::MediaSegment {
+                reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 0, Some(1));
+                let fragments_info_bytes = resolve_async_stream_fragments_info_bytes(
+                    fragments_info_reader.take(),
+                    options,
+                )
+                .await?;
+                reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 1, Some(1));
+                Some(fragments_info_bytes)
+            } else {
+                None
+            };
+
+            SyncStreamDecryptExecution::CommonEncryption(
+                build_common_encryption_stream_plan_async(
+                    input,
+                    &root_boxes,
+                    layout,
+                    options.keys(),
+                    fragments_info_bytes.as_deref(),
+                )
+                .await?,
+            )
+        }
+        DecryptInputLayout::MarlinIpmpFile => SyncStreamDecryptExecution::Movie(
+            build_marlin_movie_stream_plan_async(input, &root_boxes, options.keys()).await?,
+        ),
+        DecryptInputLayout::OmaDcfProtectedMovieFile => SyncStreamDecryptExecution::Movie(
+            build_oma_dcf_movie_stream_plan_async(input, &root_boxes, options.keys()).await?,
+        ),
+        DecryptInputLayout::IaecProtectedMovieFile => SyncStreamDecryptExecution::Movie(
+            build_iaec_movie_stream_plan_async(input, &root_boxes, options.keys()).await?,
+        ),
+        DecryptInputLayout::OmaDcfAtomFile => SyncStreamDecryptExecution::RootRewrite(
+            build_oma_dcf_atom_stream_plan_async(input, &root_boxes, options.keys()).await?,
+        ),
+    };
+
+    Ok(SyncStreamDecryptPlan { execution })
+}
+
+fn execute_sync_stream_decrypt_plan<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &SyncStreamDecryptPlan,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+{
+    match &plan.execution {
+        SyncStreamDecryptExecution::RootRewrite(plan) => {
+            execute_root_rewrite_stream_plan(input, output, plan)
+        }
+        SyncStreamDecryptExecution::CommonEncryption(plan) => {
+            execute_common_encryption_stream_plan(input, output, plan)
+        }
+        SyncStreamDecryptExecution::Movie(plan) => execute_movie_stream_plan(input, output, plan),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn execute_async_stream_decrypt_plan<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &SyncStreamDecryptPlan,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+{
+    match &plan.execution {
+        SyncStreamDecryptExecution::RootRewrite(plan) => {
+            execute_root_rewrite_stream_plan_async(input, output, plan).await
+        }
+        SyncStreamDecryptExecution::CommonEncryption(plan) => {
+            execute_common_encryption_stream_plan_async(input, output, plan).await
+        }
+        SyncStreamDecryptExecution::Movie(plan) => {
+            execute_movie_stream_plan_async(input, output, plan).await
+        }
+    }
+}
+
+fn resolve_stream_fragments_info_bytes(
+    fragments_info_reader: Option<&mut dyn SyncReadSeek>,
+    options: &DecryptOptions,
+) -> Result<Vec<u8>, DecryptError> {
+    if let Some(bytes) = options.fragments_info_bytes() {
+        return Ok(bytes.to_vec());
+    }
+    let Some(reader) = fragments_info_reader else {
+        return Err(DecryptError::MissingFragmentsInfo);
+    };
+    read_all_bytes_from_reader(reader)
+}
+
+#[cfg(feature = "async")]
+async fn resolve_async_stream_fragments_info_bytes(
+    fragments_info_reader: Option<&mut dyn AsyncReadSeek>,
+    options: &DecryptOptions,
+) -> Result<Vec<u8>, DecryptError> {
+    if let Some(bytes) = options.fragments_info_bytes() {
+        return Ok(bytes.to_vec());
+    }
+    let Some(reader) = fragments_info_reader else {
+        return Err(DecryptError::MissingFragmentsInfo);
+    };
+    read_all_bytes_from_async_reader(reader).await
+}
+
+fn build_common_encryption_init_stream_plan<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<RootRewriteStreamPlan, DecryptError>
+where
+    R: Read + Seek,
+{
+    let init_bytes = collect_selected_root_box_bytes_from_reader(input, root_boxes, |_| true)?;
+    let context = analyze_init_segment(&init_bytes)?;
+    let rebuilt_moov = rebuild_common_encryption_moov(&init_bytes, &context, keys)?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| invalid_layout("expected one moov box in the init segment".to_owned()))?;
+
+    Ok(RootRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        replacements: BTreeMap::from([(original_moov.offset(), rebuilt_moov)]),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn build_common_encryption_init_stream_plan_async<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<RootRewriteStreamPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let init_bytes =
+        collect_selected_root_box_bytes_from_async_reader(input, root_boxes, |_| true).await?;
+    let context = analyze_init_segment(&init_bytes)?;
+    let rebuilt_moov = rebuild_common_encryption_moov(&init_bytes, &context, keys)?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| invalid_layout("expected one moov box in the init segment".to_owned()))?;
+
+    Ok(RootRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        replacements: BTreeMap::from([(original_moov.offset(), rebuilt_moov)]),
+    })
+}
+
+fn build_oma_dcf_atom_stream_plan<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<RootRewriteStreamPlan, DecryptError>
+where
+    R: Read + Seek,
+{
+    let mut replacements = BTreeMap::new();
+    let mut odrm_index = 0_u32;
+    for info in root_boxes.iter().copied() {
+        if info.box_type() != ODRM {
+            continue;
+        }
+
+        odrm_index = odrm_index
+            .checked_add(1)
+            .ok_or_else(|| invalid_layout("OMA DCF atom index overflowed u32".to_owned()))?;
+        let Some(key) = keys.iter().find_map(|entry| match entry.id() {
+            DecryptionKeyId::TrackId(candidate) if candidate == odrm_index => {
+                Some(entry.key_bytes())
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        let odrm_bytes = read_box_bytes_from_reader(input, info)?;
+        let local_root_boxes = read_root_box_infos(&odrm_bytes)?;
+        let local_odrm_info = local_root_boxes
+            .iter()
+            .copied()
+            .find(|candidate| candidate.box_type() == ODRM)
+            .ok_or_else(|| invalid_layout("expected one local odrm box".to_owned()))?;
+        replacements.insert(
+            info.offset(),
+            rewrite_oma_dcf_atom_box(&odrm_bytes, local_odrm_info, key)?,
+        );
+    }
+
+    Ok(RootRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        replacements,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn build_oma_dcf_atom_stream_plan_async<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<RootRewriteStreamPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let mut replacements = BTreeMap::new();
+    let mut odrm_index = 0_u32;
+    for info in root_boxes.iter().copied() {
+        if info.box_type() != ODRM {
+            continue;
+        }
+
+        odrm_index = odrm_index
+            .checked_add(1)
+            .ok_or_else(|| invalid_layout("OMA DCF atom index overflowed u32".to_owned()))?;
+        let Some(key) = keys.iter().find_map(|entry| match entry.id() {
+            DecryptionKeyId::TrackId(candidate) if candidate == odrm_index => {
+                Some(entry.key_bytes())
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        let odrm_bytes = read_box_bytes_from_async_reader(input, info).await?;
+        let local_root_boxes = read_root_box_infos(&odrm_bytes)?;
+        let local_odrm_info = local_root_boxes
+            .iter()
+            .copied()
+            .find(|candidate| candidate.box_type() == ODRM)
+            .ok_or_else(|| invalid_layout("expected one local odrm box".to_owned()))?;
+        replacements.insert(
+            info.offset(),
+            rewrite_oma_dcf_atom_box(&odrm_bytes, local_odrm_info, key)?,
+        );
+    }
+
+    Ok(RootRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        replacements,
+    })
+}
+
+fn execute_root_rewrite_stream_plan<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &RootRewriteStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+{
+    output.seek(SeekFrom::Start(0))?;
+    for root_info in &plan.root_boxes {
+        if let Some(replacement) = plan.replacements.get(&root_info.offset()) {
+            output.write_all(replacement)?;
+        } else {
+            copy_exact_range(input, output, root_info.offset(), root_info.size())?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn execute_root_rewrite_stream_plan_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &RootRewriteStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+{
+    output.seek(SeekFrom::Start(0)).await?;
+    for root_info in &plan.root_boxes {
+        if let Some(replacement) = plan.replacements.get(&root_info.offset()) {
+            output.write_all(replacement).await?;
+        } else {
+            copy_exact_range_async(input, output, root_info.offset(), root_info.size()).await?;
+        }
+    }
+    output.flush().await?;
+    Ok(())
+}
+
+fn collect_selected_root_box_bytes_from_reader<R, P>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    mut include: P,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek,
+    P: FnMut(BoxInfo) -> bool,
+{
+    let mut bytes = Vec::new();
+    for info in root_boxes.iter().copied().filter(|info| include(*info)) {
+        bytes.extend_from_slice(&read_box_bytes_from_reader(input, info)?);
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn collect_selected_root_box_bytes_from_async_reader<R, P>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    mut include: P,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek,
+    P: FnMut(BoxInfo) -> bool,
+{
+    let mut bytes = Vec::new();
+    for info in root_boxes.iter().copied().filter(|info| include(*info)) {
+        bytes.extend_from_slice(&read_box_bytes_from_async_reader(input, info).await?);
+    }
+    Ok(bytes)
+}
+
+fn collect_non_mdat_root_box_bytes_from_reader<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek,
+{
+    collect_selected_root_box_bytes_from_reader(input, root_boxes, |info| info.box_type() != MDAT)
+}
+
+#[cfg(feature = "async")]
+async fn collect_non_mdat_root_box_bytes_from_async_reader<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    collect_selected_root_box_bytes_from_async_reader(input, root_boxes, |info| {
+        info.box_type() != MDAT
+    })
+    .await
+}
+
+type StreamedMoviePayloadPlan = (
+    RebuiltMovieSampleSizes,
+    TrackRelativeChunkOffsets,
+    Vec<MovieSampleEdit>,
+    u64,
+);
+
+fn build_marlin_movie_stream_plan<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<MovieRewriteStreamPlan, DecryptError>
+where
+    R: Read + Seek,
+{
+    let metadata_input = collect_non_mdat_root_box_bytes_from_reader(input, root_boxes)?;
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let context = analyze_marlin_movie_metadata_from_reader(&metadata_input, input, mdat_infos)?;
+    let metadata_root_boxes = read_root_box_infos(&metadata_input)?;
+    let mdat_ranges = media_data_ranges_from_infos(&context.mdat_infos);
+
+    let mut track_processes = BTreeMap::new();
+    for track in &context.tracks {
+        let process = match track.marlin.as_ref() {
+            Some(protection) => resolve_marlin_track_key(track.track_id, protection, keys)?
+                .map(|key| MovieSampleProcessKind::Marlin { key })
+                .unwrap_or(MovieSampleProcessKind::Copy),
+            None => MovieSampleProcessKind::Copy,
+        };
+        track_processes.insert(track.track_id, process);
+    }
+
+    let payload_tracks = context
+        .tracks
+        .iter()
+        .map(|track| MovieTrackPayloadPlan {
+            track_id: track.track_id,
+            stsc: &track.stsc,
+            chunk_offsets: &track.chunk_offsets,
+            sample_sizes: &track.sample_sizes,
+        })
+        .collect::<Vec<_>>();
+    let (clear_sample_sizes, relative_chunk_offsets, sample_edits, clear_payload_size) =
+        plan_movie_payload_from_reader(input, &mdat_ranges, &payload_tracks, |track_id| {
+            track_processes.get(&track_id).cloned().ok_or_else(|| {
+                invalid_layout(format!(
+                    "missing stream-first Marlin process for track {}",
+                    track_id
+                ))
+            })
+        })?;
+
+    let mut track_plans = Vec::new();
+    for track in &context.tracks {
+        let clear_sizes = clear_sample_sizes.get(&track.track_id).ok_or_else(|| {
+            invalid_layout(format!(
+                "missing clear sample sizes for Marlin track {}",
+                track.track_id
+            ))
+        })?;
+        track_plans.push(MovieTrackRewritePlan {
+            track_id: track.track_id,
+            trak_info: track.trak_info,
+            mdia_info: track.mdia_info,
+            minf_info: track.minf_info,
+            stbl_info: track.stbl_info,
+            chunk_offsets: track.chunk_offsets.clone(),
+            stsd_replacement: None,
+            stsz_replacement: Some((
+                track.stsz_info.offset(),
+                build_patched_stsz_bytes(&track.stsz, clear_sizes, "Marlin")?,
+            )),
+        });
+    }
+
+    let placeholder_offsets = track_plans
+        .iter()
+        .map(|plan| (plan.track_id, chunk_offsets_values(&plan.chunk_offsets)))
+        .collect::<TrackRelativeChunkOffsets>();
+    let moov_placeholder = build_marlin_moov_with_track_replacements(
+        &metadata_input,
+        &context,
+        &track_plans,
+        &placeholder_offsets,
+    )?;
+    let clear_ftyp = encode_box_with_children(&build_clear_marlin_ftyp(&context.ftyp), &[])?;
+    let clear_mdat_header = build_streamed_mdat_header(clear_payload_size)?;
+    let mdat_payload_offset = compute_single_mdat_payload_offset(
+        &metadata_input,
+        &metadata_root_boxes,
+        Some(context.ftyp_info),
+        context.moov_info,
+        Some(&clear_ftyp),
+        &moov_placeholder,
+        u64::try_from(clear_mdat_header.len()).map_err(|_| {
+            invalid_layout("clear Marlin mdat header size does not fit in u64".to_owned())
+        })?,
+    )?;
+    let absolute_offsets = relative_chunk_offsets
+        .iter()
+        .map(|(track_id, offsets)| {
+            let absolute = offsets
+                .iter()
+                .map(|offset| {
+                    mdat_payload_offset.checked_add(*offset).ok_or_else(|| {
+                        invalid_layout("clear Marlin chunk offset overflowed u64".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((*track_id, absolute))
+        })
+        .collect::<Result<TrackRelativeChunkOffsets, DecryptRewriteError>>()?;
+    let clear_moov = build_marlin_moov_with_track_replacements(
+        &metadata_input,
+        &context,
+        &track_plans,
+        &absolute_offsets,
+    )?;
+    let original_ftyp = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP)
+        .ok_or_else(|| {
+            invalid_layout("expected one root ftyp box in the Marlin movie file".to_owned())
+        })?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the Marlin movie file".to_owned())
+        })?;
+
+    Ok(MovieRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        root_replacements: BTreeMap::from([
+            (original_ftyp.offset(), clear_ftyp),
+            (original_moov.offset(), clear_moov),
+        ]),
+        clear_mdat_header,
+        sample_edits,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn build_marlin_movie_stream_plan_async<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<MovieRewriteStreamPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let metadata_input =
+        collect_non_mdat_root_box_bytes_from_async_reader(input, root_boxes).await?;
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let context =
+        analyze_marlin_movie_metadata_from_async_reader(&metadata_input, input, mdat_infos).await?;
+    let metadata_root_boxes = read_root_box_infos(&metadata_input)?;
+    let mdat_ranges = media_data_ranges_from_infos(&context.mdat_infos);
+
+    let mut track_processes = BTreeMap::new();
+    for track in &context.tracks {
+        let process = match track.marlin.as_ref() {
+            Some(protection) => resolve_marlin_track_key(track.track_id, protection, keys)?
+                .map(|key| MovieSampleProcessKind::Marlin { key })
+                .unwrap_or(MovieSampleProcessKind::Copy),
+            None => MovieSampleProcessKind::Copy,
+        };
+        track_processes.insert(track.track_id, process);
+    }
+
+    let payload_tracks = context
+        .tracks
+        .iter()
+        .map(|track| MovieTrackPayloadPlan {
+            track_id: track.track_id,
+            stsc: &track.stsc,
+            chunk_offsets: &track.chunk_offsets,
+            sample_sizes: &track.sample_sizes,
+        })
+        .collect::<Vec<_>>();
+    let (clear_sample_sizes, relative_chunk_offsets, sample_edits, clear_payload_size) =
+        plan_movie_payload_from_async_reader(input, &mdat_ranges, &payload_tracks, |track_id| {
+            track_processes.get(&track_id).cloned().ok_or_else(|| {
+                invalid_layout(format!(
+                    "missing stream-first Marlin process for track {}",
+                    track_id
+                ))
+            })
+        })
+        .await?;
+
+    let mut track_plans = Vec::new();
+    for track in &context.tracks {
+        let clear_sizes = clear_sample_sizes.get(&track.track_id).ok_or_else(|| {
+            invalid_layout(format!(
+                "missing clear sample sizes for Marlin track {}",
+                track.track_id
+            ))
+        })?;
+        track_plans.push(MovieTrackRewritePlan {
+            track_id: track.track_id,
+            trak_info: track.trak_info,
+            mdia_info: track.mdia_info,
+            minf_info: track.minf_info,
+            stbl_info: track.stbl_info,
+            chunk_offsets: track.chunk_offsets.clone(),
+            stsd_replacement: None,
+            stsz_replacement: Some((
+                track.stsz_info.offset(),
+                build_patched_stsz_bytes(&track.stsz, clear_sizes, "Marlin")?,
+            )),
+        });
+    }
+
+    let placeholder_offsets = track_plans
+        .iter()
+        .map(|plan| (plan.track_id, chunk_offsets_values(&plan.chunk_offsets)))
+        .collect::<TrackRelativeChunkOffsets>();
+    let moov_placeholder = build_marlin_moov_with_track_replacements(
+        &metadata_input,
+        &context,
+        &track_plans,
+        &placeholder_offsets,
+    )?;
+    let clear_ftyp = encode_box_with_children(&build_clear_marlin_ftyp(&context.ftyp), &[])?;
+    let clear_mdat_header = build_streamed_mdat_header(clear_payload_size)?;
+    let mdat_payload_offset = compute_single_mdat_payload_offset(
+        &metadata_input,
+        &metadata_root_boxes,
+        Some(context.ftyp_info),
+        context.moov_info,
+        Some(&clear_ftyp),
+        &moov_placeholder,
+        u64::try_from(clear_mdat_header.len()).map_err(|_| {
+            invalid_layout("clear Marlin mdat header size does not fit in u64".to_owned())
+        })?,
+    )?;
+    let absolute_offsets = relative_chunk_offsets
+        .iter()
+        .map(|(track_id, offsets)| {
+            let absolute = offsets
+                .iter()
+                .map(|offset| {
+                    mdat_payload_offset.checked_add(*offset).ok_or_else(|| {
+                        invalid_layout("clear Marlin chunk offset overflowed u64".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((*track_id, absolute))
+        })
+        .collect::<Result<TrackRelativeChunkOffsets, DecryptRewriteError>>()?;
+    let clear_moov = build_marlin_moov_with_track_replacements(
+        &metadata_input,
+        &context,
+        &track_plans,
+        &absolute_offsets,
+    )?;
+    let original_ftyp = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP)
+        .ok_or_else(|| {
+            invalid_layout("expected one root ftyp box in the Marlin movie file".to_owned())
+        })?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the Marlin movie file".to_owned())
+        })?;
+
+    Ok(MovieRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        root_replacements: BTreeMap::from([
+            (original_ftyp.offset(), clear_ftyp),
+            (original_moov.offset(), clear_moov),
+        ]),
+        clear_mdat_header,
+        sample_edits,
+    })
+}
+
+fn build_oma_dcf_movie_stream_plan<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<MovieRewriteStreamPlan, DecryptError>
+where
+    R: Read + Seek,
+{
+    let metadata_input = collect_non_mdat_root_box_bytes_from_reader(input, root_boxes)?;
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let context = analyze_oma_dcf_movie_metadata(&metadata_input, mdat_infos)?;
+    let metadata_root_boxes = read_root_box_infos(&metadata_input)?;
+    let mdat_ranges = media_data_ranges_from_infos(&context.mdat_infos);
+    let protected_by_track = context
+        .tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let track_keys = keys
+        .iter()
+        .filter_map(|entry| match entry.id() {
+            DecryptionKeyId::TrackId(track_id) => Some((track_id, entry.key_bytes())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut payload_tracks = context
+        .tracks
+        .iter()
+        .map(|track| MovieTrackPayloadPlan {
+            track_id: track.track_id,
+            stsc: &track.stsc,
+            chunk_offsets: &track.chunk_offsets,
+            sample_sizes: &track.sample_sizes,
+        })
+        .collect::<Vec<_>>();
+    payload_tracks.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackPayloadPlan {
+                track_id: track.track_id,
+                stsc: &track.stsc,
+                chunk_offsets: &track.chunk_offsets,
+                sample_sizes: &track.sample_sizes,
+            }),
+    );
+
+    let (clear_sample_sizes, relative_chunk_offsets, sample_edits, clear_payload_size) =
+        plan_movie_payload_from_reader(input, &mdat_ranges, &payload_tracks, |track_id| {
+            let Some(track) = protected_by_track.get(&track_id) else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            let Some(key) = track_keys.get(&track_id).copied() else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            Ok(MovieSampleProcessKind::Oma {
+                odaf: track.odaf.clone(),
+                ohdr: track.ohdr.clone(),
+                key,
+            })
+        })?;
+
+    let mut track_plans = Vec::new();
+    for track in &context.tracks {
+        let stsd_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsd_info.offset(),
+                rebuild_box_with_child_replacements(
+                    &metadata_input,
+                    track.stsd_info,
+                    &BTreeMap::from([(
+                        track.sample_entry_info.offset(),
+                        Some(build_clear_sample_entry_bytes(
+                            &metadata_input,
+                            track.sample_entry_info,
+                            track.original_format,
+                            track.sinf_info,
+                        )?),
+                    )]),
+                    None,
+                )?,
+            ))
+        } else {
+            None
+        };
+        let stsz_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsz_info.offset(),
+                build_patched_stsz_bytes(
+                    &track.stsz,
+                    clear_sample_sizes.get(&track.track_id).ok_or_else(|| {
+                        invalid_layout(format!(
+                            "missing rebuilt sample sizes for OMA DCF track {}",
+                            track.track_id
+                        ))
+                    })?,
+                    "OMA DCF",
+                )?,
+            ))
+        } else {
+            None
+        };
+        track_plans.push(MovieTrackRewritePlan {
+            track_id: track.track_id,
+            trak_info: track.trak_info,
+            mdia_info: track.mdia_info,
+            minf_info: track.minf_info,
+            stbl_info: track.stbl_info,
+            chunk_offsets: track.chunk_offsets.clone(),
+            stsd_replacement,
+            stsz_replacement,
+        });
+    }
+    track_plans.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackRewritePlan {
+                track_id: track.track_id,
+                trak_info: track.trak_info,
+                mdia_info: track.mdia_info,
+                minf_info: track.minf_info,
+                stbl_info: track.stbl_info,
+                chunk_offsets: track.chunk_offsets.clone(),
+                stsd_replacement: None,
+                stsz_replacement: None,
+            }),
+    );
+
+    let placeholder_offsets = track_plans
+        .iter()
+        .map(|plan| (plan.track_id, chunk_offsets_values(&plan.chunk_offsets)))
+        .collect::<TrackRelativeChunkOffsets>();
+    let moov_placeholder = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &placeholder_offsets,
+    )?;
+    let clear_ftyp = build_patched_oma_clear_ftyp_bytes(&metadata_input, context.ftyp_info)?;
+    let clear_mdat_header = build_streamed_mdat_header(clear_payload_size)?;
+    let mdat_payload_offset = compute_single_mdat_payload_offset(
+        &metadata_input,
+        &metadata_root_boxes,
+        context.ftyp_info,
+        context.moov_info,
+        clear_ftyp.as_deref(),
+        &moov_placeholder,
+        u64::try_from(clear_mdat_header.len()).map_err(|_| {
+            invalid_layout("clear OMA DCF mdat header size does not fit in u64".to_owned())
+        })?,
+    )?;
+    let absolute_offsets = relative_chunk_offsets
+        .iter()
+        .map(|(track_id, offsets)| {
+            let absolute = offsets
+                .iter()
+                .map(|offset| {
+                    mdat_payload_offset.checked_add(*offset).ok_or_else(|| {
+                        invalid_layout("patched movie chunk offset overflowed u64".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((*track_id, absolute))
+        })
+        .collect::<Result<TrackRelativeChunkOffsets, DecryptRewriteError>>()?;
+    let clear_moov = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &absolute_offsets,
+    )?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the protected movie file".to_owned())
+        })?;
+    let original_ftyp = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP);
+    let mut root_replacements = BTreeMap::from([(original_moov.offset(), clear_moov)]);
+    if let (Some(original_ftyp), Some(clear_ftyp)) = (original_ftyp, clear_ftyp) {
+        root_replacements.insert(original_ftyp.offset(), clear_ftyp);
+    }
+
+    Ok(MovieRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        root_replacements,
+        clear_mdat_header,
+        sample_edits,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn build_oma_dcf_movie_stream_plan_async<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<MovieRewriteStreamPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let metadata_input =
+        collect_non_mdat_root_box_bytes_from_async_reader(input, root_boxes).await?;
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let context = analyze_oma_dcf_movie_metadata(&metadata_input, mdat_infos)?;
+    let metadata_root_boxes = read_root_box_infos(&metadata_input)?;
+    let mdat_ranges = media_data_ranges_from_infos(&context.mdat_infos);
+    let protected_by_track = context
+        .tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let track_keys = keys
+        .iter()
+        .filter_map(|entry| match entry.id() {
+            DecryptionKeyId::TrackId(track_id) => Some((track_id, entry.key_bytes())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut payload_tracks = context
+        .tracks
+        .iter()
+        .map(|track| MovieTrackPayloadPlan {
+            track_id: track.track_id,
+            stsc: &track.stsc,
+            chunk_offsets: &track.chunk_offsets,
+            sample_sizes: &track.sample_sizes,
+        })
+        .collect::<Vec<_>>();
+    payload_tracks.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackPayloadPlan {
+                track_id: track.track_id,
+                stsc: &track.stsc,
+                chunk_offsets: &track.chunk_offsets,
+                sample_sizes: &track.sample_sizes,
+            }),
+    );
+
+    let (clear_sample_sizes, relative_chunk_offsets, sample_edits, clear_payload_size) =
+        plan_movie_payload_from_async_reader(input, &mdat_ranges, &payload_tracks, |track_id| {
+            let Some(track) = protected_by_track.get(&track_id) else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            let Some(key) = track_keys.get(&track_id).copied() else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            Ok(MovieSampleProcessKind::Oma {
+                odaf: track.odaf.clone(),
+                ohdr: track.ohdr.clone(),
+                key,
+            })
+        })
+        .await?;
+
+    let mut track_plans = Vec::new();
+    for track in &context.tracks {
+        let stsd_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsd_info.offset(),
+                rebuild_box_with_child_replacements(
+                    &metadata_input,
+                    track.stsd_info,
+                    &BTreeMap::from([(
+                        track.sample_entry_info.offset(),
+                        Some(build_clear_sample_entry_bytes(
+                            &metadata_input,
+                            track.sample_entry_info,
+                            track.original_format,
+                            track.sinf_info,
+                        )?),
+                    )]),
+                    None,
+                )?,
+            ))
+        } else {
+            None
+        };
+        let stsz_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsz_info.offset(),
+                build_patched_stsz_bytes(
+                    &track.stsz,
+                    clear_sample_sizes.get(&track.track_id).ok_or_else(|| {
+                        invalid_layout(format!(
+                            "missing rebuilt sample sizes for OMA DCF track {}",
+                            track.track_id
+                        ))
+                    })?,
+                    "OMA DCF",
+                )?,
+            ))
+        } else {
+            None
+        };
+        track_plans.push(MovieTrackRewritePlan {
+            track_id: track.track_id,
+            trak_info: track.trak_info,
+            mdia_info: track.mdia_info,
+            minf_info: track.minf_info,
+            stbl_info: track.stbl_info,
+            chunk_offsets: track.chunk_offsets.clone(),
+            stsd_replacement,
+            stsz_replacement,
+        });
+    }
+    track_plans.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackRewritePlan {
+                track_id: track.track_id,
+                trak_info: track.trak_info,
+                mdia_info: track.mdia_info,
+                minf_info: track.minf_info,
+                stbl_info: track.stbl_info,
+                chunk_offsets: track.chunk_offsets.clone(),
+                stsd_replacement: None,
+                stsz_replacement: None,
+            }),
+    );
+
+    let placeholder_offsets = track_plans
+        .iter()
+        .map(|plan| (plan.track_id, chunk_offsets_values(&plan.chunk_offsets)))
+        .collect::<TrackRelativeChunkOffsets>();
+    let moov_placeholder = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &placeholder_offsets,
+    )?;
+    let clear_ftyp = build_patched_oma_clear_ftyp_bytes(&metadata_input, context.ftyp_info)?;
+    let clear_mdat_header = build_streamed_mdat_header(clear_payload_size)?;
+    let mdat_payload_offset = compute_single_mdat_payload_offset(
+        &metadata_input,
+        &metadata_root_boxes,
+        context.ftyp_info,
+        context.moov_info,
+        clear_ftyp.as_deref(),
+        &moov_placeholder,
+        u64::try_from(clear_mdat_header.len()).map_err(|_| {
+            invalid_layout("clear OMA DCF mdat header size does not fit in u64".to_owned())
+        })?,
+    )?;
+    let absolute_offsets = relative_chunk_offsets
+        .iter()
+        .map(|(track_id, offsets)| {
+            let absolute = offsets
+                .iter()
+                .map(|offset| {
+                    mdat_payload_offset.checked_add(*offset).ok_or_else(|| {
+                        invalid_layout("patched movie chunk offset overflowed u64".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((*track_id, absolute))
+        })
+        .collect::<Result<TrackRelativeChunkOffsets, DecryptRewriteError>>()?;
+    let clear_moov = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &absolute_offsets,
+    )?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the protected movie file".to_owned())
+        })?;
+    let original_ftyp = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP);
+    let mut root_replacements = BTreeMap::from([(original_moov.offset(), clear_moov)]);
+    if let (Some(original_ftyp), Some(clear_ftyp)) = (original_ftyp, clear_ftyp) {
+        root_replacements.insert(original_ftyp.offset(), clear_ftyp);
+    }
+
+    Ok(MovieRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        root_replacements,
+        clear_mdat_header,
+        sample_edits,
+    })
+}
+
+fn build_iaec_movie_stream_plan<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<MovieRewriteStreamPlan, DecryptError>
+where
+    R: Read + Seek,
+{
+    let metadata_input = collect_non_mdat_root_box_bytes_from_reader(input, root_boxes)?;
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let context = analyze_iaec_movie_metadata(&metadata_input, mdat_infos)?;
+    let metadata_root_boxes = read_root_box_infos(&metadata_input)?;
+    let mdat_ranges = media_data_ranges_from_infos(&context.mdat_infos);
+    let protected_by_track = context
+        .tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let track_keys = keys
+        .iter()
+        .filter_map(|entry| match entry.id() {
+            DecryptionKeyId::TrackId(track_id) => Some((track_id, entry.key_bytes())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut payload_tracks = context
+        .tracks
+        .iter()
+        .map(|track| MovieTrackPayloadPlan {
+            track_id: track.track_id,
+            stsc: &track.stsc,
+            chunk_offsets: &track.chunk_offsets,
+            sample_sizes: &track.sample_sizes,
+        })
+        .collect::<Vec<_>>();
+    payload_tracks.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackPayloadPlan {
+                track_id: track.track_id,
+                stsc: &track.stsc,
+                chunk_offsets: &track.chunk_offsets,
+                sample_sizes: &track.sample_sizes,
+            }),
+    );
+
+    let (clear_sample_sizes, relative_chunk_offsets, sample_edits, clear_payload_size) =
+        plan_movie_payload_from_reader(input, &mdat_ranges, &payload_tracks, |track_id| {
+            let Some(track) = protected_by_track.get(&track_id) else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            let Some(key) = track_keys.get(&track_id).copied() else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            Ok(MovieSampleProcessKind::Iaec {
+                isfm: track.isfm.clone(),
+                islt: track.islt.clone(),
+                key,
+            })
+        })?;
+
+    let mut track_plans = Vec::new();
+    for track in &context.tracks {
+        let stsd_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsd_info.offset(),
+                rebuild_box_with_child_replacements(
+                    &metadata_input,
+                    track.stsd_info,
+                    &BTreeMap::from([(
+                        track.sample_entry_info.offset(),
+                        Some(build_clear_sample_entry_bytes(
+                            &metadata_input,
+                            track.sample_entry_info,
+                            track.original_format,
+                            track.sinf_info,
+                        )?),
+                    )]),
+                    None,
+                )?,
+            ))
+        } else {
+            None
+        };
+        let stsz_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsz_info.offset(),
+                build_patched_stsz_bytes(
+                    &track.stsz,
+                    clear_sample_sizes.get(&track.track_id).ok_or_else(|| {
+                        invalid_layout(format!(
+                            "missing rebuilt sample sizes for IAEC track {}",
+                            track.track_id
+                        ))
+                    })?,
+                    "IAEC",
+                )?,
+            ))
+        } else {
+            None
+        };
+        track_plans.push(MovieTrackRewritePlan {
+            track_id: track.track_id,
+            trak_info: track.trak_info,
+            mdia_info: track.mdia_info,
+            minf_info: track.minf_info,
+            stbl_info: track.stbl_info,
+            chunk_offsets: track.chunk_offsets.clone(),
+            stsd_replacement,
+            stsz_replacement,
+        });
+    }
+    track_plans.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackRewritePlan {
+                track_id: track.track_id,
+                trak_info: track.trak_info,
+                mdia_info: track.mdia_info,
+                minf_info: track.minf_info,
+                stbl_info: track.stbl_info,
+                chunk_offsets: track.chunk_offsets.clone(),
+                stsd_replacement: None,
+                stsz_replacement: None,
+            }),
+    );
+
+    let placeholder_offsets = track_plans
+        .iter()
+        .map(|plan| (plan.track_id, chunk_offsets_values(&plan.chunk_offsets)))
+        .collect::<TrackRelativeChunkOffsets>();
+    let moov_placeholder = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &placeholder_offsets,
+    )?;
+    let clear_mdat_header = build_streamed_mdat_header(clear_payload_size)?;
+    let mdat_payload_offset = compute_single_mdat_payload_offset(
+        &metadata_input,
+        &metadata_root_boxes,
+        context.ftyp_info,
+        context.moov_info,
+        None,
+        &moov_placeholder,
+        u64::try_from(clear_mdat_header.len()).map_err(|_| {
+            invalid_layout("clear IAEC mdat header size does not fit in u64".to_owned())
+        })?,
+    )?;
+    let absolute_offsets = relative_chunk_offsets
+        .iter()
+        .map(|(track_id, offsets)| {
+            let absolute = offsets
+                .iter()
+                .map(|offset| {
+                    mdat_payload_offset.checked_add(*offset).ok_or_else(|| {
+                        invalid_layout("patched movie chunk offset overflowed u64".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((*track_id, absolute))
+        })
+        .collect::<Result<TrackRelativeChunkOffsets, DecryptRewriteError>>()?;
+    let clear_moov = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &absolute_offsets,
+    )?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the protected movie file".to_owned())
+        })?;
+
+    Ok(MovieRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        root_replacements: BTreeMap::from([(original_moov.offset(), clear_moov)]),
+        clear_mdat_header,
+        sample_edits,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn build_iaec_movie_stream_plan_async<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    keys: &[DecryptionKey],
+) -> Result<MovieRewriteStreamPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let metadata_input =
+        collect_non_mdat_root_box_bytes_from_async_reader(input, root_boxes).await?;
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let context = analyze_iaec_movie_metadata(&metadata_input, mdat_infos)?;
+    let metadata_root_boxes = read_root_box_infos(&metadata_input)?;
+    let mdat_ranges = media_data_ranges_from_infos(&context.mdat_infos);
+    let protected_by_track = context
+        .tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let track_keys = keys
+        .iter()
+        .filter_map(|entry| match entry.id() {
+            DecryptionKeyId::TrackId(track_id) => Some((track_id, entry.key_bytes())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut payload_tracks = context
+        .tracks
+        .iter()
+        .map(|track| MovieTrackPayloadPlan {
+            track_id: track.track_id,
+            stsc: &track.stsc,
+            chunk_offsets: &track.chunk_offsets,
+            sample_sizes: &track.sample_sizes,
+        })
+        .collect::<Vec<_>>();
+    payload_tracks.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackPayloadPlan {
+                track_id: track.track_id,
+                stsc: &track.stsc,
+                chunk_offsets: &track.chunk_offsets,
+                sample_sizes: &track.sample_sizes,
+            }),
+    );
+
+    let (clear_sample_sizes, relative_chunk_offsets, sample_edits, clear_payload_size) =
+        plan_movie_payload_from_async_reader(input, &mdat_ranges, &payload_tracks, |track_id| {
+            let Some(track) = protected_by_track.get(&track_id) else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            let Some(key) = track_keys.get(&track_id).copied() else {
+                return Ok(MovieSampleProcessKind::Copy);
+            };
+            Ok(MovieSampleProcessKind::Iaec {
+                isfm: track.isfm.clone(),
+                islt: track.islt.clone(),
+                key,
+            })
+        })
+        .await?;
+
+    let mut track_plans = Vec::new();
+    for track in &context.tracks {
+        let stsd_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsd_info.offset(),
+                rebuild_box_with_child_replacements(
+                    &metadata_input,
+                    track.stsd_info,
+                    &BTreeMap::from([(
+                        track.sample_entry_info.offset(),
+                        Some(build_clear_sample_entry_bytes(
+                            &metadata_input,
+                            track.sample_entry_info,
+                            track.original_format,
+                            track.sinf_info,
+                        )?),
+                    )]),
+                    None,
+                )?,
+            ))
+        } else {
+            None
+        };
+        let stsz_replacement = if track_keys.contains_key(&track.track_id) {
+            Some((
+                track.stsz_info.offset(),
+                build_patched_stsz_bytes(
+                    &track.stsz,
+                    clear_sample_sizes.get(&track.track_id).ok_or_else(|| {
+                        invalid_layout(format!(
+                            "missing rebuilt sample sizes for IAEC track {}",
+                            track.track_id
+                        ))
+                    })?,
+                    "IAEC",
+                )?,
+            ))
+        } else {
+            None
+        };
+        track_plans.push(MovieTrackRewritePlan {
+            track_id: track.track_id,
+            trak_info: track.trak_info,
+            mdia_info: track.mdia_info,
+            minf_info: track.minf_info,
+            stbl_info: track.stbl_info,
+            chunk_offsets: track.chunk_offsets.clone(),
+            stsd_replacement,
+            stsz_replacement,
+        });
+    }
+    track_plans.extend(
+        context
+            .other_tracks
+            .iter()
+            .map(|track| MovieTrackRewritePlan {
+                track_id: track.track_id,
+                trak_info: track.trak_info,
+                mdia_info: track.mdia_info,
+                minf_info: track.minf_info,
+                stbl_info: track.stbl_info,
+                chunk_offsets: track.chunk_offsets.clone(),
+                stsd_replacement: None,
+                stsz_replacement: None,
+            }),
+    );
+
+    let placeholder_offsets = track_plans
+        .iter()
+        .map(|plan| (plan.track_id, chunk_offsets_values(&plan.chunk_offsets)))
+        .collect::<TrackRelativeChunkOffsets>();
+    let moov_placeholder = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &placeholder_offsets,
+    )?;
+    let clear_mdat_header = build_streamed_mdat_header(clear_payload_size)?;
+    let mdat_payload_offset = compute_single_mdat_payload_offset(
+        &metadata_input,
+        &metadata_root_boxes,
+        context.ftyp_info,
+        context.moov_info,
+        None,
+        &moov_placeholder,
+        u64::try_from(clear_mdat_header.len()).map_err(|_| {
+            invalid_layout("clear IAEC mdat header size does not fit in u64".to_owned())
+        })?,
+    )?;
+    let absolute_offsets = relative_chunk_offsets
+        .iter()
+        .map(|(track_id, offsets)| {
+            let absolute = offsets
+                .iter()
+                .map(|offset| {
+                    mdat_payload_offset.checked_add(*offset).ok_or_else(|| {
+                        invalid_layout("patched movie chunk offset overflowed u64".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((*track_id, absolute))
+        })
+        .collect::<Result<TrackRelativeChunkOffsets, DecryptRewriteError>>()?;
+    let clear_moov = build_movie_moov_with_track_replacements(
+        &metadata_input,
+        context.moov_info,
+        &track_plans,
+        &absolute_offsets,
+    )?;
+    let original_moov = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the protected movie file".to_owned())
+        })?;
+
+    Ok(MovieRewriteStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        root_replacements: BTreeMap::from([(original_moov.offset(), clear_moov)]),
+        clear_mdat_header,
+        sample_edits,
+    })
+}
+
+fn build_streamed_mdat_header(payload_size: u64) -> Result<Vec<u8>, DecryptRewriteError> {
+    let header_size = if payload_size
+        .checked_add(8)
+        .is_some_and(|size| size <= u64::from(u32::MAX))
+    {
+        8
+    } else {
+        16
+    };
+    encode_raw_box_with_header_size(MDAT, &[], header_size).and_then(|_| {
+        let total_size = payload_size
+            .checked_add(header_size)
+            .ok_or_else(|| invalid_layout("clear mdat size overflowed u64".to_owned()))?;
+        Ok(BoxInfo::new(MDAT, total_size)
+            .with_header_size(header_size)
+            .encode())
+    })
+}
+
+fn execute_movie_stream_plan<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &MovieRewriteStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+{
+    output.seek(SeekFrom::Start(0))?;
+    for root_info in &plan.root_boxes {
+        if root_info.box_type() == MDAT {
+            continue;
+        }
+        if let Some(replacement) = plan.root_replacements.get(&root_info.offset()) {
+            output.write_all(replacement)?;
+        } else {
+            copy_exact_range(input, output, root_info.offset(), root_info.size())?;
+        }
+    }
+    output.write_all(&plan.clear_mdat_header)?;
+    for sample_edit in &plan.sample_edits {
+        let encrypted = read_sample_bytes_from_reader(
+            input,
+            sample_edit.absolute_offset,
+            sample_edit.sample_size,
+        )?;
+        let clear = process_movie_sample_bytes(&sample_edit.process, &encrypted)?;
+        output.write_all(&clear)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn execute_movie_stream_plan_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &MovieRewriteStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+{
+    output.seek(SeekFrom::Start(0)).await?;
+    for root_info in &plan.root_boxes {
+        if root_info.box_type() == MDAT {
+            continue;
+        }
+        if let Some(replacement) = plan.root_replacements.get(&root_info.offset()) {
+            output.write_all(replacement).await?;
+        } else {
+            copy_exact_range_async(input, output, root_info.offset(), root_info.size()).await?;
+        }
+    }
+    output.write_all(&plan.clear_mdat_header).await?;
+    for sample_edit in &plan.sample_edits {
+        let encrypted = read_sample_bytes_from_async_reader(
+            input,
+            sample_edit.absolute_offset,
+            sample_edit.sample_size,
+        )
+        .await?;
+        let clear = process_movie_sample_bytes(&sample_edit.process, &encrypted)?;
+        output.write_all(&clear).await?;
+    }
+    output.flush().await?;
+    Ok(())
+}
+
+fn plan_movie_payload_from_reader<R, F>(
+    input: &mut R,
+    mdat_ranges: &[MediaDataRange],
+    tracks: &[MovieTrackPayloadPlan<'_>],
+    mut resolve_process: F,
+) -> Result<StreamedMoviePayloadPlan, DecryptRewriteError>
+where
+    R: Read + Seek,
+    F: FnMut(u32) -> Result<MovieSampleProcessKind, DecryptRewriteError>,
+{
+    let mut all_chunks = Vec::new();
+    let mut sample_indices = BTreeMap::new();
+    let mut rebuilt_sample_sizes = BTreeMap::<u32, Vec<u64>>::new();
+    let mut relative_offsets = BTreeMap::<u32, Vec<u64>>::new();
+    for track in tracks {
+        sample_indices.insert(track.track_id, 0_u32);
+        rebuilt_sample_sizes.insert(track.track_id, Vec::new());
+        relative_offsets.insert(track.track_id, Vec::new());
+        for chunk in compute_track_chunks(
+            track.track_id,
+            track.stsc,
+            track.chunk_offsets,
+            track.sample_sizes,
+        )? {
+            all_chunks.push((track.track_id, chunk));
+        }
+    }
+    all_chunks.sort_by_key(|(_, chunk)| chunk.offset);
+
+    let mut payload_size = 0_u64;
+    let mut previous_chunk_end = None;
+    let mut sample_edits = Vec::new();
+    for (track_id, chunk) in all_chunks {
+        let chunk_size = sum_chunk_size(&chunk.sample_sizes)?;
+        if let Some(previous_chunk_end) = previous_chunk_end
+            && chunk.offset < previous_chunk_end
+        {
+            return Err(invalid_layout(format!(
+                "track {track_id} has overlapping chunk ranges in the protected movie layout at sample-description index {}",
+                chunk.sample_description_index
+            )));
+        }
+        previous_chunk_end = Some(
+            chunk
+                .offset
+                .checked_add(chunk_size)
+                .ok_or_else(|| invalid_layout("movie chunk end overflowed u64".to_owned()))?,
+        );
+
+        relative_offsets
+            .get_mut(&track_id)
+            .unwrap()
+            .push(payload_size);
+
+        let process = resolve_process(track_id)?;
+        let mut sample_offset = chunk.offset;
+        for sample_size in chunk.sample_sizes {
+            let sample_index = sample_indices.get_mut(&track_id).ok_or_else(|| {
+                invalid_layout(format!(
+                    "missing sample index state for movie track {}",
+                    track_id
+                ))
+            })?;
+            *sample_index = sample_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_layout("movie sample index overflowed u32".to_owned()))?;
+            ensure_sample_range_in_mdat(
+                mdat_ranges,
+                track_id,
+                *sample_index,
+                sample_offset,
+                sample_size,
+            )?;
+            let sample_bytes =
+                read_sample_bytes_for_rewrite_from_reader(input, sample_offset, sample_size)?;
+            let clear_size =
+                u64::try_from(process_movie_sample_bytes(&process, &sample_bytes)?.len()).map_err(
+                    |_| invalid_layout("rebuilt movie sample size does not fit in u64".to_owned()),
+                )?;
+            rebuilt_sample_sizes
+                .get_mut(&track_id)
+                .unwrap()
+                .push(clear_size);
+            sample_edits.push(MovieSampleEdit {
+                absolute_offset: sample_offset,
+                sample_size,
+                process: process.clone(),
+            });
+            payload_size = payload_size.checked_add(clear_size).ok_or_else(|| {
+                invalid_layout("rebuilt mdat payload length does not fit in u64".to_owned())
+            })?;
+            sample_offset = sample_offset
+                .checked_add(u64::from(sample_size))
+                .ok_or_else(|| invalid_layout("movie sample offset overflowed u64".to_owned()))?;
+        }
+    }
+
+    Ok((
+        rebuilt_sample_sizes,
+        relative_offsets,
+        sample_edits,
+        payload_size,
+    ))
+}
+
+#[cfg(feature = "async")]
+async fn plan_movie_payload_from_async_reader<R, F>(
+    input: &mut R,
+    mdat_ranges: &[MediaDataRange],
+    tracks: &[MovieTrackPayloadPlan<'_>],
+    mut resolve_process: F,
+) -> Result<StreamedMoviePayloadPlan, DecryptRewriteError>
+where
+    R: AsyncReadSeek,
+    F: FnMut(u32) -> Result<MovieSampleProcessKind, DecryptRewriteError>,
+{
+    let mut all_chunks = Vec::new();
+    let mut sample_indices = BTreeMap::new();
+    let mut rebuilt_sample_sizes = BTreeMap::<u32, Vec<u64>>::new();
+    let mut relative_offsets = BTreeMap::<u32, Vec<u64>>::new();
+    for track in tracks {
+        sample_indices.insert(track.track_id, 0_u32);
+        rebuilt_sample_sizes.insert(track.track_id, Vec::new());
+        relative_offsets.insert(track.track_id, Vec::new());
+        for chunk in compute_track_chunks(
+            track.track_id,
+            track.stsc,
+            track.chunk_offsets,
+            track.sample_sizes,
+        )? {
+            all_chunks.push((track.track_id, chunk));
+        }
+    }
+    all_chunks.sort_by_key(|(_, chunk)| chunk.offset);
+
+    let mut payload_size = 0_u64;
+    let mut previous_chunk_end = None;
+    let mut sample_edits = Vec::new();
+    for (track_id, chunk) in all_chunks {
+        let chunk_size = sum_chunk_size(&chunk.sample_sizes)?;
+        if let Some(previous_chunk_end) = previous_chunk_end
+            && chunk.offset < previous_chunk_end
+        {
+            return Err(invalid_layout(format!(
+                "track {track_id} has overlapping chunk ranges in the protected movie layout at sample-description index {}",
+                chunk.sample_description_index
+            )));
+        }
+        previous_chunk_end = Some(
+            chunk
+                .offset
+                .checked_add(chunk_size)
+                .ok_or_else(|| invalid_layout("movie chunk end overflowed u64".to_owned()))?,
+        );
+
+        relative_offsets
+            .get_mut(&track_id)
+            .unwrap()
+            .push(payload_size);
+
+        let process = resolve_process(track_id)?;
+        let mut sample_offset = chunk.offset;
+        for sample_size in chunk.sample_sizes {
+            let sample_index = sample_indices.get_mut(&track_id).ok_or_else(|| {
+                invalid_layout(format!(
+                    "missing sample index state for movie track {}",
+                    track_id
+                ))
+            })?;
+            *sample_index = sample_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_layout("movie sample index overflowed u32".to_owned()))?;
+            ensure_sample_range_in_mdat(
+                mdat_ranges,
+                track_id,
+                *sample_index,
+                sample_offset,
+                sample_size,
+            )?;
+            let sample_bytes =
+                read_sample_bytes_for_rewrite_from_async_reader(input, sample_offset, sample_size)
+                    .await?;
+            let clear_size =
+                u64::try_from(process_movie_sample_bytes(&process, &sample_bytes)?.len()).map_err(
+                    |_| invalid_layout("rebuilt movie sample size does not fit in u64".to_owned()),
+                )?;
+            rebuilt_sample_sizes
+                .get_mut(&track_id)
+                .unwrap()
+                .push(clear_size);
+            sample_edits.push(MovieSampleEdit {
+                absolute_offset: sample_offset,
+                sample_size,
+                process: process.clone(),
+            });
+            payload_size = payload_size.checked_add(clear_size).ok_or_else(|| {
+                invalid_layout("rebuilt mdat payload length does not fit in u64".to_owned())
+            })?;
+            sample_offset = sample_offset
+                .checked_add(u64::from(sample_size))
+                .ok_or_else(|| invalid_layout("movie sample offset overflowed u64".to_owned()))?;
+        }
+    }
+
+    Ok((
+        rebuilt_sample_sizes,
+        relative_offsets,
+        sample_edits,
+        payload_size,
+    ))
+}
+
+fn process_movie_sample_bytes(
+    process: &MovieSampleProcessKind,
+    sample_bytes: &[u8],
+) -> Result<Vec<u8>, DecryptRewriteError> {
+    match process {
+        MovieSampleProcessKind::Copy => Ok(sample_bytes.to_vec()),
+        MovieSampleProcessKind::Marlin { key } => decrypt_marlin_sample_payload(sample_bytes, *key),
+        MovieSampleProcessKind::Oma { odaf, ohdr, key } => {
+            decrypt_oma_dcf_sample_entry_payload(odaf, ohdr, *key, sample_bytes)
+        }
+        MovieSampleProcessKind::Iaec { isfm, islt, key } => {
+            decrypt_iaec_sample_entry_payload(isfm, islt.as_ref(), *key, sample_bytes)
+        }
+    }
+}
+
+fn ensure_sample_range_in_mdat(
+    ranges: &[MediaDataRange],
+    track_id: u32,
+    sample_index: u32,
+    absolute_offset: u64,
+    sample_size: u32,
+) -> Result<(), DecryptRewriteError> {
+    let end = absolute_offset
+        .checked_add(u64::from(sample_size))
+        .ok_or_else(|| invalid_layout("sample range end overflowed u64".to_owned()))?;
+    if ranges
+        .iter()
+        .any(|range| absolute_offset >= range.start && end <= range.end)
+    {
+        return Ok(());
+    }
+    Err(DecryptRewriteError::SampleDataRangeNotFound {
+        track_id,
+        sample_index,
+        absolute_offset,
+        sample_size,
+    })
+}
+
+fn read_sample_bytes_from_reader<R>(
+    input: &mut R,
+    absolute_offset: u64,
+    sample_size: u32,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek,
+{
+    input.seek(SeekFrom::Start(absolute_offset))?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(sample_size).map_err(|_| DecryptError::InvalidInput {
+            reason: "sample size does not fit in usize".to_owned(),
+        })?
+    ];
+    input.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_sample_bytes_for_rewrite_from_reader<R>(
+    input: &mut R,
+    absolute_offset: u64,
+    sample_size: u32,
+) -> Result<Vec<u8>, DecryptRewriteError>
+where
+    R: Read + Seek,
+{
+    read_sample_bytes_from_reader(input, absolute_offset, sample_size).map_err(|error| {
+        invalid_layout(format!(
+            "failed to read movie sample bytes from the source reader at offset {absolute_offset}: {error}"
+        ))
+    })
+}
+
+#[cfg(feature = "async")]
+async fn read_sample_bytes_from_async_reader<R>(
+    input: &mut R,
+    absolute_offset: u64,
+    sample_size: u32,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    input.seek(SeekFrom::Start(absolute_offset)).await?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(sample_size).map_err(|_| DecryptError::InvalidInput {
+            reason: "sample size does not fit in usize".to_owned(),
+        })?
+    ];
+    input.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_sample_bytes_for_rewrite_from_async_reader<R>(
+    input: &mut R,
+    absolute_offset: u64,
+    sample_size: u32,
+) -> Result<Vec<u8>, DecryptRewriteError>
+where
+    R: AsyncReadSeek,
+{
+    read_sample_bytes_from_async_reader(input, absolute_offset, sample_size)
+        .await
+        .map_err(|error| {
+            invalid_layout(format!(
+                "failed to read movie sample bytes from the source reader at offset {absolute_offset}: {error}"
+            ))
+        })
+}
+
+fn read_all_bytes_from_reader<R>(reader: &mut R) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek + ?Sized,
+{
+    reader.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_all_bytes_from_async_reader<R>(reader: &mut R) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek + ?Sized,
+{
+    reader.seek(SeekFrom::Start(0)).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+fn read_box_bytes_from_reader<R>(reader: &mut R, info: BoxInfo) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek,
+{
+    info.seek_to_start(reader)?;
+    let size = usize::try_from(info.size()).map_err(|_| DecryptError::InvalidInput {
+        reason: format!("box {} is too large to buffer in memory", info.box_type()),
+    })?;
+    let mut bytes = vec![0_u8; size];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_box_bytes_from_async_reader<R>(
+    reader: &mut R,
+    info: BoxInfo,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    info.seek_to_start_async(reader).await?;
+    let size = usize::try_from(info.size()).map_err(|_| DecryptError::InvalidInput {
+        reason: format!("box {} is too large to buffer in memory", info.box_type()),
+    })?;
+    let mut bytes = vec![0_u8; size];
+    reader.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+fn read_root_box_infos_from_reader<R>(reader: &mut R) -> Result<Vec<BoxInfo>, DecryptError>
+where
+    R: Read + Seek,
+{
+    reader.seek(SeekFrom::Start(0))?;
+    let stream_end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    let mut root_boxes = Vec::new();
+    loop {
+        let position = reader.stream_position()?;
+        if position >= stream_end {
+            break;
+        }
+
+        let info = BoxInfo::read(reader).map_err(std::io::Error::other)?;
+        info.seek_to_end(reader).map_err(std::io::Error::other)?;
+        root_boxes.push(info);
+    }
+    Ok(root_boxes)
+}
+
+#[cfg(feature = "async")]
+async fn read_root_box_infos_from_async_reader<R>(
+    reader: &mut R,
+) -> Result<Vec<BoxInfo>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    reader.seek(SeekFrom::Start(0)).await?;
+    let stream_end = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(0)).await?;
+
+    let mut root_boxes = Vec::new();
+    loop {
+        let position = reader.stream_position().await?;
+        if position >= stream_end {
+            break;
+        }
+
+        let info = BoxInfo::read_async(reader)
+            .await
+            .map_err(std::io::Error::other)?;
+        info.seek_to_end_async(reader)
+            .await
+            .map_err(std::io::Error::other)?;
+        root_boxes.push(info);
+    }
+    Ok(root_boxes)
+}
+
+fn classify_decrypt_input_from_reader<R>(
+    reader: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<DecryptInputLayout, DecryptError>
+where
+    R: Read + Seek,
+{
+    let has_moov = root_boxes.iter().any(|info| info.box_type() == MOOV);
+    let has_moof = root_boxes.iter().any(|info| info.box_type() == MOOF);
+    let has_mdat = root_boxes.iter().any(|info| info.box_type() == MDAT);
+    let has_odrm = root_boxes.iter().any(|info| info.box_type() == ODRM);
+
+    let ftyp = if let Some(ftyp_info) = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP)
+    {
+        let ftyp_bytes = read_box_bytes_from_reader(reader, ftyp_info)?;
+        extract_single_as::<_, Ftyp>(
+            &mut Cursor::new(&ftyp_bytes),
+            None,
+            BoxPath::from([FTYP]),
+            "ftyp",
+        )
+        .map(Some)?
+    } else {
+        None
+    };
+    let is_marlin_ipmp_movie = ftyp.as_ref().is_some_and(|entry| {
+        entry.major_brand == MARLIN_BRAND_MGSV
+            || entry.compatible_brands.contains(&MARLIN_BRAND_MGSV)
+    });
+    let is_oma_dcf_atom_file = has_odrm
+        && ftyp.as_ref().is_some_and(|entry| {
+            entry.major_brand == ODCF || entry.compatible_brands.contains(&ODCF)
+        });
+
+    let protected_movie_layout =
+        if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file && is_marlin_ipmp_movie {
+            Some(DecryptInputLayout::MarlinIpmpFile)
+        } else if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file {
+            let mut metadata = Vec::new();
+            for info in root_boxes
+                .iter()
+                .copied()
+                .filter(|info| info.box_type() != MDAT)
+            {
+                metadata.extend_from_slice(&read_box_bytes_from_reader(reader, info)?);
+            }
+            detect_non_fragmented_protected_movie_layout(&metadata)?
+        } else {
+            None
+        };
+
+    match (
+        has_moov,
+        has_moof,
+        has_mdat,
+        is_oma_dcf_atom_file,
+        protected_movie_layout,
+    ) {
+        (false, false, _, true, _) => Ok(DecryptInputLayout::OmaDcfAtomFile),
+        (true, true, _, false, _) => Ok(DecryptInputLayout::FragmentedFile),
+        (true, false, true, false, Some(DecryptInputLayout::MarlinIpmpFile)) => {
+            Ok(DecryptInputLayout::MarlinIpmpFile)
+        }
+        (true, false, true, false, Some(DecryptInputLayout::OmaDcfProtectedMovieFile)) => {
+            Ok(DecryptInputLayout::OmaDcfProtectedMovieFile)
+        }
+        (true, false, true, false, Some(DecryptInputLayout::IaecProtectedMovieFile)) => {
+            Ok(DecryptInputLayout::IaecProtectedMovieFile)
+        }
+        (true, false, false, false, _) => Ok(DecryptInputLayout::InitSegment),
+        (false, true, _, false, _) => Ok(DecryptInputLayout::MediaSegment),
+        (false, false, false, false, _) => Err(DecryptError::InvalidInput {
+            reason: "expected a moov box, a moof box, both, or a root OMA DCF atom file"
+                .to_owned(),
+        }),
+        (_, _, _, true, _) => Err(DecryptError::InvalidInput {
+            reason:
+                "root OMA DCF atom files are expected to carry odrm without moov or moof at the top level"
+                    .to_owned(),
+        }),
+        (true, false, true, false, None) => Err(DecryptError::InvalidInput {
+            reason:
+                "non-fragmented movie files are only supported for the current Marlin IPMP, OMA DCF, or IAEC protected layouts"
+                    .to_owned(),
+        }),
+        _ => Err(DecryptError::InvalidInput {
+            reason: "input does not match one of the currently supported decrypt layouts"
+                .to_owned(),
+        }),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn classify_decrypt_input_from_async_reader<R>(
+    reader: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<DecryptInputLayout, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let has_moov = root_boxes.iter().any(|info| info.box_type() == MOOV);
+    let has_moof = root_boxes.iter().any(|info| info.box_type() == MOOF);
+    let has_mdat = root_boxes.iter().any(|info| info.box_type() == MDAT);
+    let has_odrm = root_boxes.iter().any(|info| info.box_type() == ODRM);
+
+    let ftyp = if let Some(ftyp_info) = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP)
+    {
+        let ftyp_bytes = read_box_bytes_from_async_reader(reader, ftyp_info).await?;
+        extract_single_as::<_, Ftyp>(
+            &mut Cursor::new(&ftyp_bytes),
+            None,
+            BoxPath::from([FTYP]),
+            "ftyp",
+        )
+        .map(Some)?
+    } else {
+        None
+    };
+    let is_marlin_ipmp_movie = ftyp.as_ref().is_some_and(|entry| {
+        entry.major_brand == MARLIN_BRAND_MGSV
+            || entry.compatible_brands.contains(&MARLIN_BRAND_MGSV)
+    });
+    let is_oma_dcf_atom_file = has_odrm
+        && ftyp.as_ref().is_some_and(|entry| {
+            entry.major_brand == ODCF || entry.compatible_brands.contains(&ODCF)
+        });
+
+    let protected_movie_layout =
+        if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file && is_marlin_ipmp_movie {
+            Some(DecryptInputLayout::MarlinIpmpFile)
+        } else if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file {
+            let mut metadata = Vec::new();
+            for info in root_boxes
+                .iter()
+                .copied()
+                .filter(|info| info.box_type() != MDAT)
+            {
+                metadata.extend_from_slice(&read_box_bytes_from_async_reader(reader, info).await?);
+            }
+            detect_non_fragmented_protected_movie_layout(&metadata)?
+        } else {
+            None
+        };
+
+    match (
+        has_moov,
+        has_moof,
+        has_mdat,
+        is_oma_dcf_atom_file,
+        protected_movie_layout,
+    ) {
+        (false, false, _, true, _) => Ok(DecryptInputLayout::OmaDcfAtomFile),
+        (true, true, _, false, _) => Ok(DecryptInputLayout::FragmentedFile),
+        (true, false, true, false, Some(DecryptInputLayout::MarlinIpmpFile)) => {
+            Ok(DecryptInputLayout::MarlinIpmpFile)
+        }
+        (true, false, true, false, Some(DecryptInputLayout::OmaDcfProtectedMovieFile)) => {
+            Ok(DecryptInputLayout::OmaDcfProtectedMovieFile)
+        }
+        (true, false, true, false, Some(DecryptInputLayout::IaecProtectedMovieFile)) => {
+            Ok(DecryptInputLayout::IaecProtectedMovieFile)
+        }
+        (true, false, false, false, _) => Ok(DecryptInputLayout::InitSegment),
+        (false, true, _, false, _) => Ok(DecryptInputLayout::MediaSegment),
+        (false, false, false, false, _) => Err(DecryptError::InvalidInput {
+            reason: "expected a moov box, a moof box, both, or a root OMA DCF atom file"
+                .to_owned(),
+        }),
+        (_, _, _, true, _) => Err(DecryptError::InvalidInput {
+            reason:
+                "root OMA DCF atom files are expected to carry odrm without moov or moof at the top level"
+                    .to_owned(),
+        }),
+        (true, false, true, false, None) => Err(DecryptError::InvalidInput {
+            reason:
+                "non-fragmented movie files are only supported for the current Marlin IPMP, OMA DCF, or IAEC protected layouts"
+                    .to_owned(),
+        }),
+        _ => Err(DecryptError::InvalidInput {
+            reason: "input does not match one of the currently supported decrypt layouts"
+                .to_owned(),
+        }),
     }
 }
 
@@ -1268,9 +3651,10 @@ where
     Ok(output)
 }
 
-fn decrypt_file_with_optional_progress<F>(
+pub(crate) fn decrypt_file_with_optional_progress_and_fragments_info_path<F>(
     input_path: &Path,
     output_path: &Path,
+    fragments_info_path: Option<&Path>,
     options: &DecryptOptions,
     progress: Option<F>,
 ) -> Result<(), DecryptError>
@@ -1279,13 +3663,30 @@ where
 {
     let mut reporter = ProgressReporter::new(progress);
     reporter.report(DecryptProgressPhase::OpenInput, 0, Some(1));
-    let input = fs::read(input_path)?;
+    let mut input = fs::File::open(input_path)?;
     reporter.report(DecryptProgressPhase::OpenInput, 1, Some(1));
 
-    let output = decrypt_input_bytes(&input, options, &mut reporter)?;
+    let mut fragments_info = fragments_info_path.map(fs::File::open).transpose()?;
+
+    // Keep the externally visible progress phase order stable while the file-backed path moves
+    // onto the stream-first core internally.
+    let mut output = fs::File::create(output_path)?;
+    if let Err(error) = decrypt_sync_stream_with_optional_progress(
+        &mut input,
+        &mut output,
+        fragments_info
+            .as_mut()
+            .map(|file| file as &mut dyn SyncReadSeek),
+        options,
+        &mut reporter,
+    ) {
+        drop(output);
+        let _ = fs::remove_file(output_path);
+        return Err(error);
+    }
 
     reporter.report(DecryptProgressPhase::OpenOutput, 0, Some(1));
-    fs::write(output_path, output)?;
+    output.flush()?;
     reporter.report(DecryptProgressPhase::OpenOutput, 1, Some(1));
     reporter.report(DecryptProgressPhase::FinalizeOutput, 0, Some(1));
     reporter.report(DecryptProgressPhase::FinalizeOutput, 1, Some(1));
@@ -1304,13 +3705,25 @@ where
 {
     let mut reporter = ProgressReporter::new(progress);
     reporter.report(DecryptProgressPhase::OpenInput, 0, Some(1));
-    let input = tokio_fs::read(input_path).await?;
+    let mut input = tokio_fs::File::open(input_path).await?;
     reporter.report(DecryptProgressPhase::OpenInput, 1, Some(1));
 
-    let output = decrypt_input_bytes(&input, options, &mut reporter)?;
-
+    let mut output = tokio_fs::File::create(output_path).await?;
+    if let Err(error) = decrypt_async_stream_with_optional_progress(
+        &mut input,
+        &mut output,
+        None,
+        options,
+        &mut reporter,
+    )
+    .await
+    {
+        drop(output);
+        let _ = tokio_fs::remove_file(output_path).await;
+        return Err(error);
+    }
     reporter.report(DecryptProgressPhase::OpenOutput, 0, Some(1));
-    tokio_fs::write(output_path, output).await?;
+    output.flush().await?;
     reporter.report(DecryptProgressPhase::OpenOutput, 1, Some(1));
     reporter.report(DecryptProgressPhase::FinalizeOutput, 0, Some(1));
     reporter.report(DecryptProgressPhase::FinalizeOutput, 1, Some(1));
@@ -1381,6 +3794,1371 @@ where
             Ok(output)
         }
     }
+}
+
+fn build_common_encryption_stream_plan<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    layout: DecryptInputLayout,
+    keys: &[DecryptionKey],
+    fragments_info_bytes: Option<&[u8]>,
+) -> Result<CommonEncryptionStreamPlan, DecryptError>
+where
+    R: Read + Seek,
+{
+    let init_bytes = match layout {
+        DecryptInputLayout::FragmentedFile => {
+            collect_common_encryption_init_segment_bytes_from_reader(input, root_boxes)?
+        }
+        DecryptInputLayout::MediaSegment => fragments_info_bytes
+            .ok_or(DecryptError::MissingFragmentsInfo)?
+            .to_vec(),
+        _ => {
+            return Err(DecryptError::InvalidInput {
+                reason: "the stream-first Common Encryption core expects either a fragmented file or a standalone media segment".to_owned(),
+            });
+        }
+    };
+    let context = analyze_init_segment(&init_bytes)?;
+    let moov_replacement = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .map(|info| {
+            rebuild_common_encryption_moov(&init_bytes, &context, keys)
+                .map(|bytes| (info.offset(), bytes))
+        })
+        .transpose()?;
+    let (moof_replacements, mdat_edits) =
+        build_common_encryption_fragment_replacements_from_stream(
+            input, root_boxes, &context, keys,
+        )?;
+    let extra_root_replacements = build_common_encryption_mfra_replacements_from_stream(
+        input,
+        root_boxes,
+        moov_replacement
+            .as_ref()
+            .map(|(offset, bytes)| (*offset, bytes.as_slice())),
+        &moof_replacements,
+    )?;
+
+    Ok(CommonEncryptionStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        moov_replacement,
+        moof_replacements,
+        extra_root_replacements,
+        mdat_edits,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn build_common_encryption_stream_plan_async<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    layout: DecryptInputLayout,
+    keys: &[DecryptionKey],
+    fragments_info_bytes: Option<&[u8]>,
+) -> Result<CommonEncryptionStreamPlan, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let init_bytes = match layout {
+        DecryptInputLayout::FragmentedFile => {
+            collect_common_encryption_init_segment_bytes_from_async_reader(input, root_boxes)
+                .await?
+        }
+        DecryptInputLayout::MediaSegment => fragments_info_bytes
+            .ok_or(DecryptError::MissingFragmentsInfo)?
+            .to_vec(),
+        _ => {
+            return Err(DecryptError::InvalidInput {
+                reason: "the stream-first Common Encryption core expects either a fragmented file or a standalone media segment".to_owned(),
+            });
+        }
+    };
+    let context = analyze_init_segment(&init_bytes)?;
+    let moov_replacement = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .map(|info| {
+            rebuild_common_encryption_moov(&init_bytes, &context, keys)
+                .map(|bytes| (info.offset(), bytes))
+        })
+        .transpose()?;
+    let (moof_replacements, mdat_edits) =
+        build_common_encryption_fragment_replacements_from_async_stream(
+            input, root_boxes, &context, keys,
+        )
+        .await?;
+    let extra_root_replacements = build_common_encryption_mfra_replacements_from_async_stream(
+        input,
+        root_boxes,
+        moov_replacement
+            .as_ref()
+            .map(|(offset, bytes)| (*offset, bytes.as_slice())),
+        &moof_replacements,
+    )
+    .await?;
+
+    Ok(CommonEncryptionStreamPlan {
+        root_boxes: root_boxes.to_vec(),
+        moov_replacement,
+        moof_replacements,
+        extra_root_replacements,
+        mdat_edits,
+    })
+}
+
+fn collect_common_encryption_init_segment_bytes_from_reader<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek,
+{
+    let mut init_bytes = Vec::new();
+    for info in root_boxes.iter().copied() {
+        if matches!(info.box_type(), FTYP | MOOV) {
+            init_bytes.extend_from_slice(&read_box_bytes_from_reader(input, info)?);
+        }
+    }
+    Ok(init_bytes)
+}
+
+#[cfg(feature = "async")]
+async fn collect_common_encryption_init_segment_bytes_from_async_reader<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let mut init_bytes = Vec::new();
+    for info in root_boxes.iter().copied() {
+        if matches!(info.box_type(), FTYP | MOOV) {
+            init_bytes.extend_from_slice(&read_box_bytes_from_async_reader(input, info).await?);
+        }
+    }
+    Ok(init_bytes)
+}
+
+fn build_common_encryption_fragment_replacements_from_stream<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    context: &InitDecryptContext,
+    keys: &[DecryptionKey],
+) -> Result<CommonEncryptionStreamRewrites, DecryptError>
+where
+    R: Read + Seek,
+{
+    let track_by_id = context
+        .tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let moof_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MOOF)
+        .collect::<Vec<_>>();
+
+    let mut moof_replacements = BTreeMap::new();
+    let mut mdat_edits = BTreeMap::<u64, Vec<CommonEncryptionSampleEdit>>::new();
+    for original_moof_info in moof_infos {
+        let moof_bytes = read_box_bytes_from_reader(input, original_moof_info)?;
+        let local_root_boxes = read_root_box_infos(&moof_bytes)?;
+        let local_moof_info = local_root_boxes
+            .iter()
+            .copied()
+            .find(|info| info.box_type() == MOOF)
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "expected one local moof box while planning stream-first Common Encryption rewrite".to_owned(),
+            })?;
+        let mut reader = Cursor::new(&moof_bytes);
+        let trafs = extract_box(&mut reader, None, BoxPath::from([MOOF, TRAF]))?;
+        let mut plans = Vec::new();
+        for traf_info in trafs {
+            let mut reader = Cursor::new(&moof_bytes);
+            let tfhd = extract_single_as::<_, Tfhd>(
+                &mut reader,
+                Some(&traf_info),
+                BoxPath::from([TFHD]),
+                "tfhd",
+            )?;
+
+            let mut reader = Cursor::new(&moof_bytes);
+            let truns =
+                extract_box_as::<_, Trun>(&mut reader, Some(&traf_info), BoxPath::from([TRUN]))?;
+            let mut reader = Cursor::new(&moof_bytes);
+            let trun_infos = extract_box(&mut reader, Some(&traf_info), BoxPath::from([TRUN]))?;
+            if truns.is_empty() || truns.len() != trun_infos.len() {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: format!(
+                        "track {} requires one or more aligned trun boxes in the stream-first Common Encryption path",
+                        tfhd.track_id
+                    ),
+                }
+                .into());
+            }
+
+            let mut remove_infos = Vec::new();
+            if let Some(track) = track_by_id.get(&tfhd.track_id).copied() {
+                let sample_description_index =
+                    resolve_fragment_sample_description_index(track, &tfhd)?;
+                if let Some(active) =
+                    activate_track_sample_entry(track, sample_description_index, keys)?
+                {
+                    let (senc, senc_info) = extract_fragment_sample_encryption_box(
+                        &moof_bytes,
+                        &traf_info,
+                        &active.sample_entry.tenc,
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let saiz = extract_optional_single_as::<_, Saiz>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SAIZ]),
+                        "saiz",
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let saio = extract_optional_single_as::<_, Saio>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SAIO]),
+                        "saio",
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sgpd_entries = extract_box_as::<_, Sgpd>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SGPD]),
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sgpd_infos =
+                        extract_box(&mut reader, Some(&traf_info), BoxPath::from([SGPD]))?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sbgp_entries = extract_box_as::<_, Sbgp>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SBGP]),
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sbgp_infos =
+                        extract_box(&mut reader, Some(&traf_info), BoxPath::from([SBGP]))?;
+
+                    let sgpd = select_seig_sgpd(&sgpd_entries);
+                    let sbgp = select_seig_sbgp(&sbgp_entries);
+                    let resolved = resolve_sample_encryption(
+                        &senc,
+                        SampleEncryptionContext {
+                            tenc: Some(&active.sample_entry.tenc),
+                            sgpd,
+                            sbgp,
+                            saiz: saiz.as_ref(),
+                        },
+                    )
+                    .map_err(DecryptRewriteError::from)?;
+                    let sample_spans = compute_sample_spans(
+                        &tfhd,
+                        active.track.trex.as_ref(),
+                        original_moof_info.offset(),
+                        &truns,
+                        &trun_infos,
+                    )?;
+                    if sample_spans.len() != resolved.samples.len() {
+                        return Err(DecryptRewriteError::InvalidLayout {
+                            reason: format!(
+                                "track {} resolved {} encrypted sample records but {} sample span(s) in the stream-first Common Encryption path",
+                                active.track.track_id,
+                                resolved.samples.len(),
+                                sample_spans.len()
+                            ),
+                        }
+                        .into());
+                    }
+
+                    if active.sample_entry.scheme_type != PIFF {
+                        for (sample, span) in resolved.samples.iter().zip(sample_spans.iter()) {
+                            let mdat_info = find_mdat_info_containing_sample(
+                                &mdat_infos,
+                                span.offset,
+                                span.size,
+                            )
+                            .ok_or(
+                                DecryptRewriteError::SampleDataRangeNotFound {
+                                    track_id: active.track.track_id,
+                                    sample_index: sample.sample_index,
+                                    absolute_offset: span.offset,
+                                    sample_size: span.size,
+                                },
+                            )?;
+                            mdat_edits.entry(mdat_info.offset()).or_default().push(
+                                CommonEncryptionSampleEdit {
+                                    absolute_offset: span.offset,
+                                    sample_size: span.size,
+                                    track_id: active.track.track_id,
+                                    scheme_type: active.sample_entry.scheme_type,
+                                    content_key: active.key,
+                                    sample: OwnedResolvedSampleEncryptionSample::from_resolved(
+                                        sample,
+                                    ),
+                                },
+                            );
+                        }
+                    }
+
+                    if active.sample_entry.scheme_type == PIFF {
+                        plans.push(TrafRewritePlan {
+                            moof_info: local_moof_info,
+                            traf_info,
+                            tfhd_flags: tfhd.flags(),
+                            trun_infos,
+                            truns,
+                            remove_infos,
+                        });
+                        continue;
+                    }
+
+                    remove_infos.push(senc_info);
+                    if let Some(saiz_info) =
+                        extract_optional_single_info_from_infos(&traf_info, SAIZ, &moof_bytes)?
+                    {
+                        remove_infos.push(saiz_info);
+                    }
+                    if let Some(saio_info) =
+                        extract_optional_single_info_from_infos(&traf_info, SAIO, &moof_bytes)?
+                        && saio.as_ref().is_none_or(|saio| {
+                            saio.aux_info_type == FourCc::ANY
+                                || saio.aux_info_type == active.sample_entry.scheme_type
+                        })
+                    {
+                        remove_infos.push(saio_info);
+                    }
+                    for (entry, info) in sbgp_entries.iter().zip(sbgp_infos.iter().copied()) {
+                        if entry.grouping_type == u32::from_be_bytes(*b"seig") {
+                            remove_infos.push(info);
+                        }
+                    }
+                    for (entry, info) in sgpd_entries.iter().zip(sgpd_infos.iter().copied()) {
+                        if entry.grouping_type == SEIG {
+                            remove_infos.push(info);
+                        }
+                    }
+                }
+            }
+
+            plans.push(TrafRewritePlan {
+                moof_info: local_moof_info,
+                traf_info,
+                tfhd_flags: tfhd.flags(),
+                trun_infos,
+                truns,
+                remove_infos,
+            });
+        }
+
+        let moof_plans = plans
+            .iter()
+            .filter(|plan| plan.moof_info.offset() == local_moof_info.offset())
+            .collect::<Vec<_>>();
+        if moof_plans.is_empty() {
+            continue;
+        }
+
+        let removed_in_moof = moof_plans
+            .iter()
+            .flat_map(|plan| plan.remove_infos.iter())
+            .try_fold(0_u64, |acc, info| {
+                acc.checked_add(info.size()).ok_or_else(|| {
+                    DecryptRewriteError::InvalidLayout {
+                        reason: "removed fragment metadata size overflowed u64 in the stream-first Common Encryption path".to_owned(),
+                    }
+                })
+            })?;
+
+        if removed_in_moof != 0
+            && moof_plans.iter().any(|plan| {
+                plan.tfhd_flags & TFHD_BASE_DATA_OFFSET_PRESENT != 0
+                    || plan
+                        .truns
+                        .iter()
+                        .any(|trun| trun.flags() & TRUN_DATA_OFFSET_PRESENT == 0)
+            })
+        {
+            continue;
+        }
+
+        let mut traf_edits = Vec::new();
+        for plan in moof_plans {
+            let mut child_edits = Vec::new();
+            for (trun_info, trun) in plan.trun_infos.iter().copied().zip(plan.truns.iter()) {
+                let mut patched_trun = trun.clone();
+                if removed_in_moof != 0 {
+                    let removed = i64::try_from(removed_in_moof).map_err(|_| {
+                        DecryptRewriteError::InvalidLayout {
+                            reason: "removed fragment metadata size does not fit in i64 in the stream-first Common Encryption path".to_owned(),
+                        }
+                    })?;
+                    let patched = i64::from(trun.data_offset)
+                        .checked_sub(removed)
+                        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                            reason: "patched trun data offset overflowed i64 in the stream-first Common Encryption path".to_owned(),
+                        })?;
+                    patched_trun.data_offset =
+                        i32::try_from(patched).map_err(|_| DecryptRewriteError::InvalidLayout {
+                            reason: format!(
+                                "patched trun data offset for traf at {} does not fit in i32",
+                                plan.traf_info.offset()
+                            ),
+                        })?;
+                }
+                child_edits.push(DirectChildEdit {
+                    child_info: trun_info,
+                    replacement: Some(encode_box_with_children(&patched_trun, &[])?),
+                });
+            }
+            child_edits.extend(
+                plan.remove_infos
+                    .iter()
+                    .copied()
+                    .map(|info| DirectChildEdit {
+                        child_info: info,
+                        replacement: None,
+                    }),
+            );
+
+            let rebuilt_traf =
+                rebuild_box_with_child_edits(&moof_bytes, plan.traf_info, &child_edits)?;
+            if rebuilt_traf != slice_box_bytes(&moof_bytes, plan.traf_info)? {
+                traf_edits.push(DirectChildEdit {
+                    child_info: plan.traf_info,
+                    replacement: Some(rebuilt_traf),
+                });
+            }
+        }
+
+        if !traf_edits.is_empty() {
+            moof_replacements.insert(
+                original_moof_info.offset(),
+                rebuild_box_with_child_edits(&moof_bytes, local_moof_info, &traf_edits)?,
+            );
+        }
+    }
+
+    for edits in mdat_edits.values_mut() {
+        edits.sort_by_key(|edit| edit.absolute_offset);
+    }
+
+    Ok((moof_replacements, mdat_edits))
+}
+
+#[cfg(feature = "async")]
+async fn build_common_encryption_fragment_replacements_from_async_stream<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    context: &InitDecryptContext,
+    keys: &[DecryptionKey],
+) -> Result<CommonEncryptionStreamRewrites, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let track_by_id = context
+        .tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let mdat_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MDAT)
+        .collect::<Vec<_>>();
+    let moof_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MOOF)
+        .collect::<Vec<_>>();
+
+    let mut moof_replacements = BTreeMap::new();
+    let mut mdat_edits = BTreeMap::<u64, Vec<CommonEncryptionSampleEdit>>::new();
+    for original_moof_info in moof_infos {
+        let moof_bytes = read_box_bytes_from_async_reader(input, original_moof_info).await?;
+        let local_root_boxes = read_root_box_infos(&moof_bytes)?;
+        let local_moof_info = local_root_boxes
+            .iter()
+            .copied()
+            .find(|info| info.box_type() == MOOF)
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "expected one local moof box while planning stream-first Common Encryption rewrite".to_owned(),
+            })?;
+        let mut reader = Cursor::new(&moof_bytes);
+        let trafs = extract_box(&mut reader, None, BoxPath::from([MOOF, TRAF]))?;
+        let mut plans = Vec::new();
+        for traf_info in trafs {
+            let mut reader = Cursor::new(&moof_bytes);
+            let tfhd = extract_single_as::<_, Tfhd>(
+                &mut reader,
+                Some(&traf_info),
+                BoxPath::from([TFHD]),
+                "tfhd",
+            )?;
+
+            let mut reader = Cursor::new(&moof_bytes);
+            let truns =
+                extract_box_as::<_, Trun>(&mut reader, Some(&traf_info), BoxPath::from([TRUN]))?;
+            let mut reader = Cursor::new(&moof_bytes);
+            let trun_infos = extract_box(&mut reader, Some(&traf_info), BoxPath::from([TRUN]))?;
+            if truns.is_empty() || truns.len() != trun_infos.len() {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: format!(
+                        "track {} requires one or more aligned trun boxes in the stream-first Common Encryption path",
+                        tfhd.track_id
+                    ),
+                }
+                .into());
+            }
+
+            let mut remove_infos = Vec::new();
+            if let Some(track) = track_by_id.get(&tfhd.track_id).copied() {
+                let sample_description_index =
+                    resolve_fragment_sample_description_index(track, &tfhd)?;
+                if let Some(active) =
+                    activate_track_sample_entry(track, sample_description_index, keys)?
+                {
+                    let (senc, senc_info) = extract_fragment_sample_encryption_box(
+                        &moof_bytes,
+                        &traf_info,
+                        &active.sample_entry.tenc,
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let saiz = extract_optional_single_as::<_, Saiz>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SAIZ]),
+                        "saiz",
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let saio = extract_optional_single_as::<_, Saio>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SAIO]),
+                        "saio",
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sgpd_entries = extract_box_as::<_, Sgpd>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SGPD]),
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sgpd_infos =
+                        extract_box(&mut reader, Some(&traf_info), BoxPath::from([SGPD]))?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sbgp_entries = extract_box_as::<_, Sbgp>(
+                        &mut reader,
+                        Some(&traf_info),
+                        BoxPath::from([SBGP]),
+                    )?;
+                    let mut reader = Cursor::new(&moof_bytes);
+                    let sbgp_infos =
+                        extract_box(&mut reader, Some(&traf_info), BoxPath::from([SBGP]))?;
+
+                    let sgpd = select_seig_sgpd(&sgpd_entries);
+                    let sbgp = select_seig_sbgp(&sbgp_entries);
+                    let resolved = resolve_sample_encryption(
+                        &senc,
+                        SampleEncryptionContext {
+                            tenc: Some(&active.sample_entry.tenc),
+                            sgpd,
+                            sbgp,
+                            saiz: saiz.as_ref(),
+                        },
+                    )
+                    .map_err(DecryptRewriteError::from)?;
+                    let sample_spans = compute_sample_spans(
+                        &tfhd,
+                        active.track.trex.as_ref(),
+                        original_moof_info.offset(),
+                        &truns,
+                        &trun_infos,
+                    )?;
+                    if sample_spans.len() != resolved.samples.len() {
+                        return Err(DecryptRewriteError::InvalidLayout {
+                            reason: format!(
+                                "track {} resolved {} encrypted sample records but {} sample span(s) in the stream-first Common Encryption path",
+                                active.track.track_id,
+                                resolved.samples.len(),
+                                sample_spans.len()
+                            ),
+                        }
+                        .into());
+                    }
+
+                    if active.sample_entry.scheme_type != PIFF {
+                        for (sample, span) in resolved.samples.iter().zip(sample_spans.iter()) {
+                            let mdat_info = find_mdat_info_containing_sample(
+                                &mdat_infos,
+                                span.offset,
+                                span.size,
+                            )
+                            .ok_or(
+                                DecryptRewriteError::SampleDataRangeNotFound {
+                                    track_id: active.track.track_id,
+                                    sample_index: sample.sample_index,
+                                    absolute_offset: span.offset,
+                                    sample_size: span.size,
+                                },
+                            )?;
+                            mdat_edits.entry(mdat_info.offset()).or_default().push(
+                                CommonEncryptionSampleEdit {
+                                    absolute_offset: span.offset,
+                                    sample_size: span.size,
+                                    track_id: active.track.track_id,
+                                    scheme_type: active.sample_entry.scheme_type,
+                                    content_key: active.key,
+                                    sample: OwnedResolvedSampleEncryptionSample::from_resolved(
+                                        sample,
+                                    ),
+                                },
+                            );
+                        }
+                    }
+
+                    if active.sample_entry.scheme_type == PIFF {
+                        plans.push(TrafRewritePlan {
+                            moof_info: local_moof_info,
+                            traf_info,
+                            tfhd_flags: tfhd.flags(),
+                            trun_infos,
+                            truns,
+                            remove_infos,
+                        });
+                        continue;
+                    }
+
+                    remove_infos.push(senc_info);
+                    if let Some(saiz_info) =
+                        extract_optional_single_info_from_infos(&traf_info, SAIZ, &moof_bytes)?
+                    {
+                        remove_infos.push(saiz_info);
+                    }
+                    if let Some(saio_info) =
+                        extract_optional_single_info_from_infos(&traf_info, SAIO, &moof_bytes)?
+                        && saio.as_ref().is_none_or(|saio| {
+                            saio.aux_info_type == FourCc::ANY
+                                || saio.aux_info_type == active.sample_entry.scheme_type
+                        })
+                    {
+                        remove_infos.push(saio_info);
+                    }
+                    for (entry, info) in sbgp_entries.iter().zip(sbgp_infos.iter().copied()) {
+                        if entry.grouping_type == u32::from_be_bytes(*b"seig") {
+                            remove_infos.push(info);
+                        }
+                    }
+                    for (entry, info) in sgpd_entries.iter().zip(sgpd_infos.iter().copied()) {
+                        if entry.grouping_type == SEIG {
+                            remove_infos.push(info);
+                        }
+                    }
+                }
+            }
+
+            plans.push(TrafRewritePlan {
+                moof_info: local_moof_info,
+                traf_info,
+                tfhd_flags: tfhd.flags(),
+                trun_infos,
+                truns,
+                remove_infos,
+            });
+        }
+
+        let moof_plans = plans
+            .iter()
+            .filter(|plan| plan.moof_info.offset() == local_moof_info.offset())
+            .collect::<Vec<_>>();
+        if moof_plans.is_empty() {
+            continue;
+        }
+
+        let removed_in_moof = moof_plans
+            .iter()
+            .flat_map(|plan| plan.remove_infos.iter())
+            .try_fold(0_u64, |acc, info| {
+                acc.checked_add(info.size()).ok_or_else(|| {
+                    DecryptRewriteError::InvalidLayout {
+                        reason: "removed fragment metadata size overflowed u64 in the stream-first Common Encryption path".to_owned(),
+                    }
+                })
+            })?;
+
+        if removed_in_moof != 0
+            && moof_plans.iter().any(|plan| {
+                plan.tfhd_flags & TFHD_BASE_DATA_OFFSET_PRESENT != 0
+                    || plan
+                        .truns
+                        .iter()
+                        .any(|trun| trun.flags() & TRUN_DATA_OFFSET_PRESENT == 0)
+            })
+        {
+            continue;
+        }
+
+        let mut traf_edits = Vec::new();
+        for plan in moof_plans {
+            let mut child_edits = Vec::new();
+            for (trun_info, trun) in plan.trun_infos.iter().copied().zip(plan.truns.iter()) {
+                let mut patched_trun = trun.clone();
+                if removed_in_moof != 0 {
+                    let removed = i64::try_from(removed_in_moof).map_err(|_| {
+                        DecryptRewriteError::InvalidLayout {
+                            reason: "removed fragment metadata size does not fit in i64 in the stream-first Common Encryption path".to_owned(),
+                        }
+                    })?;
+                    let patched = i64::from(trun.data_offset)
+                        .checked_sub(removed)
+                        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                            reason: "patched trun data offset overflowed i64 in the stream-first Common Encryption path".to_owned(),
+                        })?;
+                    patched_trun.data_offset =
+                        i32::try_from(patched).map_err(|_| DecryptRewriteError::InvalidLayout {
+                            reason: format!(
+                                "patched trun data offset for traf at {} does not fit in i32",
+                                plan.traf_info.offset()
+                            ),
+                        })?;
+                }
+                child_edits.push(DirectChildEdit {
+                    child_info: trun_info,
+                    replacement: Some(encode_box_with_children(&patched_trun, &[])?),
+                });
+            }
+            child_edits.extend(
+                plan.remove_infos
+                    .iter()
+                    .copied()
+                    .map(|info| DirectChildEdit {
+                        child_info: info,
+                        replacement: None,
+                    }),
+            );
+
+            let rebuilt_traf =
+                rebuild_box_with_child_edits(&moof_bytes, plan.traf_info, &child_edits)?;
+            if rebuilt_traf != slice_box_bytes(&moof_bytes, plan.traf_info)? {
+                traf_edits.push(DirectChildEdit {
+                    child_info: plan.traf_info,
+                    replacement: Some(rebuilt_traf),
+                });
+            }
+        }
+
+        if !traf_edits.is_empty() {
+            moof_replacements.insert(
+                original_moof_info.offset(),
+                rebuild_box_with_child_edits(&moof_bytes, local_moof_info, &traf_edits)?,
+            );
+        }
+    }
+
+    for edits in mdat_edits.values_mut() {
+        edits.sort_by_key(|edit| edit.absolute_offset);
+    }
+
+    Ok((moof_replacements, mdat_edits))
+}
+
+fn build_common_encryption_mfra_replacements_from_stream<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    moov_replacement: Option<(u64, &[u8])>,
+    moof_replacements: &BTreeMap<u64, Vec<u8>>,
+) -> Result<BTreeMap<u64, Vec<u8>>, DecryptError>
+where
+    R: Read + Seek,
+{
+    let mfra_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MFRA)
+        .collect::<Vec<_>>();
+    if mfra_infos.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let rewritten_offsets = compute_rewritten_root_offsets_stream(
+        root_boxes,
+        moov_replacement,
+        moof_replacements,
+        &BTreeMap::new(),
+    )?;
+    let mut replacements = BTreeMap::new();
+    for original_mfra_info in mfra_infos {
+        let mfra_bytes = read_box_bytes_from_reader(input, original_mfra_info)?;
+        let local_root_boxes = read_root_box_infos(&mfra_bytes)?;
+        let local_mfra_info = local_root_boxes
+            .iter()
+            .copied()
+            .find(|info| info.box_type() == MFRA)
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "expected one local mfra box while planning stream-first Common Encryption rewrite".to_owned(),
+            })?;
+
+        let mut reader = Cursor::new(&mfra_bytes);
+        let tfra_boxes =
+            extract_box_as::<_, Tfra>(&mut reader, Some(&local_mfra_info), BoxPath::from([TFRA]))?;
+        let mut reader = Cursor::new(&mfra_bytes);
+        let tfra_infos = extract_box(&mut reader, Some(&local_mfra_info), BoxPath::from([TFRA]))?;
+        if tfra_boxes.len() != tfra_infos.len() {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: "expected aligned tfra boxes inside mfra for the stream-first Common Encryption rewrite".to_owned(),
+            }
+            .into());
+        }
+
+        let mut child_edits = Vec::new();
+        for (tfra_info, tfra_box) in tfra_infos.iter().copied().zip(tfra_boxes) {
+            let mut patched_tfra = tfra_box.clone();
+            let version = patched_tfra.version();
+            let mut changed = false;
+            for entry in &mut patched_tfra.entries {
+                let original_moof_offset = if version == 0 {
+                    u64::from(entry.moof_offset_v0)
+                } else {
+                    entry.moof_offset_v1
+                };
+                let Some(&rewritten_moof_offset) = rewritten_offsets.get(&original_moof_offset)
+                else {
+                    continue;
+                };
+
+                if version == 0 {
+                    let rewritten_moof_offset =
+                        u32::try_from(rewritten_moof_offset).map_err(|_| {
+                            DecryptRewriteError::InvalidLayout {
+                                reason: "rewritten tfra moof offset does not fit in u32".to_owned(),
+                            }
+                        })?;
+                    if entry.moof_offset_v0 != rewritten_moof_offset {
+                        entry.moof_offset_v0 = rewritten_moof_offset;
+                        changed = true;
+                    }
+                } else if entry.moof_offset_v1 != rewritten_moof_offset {
+                    entry.moof_offset_v1 = rewritten_moof_offset;
+                    changed = true;
+                }
+            }
+            if changed {
+                child_edits.push(DirectChildEdit {
+                    child_info: tfra_info,
+                    replacement: Some(encode_box_with_children(&patched_tfra, &[])?),
+                });
+            }
+        }
+
+        let mut rebuilt_mfra =
+            rebuild_box_with_child_edits(&mfra_bytes, local_mfra_info, &child_edits)?;
+        if let Some(mfro_info) =
+            extract_optional_single_info_from_infos(&local_mfra_info, MFRO, &mfra_bytes)?
+        {
+            let mut reader = Cursor::new(&mfra_bytes);
+            let Some(mut mfro) = extract_optional_single_as::<_, Mfro>(
+                &mut reader,
+                Some(&local_mfra_info),
+                BoxPath::from([MFRO]),
+                "mfro",
+            )?
+            else {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: "expected mfro to decode when its box info is present".to_owned(),
+                }
+                .into());
+            };
+            mfro.size = u32::try_from(rebuilt_mfra.len()).map_err(|_| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "rewritten mfra size does not fit in u32".to_owned(),
+                }
+            })?;
+            let mfro_replacement = encode_box_with_children(&mfro, &[])?;
+            rebuilt_mfra = rebuild_box_with_child_edits(
+                &mfra_bytes,
+                local_mfra_info,
+                &[
+                    child_edits,
+                    vec![DirectChildEdit {
+                        child_info: mfro_info,
+                        replacement: Some(mfro_replacement),
+                    }],
+                ]
+                .concat(),
+            )?;
+        }
+
+        if rebuilt_mfra != slice_box_bytes(&mfra_bytes, local_mfra_info)? {
+            replacements.insert(original_mfra_info.offset(), rebuilt_mfra);
+        }
+    }
+
+    Ok(replacements)
+}
+
+#[cfg(feature = "async")]
+async fn build_common_encryption_mfra_replacements_from_async_stream<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+    moov_replacement: Option<(u64, &[u8])>,
+    moof_replacements: &BTreeMap<u64, Vec<u8>>,
+) -> Result<BTreeMap<u64, Vec<u8>>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let mfra_infos = root_boxes
+        .iter()
+        .copied()
+        .filter(|info| info.box_type() == MFRA)
+        .collect::<Vec<_>>();
+    if mfra_infos.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let rewritten_offsets = compute_rewritten_root_offsets_stream(
+        root_boxes,
+        moov_replacement,
+        moof_replacements,
+        &BTreeMap::new(),
+    )?;
+    let mut replacements = BTreeMap::new();
+    for original_mfra_info in mfra_infos {
+        let mfra_bytes = read_box_bytes_from_async_reader(input, original_mfra_info).await?;
+        let local_root_boxes = read_root_box_infos(&mfra_bytes)?;
+        let local_mfra_info = local_root_boxes
+            .iter()
+            .copied()
+            .find(|info| info.box_type() == MFRA)
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "expected one local mfra box while planning stream-first Common Encryption rewrite".to_owned(),
+            })?;
+
+        let mut reader = Cursor::new(&mfra_bytes);
+        let tfra_boxes =
+            extract_box_as::<_, Tfra>(&mut reader, Some(&local_mfra_info), BoxPath::from([TFRA]))?;
+        let mut reader = Cursor::new(&mfra_bytes);
+        let tfra_infos = extract_box(&mut reader, Some(&local_mfra_info), BoxPath::from([TFRA]))?;
+        if tfra_boxes.len() != tfra_infos.len() {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: "expected aligned tfra boxes inside mfra for the stream-first Common Encryption rewrite".to_owned(),
+            }
+            .into());
+        }
+
+        let mut child_edits = Vec::new();
+        for (tfra_info, tfra_box) in tfra_infos.iter().copied().zip(tfra_boxes) {
+            let mut patched_tfra = tfra_box.clone();
+            let version = patched_tfra.version();
+            let mut changed = false;
+            for entry in &mut patched_tfra.entries {
+                let original_moof_offset = if version == 0 {
+                    u64::from(entry.moof_offset_v0)
+                } else {
+                    entry.moof_offset_v1
+                };
+                let Some(&rewritten_moof_offset) = rewritten_offsets.get(&original_moof_offset)
+                else {
+                    continue;
+                };
+
+                if version == 0 {
+                    let rewritten_moof_offset =
+                        u32::try_from(rewritten_moof_offset).map_err(|_| {
+                            DecryptRewriteError::InvalidLayout {
+                                reason: "rewritten tfra moof offset does not fit in u32".to_owned(),
+                            }
+                        })?;
+                    if entry.moof_offset_v0 != rewritten_moof_offset {
+                        entry.moof_offset_v0 = rewritten_moof_offset;
+                        changed = true;
+                    }
+                } else if entry.moof_offset_v1 != rewritten_moof_offset {
+                    entry.moof_offset_v1 = rewritten_moof_offset;
+                    changed = true;
+                }
+            }
+            if changed {
+                child_edits.push(DirectChildEdit {
+                    child_info: tfra_info,
+                    replacement: Some(encode_box_with_children(&patched_tfra, &[])?),
+                });
+            }
+        }
+
+        let mut rebuilt_mfra =
+            rebuild_box_with_child_edits(&mfra_bytes, local_mfra_info, &child_edits)?;
+        if let Some(mfro_info) =
+            extract_optional_single_info_from_infos(&local_mfra_info, MFRO, &mfra_bytes)?
+        {
+            let mut reader = Cursor::new(&mfra_bytes);
+            let Some(mut mfro) = extract_optional_single_as::<_, Mfro>(
+                &mut reader,
+                Some(&local_mfra_info),
+                BoxPath::from([MFRO]),
+                "mfro",
+            )?
+            else {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: "expected mfro to decode when its box info is present".to_owned(),
+                }
+                .into());
+            };
+            mfro.size = u32::try_from(rebuilt_mfra.len()).map_err(|_| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "rewritten mfra size does not fit in u32".to_owned(),
+                }
+            })?;
+            let mfro_replacement = encode_box_with_children(&mfro, &[])?;
+            rebuilt_mfra = rebuild_box_with_child_edits(
+                &mfra_bytes,
+                local_mfra_info,
+                &[
+                    child_edits,
+                    vec![DirectChildEdit {
+                        child_info: mfro_info,
+                        replacement: Some(mfro_replacement),
+                    }],
+                ]
+                .concat(),
+            )?;
+        }
+
+        if rebuilt_mfra != slice_box_bytes(&mfra_bytes, local_mfra_info)? {
+            replacements.insert(original_mfra_info.offset(), rebuilt_mfra);
+        }
+    }
+
+    Ok(replacements)
+}
+
+fn compute_rewritten_root_offsets_stream(
+    root_boxes: &[BoxInfo],
+    moov_replacement: Option<(u64, &[u8])>,
+    moof_replacements: &BTreeMap<u64, Vec<u8>>,
+    extra_root_replacements: &BTreeMap<u64, Vec<u8>>,
+) -> Result<BTreeMap<u64, u64>, DecryptRewriteError> {
+    let mut next_offset = 0_u64;
+    let mut offsets = BTreeMap::new();
+    for info in root_boxes {
+        offsets.insert(info.offset(), next_offset);
+        next_offset = next_offset
+            .checked_add(rewritten_root_box_size_stream(
+                *info,
+                moov_replacement,
+                moof_replacements,
+                extra_root_replacements,
+            )?)
+            .ok_or_else(|| invalid_layout("rewritten root offset overflowed u64".to_owned()))?;
+    }
+    Ok(offsets)
+}
+
+fn rewritten_root_box_size_stream(
+    info: BoxInfo,
+    moov_replacement: Option<(u64, &[u8])>,
+    moof_replacements: &BTreeMap<u64, Vec<u8>>,
+    extra_root_replacements: &BTreeMap<u64, Vec<u8>>,
+) -> Result<u64, DecryptRewriteError> {
+    if let Some((moov_offset, replacement)) = moov_replacement
+        && info.offset() == moov_offset
+    {
+        return u64::try_from(replacement.len())
+            .map_err(|_| invalid_layout("rebuilt moov size does not fit in u64".to_owned()));
+    }
+    if let Some(replacement) = extra_root_replacements.get(&info.offset()) {
+        return u64::try_from(replacement.len()).map_err(|_| {
+            invalid_layout("rewritten root replacement size does not fit in u64".to_owned())
+        });
+    }
+    if let Some(replacement) = moof_replacements.get(&info.offset()) {
+        return u64::try_from(replacement.len())
+            .map_err(|_| invalid_layout("rebuilt moof size does not fit in u64".to_owned()));
+    }
+    Ok(info.size())
+}
+
+fn execute_common_encryption_stream_plan<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &CommonEncryptionStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+{
+    output.seek(SeekFrom::Start(0))?;
+    for root_info in &plan.root_boxes {
+        if let Some((offset, replacement)) = &plan.moov_replacement
+            && root_info.offset() == *offset
+        {
+            output.write_all(replacement)?;
+            continue;
+        }
+        if let Some(replacement) = plan.extra_root_replacements.get(&root_info.offset()) {
+            output.write_all(replacement)?;
+            continue;
+        }
+        if let Some(replacement) = plan.moof_replacements.get(&root_info.offset()) {
+            output.write_all(replacement)?;
+            continue;
+        }
+        if root_info.box_type() == MDAT {
+            stream_mdat_with_sample_edits(
+                input,
+                output,
+                *root_info,
+                plan.mdat_edits.get(&root_info.offset()),
+            )?;
+            continue;
+        }
+        copy_exact_range(input, output, root_info.offset(), root_info.size())?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn execute_common_encryption_stream_plan_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &CommonEncryptionStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWriteSeek,
+{
+    output.seek(SeekFrom::Start(0)).await?;
+    for root_info in &plan.root_boxes {
+        if let Some((offset, replacement)) = &plan.moov_replacement
+            && root_info.offset() == *offset
+        {
+            output.write_all(replacement).await?;
+            continue;
+        }
+        if let Some(replacement) = plan.extra_root_replacements.get(&root_info.offset()) {
+            output.write_all(replacement).await?;
+            continue;
+        }
+        if let Some(replacement) = plan.moof_replacements.get(&root_info.offset()) {
+            output.write_all(replacement).await?;
+            continue;
+        }
+        if root_info.box_type() == MDAT {
+            stream_mdat_with_sample_edits_async(
+                input,
+                output,
+                *root_info,
+                plan.mdat_edits.get(&root_info.offset()),
+            )
+            .await?;
+            continue;
+        }
+        copy_exact_range_async(input, output, root_info.offset(), root_info.size()).await?;
+    }
+    output.flush().await?;
+    Ok(())
+}
+
+fn stream_mdat_with_sample_edits<R, W>(
+    input: &mut R,
+    output: &mut W,
+    mdat_info: BoxInfo,
+    sample_edits: Option<&Vec<CommonEncryptionSampleEdit>>,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    copy_exact_range(input, output, mdat_info.offset(), mdat_info.header_size())?;
+
+    let payload_start = mdat_info.offset() + mdat_info.header_size();
+    let payload_end = mdat_info.offset() + mdat_info.size();
+    let mut cursor = payload_start;
+    for edit in sample_edits.into_iter().flatten() {
+        if edit.absolute_offset < cursor {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: format!(
+                    "track {} has overlapping Common Encryption sample ranges in the stream-first mdat writer",
+                    edit.track_id
+                ),
+            }
+            .into());
+        }
+        copy_exact_range(input, output, cursor, edit.absolute_offset - cursor)?;
+        input.seek(SeekFrom::Start(edit.absolute_offset))?;
+        let mut encrypted = vec![
+            0_u8;
+            usize::try_from(edit.sample_size).map_err(|_| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "encrypted sample size does not fit in usize".to_owned(),
+                }
+            })?
+        ];
+        input.read_exact(&mut encrypted)?;
+        let clear = decrypt_common_encryption_sample_edit(edit, &encrypted)?;
+        output.write_all(&clear)?;
+        cursor = edit
+            .absolute_offset
+            .checked_add(u64::from(edit.sample_size))
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "stream-first mdat cursor overflowed u64".to_owned(),
+            })?;
+    }
+
+    copy_exact_range(input, output, cursor, payload_end.saturating_sub(cursor))?;
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn stream_mdat_with_sample_edits_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    mdat_info: BoxInfo,
+    sample_edits: Option<&Vec<CommonEncryptionSampleEdit>>,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    copy_exact_range_async(input, output, mdat_info.offset(), mdat_info.header_size()).await?;
+
+    let payload_start = mdat_info.offset() + mdat_info.header_size();
+    let payload_end = mdat_info.offset() + mdat_info.size();
+    let mut cursor = payload_start;
+    for edit in sample_edits.into_iter().flatten() {
+        if edit.absolute_offset < cursor {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: format!(
+                    "track {} has overlapping Common Encryption sample ranges in the stream-first mdat writer",
+                    edit.track_id
+                ),
+            }
+            .into());
+        }
+        copy_exact_range_async(input, output, cursor, edit.absolute_offset - cursor).await?;
+        input.seek(SeekFrom::Start(edit.absolute_offset)).await?;
+        let mut encrypted = vec![
+            0_u8;
+            usize::try_from(edit.sample_size).map_err(|_| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "encrypted sample size does not fit in usize".to_owned(),
+                }
+            })?
+        ];
+        input.read_exact(&mut encrypted).await?;
+        let clear = decrypt_common_encryption_sample_edit(edit, &encrypted)?;
+        output.write_all(&clear).await?;
+        cursor = edit
+            .absolute_offset
+            .checked_add(u64::from(edit.sample_size))
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "stream-first mdat cursor overflowed u64".to_owned(),
+            })?;
+    }
+
+    copy_exact_range_async(input, output, cursor, payload_end.saturating_sub(cursor)).await?;
+    Ok(())
+}
+
+fn decrypt_common_encryption_sample_edit(
+    edit: &CommonEncryptionSampleEdit,
+    encrypted_sample: &[u8],
+) -> Result<Vec<u8>, DecryptError> {
+    if edit.scheme_type == PIFF {
+        return Ok(encrypted_sample.to_vec());
+    }
+    let sample = edit.sample.as_borrowed();
+    let scheme = NativeCommonEncryptionScheme::from_scheme_type(edit.scheme_type).ok_or(
+        DecryptRewriteError::UnsupportedTrackSchemeType {
+            track_id: edit.track_id,
+            scheme_type: edit.scheme_type,
+        },
+    )?;
+    let clear =
+        decrypt_common_encryption_sample(scheme, edit.content_key, &sample, encrypted_sample)
+            .map_err(DecryptRewriteError::from)?;
+    if clear.len() != encrypted_sample.len() {
+        return Err(DecryptRewriteError::InvalidLayout {
+            reason: format!(
+                "track {} changed Common Encryption sample size from {} to {} in the stream-first decrypt path",
+                edit.track_id,
+                encrypted_sample.len(),
+                clear.len()
+            ),
+        }
+        .into());
+    }
+    Ok(clear)
+}
+
+fn copy_exact_range<R, W>(
+    input: &mut R,
+    output: &mut W,
+    start: u64,
+    size: u64,
+) -> Result<(), DecryptError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    input.seek(SeekFrom::Start(start))?;
+    let mut remaining = size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len])?;
+        output.write_all(&buffer[..chunk_len])?;
+        remaining -= u64::try_from(chunk_len).unwrap();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn copy_exact_range_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    start: u64,
+    size: u64,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    input.seek(SeekFrom::Start(start)).await?;
+    let mut remaining = size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len]).await?;
+        output.write_all(&buffer[..chunk_len]).await?;
+        remaining -= u64::try_from(chunk_len).unwrap();
+    }
+    Ok(())
+}
+
+fn find_mdat_info_containing_sample(
+    mdat_infos: &[BoxInfo],
+    absolute_offset: u64,
+    sample_size: u32,
+) -> Option<BoxInfo> {
+    let end = absolute_offset.checked_add(u64::from(sample_size))?;
+    mdat_infos.iter().copied().find(|info| {
+        let start = info.offset() + info.header_size();
+        let finish = info.offset() + info.size();
+        absolute_offset >= start && end <= finish
+    })
 }
 
 fn classify_decrypt_input(input: &[u8]) -> Result<DecryptInputLayout, DecryptError> {
@@ -1890,7 +5668,7 @@ fn read_root_box_infos(input: &[u8]) -> Result<Vec<BoxInfo>, DecryptRewriteError
     let mut reader = Cursor::new(input);
     let mut root_boxes = Vec::new();
     loop {
-        let position = reader.stream_position().map_err(|error| {
+        let position = std::io::Seek::stream_position(&mut reader).map_err(|error| {
             invalid_layout(format!("failed to read root-box position: {error}"))
         })?;
         if usize::try_from(position)
@@ -2278,6 +6056,250 @@ fn analyze_marlin_movie_file(input: &[u8]) -> Result<MarlinMovieContext, Decrypt
     })
 }
 
+fn analyze_marlin_movie_metadata_from_reader<R>(
+    input: &[u8],
+    original_reader: &mut R,
+    mdat_infos: Vec<BoxInfo>,
+) -> Result<MarlinMovieContext, DecryptRewriteError>
+where
+    R: Read + Seek,
+{
+    let root_boxes = read_root_box_infos(input)?;
+    let ftyp_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP)
+        .ok_or_else(|| {
+            invalid_layout("expected one root ftyp box in the Marlin movie file".to_owned())
+        })?;
+    let moov_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the Marlin movie file".to_owned())
+        })?;
+    if mdat_infos.is_empty() {
+        return Err(invalid_layout(
+            "expected at least one root mdat box in the Marlin movie file".to_owned(),
+        ));
+    }
+
+    let mut reader = Cursor::new(input);
+    let ftyp = extract_single_as::<_, Ftyp>(&mut reader, None, BoxPath::from([FTYP]), "ftyp")?;
+    if ftyp.major_brand != MARLIN_BRAND_MGSV && !ftyp.compatible_brands.contains(&MARLIN_BRAND_MGSV)
+    {
+        return Err(invalid_layout(
+            "the current Marlin movie path expects the MGSV file-type brand".to_owned(),
+        ));
+    }
+
+    let iods_info = {
+        let mut reader = Cursor::new(input);
+        extract_single_info(&mut reader, None, BoxPath::from([MOOV, IODS]), "iods")?
+    };
+    let iods = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Iods>(&mut reader, None, BoxPath::from([MOOV, IODS]), "iods")?
+    };
+    let initial_object_descriptor = iods.initial_object_descriptor().ok_or_else(|| {
+        invalid_layout(
+            "the current Marlin movie path expects one initial object descriptor in iods"
+                .to_owned(),
+        )
+    })?;
+    let od_track_id = initial_object_descriptor
+        .sub_descriptors
+        .iter()
+        .find_map(|descriptor| descriptor.es_id_inc_descriptor())
+        .map(|descriptor| descriptor.track_id)
+        .ok_or_else(|| {
+            invalid_layout(
+                "the current Marlin movie path expects iods to carry one ES-ID-increment descriptor"
+                    .to_owned(),
+            )
+        })?;
+
+    let mut reader = Cursor::new(input);
+    let trak_infos = extract_box(&mut reader, None, BoxPath::from([MOOV, TRAK]))?;
+    let mut od_track_info = None;
+    for trak_info in &trak_infos {
+        let mut reader = Cursor::new(input);
+        let tkhd = extract_single_as::<_, Tkhd>(
+            &mut reader,
+            Some(trak_info),
+            BoxPath::from([TKHD]),
+            "trak/tkhd",
+        )?;
+        if tkhd.track_id == od_track_id {
+            od_track_info = Some(*trak_info);
+            break;
+        }
+    }
+    let od_track_info = od_track_info.ok_or_else(|| {
+        invalid_layout(format!(
+            "expected one Marlin object-descriptor track with track id {od_track_id}"
+        ))
+    })?;
+
+    let mdat_ranges = media_data_ranges_from_infos(&mdat_infos);
+    let marlin_tracks =
+        analyze_marlin_od_track_from_reader(input, &od_track_info, original_reader, &mdat_ranges)?;
+    if marlin_tracks.is_empty() {
+        return Err(invalid_layout(
+            "the current Marlin movie path found no carried track protection entries in the OD track"
+                .to_owned(),
+        ));
+    }
+
+    let mut tracks = Vec::new();
+    for trak_info in trak_infos {
+        if trak_info.offset() == od_track_info.offset() {
+            continue;
+        }
+        tracks.push(analyze_marlin_movie_track(
+            input,
+            &trak_info,
+            &marlin_tracks,
+        )?);
+    }
+
+    Ok(MarlinMovieContext {
+        ftyp_info,
+        ftyp,
+        moov_info,
+        iods_info,
+        od_track_info,
+        mdat_infos,
+        tracks,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn analyze_marlin_movie_metadata_from_async_reader<R>(
+    input: &[u8],
+    original_reader: &mut R,
+    mdat_infos: Vec<BoxInfo>,
+) -> Result<MarlinMovieContext, DecryptRewriteError>
+where
+    R: AsyncReadSeek,
+{
+    let root_boxes = read_root_box_infos(input)?;
+    let ftyp_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP)
+        .ok_or_else(|| {
+            invalid_layout("expected one root ftyp box in the Marlin movie file".to_owned())
+        })?;
+    let moov_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+        .ok_or_else(|| {
+            invalid_layout("expected one root moov box in the Marlin movie file".to_owned())
+        })?;
+    if mdat_infos.is_empty() {
+        return Err(invalid_layout(
+            "expected at least one root mdat box in the Marlin movie file".to_owned(),
+        ));
+    }
+
+    let mut reader = Cursor::new(input);
+    let ftyp = extract_single_as::<_, Ftyp>(&mut reader, None, BoxPath::from([FTYP]), "ftyp")?;
+    if ftyp.major_brand != MARLIN_BRAND_MGSV && !ftyp.compatible_brands.contains(&MARLIN_BRAND_MGSV)
+    {
+        return Err(invalid_layout(
+            "the current Marlin movie path expects the MGSV file-type brand".to_owned(),
+        ));
+    }
+
+    let iods_info = {
+        let mut reader = Cursor::new(input);
+        extract_single_info(&mut reader, None, BoxPath::from([MOOV, IODS]), "iods")?
+    };
+    let iods = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Iods>(&mut reader, None, BoxPath::from([MOOV, IODS]), "iods")?
+    };
+    let initial_object_descriptor = iods.initial_object_descriptor().ok_or_else(|| {
+        invalid_layout(
+            "the current Marlin movie path expects one initial object descriptor in iods"
+                .to_owned(),
+        )
+    })?;
+    let od_track_id = initial_object_descriptor
+        .sub_descriptors
+        .iter()
+        .find_map(|descriptor| descriptor.es_id_inc_descriptor())
+        .map(|descriptor| descriptor.track_id)
+        .ok_or_else(|| {
+            invalid_layout(
+                "the current Marlin movie path expects iods to carry one ES-ID-increment descriptor"
+                    .to_owned(),
+            )
+        })?;
+
+    let mut reader = Cursor::new(input);
+    let trak_infos = extract_box(&mut reader, None, BoxPath::from([MOOV, TRAK]))?;
+    let mut od_track_info = None;
+    for trak_info in &trak_infos {
+        let mut reader = Cursor::new(input);
+        let tkhd = extract_single_as::<_, Tkhd>(
+            &mut reader,
+            Some(trak_info),
+            BoxPath::from([TKHD]),
+            "trak/tkhd",
+        )?;
+        if tkhd.track_id == od_track_id {
+            od_track_info = Some(*trak_info);
+            break;
+        }
+    }
+    let od_track_info = od_track_info.ok_or_else(|| {
+        invalid_layout(format!(
+            "expected one Marlin object-descriptor track with track id {od_track_id}"
+        ))
+    })?;
+
+    let mdat_ranges = media_data_ranges_from_infos(&mdat_infos);
+    let marlin_tracks = analyze_marlin_od_track_from_async_reader(
+        input,
+        &od_track_info,
+        original_reader,
+        &mdat_ranges,
+    )
+    .await?;
+    if marlin_tracks.is_empty() {
+        return Err(invalid_layout(
+            "the current Marlin movie path found no carried track protection entries in the OD track"
+                .to_owned(),
+        ));
+    }
+
+    let mut tracks = Vec::new();
+    for trak_info in trak_infos {
+        if trak_info.offset() == od_track_info.offset() {
+            continue;
+        }
+        tracks.push(analyze_marlin_movie_track(
+            input,
+            &trak_info,
+            &marlin_tracks,
+        )?);
+    }
+
+    Ok(MarlinMovieContext {
+        ftyp_info,
+        ftyp,
+        moov_info,
+        iods_info,
+        od_track_info,
+        mdat_infos,
+        tracks,
+    })
+}
+
 fn analyze_marlin_od_track(
     input: &[u8],
     od_track_info: &BoxInfo,
@@ -2422,6 +6444,311 @@ fn analyze_marlin_od_track(
             "failed to parse Marlin OD track command stream: {error}"
         ))
     })?;
+    let object_update = commands
+        .iter()
+        .find_map(|command| match command {
+            DescriptorCommand::DescriptorUpdate(update) if update.tag == 0x01 => Some(update),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            invalid_layout(
+                "the current Marlin OD track path expects one object-descriptor-update command"
+                    .to_owned(),
+            )
+        })?;
+    let ipmp_update = commands
+        .iter()
+        .find_map(|command| match command {
+            DescriptorCommand::DescriptorUpdate(update) if update.tag == 0x05 => Some(update),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            invalid_layout(
+                "the current Marlin OD track path expects one IPMP-descriptor-update command"
+                    .to_owned(),
+            )
+        })?;
+
+    let mut tracks = BTreeMap::new();
+    for descriptor in &object_update.descriptors {
+        let Some(object_descriptor) = descriptor.object_descriptor() else {
+            continue;
+        };
+        let Some(es_id_ref) = object_descriptor
+            .sub_descriptors
+            .iter()
+            .find_map(|descriptor| descriptor.es_id_ref_descriptor())
+        else {
+            continue;
+        };
+        let ref_index = usize::from(es_id_ref.ref_index);
+        if ref_index == 0 || ref_index > mpod.track_ids.len() {
+            continue;
+        }
+        let track_id = mpod.track_ids[ref_index - 1];
+        let Some(pointer) = object_descriptor
+            .sub_descriptors
+            .iter()
+            .find_map(|descriptor| descriptor.ipmp_descriptor_pointer())
+        else {
+            continue;
+        };
+        let Some(ipmp_descriptor) = ipmp_update.descriptors.iter().find_map(|descriptor| {
+            let ipmp_descriptor = descriptor.ipmp_descriptor()?;
+            (ipmp_descriptor.ipmps_type == MARLIN_IPMPS_TYPE_MGSV
+                && ipmp_descriptor.descriptor_id == pointer.descriptor_id)
+                .then_some(ipmp_descriptor)
+        }) else {
+            continue;
+        };
+        let Some(protection) = parse_marlin_track_protection(&ipmp_descriptor.data)? else {
+            continue;
+        };
+        tracks.insert(track_id, protection);
+    }
+
+    Ok(tracks)
+}
+
+fn analyze_marlin_od_track_from_reader<R>(
+    input: &[u8],
+    od_track_info: &BoxInfo,
+    original_reader: &mut R,
+    mdat_ranges: &[MediaDataRange],
+) -> Result<BTreeMap<u32, MarlinTrackProtection>, DecryptRewriteError>
+where
+    R: Read + Seek,
+{
+    let od_track_id = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Tkhd>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([TKHD]),
+            "trak/tkhd",
+        )?
+        .track_id
+    };
+    let mpod = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Mpod>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([FourCc::from_bytes(*b"tref"), FourCc::from_bytes(*b"mpod")]),
+            "mpod",
+        )?
+    };
+    if mpod.track_ids.is_empty() {
+        return Err(invalid_layout(
+            "the current Marlin OD track expects one or more mpod track references".to_owned(),
+        ));
+    }
+
+    let stsz = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Stsz>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([MDIA, MINF, STBL, STSZ]),
+            "stsz",
+        )?
+    };
+    let od_sample_sizes = sample_sizes_from_stsz(&stsz)?;
+    if od_sample_sizes.is_empty() {
+        return Err(invalid_layout(format!(
+            "the current Marlin OD track path expects at least one OD sample but found {}",
+            od_sample_sizes.len()
+        )));
+    }
+
+    let stsc = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Stsc>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([MDIA, MINF, STBL, STSC]),
+            "stsc",
+        )?
+    };
+    let chunk_offsets = marlin_track_chunk_offsets(input, od_track_info, od_track_id)?;
+    let od_chunks = compute_track_chunks(od_track_id, &stsc, &chunk_offsets, &od_sample_sizes)?;
+    let (sample_offset, sample_size) = od_chunks
+        .iter()
+        .find_map(|chunk| chunk.sample_sizes.first().map(|size| (chunk.offset, *size)))
+        .ok_or_else(|| {
+            invalid_layout(
+                "the current Marlin OD track path could not resolve the first OD sample".to_owned(),
+            )
+        })?;
+
+    ensure_sample_range_in_mdat(mdat_ranges, od_track_id, 1, sample_offset, sample_size)?;
+    let sample_bytes =
+        read_sample_bytes_for_rewrite_from_reader(original_reader, sample_offset, sample_size)?;
+    let commands = parse_descriptor_commands(&sample_bytes).map_err(|error| {
+        invalid_layout(format!(
+            "failed to parse Marlin OD track command stream: {error}"
+        ))
+    })?;
+    extract_marlin_track_protections_from_commands(&commands, &mpod)
+}
+
+#[cfg(feature = "async")]
+async fn analyze_marlin_od_track_from_async_reader<R>(
+    input: &[u8],
+    od_track_info: &BoxInfo,
+    original_reader: &mut R,
+    mdat_ranges: &[MediaDataRange],
+) -> Result<BTreeMap<u32, MarlinTrackProtection>, DecryptRewriteError>
+where
+    R: AsyncReadSeek,
+{
+    let od_track_id = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Tkhd>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([TKHD]),
+            "trak/tkhd",
+        )?
+        .track_id
+    };
+    let mpod = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Mpod>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([FourCc::from_bytes(*b"tref"), FourCc::from_bytes(*b"mpod")]),
+            "mpod",
+        )?
+    };
+    if mpod.track_ids.is_empty() {
+        return Err(invalid_layout(
+            "the current Marlin OD track expects one or more mpod track references".to_owned(),
+        ));
+    }
+
+    let stsz = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Stsz>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([MDIA, MINF, STBL, STSZ]),
+            "stsz",
+        )?
+    };
+    let od_sample_sizes = sample_sizes_from_stsz(&stsz)?;
+    if od_sample_sizes.is_empty() {
+        return Err(invalid_layout(format!(
+            "the current Marlin OD track path expects at least one OD sample but found {}",
+            od_sample_sizes.len()
+        )));
+    }
+
+    let stsc = {
+        let mut reader = Cursor::new(input);
+        extract_single_as::<_, Stsc>(
+            &mut reader,
+            Some(od_track_info),
+            BoxPath::from([MDIA, MINF, STBL, STSC]),
+            "stsc",
+        )?
+    };
+    let chunk_offsets = marlin_track_chunk_offsets(input, od_track_info, od_track_id)?;
+    let od_chunks = compute_track_chunks(od_track_id, &stsc, &chunk_offsets, &od_sample_sizes)?;
+    let (sample_offset, sample_size) = od_chunks
+        .iter()
+        .find_map(|chunk| chunk.sample_sizes.first().map(|size| (chunk.offset, *size)))
+        .ok_or_else(|| {
+            invalid_layout(
+                "the current Marlin OD track path could not resolve the first OD sample".to_owned(),
+            )
+        })?;
+
+    ensure_sample_range_in_mdat(mdat_ranges, od_track_id, 1, sample_offset, sample_size)?;
+    let sample_bytes = read_sample_bytes_for_rewrite_from_async_reader(
+        original_reader,
+        sample_offset,
+        sample_size,
+    )
+    .await?;
+    let commands = parse_descriptor_commands(&sample_bytes).map_err(|error| {
+        invalid_layout(format!(
+            "failed to parse Marlin OD track command stream: {error}"
+        ))
+    })?;
+    extract_marlin_track_protections_from_commands(&commands, &mpod)
+}
+
+fn marlin_track_chunk_offsets(
+    input: &[u8],
+    od_track_info: &BoxInfo,
+    od_track_id: u32,
+) -> Result<ChunkOffsetBoxState, DecryptRewriteError> {
+    let mut reader = Cursor::new(input);
+    let stco = extract_optional_single_as::<_, Stco>(
+        &mut reader,
+        Some(od_track_info),
+        BoxPath::from([MDIA, MINF, STBL, STCO]),
+        "stco",
+    )?;
+    let mut reader = Cursor::new(input);
+    let co64 = extract_optional_single_as::<_, Co64>(
+        &mut reader,
+        Some(od_track_info),
+        BoxPath::from([MDIA, MINF, STBL, FourCc::from_bytes(*b"co64")]),
+        "co64",
+    )?;
+    let mut reader = Cursor::new(input);
+    let stco_info = extract_box(
+        &mut reader,
+        Some(od_track_info),
+        BoxPath::from([MDIA, MINF, STBL, STCO]),
+    )?;
+    let mut reader = Cursor::new(input);
+    let co64_info = extract_box(
+        &mut reader,
+        Some(od_track_info),
+        BoxPath::from([MDIA, MINF, STBL, FourCc::from_bytes(*b"co64")]),
+    )?;
+    match (stco, co64) {
+        (Some(_), Some(_)) => Err(invalid_layout(
+            "the current Marlin OD track path does not support both stco and co64".to_owned(),
+        )),
+        (Some(stco), None) => {
+            let [info] = stco_info.as_slice() else {
+                return Err(invalid_layout(format!(
+                    "expected exactly one stco box for the Marlin OD track but found {}",
+                    stco_info.len()
+                )));
+            };
+            Ok(ChunkOffsetBoxState::Stco {
+                info: *info,
+                box_value: stco,
+            })
+        }
+        (None, Some(co64)) => {
+            let [info] = co64_info.as_slice() else {
+                return Err(invalid_layout(format!(
+                    "expected exactly one co64 box for the Marlin OD track but found {}",
+                    co64_info.len()
+                )));
+            };
+            Ok(ChunkOffsetBoxState::Co64 {
+                info: *info,
+                box_value: co64,
+            })
+        }
+        (None, None) => Err(invalid_layout(format!(
+            "track {} is missing stco or co64 chunk offsets",
+            od_track_id
+        ))),
+    }
+}
+
+fn extract_marlin_track_protections_from_commands(
+    commands: &[DescriptorCommand],
+    mpod: &Mpod,
+) -> Result<BTreeMap<u32, MarlinTrackProtection>, DecryptRewriteError> {
     let object_update = commands
         .iter()
         .find_map(|command| match command {
@@ -3290,6 +7617,58 @@ fn analyze_oma_dcf_movie_file(
             "expected at least one root mdat box in the protected movie file".to_owned(),
         ));
     }
+    let mut reader = Cursor::new(input);
+    let traks = extract_box(&mut reader, None, BoxPath::from([MOOV, TRAK]))?;
+    let mut protected_tracks = Vec::new();
+    let mut other_tracks = Vec::new();
+    for trak_info in traks {
+        if let Some(track) = analyze_oma_dcf_movie_track(input, &trak_info)? {
+            protected_tracks.push(track);
+        } else {
+            other_tracks.push(analyze_movie_chunk_track(input, &trak_info)?);
+        }
+    }
+
+    if protected_tracks.is_empty() {
+        return Err(invalid_layout(
+            "expected at least one OMA DCF protected sample-entry track in the movie file"
+                .to_owned(),
+        ));
+    }
+
+    Ok(OmaProtectedMovieContext {
+        ftyp_info,
+        moov_info,
+        tracks: protected_tracks,
+        other_tracks,
+        mdat_infos,
+    })
+}
+
+fn analyze_oma_dcf_movie_metadata(
+    input: &[u8],
+    mdat_infos: Vec<BoxInfo>,
+) -> Result<OmaProtectedMovieContext, DecryptRewriteError> {
+    let root_boxes = read_root_box_infos(input)?;
+    let ftyp_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP);
+    let Some(moov_info) = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+    else {
+        return Err(invalid_layout(
+            "expected one root moov box in the protected movie file".to_owned(),
+        ));
+    };
+    if mdat_infos.is_empty() {
+        return Err(invalid_layout(
+            "expected at least one root mdat box in the protected movie file".to_owned(),
+        ));
+    }
+
     let mut reader = Cursor::new(input);
     let traks = extract_box(&mut reader, None, BoxPath::from([MOOV, TRAK]))?;
     let mut protected_tracks = Vec::new();
@@ -4262,6 +8641,57 @@ fn analyze_iaec_movie_file(input: &[u8]) -> Result<IaecProtectedMovieContext, De
         .copied()
         .filter(|info| info.box_type() == MDAT)
         .collect::<Vec<_>>();
+    if mdat_infos.is_empty() {
+        return Err(invalid_layout(
+            "expected at least one root mdat box in the protected movie file".to_owned(),
+        ));
+    }
+
+    let mut reader = Cursor::new(input);
+    let traks = extract_box(&mut reader, None, BoxPath::from([MOOV, TRAK]))?;
+    let mut protected_tracks = Vec::new();
+    let mut other_tracks = Vec::new();
+    for trak_info in traks {
+        if let Some(track) = analyze_iaec_movie_track(input, &trak_info)? {
+            protected_tracks.push(track);
+        } else {
+            other_tracks.push(analyze_movie_chunk_track(input, &trak_info)?);
+        }
+    }
+
+    if protected_tracks.is_empty() {
+        return Err(invalid_layout(
+            "expected at least one IAEC protected sample-entry track in the movie file".to_owned(),
+        ));
+    }
+
+    Ok(IaecProtectedMovieContext {
+        ftyp_info,
+        moov_info,
+        tracks: protected_tracks,
+        other_tracks,
+        mdat_infos,
+    })
+}
+
+fn analyze_iaec_movie_metadata(
+    input: &[u8],
+    mdat_infos: Vec<BoxInfo>,
+) -> Result<IaecProtectedMovieContext, DecryptRewriteError> {
+    let root_boxes = read_root_box_infos(input)?;
+    let ftyp_info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == FTYP);
+    let Some(moov_info) = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == MOOV)
+    else {
+        return Err(invalid_layout(
+            "expected one root moov box in the protected movie file".to_owned(),
+        ));
+    };
     if mdat_infos.is_empty() {
         return Err(invalid_layout(
             "expected at least one root mdat box in the protected movie file".to_owned(),
@@ -6617,7 +11047,39 @@ fn compute_ctr_counter_block(iv: &[u8; 16], stream_offset: u64) -> Block<Aes128>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[path = "../../../tests/support/mod.rs"]
+    mod test_support;
+
     use crate::boxes::iso14496_12::StscEntry;
+    use std::fs;
+    use std::io::Cursor;
+
+    use test_support::{
+        build_oma_dcf_broader_movie_fixture, common_encryption_fragment_fixture,
+        common_encryption_multi_track_fixture,
+    };
+
+    fn decrypt_stream_to_bytes(
+        input: &[u8],
+        options: &DecryptOptions,
+        fragments_info: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DecryptError> {
+        let mut input_reader = Cursor::new(input);
+        let mut output_writer = Cursor::new(Vec::new());
+        let mut fragments_info_reader = fragments_info.map(Cursor::new);
+        let fragments_info_reader = fragments_info_reader
+            .as_mut()
+            .map(|reader| reader as &mut dyn SyncReadSeek);
+        let mut reporter = ProgressReporter::new(None::<fn(DecryptProgress)>);
+        decrypt_sync_stream_with_optional_progress(
+            &mut input_reader,
+            &mut output_writer,
+            fragments_info_reader,
+            options,
+            &mut reporter,
+        )?;
+        Ok(output_writer.into_inner())
+    }
 
     #[test]
     fn compute_track_chunks_preserves_non_default_sample_description_indices() {
@@ -6679,5 +11141,54 @@ mod tests {
             error.to_string().contains("sample-description index 0"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn sync_stream_core_decrypts_retained_common_encryption_file() {
+        let fixture = common_encryption_multi_track_fixture();
+        let encrypted = fs::read(&fixture.encrypted_path).unwrap();
+        let expected = fs::read(&fixture.decrypted_path).unwrap();
+
+        let output = decrypt_stream_to_bytes(
+            &encrypted,
+            &DecryptOptions::new()
+                .with_key(fixture.keys[0])
+                .with_key(fixture.keys[1]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn sync_stream_core_decrypts_retained_standalone_fragment_with_seekable_fragments_info() {
+        let fixture = common_encryption_fragment_fixture("cenc-single", "video");
+        let encrypted = fs::read(&fixture.encrypted_segment_path).unwrap();
+        let expected = fs::read(&fixture.clear_segment_path).unwrap();
+        let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+
+        let output = decrypt_stream_to_bytes(
+            &encrypted,
+            &DecryptOptions::new().with_key(fixture.keys[0]),
+            Some(&fragments_info),
+        )
+        .unwrap();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn sync_stream_core_keeps_broader_protected_movie_layout_parity() {
+        let fixture = build_oma_dcf_broader_movie_fixture();
+
+        let output = decrypt_stream_to_bytes(
+            &fixture.encrypted,
+            &DecryptOptions::new().with_key(fixture.keys[0]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output, fixture.decrypted);
     }
 }

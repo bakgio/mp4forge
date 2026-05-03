@@ -220,6 +220,28 @@ fn assert_retained_fragmented_fixture_decrypts_bytes(fixture: &RetainedFragmente
     assert_eq!(output, expected);
 }
 
+fn assert_retained_fragmented_fixture_decrypts_with_progress(
+    fixture: &RetainedFragmentedDecryptFixture,
+    temp_prefix: &str,
+) {
+    let segment = fs::read(&fixture.encrypted_segment_path).unwrap();
+    let input_path = write_temp_file(temp_prefix, &segment);
+    let output_path = write_temp_file(&format!("{temp_prefix}-output"), &[]);
+    let expected = fs::read(&fixture.clear_segment_path).unwrap();
+    let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+    let options = options_with_keys(&fixture.keys).with_fragments_info_bytes(fragments_info);
+    let mut progress = Vec::new();
+
+    decrypt_file_with_progress(&input_path, &output_path, &options, |snapshot| {
+        progress.push(snapshot);
+    })
+    .unwrap();
+
+    let output = fs::read(&output_path).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(phases(&progress), expected_file_fragment_progress_phases());
+}
+
 fn assert_generated_topology_fixture_decrypts_bytes(fixture: ProtectedMovieTopologyFixture) {
     let output = decrypt_bytes(&fixture.encrypted, &options_with_keys(&fixture.keys)).unwrap();
     assert_eq!(output, fixture.decrypted);
@@ -509,6 +531,14 @@ fn decrypt_file_with_progress_supports_retained_common_encryption_multi_track_fi
 }
 
 #[test]
+fn decrypt_file_with_progress_supports_retained_cenc_single_video_media_segments() {
+    assert_retained_fragmented_fixture_decrypts_with_progress(
+        &common_encryption_fragment_fixture("cenc-single", "video"),
+        "decrypt-api-cenc-single-video-segment-input",
+    );
+}
+
+#[test]
 fn decrypt_bytes_supports_multi_sample_entry_fragmented_tracks() {
     let fixture = build_multi_sample_entry_decrypt_fixture();
     let output =
@@ -674,6 +704,23 @@ fn expected_file_progress_phases() -> Vec<DecryptProgressPhase> {
         DecryptProgressPhase::OpenInput,
         DecryptProgressPhase::OpenInput,
         DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::ProcessSamples,
+        DecryptProgressPhase::ProcessSamples,
+        DecryptProgressPhase::OpenOutput,
+        DecryptProgressPhase::OpenOutput,
+        DecryptProgressPhase::FinalizeOutput,
+        DecryptProgressPhase::FinalizeOutput,
+    ]
+}
+
+fn expected_file_fragment_progress_phases() -> Vec<DecryptProgressPhase> {
+    vec![
+        DecryptProgressPhase::OpenInput,
+        DecryptProgressPhase::OpenInput,
+        DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::OpenFragmentsInfo,
+        DecryptProgressPhase::OpenFragmentsInfo,
         DecryptProgressPhase::InspectStructure,
         DecryptProgressPhase::ProcessSamples,
         DecryptProgressPhase::ProcessSamples,

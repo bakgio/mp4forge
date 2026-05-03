@@ -219,6 +219,30 @@ async fn assert_retained_fragmented_fixture_decrypts_async(
     assert_eq!(output, expected);
 }
 
+async fn assert_retained_fragmented_fixture_decrypts_async_with_progress(
+    fixture: &RetainedFragmentedDecryptFixture,
+    temp_prefix: &str,
+) {
+    let output_path = write_temp_file(temp_prefix, &[]);
+    let expected = fs::read(&fixture.clear_segment_path).unwrap();
+    let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+    let options = options_with_keys(&fixture.keys).with_fragments_info_bytes(fragments_info);
+    let mut progress = Vec::new();
+
+    decrypt_file_with_progress_async(
+        &fixture.encrypted_segment_path,
+        &output_path,
+        &options,
+        |snapshot| progress.push(snapshot),
+    )
+    .await
+    .unwrap();
+
+    let output = fs::read(output_path).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(phases(&progress), expected_file_fragment_progress_phases());
+}
+
 async fn assert_generated_topology_fixture_decrypts_async(
     fixture: ProtectedMovieTopologyFixture,
     temp_prefix: &str,
@@ -440,6 +464,15 @@ async fn async_decrypt_file_supports_retained_common_encryption_multi_track_file
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_with_progress_supports_retained_cenc_single_video_media_segments() {
+    assert_retained_fragmented_fixture_decrypts_async_with_progress(
+        &common_encryption_fragment_fixture("cenc-single", "video"),
+        "decrypt-async-cenc-single-video-segment-progress-output",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_decrypt_file_supports_multi_sample_entry_fragmented_tracks() {
     let fixture = build_multi_sample_entry_decrypt_fixture();
     let input_path = write_temp_file("decrypt-async-multi-entry-input", &fixture.single_file);
@@ -585,4 +618,21 @@ fn options_with_keys(keys: &[DecryptionKey]) -> DecryptOptions {
 
 fn phases(progress: &[DecryptProgress]) -> Vec<DecryptProgressPhase> {
     progress.iter().map(|snapshot| snapshot.phase).collect()
+}
+
+fn expected_file_fragment_progress_phases() -> Vec<DecryptProgressPhase> {
+    vec![
+        DecryptProgressPhase::OpenInput,
+        DecryptProgressPhase::OpenInput,
+        DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::OpenFragmentsInfo,
+        DecryptProgressPhase::OpenFragmentsInfo,
+        DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::ProcessSamples,
+        DecryptProgressPhase::ProcessSamples,
+        DecryptProgressPhase::OpenOutput,
+        DecryptProgressPhase::OpenOutput,
+        DecryptProgressPhase::FinalizeOutput,
+        DecryptProgressPhase::FinalizeOutput,
+    ]
 }

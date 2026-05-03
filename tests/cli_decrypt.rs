@@ -154,6 +154,51 @@ fn decrypt_command_writes_stable_progress_lines() {
 }
 
 #[test]
+fn decrypt_command_writes_stable_progress_lines_for_media_segments() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let init_path = write_temp_file("cli-decrypt-progress-init", &fixture.init_segment);
+    let input_path = write_temp_file("cli-decrypt-progress-media", &fixture.media_segment);
+    let output_path = write_temp_file("cli-decrypt-progress-media-output", &[]);
+    let args = vec![
+        "--show-progress".to_string(),
+        "--key".to_string(),
+        fixture.all_keys[0].to_spec(),
+        "--key".to_string(),
+        fixture.all_keys[1].to_spec(),
+        "--fragments-info".to_string(),
+        init_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        output_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let _ = fs::remove_file(&init_path);
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        concat!(
+            "OpenInput 0/1\n",
+            "OpenInput 1/1\n",
+            "InspectStructure 0/1\n",
+            "OpenFragmentsInfo 0/1\n",
+            "OpenFragmentsInfo 1/1\n",
+            "InspectStructure 1/1\n",
+            "ProcessSamples 0/1\n",
+            "ProcessSamples 1/1\n",
+            "OpenOutput 0/1\n",
+            "OpenOutput 1/1\n",
+            "FinalizeOutput 0/1\n",
+            "FinalizeOutput 1/1\n",
+        )
+    );
+}
+
+#[test]
 fn decrypt_command_rejects_invalid_arguments() {
     let mut stderr = Vec::new();
     assert_eq!(decrypt::run(&[], &mut stderr), 1);

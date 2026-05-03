@@ -13,6 +13,9 @@
 //! `async` when you want the additive file-backed async decrypt companions on top of the existing
 //! synchronous in-memory decrypt helpers.
 
+#[cfg(test)]
+extern crate self as mp4forge;
+
 /// Tokio-based async I/O traits for the additive library-side async surface.
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
