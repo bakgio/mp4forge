@@ -10457,6 +10457,67 @@ impl CodecBox for WaveAudioData {
     )]);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpaqueCodecSpecificData {
+    box_type: FourCc,
+    data: Vec<u8>,
+}
+
+impl Default for OpaqueCodecSpecificData {
+    fn default() -> Self {
+        Self {
+            box_type: FourCc::ANY,
+            data: Vec::new(),
+        }
+    }
+}
+
+impl FieldHooks for OpaqueCodecSpecificData {}
+
+impl ImmutableBox for OpaqueCodecSpecificData {
+    fn box_type(&self) -> FourCc {
+        self.box_type
+    }
+}
+
+impl MutableBox for OpaqueCodecSpecificData {}
+
+impl AnyTypeBox for OpaqueCodecSpecificData {
+    fn set_box_type(&mut self, box_type: FourCc) {
+        self.box_type = box_type;
+    }
+}
+
+impl FieldValueRead for OpaqueCodecSpecificData {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Data" => Ok(FieldValue::Bytes(self.data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for OpaqueCodecSpecificData {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Data", FieldValue::Bytes(value)) => {
+                self.data = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for OpaqueCodecSpecificData {
+    const FIELD_TABLE: FieldTable =
+        FieldTable::new(&[codec_field!("Data", 0, with_bit_width(8), as_bytes())]);
+}
+
 /// One length-prefixed AVC parameter-set record carried by `avcC`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AVCParameterSet {
@@ -11327,7 +11388,7 @@ impl CodecBox for HEVCDecoderConfiguration {
         ));
         payload.extend_from_slice(&self.general_constraint_indicator);
         payload.push(self.general_level_idc);
-        payload.extend_from_slice(&(0xe000 | self.min_spatial_segmentation_idc).to_be_bytes());
+        payload.extend_from_slice(&(0xf000 | self.min_spatial_segmentation_idc).to_be_bytes());
         payload.push(0xfc | self.parallelism_type);
         payload.push(0xfc | self.chroma_format_idc);
         payload.push(0xf8 | self.bit_depth_luma_minus8);
@@ -11389,10 +11450,10 @@ impl CodecBox for HEVCDecoderConfiguration {
             offset += 1;
 
             let segmentation = read_u16(&payload, offset);
-            if segmentation >> 12 != 0x0e {
+            if segmentation >> 12 != 0x0f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved1",
-                    constant: "14",
+                    constant: "15",
                 });
             }
             self.min_spatial_segmentation_idc = segmentation & 0x0fff;
@@ -11678,6 +11739,14 @@ fn is_quicktime_wave_audio_context(context: BoxLookupContext) -> bool {
     context.is_quicktime_compatible() && context.under_wave()
 }
 
+fn is_audio_sample_entry_child_context(context: BoxLookupContext) -> bool {
+    context.under_audio_sample_entry()
+}
+
+fn is_audio_sample_entry_root_context(context: BoxLookupContext) -> bool {
+    !context.under_audio_sample_entry()
+}
+
 fn matches_audio_sample_entry_context(box_type: FourCc, context: BoxLookupContext) -> bool {
     (box_type == FourCc::from_bytes(*b"enca") || box_type == FourCc::from_bytes(*b"mp4a"))
         && !is_quicktime_wave_audio_context(context)
@@ -11716,6 +11785,8 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Ftyp>(FourCc::from_bytes(*b"ftyp"));
     registry.register::<Hdlr>(FourCc::from_bytes(*b"hdlr"));
     registry.register::<HEVCDecoderConfiguration>(FourCc::from_bytes(*b"hvcC"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"dvhe"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"dvh1"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"hev1"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"hvc1"));
     registry.register::<Kind>(FourCc::from_bytes(*b"kind"));
@@ -11741,6 +11812,26 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
         FourCc::from_bytes(*b"mp4a"),
         is_quicktime_wave_audio_context,
     );
+    registry.register_contextual_any::<AudioSampleEntry>(
+        FourCc::from_bytes(*b"alac"),
+        is_audio_sample_entry_root_context,
+    );
+    registry.register_contextual_any::<OpaqueCodecSpecificData>(
+        FourCc::from_bytes(*b"alac"),
+        is_audio_sample_entry_child_context,
+    );
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsc"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtse"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsh"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsl"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsm"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsx"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"iamf"));
+    registry.register_contextual_any::<OpaqueCodecSpecificData>(
+        FourCc::from_bytes(*b"ddts"),
+        is_audio_sample_entry_child_context,
+    );
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"udts"));
     registry.register_dynamic_any::<AudioSampleEntry>(matches_audio_sample_entry_context);
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mp4v"));
     registry.register::<Pasp>(FourCc::from_bytes(*b"pasp"));
@@ -11789,6 +11880,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Mpod>(FourCc::from_bytes(*b"mpod"));
     registry.register::<Subt>(FourCc::from_bytes(*b"subt"));
     registry.register::<Udta>(FourCc::from_bytes(*b"udta"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"swre"));
     registry.register::<Uuid>(FourCc::from_bytes(*b"uuid"));
     registry.register::<Url>(FourCc::from_bytes(*b"url "));
     registry.register::<Urn>(FourCc::from_bytes(*b"urn "));

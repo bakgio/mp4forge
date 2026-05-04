@@ -59,6 +59,40 @@ async fn async_decrypt_file_with_progress_matches_sync_output() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_with_progress_matches_sync_output_for_retained_media_segments() {
+    let fixture = common_encryption_fragment_fixture("cenc-single", "video");
+    let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+    let options = options_with_keys(&fixture.keys).with_fragments_info_bytes(fragments_info);
+    let sync_output_path = write_temp_file("decrypt-async-retained-fragment-sync-output", &[]);
+    let async_output_path = write_temp_file("decrypt-async-retained-fragment-async-output", &[]);
+
+    let mut sync_progress = Vec::new();
+    decrypt_file_with_progress(
+        &fixture.encrypted_segment_path,
+        &sync_output_path,
+        &options,
+        |snapshot| sync_progress.push(snapshot),
+    )
+    .unwrap();
+
+    let mut async_progress = Vec::new();
+    decrypt_file_with_progress_async(
+        &fixture.encrypted_segment_path,
+        &async_output_path,
+        &options,
+        |snapshot| async_progress.push(snapshot),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fs::read(sync_output_path).unwrap(),
+        fs::read(async_output_path).unwrap()
+    );
+    assert_eq!(phases(&async_progress), phases(&sync_progress));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_decrypt_helpers_can_run_on_tokio_worker_threads() {
     let fixture = build_decrypt_rewrite_fixture();
     let input_path = write_temp_file("decrypt-async-worker-input", &fixture.single_file);

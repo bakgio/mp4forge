@@ -20,6 +20,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = []
 async = ["dep:tokio"]
 decrypt = ["dep:aes"]
+mux = []
 serde = ["dep:serde"]
 
 [dependencies]

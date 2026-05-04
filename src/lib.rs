@@ -12,6 +12,19 @@
 //! protected-movie path while keeping the CLI on the synchronous path. Enable both `decrypt` and
 //! `async` when you want the additive file-backed async decrypt companions on top of the existing
 //! synchronous in-memory decrypt helpers.
+//!
+//! Enable the optional `mux` feature when you want the additive mux task surface plus the retained
+//! low-level helpers underneath it. The mux surface exposes track-based `MuxRequest` helpers for
+//! sync and async real MP4 assembly, widened repeated track-spec parsing aligned with the
+//! sync-only CLI, internal chunk and duration coordination on top of one mux event graph,
+//! retained low-level staged payload-copy helpers, and the public `mp4forge::mux::sample_reader`
+//! module built on staged mux plans. Those sample-reader helpers can also expose stable text or
+//! subtitle track identity when you construct them with companion `MuxTrackConfig` values. Raw
+//! codec-prefixed imports now cover the current widened codec set: self-describing families parse
+//! their native framing directly, while broader raw families accept explicit layout parameters
+//! when their source bytes are not self-describing enough to derive one safe MP4 sample-entry
+//! shape automatically. MP4-track merges keep covering the broader registered sample-entry
+//! families by preserving encoded sample-entry bytes from the source file.
 
 #[cfg(test)]
 extern crate self as mp4forge;
@@ -40,8 +53,14 @@ pub mod extract;
 pub mod fourcc;
 /// MP4 box header parsing and encoding helpers.
 pub mod header;
+/// Feature-gated mux planning, real container assembly, and staged payload-copy helpers.
+#[cfg(feature = "mux")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mux")))]
+pub mod mux;
 /// File-summary helpers built on the extraction and box layers.
 pub mod probe;
+#[cfg(any(feature = "decrypt", feature = "mux"))]
+pub(crate) mod queue;
 /// Path-based typed payload rewrite helpers built on the writer layer.
 pub mod rewrite;
 /// Fragmented top-level `sidx` analysis, planning, and rewrite helpers.

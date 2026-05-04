@@ -51,6 +51,8 @@ const STBL: FourCc = FourCc::from_bytes(*b"stbl");
 const STSD: FourCc = FourCc::from_bytes(*b"stsd");
 const AVC1: FourCc = FourCc::from_bytes(*b"avc1");
 const AVCC: FourCc = FourCc::from_bytes(*b"avcC");
+const DVHE: FourCc = FourCc::from_bytes(*b"dvhe");
+const DVH1: FourCc = FourCc::from_bytes(*b"dvh1");
 const HEV1: FourCc = FourCc::from_bytes(*b"hev1");
 const HVC1: FourCc = FourCc::from_bytes(*b"hvc1");
 const HVCC: FourCc = FourCc::from_bytes(*b"hvcC");
@@ -81,8 +83,16 @@ const DAC3: FourCc = FourCc::from_bytes(*b"dac3");
 const DEC3: FourCc = FourCc::from_bytes(*b"dec3");
 const AC_4: FourCc = FourCc::from_bytes(*b"ac-4");
 const DAC4: FourCc = FourCc::from_bytes(*b"dac4");
+const ALAC: FourCc = FourCc::from_bytes(*b"alac");
+const DTSC: FourCc = FourCc::from_bytes(*b"dtsc");
+const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
+const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
+const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
+const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
+const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
 const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
 const DFLA: FourCc = FourCc::from_bytes(*b"dfLa");
+const IAMF: FourCc = FourCc::from_bytes(*b"iamf");
 const MHA1: FourCc = FourCc::from_bytes(*b"mha1");
 const MHA2: FourCc = FourCc::from_bytes(*b"mha2");
 const MHM1: FourCc = FourCc::from_bytes(*b"mhm1");
@@ -908,8 +918,8 @@ pub enum TrackCodecFamily {
 /// Returns the additive codec-family label used by detailed reporting.
 ///
 /// The stable [`TrackCodecFamily`] enum intentionally keeps its current shape. Newer sample-entry
-/// families that do not yet warrant an enum expansion still surface here through their
-/// sample-entry or protected original-format box type.
+/// families that would otherwise require a breaking enum expansion surface here through their
+/// sample-entry or protected original-format box type instead.
 pub fn normalized_codec_family_name(
     codec_family: TrackCodecFamily,
     sample_entry_type: Option<FourCc>,
@@ -918,8 +928,16 @@ pub fn normalized_codec_family_name(
     match codec_family {
         TrackCodecFamily::Unknown => match original_format.or(sample_entry_type) {
             Some(AVS3) => "avs3",
+            Some(EC_3) => "eac3",
+            Some(AC_4) => "ac4",
+            Some(ALAC) => "alac",
+            Some(DTSC | DTSE | DTSH | DTSL | DTSM | DTSX) => "dts",
             Some(FLAC) => "flac",
+            Some(IAMF) => "iamf",
             Some(MHA1 | MHA2 | MHM1 | MHM2) => "mpeg_h",
+            Some(STPP) => "xml_subtitle",
+            Some(SBTT) => "text_subtitle",
+            Some(WVTT) => "webvtt",
             _ => "unknown",
         },
         TrackCodecFamily::Avc => "avc",
@@ -2048,9 +2066,12 @@ fn root_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
 }
 
 fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
-    let visual_sample_entries = [AVC1, HEV1, HVC1, VVC1, VVI1, AVS3, AV01, VP08, VP09, ENCV];
+    let visual_sample_entries = [
+        AVC1, HEV1, HVC1, DVHE, DVH1, VVC1, VVI1, AVS3, AV01, VP08, VP09, ENCV,
+    ];
     let audio_sample_entries = [
-        MP4A, OPUS, AC_3, EC_3, AC_4, FLAC, MHA1, MHA2, MHM1, MHM2, IPCM, FPCM, ENCA,
+        MP4A, OPUS, AC_3, EC_3, AC_4, ALAC, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, FLAC, IAMF, MHA1,
+        MHA2, MHM1, MHM2, IPCM, FPCM, ENCA,
     ];
     let mut paths = vec![
         BoxPath::from([TKHD]),
@@ -2064,6 +2085,10 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, HEV1, HVCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, HVC1]),
         BoxPath::from([MDIA, MINF, STBL, STSD, HVC1, HVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DVHE]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DVHE, HVCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DVH1]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DVH1, HVCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VVC1]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VVC1, VVCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VVI1]),
@@ -2096,8 +2121,16 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, EC_3, DEC3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_4]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_4, DAC4]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ALAC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSE]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSH]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSL]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSM]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSX]),
         BoxPath::from([MDIA, MINF, STBL, STSD, FLAC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, FLAC, DFLA]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, IAMF]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MHA1]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MHA1, MHAC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MHA2]),
@@ -2388,6 +2421,16 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(HVC1);
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
+            DVHE => {
+                track.codec_family = TrackCodecFamily::Hevc;
+                track.sample_entry_type = Some(DVHE);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            DVH1 => {
+                track.codec_family = TrackCodecFamily::Hevc;
+                track.sample_entry_type = Some(DVH1);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
             VVC1 => {
                 track.sample_entry_type = Some(VVC1);
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
@@ -2460,8 +2503,40 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(AC_4);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
+            ALAC => {
+                track.sample_entry_type = Some(ALAC);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSC => {
+                track.sample_entry_type = Some(DTSC);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSE => {
+                track.sample_entry_type = Some(DTSE);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSH => {
+                track.sample_entry_type = Some(DTSH);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSL => {
+                track.sample_entry_type = Some(DTSL);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSM => {
+                track.sample_entry_type = Some(DTSM);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSX => {
+                track.sample_entry_type = Some(DTSX);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
             FLAC => {
                 track.sample_entry_type = Some(FLAC);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            IAMF => {
+                track.sample_entry_type = Some(IAMF);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             MHA1 => {
@@ -2743,7 +2818,7 @@ fn parse_trak_rich_details(
 fn codec_family_from_sample_entry(sample_entry_type: FourCc) -> TrackCodecFamily {
     match sample_entry_type {
         AVC1 => TrackCodecFamily::Avc,
-        HEV1 | HVC1 => TrackCodecFamily::Hevc,
+        HEV1 | HVC1 | DVHE | DVH1 => TrackCodecFamily::Hevc,
         AV01 => TrackCodecFamily::Av1,
         VP08 => TrackCodecFamily::Vp8,
         VP09 => TrackCodecFamily::Vp9,

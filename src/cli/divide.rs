@@ -27,6 +27,34 @@ const SIDX: FourCc = FourCc::from_bytes(*b"sidx");
 const TRAK: FourCc = FourCc::from_bytes(*b"trak");
 const TKHD: FourCc = FourCc::from_bytes(*b"tkhd");
 const TFHD: FourCc = FourCc::from_bytes(*b"tfhd");
+const AVC1: FourCc = FourCc::from_bytes(*b"avc1");
+const HEV1: FourCc = FourCc::from_bytes(*b"hev1");
+const HVC1: FourCc = FourCc::from_bytes(*b"hvc1");
+const DVHE: FourCc = FourCc::from_bytes(*b"dvhe");
+const DVH1: FourCc = FourCc::from_bytes(*b"dvh1");
+const AV01: FourCc = FourCc::from_bytes(*b"av01");
+const VP08: FourCc = FourCc::from_bytes(*b"vp08");
+const VP09: FourCc = FourCc::from_bytes(*b"vp09");
+const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
+const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
+const AC_3: FourCc = FourCc::from_bytes(*b"ac-3");
+const EC_3: FourCc = FourCc::from_bytes(*b"ec-3");
+const AC_4: FourCc = FourCc::from_bytes(*b"ac-4");
+const ALAC: FourCc = FourCc::from_bytes(*b"alac");
+const DTSC: FourCc = FourCc::from_bytes(*b"dtsc");
+const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
+const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
+const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
+const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
+const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
+const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
+const IAMF: FourCc = FourCc::from_bytes(*b"iamf");
+const MHA1: FourCc = FourCc::from_bytes(*b"mha1");
+const MHA2: FourCc = FourCc::from_bytes(*b"mha2");
+const MHM1: FourCc = FourCc::from_bytes(*b"mhm1");
+const MHM2: FourCc = FourCc::from_bytes(*b"mhm2");
+const IPCM: FourCc = FourCc::from_bytes(*b"ipcm");
+const FPCM: FourCc = FourCc::from_bytes(*b"fpcm");
 
 const VIDEO_DIR: &str = "video";
 const AUDIO_DIR: &str = "audio";
@@ -80,11 +108,15 @@ where
     writeln!(writer)?;
     writeln!(
         writer,
-        "Currently supports fragmented inputs with up to one AVC video track and one MP4A audio track,"
+        "Currently supports fragmented inputs with up to one video track from AVC, HEVC, Dolby Vision on HEVC, AV1, VP8, or VP9"
     )?;
     writeln!(
         writer,
-        "including encrypted wrappers that preserve those original sample-entry formats."
+        "and one audio track from MP4A-based audio, Opus, AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM,"
+    )?;
+    writeln!(
+        writer,
+        "including encrypted wrappers that preserve those original sample-entry formats. Subtitle and text tracks remain unsupported."
     )
 }
 
@@ -151,9 +183,11 @@ fn parse_args(args: &[String]) -> Result<ParsedDivideArgs<'_>, DivideError> {
 
 /// Splits a fragmented MP4 reader into per-track outputs under `output_dir`.
 ///
-/// The current `divide` surface supports fragmented inputs with at most one AVC video track and
-/// one MP4A audio track, including encrypted `encv` and `enca` wrappers when the original format
-/// is still `avc1` or `mp4a`.
+/// The current `divide` surface supports fragmented inputs with at most one video track from AVC,
+/// HEVC, Dolby Vision on HEVC, AV1, VP8, or VP9 and one audio track from MP4A-based audio, Opus,
+/// AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM, including
+/// encrypted `encv` and `enca` wrappers when the original format stays within that accepted
+/// family set. Subtitle and text tracks remain unsupported in the current divide output model.
 pub fn divide_reader<R>(reader: &mut R, output_dir: &Path) -> Result<(), DivideError>
 where
     R: Read + Seek,
@@ -385,9 +419,29 @@ fn collect_track_plans(
     Ok(plans)
 }
 
+fn authoritative_track_format(track: &DetailedTrackInfo) -> Option<FourCc> {
+    track.original_format.or(track.sample_entry_type)
+}
+
+fn video_track_kind(track: &DetailedTrackInfo) -> TrackKind {
+    if track.summary.encrypted {
+        TrackKind::EncryptedVideo
+    } else {
+        TrackKind::Video
+    }
+}
+
+fn audio_track_kind(track: &DetailedTrackInfo) -> TrackKind {
+    if track.summary.encrypted {
+        TrackKind::EncryptedAudio
+    } else {
+        TrackKind::Audio
+    }
+}
+
 fn track_layout(track: &DetailedTrackInfo) -> Result<TrackLayout, DivideError> {
-    match track.codec_family {
-        TrackCodecFamily::Avc => {
+    match authoritative_track_format(track) {
+        Some(AVC1) => {
             let avc = track.summary.avc.as_ref().ok_or_else(|| {
                 invalid_input(format!(
                     "track {} is missing the AVC decoder configuration needed for divide playlist signaling.",
@@ -396,11 +450,7 @@ fn track_layout(track: &DetailedTrackInfo) -> Result<TrackLayout, DivideError> {
             })?;
             Ok(TrackLayout {
                 role: DivideTrackRole::Video,
-                kind: if track.summary.encrypted {
-                    TrackKind::EncryptedVideo
-                } else {
-                    TrackKind::Video
-                },
+                kind: video_track_kind(track),
                 codecs: format!(
                     "avc1.{:02x}{:02x}{:02x}",
                     avc.profile, avc.profile_compatibility, avc.level
@@ -410,29 +460,39 @@ fn track_layout(track: &DetailedTrackInfo) -> Result<TrackLayout, DivideError> {
                 height: track.display_height.or(Some(avc.height)),
             })
         }
-        TrackCodecFamily::Mp4Audio => {
-            let mp4a = track.summary.mp4a.as_ref().ok_or_else(|| {
-                invalid_input(format!(
-                    "track {} is missing the MP4A decoder configuration needed for divide playlist signaling.",
-                    track.summary.track_id
-                ))
-            })?;
-            Ok(TrackLayout {
-                role: DivideTrackRole::Audio,
-                kind: if track.summary.encrypted {
-                    TrackKind::EncryptedAudio
-                } else {
-                    TrackKind::Audio
-                },
-                codecs: mp4a_codec_string(mp4a.object_type_indication, mp4a.audio_object_type),
-                audio_channels: track
-                    .channel_count
-                    .or(Some(mp4a.channel_count))
-                    .filter(|value| *value != 0),
-                width: None,
-                height: None,
-            })
-        }
+        Some(HEV1 | HVC1 | DVHE | DVH1 | AV01 | VP08 | VP09) => Ok(TrackLayout {
+            role: DivideTrackRole::Video,
+            kind: video_track_kind(track),
+            codecs: track_codec_label(track),
+            audio_channels: None,
+            width: track.display_width,
+            height: track.display_height,
+        }),
+        Some(MP4A) => Ok(TrackLayout {
+            role: DivideTrackRole::Audio,
+            kind: audio_track_kind(track),
+            codecs: track.summary.mp4a.as_ref().map_or_else(
+                || track_codec_label(track),
+                |mp4a| mp4a_codec_string(mp4a.object_type_indication, mp4a.audio_object_type),
+            ),
+            audio_channels: track
+                .channel_count
+                .or_else(|| track.summary.mp4a.as_ref().map(|mp4a| mp4a.channel_count))
+                .filter(|value| *value != 0),
+            width: None,
+            height: None,
+        }),
+        Some(
+            OPUS | AC_3 | EC_3 | AC_4 | ALAC | DTSC | DTSE | DTSH | DTSL | DTSM | DTSX | FLAC
+            | IAMF | MHA1 | MHA2 | MHM1 | MHM2 | IPCM | FPCM,
+        ) => Ok(TrackLayout {
+            role: DivideTrackRole::Audio,
+            kind: audio_track_kind(track),
+            codecs: track_codec_label(track),
+            audio_channels: track.channel_count.filter(|value| *value != 0),
+            width: None,
+            height: None,
+        }),
         _ => Err(invalid_input(format!(
             "track {} uses unsupported codec `{}`; {}",
             track.summary.track_id,
@@ -759,7 +819,7 @@ fn track_codec_label(track: &DetailedTrackInfo) -> String {
 }
 
 fn supported_scope_message() -> &'static str {
-    "divide currently supports fragmented inputs with at most one AVC video track and one MP4A audio track"
+    "divide currently supports fragmented inputs with at most one video track from AVC, HEVC, Dolby Vision on HEVC, AV1, VP8, or VP9 and one audio track from MP4A-based audio, Opus, AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM; subtitle and text tracks remain unsupported"
 }
 
 fn invalid_input(message: String) -> DivideError {

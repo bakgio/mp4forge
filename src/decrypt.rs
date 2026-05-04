@@ -7,7 +7,7 @@
 //! decrypt entry points stay on the synchronous path, while the additive async surface later
 //! composes on top for file-backed decrypt workflows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -24,7 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::BoxInfo;
 use crate::FourCc;
 #[cfg(feature = "async")]
-use crate::async_io::{AsyncReadSeek, AsyncWrite, AsyncWriteSeek};
+use crate::async_io::{
+    AsyncReadForward, AsyncReadSeek, AsyncWrite, AsyncWriteForward, AsyncWriteSeek,
+};
 use crate::boxes::isma_cryp::{Isfm, Islt};
 use crate::boxes::iso14496_12::{
     Co64, Frma, Ftyp, Mfro, Mpod, Saio, Saiz, Sbgp, Schm, Sgpd, Sidx, Stco, Stsc, Stsd, Stsz,
@@ -49,6 +51,11 @@ use crate::encryption::{
     SampleEncryptionContext, resolve_sample_encryption,
 };
 use crate::extract::{ExtractError, extract_box, extract_box_as, extract_box_payload_bytes};
+use crate::queue::{
+    DecryptorReuseCache, DecryptorReuseKey, OrderedWorkQueue, QueueAuxiliaryInfoSpan,
+    QueueRangeWorkItem, QueueWorkItem, RangeQueueParser, RangeQueueParserStage, RawOffsetQueue,
+    RawOffsetQueueError,
+};
 use crate::sidx::{
     TopLevelSidxPlan, TopLevelSidxPlanAction, TopLevelSidxPlanOptions,
     apply_top_level_sidx_plan_bytes, plan_top_level_sidx_update_bytes,
@@ -744,6 +751,16 @@ pub fn decrypt_common_encryption_sample(
     sample: &ResolvedSampleEncryptionSample<'_>,
     encrypted_sample: &[u8],
 ) -> Result<Vec<u8>, CommonEncryptionDecryptError> {
+    let aes = Aes128::new(&content_key.into());
+    decrypt_common_encryption_sample_with_cipher(scheme, &aes, sample, encrypted_sample)
+}
+
+fn decrypt_common_encryption_sample_with_cipher(
+    scheme: NativeCommonEncryptionScheme,
+    aes: &Aes128,
+    sample: &ResolvedSampleEncryptionSample<'_>,
+    encrypted_sample: &[u8],
+) -> Result<Vec<u8>, CommonEncryptionDecryptError> {
     if !sample.is_protected {
         return Ok(encrypted_sample.to_vec());
     }
@@ -751,7 +768,7 @@ pub fn decrypt_common_encryption_sample(
     let iv = effective_initialization_vector(scheme, sample)?;
     let mut transformer = SampleTransformer::new(
         scheme,
-        Aes128::new(&content_key.into()),
+        aes,
         iv,
         sample.crypt_byte_block,
         sample.skip_byte_block,
@@ -1264,12 +1281,12 @@ struct CommonEncryptionStreamPlan {
     moov_replacement: Option<(u64, Vec<u8>)>,
     moof_replacements: BTreeMap<u64, Vec<u8>>,
     extra_root_replacements: BTreeMap<u64, Vec<u8>>,
-    mdat_edits: BTreeMap<u64, Vec<CommonEncryptionSampleEdit>>,
+    mdat_edits: BTreeMap<u64, OrderedWorkQueue<CommonEncryptionSampleEdit>>,
 }
 
 type CommonEncryptionStreamRewrites = (
     BTreeMap<u64, Vec<u8>>,
-    BTreeMap<u64, Vec<CommonEncryptionSampleEdit>>,
+    BTreeMap<u64, OrderedWorkQueue<CommonEncryptionSampleEdit>>,
 );
 
 struct MovieRewriteStreamPlan {
@@ -1310,7 +1327,31 @@ struct CommonEncryptionSampleEdit {
     track_id: u32,
     scheme_type: FourCc,
     content_key: [u8; 16],
+    auxiliary_info_span: Option<QueueAuxiliaryInfoSpan>,
     sample: OwnedResolvedSampleEncryptionSample,
+}
+
+impl QueueWorkItem for CommonEncryptionSampleEdit {
+    fn queue_order_key(&self) -> u64 {
+        self.auxiliary_info_span
+            .map_or(self.absolute_offset, |span| {
+                span.absolute_offset.min(self.absolute_offset)
+            })
+    }
+
+    fn auxiliary_info_span(&self) -> Option<QueueAuxiliaryInfoSpan> {
+        self.auxiliary_info_span
+    }
+}
+
+impl QueueRangeWorkItem for CommonEncryptionSampleEdit {
+    fn queue_range_start(&self) -> u64 {
+        self.absolute_offset
+    }
+
+    fn queue_range_size(&self) -> u64 {
+        u64::from(self.sample_size)
+    }
 }
 
 #[derive(Clone)]
@@ -1360,6 +1401,309 @@ impl OwnedResolvedSampleEncryptionSample {
             auxiliary_info_size: self.auxiliary_info_size,
         }
     }
+}
+
+struct ActiveAuxiliaryInfoCache<'a> {
+    staged_samples:
+        BTreeMap<QueueAuxiliaryInfoSpan, VecDeque<&'a OwnedResolvedSampleEncryptionSample>>,
+}
+
+impl<'a> ActiveAuxiliaryInfoCache<'a> {
+    fn stage(
+        sample_edits: Option<&'a OrderedWorkQueue<CommonEncryptionSampleEdit>>,
+        staged_spans: &'a [QueueAuxiliaryInfoSpan],
+    ) -> Result<Self, DecryptRewriteError> {
+        let mut staged_samples = staged_spans
+            .iter()
+            .copied()
+            .map(|span| (span, VecDeque::new()))
+            .collect::<BTreeMap<_, _>>();
+        let expected_spans = staged_spans.iter().copied().collect::<BTreeSet<_>>();
+
+        if let Some(sample_edits) = sample_edits {
+            let mut edits = sample_edits.items().iter().collect::<Vec<_>>();
+            edits.sort_by_key(|edit| edit.absolute_offset);
+            for edit in edits {
+                let Some(span) = edit.auxiliary_info_span else {
+                    continue;
+                };
+                let Some(samples) = staged_samples.get_mut(&span) else {
+                    return Err(DecryptRewriteError::InvalidLayout {
+                        reason: format!(
+                            "queued auxiliary info span at offset {} with size {} was not staged before decrypt execution",
+                            span.absolute_offset, span.size
+                        ),
+                    });
+                };
+                samples.push_back(&edit.sample);
+            }
+        } else if !staged_spans.is_empty() {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: "queued auxiliary info stage had no backing Common Encryption sample edits"
+                    .to_owned(),
+            });
+        }
+
+        for span in &expected_spans {
+            if staged_samples.get(span).is_none_or(VecDeque::is_empty) {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: format!(
+                        "queued auxiliary info span at offset {} with size {} did not cover any Common Encryption samples",
+                        span.absolute_offset, span.size
+                    ),
+                });
+            }
+        }
+
+        Ok(Self { staged_samples })
+    }
+
+    fn resolved_sample_for_edit(
+        &mut self,
+        edit: &'a CommonEncryptionSampleEdit,
+    ) -> Result<ResolvedSampleEncryptionSample<'a>, DecryptRewriteError> {
+        let Some(span) = edit.auxiliary_info_span else {
+            return Ok(edit.sample.as_borrowed());
+        };
+        let Some(samples) = self.staged_samples.get_mut(&span) else {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: format!(
+                    "missing staged auxiliary info span at offset {} with size {} for track {} sample {}",
+                    span.absolute_offset, span.size, edit.track_id, edit.sample.sample_index
+                ),
+            });
+        };
+        let Some(staged_sample) = samples.pop_front() else {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: format!(
+                    "staged auxiliary info span at offset {} with size {} ran out of parsed sample state before track {} sample {}",
+                    span.absolute_offset, span.size, edit.track_id, edit.sample.sample_index
+                ),
+            });
+        };
+        if staged_sample.sample_index != edit.sample.sample_index {
+            return Err(DecryptRewriteError::InvalidLayout {
+                reason: format!(
+                    "staged auxiliary info sample order drifted: expected track {} sample {} but cache produced sample {}",
+                    edit.track_id, edit.sample.sample_index, staged_sample.sample_index
+                ),
+            });
+        }
+        Ok(staged_sample.as_borrowed())
+    }
+
+    fn finish(self) -> Result<(), DecryptRewriteError> {
+        for (span, remaining_samples) in self.staged_samples {
+            if !remaining_samples.is_empty() {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: format!(
+                        "staged auxiliary info span at offset {} with size {} still had {} queued sample state entr{} after decrypt execution",
+                        span.absolute_offset,
+                        span.size,
+                        remaining_samples.len(),
+                        if remaining_samples.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn queue_common_encryption_mdat_edits(
+    mdat_edits: BTreeMap<u64, Vec<CommonEncryptionSampleEdit>>,
+) -> BTreeMap<u64, OrderedWorkQueue<CommonEncryptionSampleEdit>> {
+    mdat_edits
+        .into_iter()
+        .map(|(mdat_offset, edits)| (mdat_offset, OrderedWorkQueue::new(edits)))
+        .collect()
+}
+
+fn compute_fragment_auxiliary_info_spans(
+    moof_offset: u64,
+    saio: Option<&Saio>,
+    truns: &[Trun],
+    resolved_samples: &[ResolvedSampleEncryptionSample<'_>],
+) -> Result<Vec<Option<QueueAuxiliaryInfoSpan>>, DecryptRewriteError> {
+    let Some(saio) = saio else {
+        return Ok(vec![None; truns.len()]);
+    };
+    if saio.entry_count == 0 {
+        return Ok(vec![None; truns.len()]);
+    }
+
+    let mut spans = Vec::with_capacity(truns.len());
+    let mut sample_cursor = 0usize;
+    let mut next_chained_offset = None::<u64>;
+    let saio_entry_count = usize::try_from(saio.entry_count).unwrap_or(usize::MAX);
+
+    for (run_index, trun) in truns.iter().enumerate() {
+        let run_sample_count =
+            usize::try_from(trun.sample_count).map_err(|_| DecryptRewriteError::InvalidLayout {
+                reason: "fragment run sample count does not fit in usize".to_owned(),
+            })?;
+        let next_sample_cursor = sample_cursor.checked_add(run_sample_count).ok_or_else(|| {
+            DecryptRewriteError::InvalidLayout {
+                reason: "fragment run sample count overflowed usize".to_owned(),
+            }
+        })?;
+        let run_samples = resolved_samples
+            .get(sample_cursor..next_sample_cursor)
+            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                reason: "resolved sample metadata does not cover the fragment run layout"
+                    .to_owned(),
+            })?;
+        let run_auxiliary_info_size = run_samples.iter().try_fold(0_u64, |acc, sample| {
+            acc.checked_add(u64::from(sample.auxiliary_info_size))
+                .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                    reason: "fragment auxiliary info size overflowed u64".to_owned(),
+                })
+        })?;
+
+        let span = if run_auxiliary_info_size == 0 {
+            None
+        } else {
+            let start_offset = if run_index < saio_entry_count {
+                let saio_offset = match saio.version() {
+                    0 => saio.offset_v0.get(run_index).copied(),
+                    1 => saio.offset_v1.get(run_index).copied(),
+                    _ => None,
+                }
+                .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                    reason:
+                        "fragment auxiliary info offsets do not cover the declared saio entry count"
+                            .to_owned(),
+                })?;
+                moof_offset.checked_add(saio_offset).ok_or_else(|| {
+                    DecryptRewriteError::InvalidLayout {
+                        reason: "fragment auxiliary info offset overflowed u64".to_owned(),
+                    }
+                })?
+            } else if saio_entry_count == 1 {
+                next_chained_offset.ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                    reason: "single-entry saio did not produce a chained auxiliary info offset"
+                        .to_owned(),
+                })?
+            } else {
+                0
+            };
+
+            if run_index >= saio_entry_count && saio_entry_count != 1 {
+                None
+            } else {
+                let span = QueueAuxiliaryInfoSpan {
+                    absolute_offset: start_offset,
+                    size: run_auxiliary_info_size,
+                };
+                next_chained_offset = Some(
+                    start_offset
+                        .checked_add(run_auxiliary_info_size)
+                        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                            reason: "fragment auxiliary info span overflowed u64".to_owned(),
+                        })?,
+                );
+                Some(span)
+            }
+        };
+
+        spans.push(span);
+        sample_cursor = next_sample_cursor;
+    }
+
+    if sample_cursor != resolved_samples.len() {
+        return Err(DecryptRewriteError::InvalidLayout {
+            reason: "fragment runs did not account for every resolved sample metadata record"
+                .to_owned(),
+        });
+    }
+
+    Ok(spans)
+}
+
+struct CommonEncryptionFragmentQueueContext<'a> {
+    active: &'a ActiveTrackDecryption<'a>,
+    original_moof_offset: u64,
+    tfhd: &'a Tfhd,
+    truns: &'a [Trun],
+    trun_infos: &'a [BoxInfo],
+    mdat_infos: &'a [BoxInfo],
+    saio: Option<&'a Saio>,
+    resolved_samples: &'a [ResolvedSampleEncryptionSample<'a>],
+}
+
+fn append_common_encryption_sample_edits(
+    mdat_edits: &mut BTreeMap<u64, Vec<CommonEncryptionSampleEdit>>,
+    context: CommonEncryptionFragmentQueueContext<'_>,
+) -> Result<(), DecryptRewriteError> {
+    let sample_spans = compute_sample_spans(
+        context.tfhd,
+        context.active.track.trex.as_ref(),
+        context.original_moof_offset,
+        context.truns,
+        context.trun_infos,
+    )?;
+    if sample_spans.len() != context.resolved_samples.len() {
+        return Err(DecryptRewriteError::InvalidLayout {
+            reason: format!(
+                "track {} resolved {} encrypted sample records but {} sample span(s) in the stream-first Common Encryption path",
+                context.active.track.track_id,
+                context.resolved_samples.len(),
+                sample_spans.len()
+            ),
+        });
+    }
+
+    let auxiliary_info_spans = compute_fragment_auxiliary_info_spans(
+        context.original_moof_offset,
+        context.saio,
+        context.truns,
+        context.resolved_samples,
+    )?;
+    let mut sample_cursor = 0usize;
+    for (trun, auxiliary_info_span) in context.truns.iter().zip(auxiliary_info_spans.into_iter()) {
+        let run_sample_count =
+            usize::try_from(trun.sample_count).map_err(|_| DecryptRewriteError::InvalidLayout {
+                reason: "fragment run sample count does not fit in usize".to_owned(),
+            })?;
+        let next_sample_cursor = sample_cursor.checked_add(run_sample_count).ok_or_else(|| {
+            DecryptRewriteError::InvalidLayout {
+                reason: "fragment run sample count overflowed usize".to_owned(),
+            }
+        })?;
+        let run_samples = &context.resolved_samples[sample_cursor..next_sample_cursor];
+        let run_spans = &sample_spans[sample_cursor..next_sample_cursor];
+
+        for (sample, span) in run_samples.iter().zip(run_spans.iter()) {
+            let mdat_info =
+                find_mdat_info_containing_sample(context.mdat_infos, span.offset, span.size)
+                    .ok_or(DecryptRewriteError::SampleDataRangeNotFound {
+                        track_id: context.active.track.track_id,
+                        sample_index: sample.sample_index,
+                        absolute_offset: span.offset,
+                        sample_size: span.size,
+                    })?;
+            mdat_edits
+                .entry(mdat_info.offset())
+                .or_default()
+                .push(CommonEncryptionSampleEdit {
+                    absolute_offset: span.offset,
+                    sample_size: span.size,
+                    track_id: context.active.track.track_id,
+                    scheme_type: context.active.sample_entry.scheme_type,
+                    content_key: context.active.key,
+                    auxiliary_info_span,
+                    sample: OwnedResolvedSampleEncryptionSample::from_resolved(sample),
+                });
+        }
+
+        sample_cursor = next_sample_cursor;
+    }
+
+    Ok(())
 }
 
 impl<F> ProgressReporter<F>
@@ -4064,53 +4408,20 @@ where
                         },
                     )
                     .map_err(DecryptRewriteError::from)?;
-                    let sample_spans = compute_sample_spans(
-                        &tfhd,
-                        active.track.trex.as_ref(),
-                        original_moof_info.offset(),
-                        &truns,
-                        &trun_infos,
-                    )?;
-                    if sample_spans.len() != resolved.samples.len() {
-                        return Err(DecryptRewriteError::InvalidLayout {
-                            reason: format!(
-                                "track {} resolved {} encrypted sample records but {} sample span(s) in the stream-first Common Encryption path",
-                                active.track.track_id,
-                                resolved.samples.len(),
-                                sample_spans.len()
-                            ),
-                        }
-                        .into());
-                    }
-
                     if active.sample_entry.scheme_type != PIFF {
-                        for (sample, span) in resolved.samples.iter().zip(sample_spans.iter()) {
-                            let mdat_info = find_mdat_info_containing_sample(
-                                &mdat_infos,
-                                span.offset,
-                                span.size,
-                            )
-                            .ok_or(
-                                DecryptRewriteError::SampleDataRangeNotFound {
-                                    track_id: active.track.track_id,
-                                    sample_index: sample.sample_index,
-                                    absolute_offset: span.offset,
-                                    sample_size: span.size,
-                                },
-                            )?;
-                            mdat_edits.entry(mdat_info.offset()).or_default().push(
-                                CommonEncryptionSampleEdit {
-                                    absolute_offset: span.offset,
-                                    sample_size: span.size,
-                                    track_id: active.track.track_id,
-                                    scheme_type: active.sample_entry.scheme_type,
-                                    content_key: active.key,
-                                    sample: OwnedResolvedSampleEncryptionSample::from_resolved(
-                                        sample,
-                                    ),
-                                },
-                            );
-                        }
+                        append_common_encryption_sample_edits(
+                            &mut mdat_edits,
+                            CommonEncryptionFragmentQueueContext {
+                                active: &active,
+                                original_moof_offset: original_moof_info.offset(),
+                                tfhd: &tfhd,
+                                truns: &truns,
+                                trun_infos: &trun_infos,
+                                mdat_infos: &mdat_infos,
+                                saio: saio.as_ref(),
+                                resolved_samples: &resolved.samples,
+                            },
+                        )?;
                     }
 
                     if active.sample_entry.scheme_type == PIFF {
@@ -4251,11 +4562,10 @@ where
         }
     }
 
-    for edits in mdat_edits.values_mut() {
-        edits.sort_by_key(|edit| edit.absolute_offset);
-    }
-
-    Ok((moof_replacements, mdat_edits))
+    Ok((
+        moof_replacements,
+        queue_common_encryption_mdat_edits(mdat_edits),
+    ))
 }
 
 #[cfg(feature = "async")]
@@ -4380,53 +4690,20 @@ where
                         },
                     )
                     .map_err(DecryptRewriteError::from)?;
-                    let sample_spans = compute_sample_spans(
-                        &tfhd,
-                        active.track.trex.as_ref(),
-                        original_moof_info.offset(),
-                        &truns,
-                        &trun_infos,
-                    )?;
-                    if sample_spans.len() != resolved.samples.len() {
-                        return Err(DecryptRewriteError::InvalidLayout {
-                            reason: format!(
-                                "track {} resolved {} encrypted sample records but {} sample span(s) in the stream-first Common Encryption path",
-                                active.track.track_id,
-                                resolved.samples.len(),
-                                sample_spans.len()
-                            ),
-                        }
-                        .into());
-                    }
-
                     if active.sample_entry.scheme_type != PIFF {
-                        for (sample, span) in resolved.samples.iter().zip(sample_spans.iter()) {
-                            let mdat_info = find_mdat_info_containing_sample(
-                                &mdat_infos,
-                                span.offset,
-                                span.size,
-                            )
-                            .ok_or(
-                                DecryptRewriteError::SampleDataRangeNotFound {
-                                    track_id: active.track.track_id,
-                                    sample_index: sample.sample_index,
-                                    absolute_offset: span.offset,
-                                    sample_size: span.size,
-                                },
-                            )?;
-                            mdat_edits.entry(mdat_info.offset()).or_default().push(
-                                CommonEncryptionSampleEdit {
-                                    absolute_offset: span.offset,
-                                    sample_size: span.size,
-                                    track_id: active.track.track_id,
-                                    scheme_type: active.sample_entry.scheme_type,
-                                    content_key: active.key,
-                                    sample: OwnedResolvedSampleEncryptionSample::from_resolved(
-                                        sample,
-                                    ),
-                                },
-                            );
-                        }
+                        append_common_encryption_sample_edits(
+                            &mut mdat_edits,
+                            CommonEncryptionFragmentQueueContext {
+                                active: &active,
+                                original_moof_offset: original_moof_info.offset(),
+                                tfhd: &tfhd,
+                                truns: &truns,
+                                trun_infos: &trun_infos,
+                                mdat_infos: &mdat_infos,
+                                saio: saio.as_ref(),
+                                resolved_samples: &resolved.samples,
+                            },
+                        )?;
                     }
 
                     if active.sample_entry.scheme_type == PIFF {
@@ -4567,11 +4844,10 @@ where
         }
     }
 
-    for edits in mdat_edits.values_mut() {
-        edits.sort_by_key(|edit| edit.absolute_offset);
-    }
-
-    Ok((moof_replacements, mdat_edits))
+    Ok((
+        moof_replacements,
+        queue_common_encryption_mdat_edits(mdat_edits),
+    ))
 }
 
 fn build_common_encryption_mfra_replacements_from_stream<R>(
@@ -4898,32 +5174,78 @@ where
     R: Read + Seek,
     W: Write + Seek,
 {
+    input.seek(SeekFrom::Start(0))?;
     output.seek(SeekFrom::Start(0))?;
+    execute_common_encryption_stream_plan_non_seekable(input, output, plan)
+}
+
+fn execute_common_encryption_stream_plan_non_seekable<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &CommonEncryptionStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: Read,
+    W: Write,
+{
+    let mut cursor = 0_u64;
     for root_info in &plan.root_boxes {
+        if root_info.offset() > cursor {
+            copy_exact_from_current(input, output, root_info.offset() - cursor)?;
+            cursor = root_info.offset();
+        }
         if let Some((offset, replacement)) = &plan.moov_replacement
             && root_info.offset() == *offset
         {
+            discard_exact_from_current(input, root_info.size())?;
             output.write_all(replacement)?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
         if let Some(replacement) = plan.extra_root_replacements.get(&root_info.offset()) {
+            discard_exact_from_current(input, root_info.size())?;
             output.write_all(replacement)?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
         if let Some(replacement) = plan.moof_replacements.get(&root_info.offset()) {
+            discard_exact_from_current(input, root_info.size())?;
             output.write_all(replacement)?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
         if root_info.box_type() == MDAT {
-            stream_mdat_with_sample_edits(
+            stream_mdat_with_sample_edits_non_seekable(
                 input,
                 output,
                 *root_info,
                 plan.mdat_edits.get(&root_info.offset()),
             )?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
-        copy_exact_range(input, output, root_info.offset(), root_info.size())?;
+        copy_exact_from_current(input, output, root_info.size())?;
+        cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+            DecryptRewriteError::InvalidLayout {
+                reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+            }
+        })?;
     }
     output.flush()?;
     Ok(())
@@ -4939,156 +5261,308 @@ where
     R: AsyncReadSeek,
     W: AsyncWriteSeek,
 {
+    input.seek(SeekFrom::Start(0)).await?;
     output.seek(SeekFrom::Start(0)).await?;
+    execute_common_encryption_stream_plan_non_seekable_async(input, output, plan).await
+}
+
+#[cfg(feature = "async")]
+async fn execute_common_encryption_stream_plan_non_seekable_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    plan: &CommonEncryptionStreamPlan,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadForward,
+    W: AsyncWriteForward,
+{
+    let mut cursor = 0_u64;
     for root_info in &plan.root_boxes {
+        if root_info.offset() > cursor {
+            copy_exact_from_current_async(input, output, root_info.offset() - cursor).await?;
+            cursor = root_info.offset();
+        }
         if let Some((offset, replacement)) = &plan.moov_replacement
             && root_info.offset() == *offset
         {
+            discard_exact_from_current_async(input, root_info.size()).await?;
             output.write_all(replacement).await?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
         if let Some(replacement) = plan.extra_root_replacements.get(&root_info.offset()) {
+            discard_exact_from_current_async(input, root_info.size()).await?;
             output.write_all(replacement).await?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
         if let Some(replacement) = plan.moof_replacements.get(&root_info.offset()) {
+            discard_exact_from_current_async(input, root_info.size()).await?;
             output.write_all(replacement).await?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
         if root_info.box_type() == MDAT {
-            stream_mdat_with_sample_edits_async(
+            stream_mdat_with_sample_edits_non_seekable_async(
                 input,
                 output,
                 *root_info,
                 plan.mdat_edits.get(&root_info.offset()),
             )
             .await?;
+            cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+                DecryptRewriteError::InvalidLayout {
+                    reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+                }
+            })?;
             continue;
         }
-        copy_exact_range_async(input, output, root_info.offset(), root_info.size()).await?;
+        copy_exact_from_current_async(input, output, root_info.size()).await?;
+        cursor = cursor.checked_add(root_info.size()).ok_or_else(|| {
+            DecryptRewriteError::InvalidLayout {
+                reason: "non-seekable root rewrite cursor overflowed u64".to_owned(),
+            }
+        })?;
     }
     output.flush().await?;
     Ok(())
 }
 
-fn stream_mdat_with_sample_edits<R, W>(
+fn stream_mdat_with_sample_edits_non_seekable<R, W>(
     input: &mut R,
     output: &mut W,
     mdat_info: BoxInfo,
-    sample_edits: Option<&Vec<CommonEncryptionSampleEdit>>,
+    sample_edits: Option<&OrderedWorkQueue<CommonEncryptionSampleEdit>>,
 ) -> Result<(), DecryptError>
 where
-    R: Read + Seek,
+    R: Read,
     W: Write,
 {
-    copy_exact_range(input, output, mdat_info.offset(), mdat_info.header_size())?;
+    copy_exact_from_current(input, output, mdat_info.header_size())?;
 
     let payload_start = mdat_info.offset() + mdat_info.header_size();
     let payload_end = mdat_info.offset() + mdat_info.size();
     let mut cursor = payload_start;
-    for edit in sample_edits.into_iter().flatten() {
-        if edit.absolute_offset < cursor {
-            return Err(DecryptRewriteError::InvalidLayout {
-                reason: format!(
-                    "track {} has overlapping Common Encryption sample ranges in the stream-first mdat writer",
-                    edit.track_id
-                ),
+    let mut raw_queue = RawOffsetQueue::new(payload_start);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
+    let mut decryptor_reuse = DecryptorReuseCache::<Aes128>::new();
+    let mut auxiliary_info_cache = None::<ActiveAuxiliaryInfoCache<'_>>;
+    let mut parser = RangeQueueParser::new(sample_edits, payload_start, payload_end);
+    loop {
+        match parser
+            .next_stage()
+            .map_err(|error| DecryptRewriteError::InvalidLayout {
+                reason: error.to_string(),
+            })? {
+            RangeQueueParserStage::AuxiliaryInfo(staged_auxiliary_info_spans) => {
+                auxiliary_info_cache = Some(ActiveAuxiliaryInfoCache::stage(
+                    sample_edits,
+                    staged_auxiliary_info_spans,
+                )?);
             }
-            .into());
-        }
-        copy_exact_range(input, output, cursor, edit.absolute_offset - cursor)?;
-        input.seek(SeekFrom::Start(edit.absolute_offset))?;
-        let mut encrypted = vec![
-            0_u8;
-            usize::try_from(edit.sample_size).map_err(|_| {
-                DecryptRewriteError::InvalidLayout {
-                    reason: "encrypted sample size does not fit in usize".to_owned(),
+            RangeQueueParserStage::CopyRange { start, size } => {
+                if start != cursor {
+                    return Err(DecryptRewriteError::InvalidLayout {
+                        reason: "non-seekable Common Encryption parser lost mdat payload position"
+                            .to_owned(),
+                    }
+                    .into());
                 }
-            })?
-        ];
-        input.read_exact(&mut encrypted)?;
-        let clear = decrypt_common_encryption_sample_edit(edit, &encrypted)?;
-        output.write_all(&clear)?;
-        cursor = edit
-            .absolute_offset
-            .checked_add(u64::from(edit.sample_size))
-            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
-                reason: "stream-first mdat cursor overflowed u64".to_owned(),
-            })?;
+                copy_range_from_progressive_queue(
+                    input,
+                    output,
+                    &mut raw_queue,
+                    &mut queue_buffer,
+                    start,
+                    size,
+                )?;
+                cursor =
+                    start
+                        .checked_add(size)
+                        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                            reason: "non-seekable mdat cursor overflowed u64".to_owned(),
+                        })?;
+            }
+            RangeQueueParserStage::WorkItem(edit) => {
+                if edit.absolute_offset != cursor {
+                    return Err(DecryptRewriteError::InvalidLayout {
+                        reason: "non-seekable Common Encryption parser lost sample alignment"
+                            .to_owned(),
+                    }
+                    .into());
+                }
+                let encrypted = read_range_from_progressive_queue(
+                    input,
+                    &mut raw_queue,
+                    &mut queue_buffer,
+                    edit.absolute_offset,
+                    u64::from(edit.sample_size),
+                )?;
+                let resolved_sample = auxiliary_info_cache
+                    .as_mut()
+                    .map(|cache| cache.resolved_sample_for_edit(edit))
+                    .transpose()?
+                    .unwrap_or_else(|| edit.sample.as_borrowed());
+                let clear = decrypt_common_encryption_sample_edit_with_reuse(
+                    edit,
+                    &resolved_sample,
+                    &encrypted,
+                    &mut decryptor_reuse,
+                )?;
+                output.write_all(&clear)?;
+                cursor = cursor
+                    .checked_add(u64::from(edit.sample_size))
+                    .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                        reason: "non-seekable mdat cursor overflowed u64".to_owned(),
+                    })?;
+            }
+            RangeQueueParserStage::Complete => break,
+        }
     }
-
-    copy_exact_range(input, output, cursor, payload_end.saturating_sub(cursor))?;
+    if let Some(auxiliary_info_cache) = auxiliary_info_cache {
+        auxiliary_info_cache.finish()?;
+    }
     Ok(())
 }
 
 #[cfg(feature = "async")]
-async fn stream_mdat_with_sample_edits_async<R, W>(
+async fn stream_mdat_with_sample_edits_non_seekable_async<R, W>(
     input: &mut R,
     output: &mut W,
     mdat_info: BoxInfo,
-    sample_edits: Option<&Vec<CommonEncryptionSampleEdit>>,
+    sample_edits: Option<&OrderedWorkQueue<CommonEncryptionSampleEdit>>,
 ) -> Result<(), DecryptError>
 where
-    R: AsyncReadSeek,
-    W: AsyncWrite + Unpin,
+    R: AsyncReadForward,
+    W: AsyncWriteForward,
 {
-    copy_exact_range_async(input, output, mdat_info.offset(), mdat_info.header_size()).await?;
+    copy_exact_from_current_async(input, output, mdat_info.header_size()).await?;
 
     let payload_start = mdat_info.offset() + mdat_info.header_size();
     let payload_end = mdat_info.offset() + mdat_info.size();
     let mut cursor = payload_start;
-    for edit in sample_edits.into_iter().flatten() {
-        if edit.absolute_offset < cursor {
-            return Err(DecryptRewriteError::InvalidLayout {
-                reason: format!(
-                    "track {} has overlapping Common Encryption sample ranges in the stream-first mdat writer",
-                    edit.track_id
-                ),
+    let mut raw_queue = RawOffsetQueue::new(payload_start);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
+    let mut decryptor_reuse = DecryptorReuseCache::<Aes128>::new();
+    let mut auxiliary_info_cache = None::<ActiveAuxiliaryInfoCache<'_>>;
+    let mut parser = RangeQueueParser::new(sample_edits, payload_start, payload_end);
+    loop {
+        match parser
+            .next_stage()
+            .map_err(|error| DecryptRewriteError::InvalidLayout {
+                reason: error.to_string(),
+            })? {
+            RangeQueueParserStage::AuxiliaryInfo(staged_auxiliary_info_spans) => {
+                auxiliary_info_cache = Some(ActiveAuxiliaryInfoCache::stage(
+                    sample_edits,
+                    staged_auxiliary_info_spans,
+                )?);
             }
-            .into());
-        }
-        copy_exact_range_async(input, output, cursor, edit.absolute_offset - cursor).await?;
-        input.seek(SeekFrom::Start(edit.absolute_offset)).await?;
-        let mut encrypted = vec![
-            0_u8;
-            usize::try_from(edit.sample_size).map_err(|_| {
-                DecryptRewriteError::InvalidLayout {
-                    reason: "encrypted sample size does not fit in usize".to_owned(),
+            RangeQueueParserStage::CopyRange { start, size } => {
+                if start != cursor {
+                    return Err(DecryptRewriteError::InvalidLayout {
+                        reason: "non-seekable Common Encryption parser lost mdat payload position"
+                            .to_owned(),
+                    }
+                    .into());
                 }
-            })?
-        ];
-        input.read_exact(&mut encrypted).await?;
-        let clear = decrypt_common_encryption_sample_edit(edit, &encrypted)?;
-        output.write_all(&clear).await?;
-        cursor = edit
-            .absolute_offset
-            .checked_add(u64::from(edit.sample_size))
-            .ok_or_else(|| DecryptRewriteError::InvalidLayout {
-                reason: "stream-first mdat cursor overflowed u64".to_owned(),
-            })?;
+                copy_range_from_progressive_queue_async(
+                    input,
+                    output,
+                    &mut raw_queue,
+                    &mut queue_buffer,
+                    start,
+                    size,
+                )
+                .await?;
+                cursor =
+                    start
+                        .checked_add(size)
+                        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                            reason: "non-seekable mdat cursor overflowed u64".to_owned(),
+                        })?;
+            }
+            RangeQueueParserStage::WorkItem(edit) => {
+                if edit.absolute_offset != cursor {
+                    return Err(DecryptRewriteError::InvalidLayout {
+                        reason: "non-seekable Common Encryption parser lost sample alignment"
+                            .to_owned(),
+                    }
+                    .into());
+                }
+                let encrypted = read_range_from_progressive_queue_async(
+                    input,
+                    &mut raw_queue,
+                    &mut queue_buffer,
+                    edit.absolute_offset,
+                    u64::from(edit.sample_size),
+                )
+                .await?;
+                let resolved_sample = auxiliary_info_cache
+                    .as_mut()
+                    .map(|cache| cache.resolved_sample_for_edit(edit))
+                    .transpose()?
+                    .unwrap_or_else(|| edit.sample.as_borrowed());
+                let clear = decrypt_common_encryption_sample_edit_with_reuse(
+                    edit,
+                    &resolved_sample,
+                    &encrypted,
+                    &mut decryptor_reuse,
+                )?;
+                output.write_all(&clear).await?;
+                cursor = cursor
+                    .checked_add(u64::from(edit.sample_size))
+                    .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+                        reason: "non-seekable mdat cursor overflowed u64".to_owned(),
+                    })?;
+            }
+            RangeQueueParserStage::Complete => break,
+        }
     }
-
-    copy_exact_range_async(input, output, cursor, payload_end.saturating_sub(cursor)).await?;
+    if let Some(auxiliary_info_cache) = auxiliary_info_cache {
+        auxiliary_info_cache.finish()?;
+    }
     Ok(())
 }
 
-fn decrypt_common_encryption_sample_edit(
+fn decrypt_common_encryption_sample_edit_with_reuse(
     edit: &CommonEncryptionSampleEdit,
+    resolved_sample: &ResolvedSampleEncryptionSample<'_>,
     encrypted_sample: &[u8],
+    decryptor_reuse: &mut DecryptorReuseCache<Aes128>,
 ) -> Result<Vec<u8>, DecryptError> {
     if edit.scheme_type == PIFF {
         return Ok(encrypted_sample.to_vec());
     }
-    let sample = edit.sample.as_borrowed();
     let scheme = NativeCommonEncryptionScheme::from_scheme_type(edit.scheme_type).ok_or(
         DecryptRewriteError::UnsupportedTrackSchemeType {
             track_id: edit.track_id,
             scheme_type: edit.scheme_type,
         },
     )?;
-    let clear =
-        decrypt_common_encryption_sample(scheme, edit.content_key, &sample, encrypted_sample)
-            .map_err(DecryptRewriteError::from)?;
+    let aes = decryptor_reuse.touch_or_insert_with(
+        DecryptorReuseKey::new(edit.scheme_type, edit.content_key),
+        || Aes128::new(&edit.content_key.into()),
+    );
+    let clear = decrypt_common_encryption_sample_with_cipher(
+        scheme,
+        aes,
+        resolved_sample,
+        encrypted_sample,
+    )
+    .map_err(DecryptRewriteError::from)?;
     if clear.len() != encrypted_sample.len() {
         return Err(DecryptRewriteError::InvalidLayout {
             reason: format!(
@@ -5101,6 +5575,86 @@ fn decrypt_common_encryption_sample_edit(
         .into());
     }
     Ok(clear)
+}
+
+fn map_raw_offset_queue_error(error: RawOffsetQueueError) -> DecryptError {
+    DecryptRewriteError::InvalidLayout {
+        reason: error.to_string(),
+    }
+    .into()
+}
+
+fn fill_progressive_raw_queue<R>(
+    input: &mut R,
+    raw_queue: &mut RawOffsetQueue,
+    target_end: u64,
+    buffer: &mut [u8],
+) -> Result<(), DecryptError>
+where
+    R: Read,
+{
+    while raw_queue.tail() < target_end {
+        let remaining = target_end - raw_queue.tail();
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len])?;
+        raw_queue.push_bytes(&buffer[..chunk_len]);
+    }
+    Ok(())
+}
+
+fn copy_range_from_progressive_queue<R, W>(
+    input: &mut R,
+    output: &mut W,
+    raw_queue: &mut RawOffsetQueue,
+    buffer: &mut [u8],
+    start: u64,
+    size: u64,
+) -> Result<(), DecryptError>
+where
+    R: Read,
+    W: Write,
+{
+    let mut cursor = start;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+            reason: "progressive copy range overflowed u64".to_owned(),
+        })?;
+    while cursor < end {
+        let chunk_end = end.min(cursor + buffer.len() as u64);
+        fill_progressive_raw_queue(input, raw_queue, chunk_end, buffer)?;
+        raw_queue
+            .with_range_bytes(cursor, chunk_end - cursor, |bytes| output.write_all(bytes))
+            .map_err(map_raw_offset_queue_error)??;
+        raw_queue
+            .trim_to(chunk_end)
+            .map_err(map_raw_offset_queue_error)?;
+        cursor = chunk_end;
+    }
+    Ok(())
+}
+
+fn read_range_from_progressive_queue<R>(
+    input: &mut R,
+    raw_queue: &mut RawOffsetQueue,
+    buffer: &mut [u8],
+    start: u64,
+    size: u64,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read,
+{
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+            reason: "progressive sample range overflowed u64".to_owned(),
+        })?;
+    fill_progressive_raw_queue(input, raw_queue, end, buffer)?;
+    let bytes = raw_queue
+        .with_range_bytes(start, size, <[u8]>::to_vec)
+        .map_err(map_raw_offset_queue_error)?;
+    raw_queue.trim_to(end).map_err(map_raw_offset_queue_error)?;
+    Ok(bytes)
 }
 
 fn copy_exact_range<R, W>(
@@ -5125,6 +5679,40 @@ where
     Ok(())
 }
 
+fn copy_exact_from_current<R, W>(
+    input: &mut R,
+    output: &mut W,
+    size: u64,
+) -> Result<(), DecryptError>
+where
+    R: Read,
+    W: Write,
+{
+    let mut remaining = size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len])?;
+        output.write_all(&buffer[..chunk_len])?;
+        remaining -= u64::try_from(chunk_len).unwrap();
+    }
+    Ok(())
+}
+
+fn discard_exact_from_current<R>(input: &mut R, size: u64) -> Result<(), DecryptError>
+where
+    R: Read,
+{
+    let mut remaining = size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len])?;
+        remaining -= u64::try_from(chunk_len).unwrap();
+    }
+    Ok(())
+}
+
 #[cfg(feature = "async")]
 async fn copy_exact_range_async<R, W>(
     input: &mut R,
@@ -5138,7 +5726,7 @@ where
 {
     input.seek(SeekFrom::Start(start)).await?;
     let mut remaining = size;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     while remaining != 0 {
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
         input.read_exact(&mut buffer[..chunk_len]).await?;
@@ -5146,6 +5734,119 @@ where
         remaining -= u64::try_from(chunk_len).unwrap();
     }
     Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn copy_exact_from_current_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    size: u64,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadForward,
+    W: AsyncWriteForward,
+{
+    let mut remaining = size;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len]).await?;
+        output.write_all(&buffer[..chunk_len]).await?;
+        remaining -= u64::try_from(chunk_len).unwrap();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn discard_exact_from_current_async<R>(input: &mut R, size: u64) -> Result<(), DecryptError>
+where
+    R: AsyncReadForward,
+{
+    let mut remaining = size;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len]).await?;
+        remaining -= u64::try_from(chunk_len).unwrap();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn fill_progressive_raw_queue_async<R>(
+    input: &mut R,
+    raw_queue: &mut RawOffsetQueue,
+    target_end: u64,
+    buffer: &mut [u8],
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadForward,
+{
+    while raw_queue.tail() < target_end {
+        let remaining = target_end - raw_queue.tail();
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        input.read_exact(&mut buffer[..chunk_len]).await?;
+        raw_queue.push_bytes(&buffer[..chunk_len]);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn copy_range_from_progressive_queue_async<R, W>(
+    input: &mut R,
+    output: &mut W,
+    raw_queue: &mut RawOffsetQueue,
+    buffer: &mut [u8],
+    start: u64,
+    size: u64,
+) -> Result<(), DecryptError>
+where
+    R: AsyncReadForward,
+    W: AsyncWriteForward,
+{
+    let mut cursor = start;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+            reason: "progressive copy range overflowed u64".to_owned(),
+        })?;
+    while cursor < end {
+        let chunk_end = end.min(cursor + buffer.len() as u64);
+        fill_progressive_raw_queue_async(input, raw_queue, chunk_end, buffer).await?;
+        let chunk = raw_queue
+            .with_range_bytes(cursor, chunk_end - cursor, <[u8]>::to_vec)
+            .map_err(map_raw_offset_queue_error)?;
+        output.write_all(&chunk).await?;
+        raw_queue
+            .trim_to(chunk_end)
+            .map_err(map_raw_offset_queue_error)?;
+        cursor = chunk_end;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn read_range_from_progressive_queue_async<R>(
+    input: &mut R,
+    raw_queue: &mut RawOffsetQueue,
+    buffer: &mut [u8],
+    start: u64,
+    size: u64,
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadForward,
+{
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+            reason: "progressive sample range overflowed u64".to_owned(),
+        })?;
+    fill_progressive_raw_queue_async(input, raw_queue, end, buffer).await?;
+    let bytes = raw_queue
+        .with_range_bytes(start, size, <[u8]>::to_vec)
+        .map_err(map_raw_offset_queue_error)?;
+    raw_queue.trim_to(end).map_err(map_raw_offset_queue_error)?;
+    Ok(bytes)
 }
 
 fn find_mdat_info_containing_sample(
@@ -10862,7 +11563,7 @@ struct SampleTransformer {
 impl SampleTransformer {
     fn new(
         scheme: NativeCommonEncryptionScheme,
-        aes: Aes128,
+        aes: &Aes128,
         iv: [u8; 16],
         crypt_byte_block: u8,
         skip_byte_block: u8,
@@ -10873,13 +11574,13 @@ impl SampleTransformer {
             pattern_stream_offset: 0,
             cipher: if scheme.uses_cbc() {
                 SampleCipher::Cbc {
-                    aes,
+                    aes: aes.clone(),
                     iv,
                     chain_block: iv,
                 }
             } else {
                 SampleCipher::Ctr {
-                    aes,
+                    aes: aes.clone(),
                     iv,
                     encrypted_offset: 0,
                 }
@@ -11081,6 +11782,53 @@ mod tests {
         Ok(output_writer.into_inner())
     }
 
+    fn build_common_encryption_plan_for_bytes(
+        input: &[u8],
+        options: &DecryptOptions,
+        fragments_info: Option<&[u8]>,
+    ) -> Result<CommonEncryptionStreamPlan, DecryptError> {
+        let mut reader = Cursor::new(input);
+        let root_boxes = read_root_box_infos_from_reader(&mut reader)?;
+        let layout = classify_decrypt_input_from_reader(&mut reader, &root_boxes)?;
+        build_common_encryption_stream_plan(
+            &mut reader,
+            &root_boxes,
+            layout,
+            options.keys(),
+            fragments_info,
+        )
+    }
+
+    fn decrypt_stream_to_bytes_non_seekable(
+        input: &[u8],
+        options: &DecryptOptions,
+        fragments_info: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DecryptError> {
+        let plan = build_common_encryption_plan_for_bytes(input, options, fragments_info)?;
+        let mut input_reader = input;
+        let mut output = Vec::new();
+        execute_common_encryption_stream_plan_non_seekable(&mut input_reader, &mut output, &plan)?;
+        Ok(output)
+    }
+
+    #[cfg(feature = "async")]
+    async fn decrypt_stream_to_bytes_non_seekable_async(
+        input: &[u8],
+        options: &DecryptOptions,
+        fragments_info: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DecryptError> {
+        let plan = build_common_encryption_plan_for_bytes(input, options, fragments_info)?;
+        let mut input_reader = Cursor::new(input.to_vec());
+        let mut output = Cursor::new(Vec::new());
+        execute_common_encryption_stream_plan_non_seekable_async(
+            &mut input_reader,
+            &mut output,
+            &plan,
+        )
+        .await?;
+        Ok(output.into_inner())
+    }
+
     #[test]
     fn compute_track_chunks_preserves_non_default_sample_description_indices() {
         let mut stsc = Stsc::default();
@@ -11162,6 +11910,24 @@ mod tests {
     }
 
     #[test]
+    fn sync_stream_core_decrypts_retained_common_encryption_file_from_non_seekable_input() {
+        let fixture = common_encryption_multi_track_fixture();
+        let encrypted = fs::read(&fixture.encrypted_path).unwrap();
+        let expected = fs::read(&fixture.decrypted_path).unwrap();
+
+        let output = decrypt_stream_to_bytes_non_seekable(
+            &encrypted,
+            &DecryptOptions::new()
+                .with_key(fixture.keys[0])
+                .with_key(fixture.keys[1]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
     fn sync_stream_core_decrypts_retained_standalone_fragment_with_seekable_fragments_info() {
         let fixture = common_encryption_fragment_fixture("cenc-single", "video");
         let encrypted = fs::read(&fixture.encrypted_segment_path).unwrap();
@@ -11173,6 +11939,25 @@ mod tests {
             &DecryptOptions::new().with_key(fixture.keys[0]),
             Some(&fragments_info),
         )
+        .unwrap();
+
+        assert_eq!(output, expected);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_stream_core_decrypts_retained_standalone_fragment_from_non_seekable_input() {
+        let fixture = common_encryption_fragment_fixture("cenc-single", "video");
+        let encrypted = fs::read(&fixture.encrypted_segment_path).unwrap();
+        let expected = fs::read(&fixture.clear_segment_path).unwrap();
+        let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+
+        let output = decrypt_stream_to_bytes_non_seekable_async(
+            &encrypted,
+            &DecryptOptions::new().with_key(fixture.keys[0]),
+            Some(&fragments_info),
+        )
+        .await
         .unwrap();
 
         assert_eq!(output, expected);
@@ -11190,5 +11975,242 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, fixture.decrypted);
+    }
+
+    #[test]
+    fn compute_fragment_auxiliary_info_spans_chains_single_saio_entry_across_runs() {
+        let mut saio = Saio::default();
+        saio.entry_count = 1;
+        saio.offset_v0 = vec![24];
+
+        let mut first_trun = Trun::default();
+        first_trun.sample_count = 2;
+        let mut second_trun = Trun::default();
+        second_trun.sample_count = 1;
+
+        let samples = [
+            ResolvedSampleEncryptionSample {
+                sample_index: 1,
+                metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                is_protected: true,
+                crypt_byte_block: 0,
+                skip_byte_block: 0,
+                per_sample_iv_size: Some(8),
+                initialization_vector: &[],
+                constant_iv: None,
+                kid: [0; 16],
+                subsamples: &[],
+                auxiliary_info_size: 10,
+            },
+            ResolvedSampleEncryptionSample {
+                sample_index: 2,
+                metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                is_protected: true,
+                crypt_byte_block: 0,
+                skip_byte_block: 0,
+                per_sample_iv_size: Some(8),
+                initialization_vector: &[],
+                constant_iv: None,
+                kid: [0; 16],
+                subsamples: &[],
+                auxiliary_info_size: 6,
+            },
+            ResolvedSampleEncryptionSample {
+                sample_index: 3,
+                metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                is_protected: true,
+                crypt_byte_block: 0,
+                skip_byte_block: 0,
+                per_sample_iv_size: Some(8),
+                initialization_vector: &[],
+                constant_iv: None,
+                kid: [0; 16],
+                subsamples: &[],
+                auxiliary_info_size: 12,
+            },
+        ];
+
+        let spans = compute_fragment_auxiliary_info_spans(
+            100,
+            Some(&saio),
+            &[first_trun, second_trun],
+            &samples,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spans,
+            vec![
+                Some(QueueAuxiliaryInfoSpan {
+                    absolute_offset: 124,
+                    size: 16,
+                }),
+                Some(QueueAuxiliaryInfoSpan {
+                    absolute_offset: 140,
+                    size: 12,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn queue_common_encryption_mdat_edits_use_earliest_relevant_offsets_without_reordering_sample_writes()
+     {
+        let edits = vec![
+            CommonEncryptionSampleEdit {
+                absolute_offset: 400,
+                sample_size: 16,
+                track_id: 1,
+                scheme_type: CENC,
+                content_key: [0x11; 16],
+                auxiliary_info_span: Some(QueueAuxiliaryInfoSpan {
+                    absolute_offset: 300,
+                    size: 24,
+                }),
+                sample: OwnedResolvedSampleEncryptionSample {
+                    sample_index: 1,
+                    metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                    is_protected: true,
+                    crypt_byte_block: 0,
+                    skip_byte_block: 0,
+                    per_sample_iv_size: Some(8),
+                    initialization_vector: Vec::new(),
+                    constant_iv: None,
+                    kid: [0; 16],
+                    subsamples: Vec::new(),
+                    auxiliary_info_size: 16,
+                },
+            },
+            CommonEncryptionSampleEdit {
+                absolute_offset: 350,
+                sample_size: 16,
+                track_id: 1,
+                scheme_type: CENC,
+                content_key: [0x11; 16],
+                auxiliary_info_span: Some(QueueAuxiliaryInfoSpan {
+                    absolute_offset: 600,
+                    size: 24,
+                }),
+                sample: OwnedResolvedSampleEncryptionSample {
+                    sample_index: 2,
+                    metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                    is_protected: true,
+                    crypt_byte_block: 0,
+                    skip_byte_block: 0,
+                    per_sample_iv_size: Some(8),
+                    initialization_vector: Vec::new(),
+                    constant_iv: None,
+                    kid: [0; 16],
+                    subsamples: Vec::new(),
+                    auxiliary_info_size: 8,
+                },
+            },
+        ];
+
+        let queued = queue_common_encryption_mdat_edits(BTreeMap::from([(200_u64, edits)]));
+        let queue = queued.get(&200).unwrap();
+
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(|edit| edit.absolute_offset)
+                .collect::<Vec<_>>(),
+            vec![400, 350]
+        );
+        assert_eq!(
+            queue.auxiliary_info_spans(),
+            &[
+                QueueAuxiliaryInfoSpan {
+                    absolute_offset: 300,
+                    size: 24,
+                },
+                QueueAuxiliaryInfoSpan {
+                    absolute_offset: 600,
+                    size: 24,
+                },
+            ]
+        );
+
+        let payload_start = 320;
+        let payload_end = 420;
+        let mut parser = RangeQueueParser::new(Some(queue), payload_start, payload_end);
+        let mut work_item_offsets = Vec::new();
+        loop {
+            match parser.next_stage().unwrap() {
+                RangeQueueParserStage::AuxiliaryInfo(..)
+                | RangeQueueParserStage::CopyRange { .. } => {}
+                RangeQueueParserStage::WorkItem(item) => {
+                    work_item_offsets.push(item.absolute_offset)
+                }
+                RangeQueueParserStage::Complete => break,
+            }
+        }
+        assert_eq!(work_item_offsets, vec![350, 400]);
+    }
+
+    #[test]
+    fn auxiliary_info_stage_builds_live_sample_state_cache_for_fragmented_decrypt() {
+        let edits = vec![
+            CommonEncryptionSampleEdit {
+                absolute_offset: 400,
+                sample_size: 16,
+                track_id: 7,
+                scheme_type: CENC,
+                content_key: [0x11; 16],
+                auxiliary_info_span: Some(QueueAuxiliaryInfoSpan {
+                    absolute_offset: 300,
+                    size: 24,
+                }),
+                sample: OwnedResolvedSampleEncryptionSample {
+                    sample_index: 1,
+                    metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                    is_protected: true,
+                    crypt_byte_block: 0,
+                    skip_byte_block: 0,
+                    per_sample_iv_size: Some(8),
+                    initialization_vector: Vec::new(),
+                    constant_iv: None,
+                    kid: [0; 16],
+                    subsamples: Vec::new(),
+                    auxiliary_info_size: 16,
+                },
+            },
+            CommonEncryptionSampleEdit {
+                absolute_offset: 500,
+                sample_size: 16,
+                track_id: 7,
+                scheme_type: CENC,
+                content_key: [0x11; 16],
+                auxiliary_info_span: Some(QueueAuxiliaryInfoSpan {
+                    absolute_offset: 300,
+                    size: 24,
+                }),
+                sample: OwnedResolvedSampleEncryptionSample {
+                    sample_index: 2,
+                    metadata_source: ResolvedSampleEncryptionSource::TrackEncryptionBox,
+                    is_protected: true,
+                    crypt_byte_block: 0,
+                    skip_byte_block: 0,
+                    per_sample_iv_size: Some(8),
+                    initialization_vector: Vec::new(),
+                    constant_iv: None,
+                    kid: [0; 16],
+                    subsamples: Vec::new(),
+                    auxiliary_info_size: 8,
+                },
+            },
+        ];
+
+        let queue = OrderedWorkQueue::new(edits);
+        let mut cache =
+            ActiveAuxiliaryInfoCache::stage(Some(&queue), queue.auxiliary_info_spans()).unwrap();
+        let edits = queue.items();
+
+        let first = cache.resolved_sample_for_edit(&edits[0]).unwrap();
+        assert_eq!(first.sample_index, 1);
+        let second = cache.resolved_sample_for_edit(&edits[1]).unwrap();
+        assert_eq!(second.sample_index, 2);
+        cache.finish().unwrap();
     }
 }

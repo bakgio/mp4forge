@@ -60,6 +60,7 @@ pub struct BoxLookupContext {
     pub(crate) is_quicktime_compatible: bool,
     pub(crate) quicktime_keys_meta_entry_count: usize,
     pub(crate) ilst_meta_item: Option<FourCc>,
+    pub(crate) under_audio_sample_entry: bool,
     pub(crate) under_wave: bool,
     pub(crate) under_ilst: bool,
     pub(crate) under_ilst_meta: bool,
@@ -74,6 +75,7 @@ impl BoxLookupContext {
             is_quicktime_compatible: false,
             quicktime_keys_meta_entry_count: 0,
             ilst_meta_item: None,
+            under_audio_sample_entry: false,
             under_wave: false,
             under_ilst: false,
             under_ilst_meta: false,
@@ -112,6 +114,11 @@ impl BoxLookupContext {
         self.ilst_meta_item
     }
 
+    /// Returns `true` when the current lookup runs under an audio sample-entry box.
+    pub const fn under_audio_sample_entry(&self) -> bool {
+        self.under_audio_sample_entry
+    }
+
     /// Returns `true` when the current lookup runs under a `wave` box.
     pub const fn under_wave(&self) -> bool {
         self.under_wave
@@ -143,6 +150,45 @@ impl BoxLookupContext {
         const ILST: FourCc = FourCc::from_bytes(*b"ilst");
         const UDTA: FourCc = FourCc::from_bytes(*b"udta");
         const FREE_FORM: FourCc = FourCc::from_bytes(*b"----");
+        const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
+        const ENCA: FourCc = FourCc::from_bytes(*b"enca");
+        const ALAC: FourCc = FourCc::from_bytes(*b"alac");
+        const AC_3: FourCc = FourCc::from_bytes(*b"ac-3");
+        const EC_3: FourCc = FourCc::from_bytes(*b"ec-3");
+        const AC_4: FourCc = FourCc::from_bytes(*b"ac-4");
+        const DTSC: FourCc = FourCc::from_bytes(*b"dtsc");
+        const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
+        const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
+        const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
+        const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
+        const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
+        const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
+        const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
+        const IAMF: FourCc = FourCc::from_bytes(*b"iamf");
+        const MHA1: FourCc = FourCc::from_bytes(*b"mha1");
+        const MHM1: FourCc = FourCc::from_bytes(*b"mhm1");
+
+        if matches!(
+            box_type,
+            MP4A | ENCA
+                | ALAC
+                | AC_3
+                | EC_3
+                | AC_4
+                | DTSC
+                | DTSE
+                | DTSH
+                | DTSL
+                | DTSM
+                | DTSX
+                | FLAC
+                | OPUS
+                | IAMF
+                | MHA1
+                | MHM1
+        ) {
+            self.under_audio_sample_entry = true;
+        }
 
         if box_type == WAVE {
             self.under_wave = true;

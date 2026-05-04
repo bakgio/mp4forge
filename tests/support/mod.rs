@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aes::Aes128;
 #[cfg(feature = "decrypt")]
 use aes::cipher::{Block, BlockEncrypt, KeyInit};
+#[cfg(feature = "mux")]
+use mp4forge::bitio::BitWriter;
 use mp4forge::boxes::AnyTypeBox;
 #[cfg(feature = "decrypt")]
 use mp4forge::boxes::isma_cryp::{Isfm, Islt};
@@ -46,6 +48,11 @@ use mp4forge::decrypt::{DecryptionKey, NativeCommonEncryptionScheme};
 use mp4forge::encryption::{ResolvedSampleEncryptionSample, ResolvedSampleEncryptionSource};
 #[cfg(feature = "decrypt")]
 use mp4forge::extract::{extract_box, extract_box_as};
+#[cfg(feature = "mux")]
+use mp4forge::mux::{
+    MuxFileConfig, MuxInterleavePolicy, MuxStagedMediaItem, MuxTrackConfig,
+    plan_staged_media_items, write_mp4_mux_to_path,
+};
 #[cfg(feature = "decrypt")]
 use mp4forge::walk::BoxPath;
 use mp4forge::{BoxInfo, FourCc};
@@ -82,6 +89,289 @@ pub fn write_temp_file(prefix: &str, data: &[u8]) -> PathBuf {
     ));
     fs::write(&path, data).unwrap();
     path
+}
+
+#[cfg(feature = "mux")]
+#[derive(Clone, Copy)]
+pub struct TestMuxSample<'a> {
+    pub bytes: &'a [u8],
+    pub duration: u32,
+    pub composition_time_offset: i32,
+    pub is_sync_sample: bool,
+}
+
+#[cfg(feature = "mux")]
+pub fn write_single_track_mp4_input(
+    prefix: &str,
+    file_config: &MuxFileConfig,
+    track_config: MuxTrackConfig,
+    samples: &[TestMuxSample<'_>],
+) -> PathBuf {
+    let source_bytes = samples
+        .iter()
+        .flat_map(|sample| sample.bytes)
+        .copied()
+        .collect::<Vec<_>>();
+    let source_path = write_temp_file(&format!("{prefix}-source"), &source_bytes);
+    let output_path = write_temp_file(&format!("{prefix}-output"), &[]);
+
+    let mut source_offset = 0_u64;
+    let mut decode_time = 0_u64;
+    let staged_items = samples
+        .iter()
+        .map(|sample| {
+            let item = MuxStagedMediaItem::new(
+                0,
+                track_config.track_id(),
+                decode_time,
+                sample.duration,
+                source_offset,
+                u32::try_from(sample.bytes.len()).unwrap(),
+            )
+            .with_composition_time_offset(sample.composition_time_offset)
+            .with_sync_sample(sample.is_sync_sample);
+            source_offset += u64::try_from(sample.bytes.len()).unwrap();
+            decode_time += u64::from(sample.duration);
+            item
+        })
+        .collect::<Vec<_>>();
+    let plan = plan_staged_media_items(staged_items, MuxInterleavePolicy::DecodeTime).unwrap();
+
+    write_mp4_mux_to_path(
+        &[&source_path],
+        &output_path,
+        file_config,
+        &[track_config],
+        &plan,
+    )
+    .unwrap();
+    output_path
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_adts_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_adts_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_mp3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_mp3_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_mp3_file_with_leading_id3_tag(
+    prefix: &str,
+    tag_payload: &[u8],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    let mut bytes = build_id3v2_tag(tag_payload);
+    for payload in frame_payloads {
+        bytes.extend_from_slice(&build_mp3_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_ac3_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ac3_44100_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_ac3_44100_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_eac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_eac3_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ac4_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_ac4_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_h265_annexb_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    const START_CODE: &[u8] = &[0, 0, 0, 1];
+    const AUD: &[u8] = &[0x46, 0x01, 0x50];
+    const VPS: &[u8] = &[
+        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0x99, 0x98, 0x09,
+    ];
+    const SPS: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x66, 0x69, 0x24, 0xca, 0xe0,
+        0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x80,
+    ];
+    const PPS: &[u8] = &[0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40];
+
+    let mut bytes = Vec::new();
+    for nal in [VPS, SPS, PPS] {
+        bytes.extend_from_slice(START_CODE);
+        bytes.extend_from_slice(nal);
+    }
+    for (index, payload) in sample_payloads.iter().enumerate() {
+        if index != 0 {
+            bytes.extend_from_slice(START_CODE);
+            bytes.extend_from_slice(AUD);
+        }
+        bytes.extend_from_slice(START_CODE);
+        bytes.extend_from_slice(&[0x26, 0x01]);
+        bytes.extend_from_slice(payload);
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+fn build_adts_frame(payload: &[u8]) -> Vec<u8> {
+    let profile = 1_u8;
+    let sampling_frequency_index = 4_u8;
+    let channel_configuration = 2_u8;
+    let frame_length = payload.len() + 7;
+
+    let mut header = [0_u8; 7];
+    header[0] = 0xFF;
+    header[1] = 0xF1;
+    header[2] =
+        (profile << 6) | (sampling_frequency_index << 2) | ((channel_configuration >> 2) & 0x01);
+    header[3] =
+        ((channel_configuration & 0x03) << 6) | u8::try_from((frame_length >> 11) & 0x03).unwrap();
+    header[4] = u8::try_from((frame_length >> 3) & 0xFF).unwrap();
+    header[5] = (u8::try_from(frame_length & 0x07).unwrap() << 5) | 0x1F;
+    header[6] = 0xFC;
+
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_mp3_frame(payload: &[u8]) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 384;
+    assert!(payload.len() <= FRAME_LENGTH - 4);
+    let mut frame = vec![0_u8; FRAME_LENGTH];
+    frame[0] = 0xFF;
+    frame[1] = 0xFB;
+    frame[2] = 0x94;
+    frame[3] = 0x00;
+    frame[4..4 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_id3v2_tag(payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() <= 0x0FFF_FFFF);
+    let size = payload.len();
+    let mut tag = vec![
+        b'I',
+        b'D',
+        b'3',
+        3,
+        0,
+        0,
+        u8::try_from((size >> 21) & 0x7F).unwrap(),
+        u8::try_from((size >> 14) & 0x7F).unwrap(),
+        u8::try_from((size >> 7) & 0x7F).unwrap(),
+        u8::try_from(size & 0x7F).unwrap(),
+    ];
+    tag.extend_from_slice(payload);
+    tag
+}
+
+#[cfg(feature = "mux")]
+fn build_ac3_frame(payload: &[u8]) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 256;
+    assert!(payload.len() <= FRAME_LENGTH - 7);
+    let mut frame = vec![0_u8; FRAME_LENGTH];
+    frame[0] = 0x0B;
+    frame[1] = 0x77;
+    frame[4] = 0x08;
+    frame[5] = 0x40;
+    frame[6] = 0x44;
+    frame[7..7 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_ac3_44100_frame(payload: &[u8]) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 138;
+    assert!(payload.len() <= FRAME_LENGTH - 7);
+    let mut frame = vec![0_u8; FRAME_LENGTH];
+    frame[0] = 0x0B;
+    frame[1] = 0x77;
+    frame[4] = 0x40;
+    frame[5] = 0x40;
+    frame[6] = 0x44;
+    frame[7..7 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_eac3_frame(payload: &[u8]) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 64;
+    assert!(payload.len() <= FRAME_LENGTH - 6);
+    let mut header_writer = BitWriter::new(Vec::new());
+    header_writer.write_bits(&[0_u8], 2).unwrap();
+    header_writer.write_bits(&[0_u8], 3).unwrap();
+    header_writer
+        .write_bits(
+            &u16::try_from((FRAME_LENGTH / 2) - 1).unwrap().to_be_bytes(),
+            11,
+        )
+        .unwrap();
+    header_writer.write_bits(&[0_u8], 2).unwrap();
+    header_writer.write_bits(&[3_u8], 2).unwrap();
+    header_writer.write_bits(&[2_u8], 3).unwrap();
+    header_writer.write_bits(&[1_u8], 1).unwrap();
+    header_writer.write_bits(&[16_u8], 5).unwrap();
+    header_writer.write_bits(&[0_u8], 3).unwrap();
+    let header_suffix = header_writer.into_inner().unwrap();
+
+    let mut frame = vec![0_u8; FRAME_LENGTH];
+    frame[0] = 0x0B;
+    frame[1] = 0x77;
+    frame[2..2 + header_suffix.len()].copy_from_slice(&header_suffix);
+    frame[6..6 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_ac4_frame(payload: &[u8]) -> Vec<u8> {
+    let payload_size = u16::try_from(payload.len().max(1)).unwrap();
+    let mut frame = Vec::with_capacity(4 + usize::from(payload_size));
+    frame.extend_from_slice(&[0xAC, 0x40]);
+    frame.extend_from_slice(&payload_size.to_be_bytes());
+    if payload.is_empty() {
+        frame.push(0);
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    frame
 }
 
 pub fn temp_output_dir(prefix: &str) -> PathBuf {

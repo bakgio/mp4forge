@@ -8,6 +8,8 @@ pub mod divide;
 pub mod dump;
 pub mod edit;
 pub mod extract;
+#[cfg(feature = "mux")]
+pub mod mux;
 pub mod probe;
 pub mod pssh;
 pub mod util;
@@ -34,6 +36,8 @@ where
         "dump" => dump::run(&args[1..], stdout, stderr),
         "edit" => edit::run(&args[1..], stderr),
         "extract" => extract::run(&args[1..], stdout, stderr),
+        #[cfg(feature = "mux")]
+        "mux" => mux::run(&args[1..], stderr),
         "psshdump" => pssh::run(&args[1..], stdout, stderr),
         "probe" => probe::run(&args[1..], stdout, stderr),
         _ => {
@@ -63,6 +67,11 @@ where
     writeln!(writer, "  dump         display the MP4 box tree")?;
     writeln!(writer, "  edit         rewrite selected boxes")?;
     writeln!(writer, "  extract      extract raw boxes by type or path")?;
+    #[cfg(feature = "mux")]
+    writeln!(
+        writer,
+        "  mux          merge one video track plus audio tracks into one MP4"
+    )?;
     writeln!(writer, "  psshdump     summarize pssh boxes")?;
     writeln!(writer, "  probe        summarize an MP4 file")?;
     Ok(())

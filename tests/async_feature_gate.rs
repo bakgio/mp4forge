@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mp4forge::FourCc;
-use mp4forge::async_io::{AsyncReadSeek, AsyncWriteSeek};
+use mp4forge::async_io::{AsyncReadForward, AsyncReadSeek, AsyncWriteForward, AsyncWriteSeek};
 use mp4forge::boxes::iso14496_12::Ftyp;
 use mp4forge::codec::{marshal_async, unmarshal_async};
 use mp4forge::header::BoxInfo;
@@ -19,15 +19,21 @@ use tokio::fs::File as TokioFile;
 
 fn assert_async_read_seek<T: AsyncReadSeek>(_value: &mut T) {}
 
+fn assert_async_read_forward<T: AsyncReadForward>(_value: &mut T) {}
+
 fn assert_async_write_seek<T: AsyncWriteSeek>(_value: &mut T) {}
+
+fn assert_async_write_forward<T: AsyncWriteForward>(_value: &mut T) {}
 
 #[test]
 fn cursor_satisfies_async_seek_aliases() {
     let mut reader = Cursor::new(vec![0_u8; 4]);
     assert_async_read_seek(&mut reader);
+    assert_async_read_forward(&mut reader);
 
     let mut writer = Cursor::new(Vec::<u8>::new());
     assert_async_write_seek(&mut writer);
+    assert_async_write_forward(&mut writer);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

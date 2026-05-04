@@ -170,12 +170,33 @@ fn write_uvarint(
         ));
     }
 
-    for shift in [21_u32, 14, 7] {
-        let octet = (((value >> shift) as u8) & 0x7f) | 0x80;
-        buffer.push(octet);
+    let mut octets = [0_u8; 4];
+    let mut count = 0_usize;
+    let mut remaining = value;
+    loop {
+        octets[3 - count] = (remaining & 0x7f) as u8;
+        count += 1;
+        remaining >>= 7;
+        if remaining == 0 {
+            break;
+        }
     }
-    buffer.push((value & 0x7f) as u8);
+    for octet in octets[(4 - count)..].iter().take(count.saturating_sub(1)) {
+        buffer.push(*octet | 0x80);
+    }
+    buffer.push(octets[3]);
     Ok(())
+}
+
+#[cfg(feature = "mux")]
+fn uvarint_len(value: u32) -> u32 {
+    let mut encoded_len = 1_u32;
+    let mut remaining = value;
+    while remaining > 0x7f {
+        encoded_len += 1;
+        remaining >>= 7;
+    }
+    encoded_len
 }
 
 fn descriptor_tag_name(tag: u8) -> Option<&'static str> {
@@ -1037,6 +1058,101 @@ impl Esds {
         self.first_descriptor_with_tag(DECODER_SPECIFIC_INFO_TAG)
             .map(|descriptor| descriptor.data.as_slice())
     }
+
+    #[cfg(feature = "mux")]
+    pub(crate) fn normalize_descriptor_sizes_for_mux(&mut self) -> Result<(), FieldValueError> {
+        let mut payload_sizes = self
+            .descriptors
+            .iter()
+            .map(canonical_descriptor_payload_size)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if let Some(decoder_config_index) = self
+            .descriptors
+            .iter()
+            .position(|descriptor| descriptor.tag == DECODER_CONFIG_DESCRIPTOR_TAG)
+        {
+            let mut decoder_config_size = payload_sizes[decoder_config_index];
+            for nested_size in payload_sizes
+                .iter()
+                .skip(decoder_config_index + 1)
+                .zip(self.descriptors.iter().skip(decoder_config_index + 1))
+                .take_while(|(_, descriptor)| descriptor.tag == DECODER_SPECIFIC_INFO_TAG)
+                .map(|(payload_size, _)| descriptor_marshaled_size(*payload_size))
+            {
+                decoder_config_size = decoder_config_size
+                    .checked_add(nested_size)
+                    .ok_or_else(|| invalid_value("Size", "descriptor size overflow"))?;
+            }
+            payload_sizes[decoder_config_index] = decoder_config_size;
+        }
+
+        if let Some(es_descriptor_index) = self
+            .descriptors
+            .iter()
+            .position(|descriptor| descriptor.tag == ES_DESCRIPTOR_TAG)
+        {
+            let mut es_descriptor_size = payload_sizes[es_descriptor_index];
+            let mut descriptor_index = es_descriptor_index + 1;
+            while descriptor_index < self.descriptors.len() {
+                let nested_size = descriptor_marshaled_size(payload_sizes[descriptor_index]);
+                es_descriptor_size = es_descriptor_size
+                    .checked_add(nested_size)
+                    .ok_or_else(|| invalid_value("Size", "descriptor size overflow"))?;
+                descriptor_index += 1;
+                if self.descriptors[descriptor_index - 1].tag == DECODER_CONFIG_DESCRIPTOR_TAG {
+                    while descriptor_index < self.descriptors.len()
+                        && self.descriptors[descriptor_index].tag == DECODER_SPECIFIC_INFO_TAG
+                    {
+                        descriptor_index += 1;
+                    }
+                }
+            }
+            payload_sizes[es_descriptor_index] = es_descriptor_size;
+        }
+
+        for (descriptor, payload_size) in self.descriptors.iter_mut().zip(payload_sizes) {
+            descriptor.size = payload_size;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mux")]
+fn canonical_descriptor_payload_size(descriptor: &Descriptor) -> Result<u32, FieldValueError> {
+    match descriptor.tag {
+        ES_DESCRIPTOR_TAG => {
+            let nested = descriptor
+                .es_descriptor
+                .as_ref()
+                .ok_or_else(|| invalid_value("ESDescriptor", "descriptor payload is missing"))?;
+            let payload = encode_es_descriptor("ESDescriptor", nested)?;
+            u32::try_from(payload.len()).map_err(|_| invalid_value("Size", "descriptor too large"))
+        }
+        DECODER_CONFIG_DESCRIPTOR_TAG => {
+            let nested = descriptor
+                .decoder_config_descriptor
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid_value("DecoderConfigDescriptor", "descriptor payload is missing")
+                })?;
+            let payload = encode_decoder_config_descriptor("DecoderConfigDescriptor", nested)?;
+            u32::try_from(payload.len()).map_err(|_| invalid_value("Size", "descriptor too large"))
+        }
+        _ => {
+            if descriptor.data.len() != descriptor.size as usize {
+                return Err(invalid_value("Data", "value length does not match Size"));
+            }
+            u32::try_from(descriptor.data.len())
+                .map_err(|_| invalid_value("Size", "descriptor too large"))
+        }
+    }
+}
+
+#[cfg(feature = "mux")]
+fn descriptor_marshaled_size(payload_size: u32) -> u32 {
+    1 + uvarint_len(payload_size) + payload_size
 }
 
 impl FieldValueRead for Esds {

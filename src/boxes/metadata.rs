@@ -413,7 +413,6 @@ pub(crate) fn is_ilst_meta_box_type(box_type: FourCc) -> bool {
 }
 
 /// Returns `true` when `box_type` falls into the numbered item range learned from `keys`.
-#[allow(dead_code)]
 pub(crate) fn is_numbered_metadata_item_type(
     box_type: FourCc,
     quicktime_keys_meta_entry_count: usize,

@@ -763,42 +763,114 @@ fn probe_detailed_recognizes_av01_track_family() {
 }
 
 #[test]
-fn probe_detailed_surfaces_new_sample_entry_types_without_new_family_variants() {
-    {
-        let mut reader = Cursor::new(build_ec3_movie_file());
-        let info = probe_detailed(&mut reader).unwrap();
+fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
+    for (
+        file,
+        sample_entry_type,
+        expected_family_name,
+        expected_channel_count,
+        expected_sample_rate,
+    ) in [
+        (
+            build_ec3_movie_file(),
+            "ec-3",
+            "eac3",
+            Some(6),
+            Some(48_000),
+        ),
+        (build_ac4_movie_file(), "ac-4", "ac4", Some(2), Some(48_000)),
+        (
+            build_simple_audio_movie_file("alac", 2, 48_000, 1_024, 4, Vec::new(), vec![0x2d; 4]),
+            "alac",
+            "alac",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("dtsc", 2, 48_000, 1_024, 4, Vec::new(), vec![0x2e; 4]),
+            "dtsc",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("dtse", 2, 48_000, 1_024, 4, Vec::new(), vec![0x2f; 4]),
+            "dtse",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("dtsh", 2, 48_000, 1_024, 4, Vec::new(), vec![0x30; 4]),
+            "dtsh",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("dtsl", 2, 48_000, 1_024, 4, Vec::new(), vec![0x31; 4]),
+            "dtsl",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("dtsm", 2, 48_000, 1_024, 4, Vec::new(), vec![0x32; 4]),
+            "dtsm",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("dtsx", 2, 48_000, 1_024, 4, Vec::new(), vec![0x33; 4]),
+            "dtsx",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_flac_movie_file(),
+            "fLaC",
+            "flac",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("iamf", 2, 48_000, 1_024, 4, Vec::new(), vec![0x34; 4]),
+            "iamf",
+            "iamf",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_mha1_movie_file(),
+            "mha1",
+            "mpeg_h",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_mpeg_h_audio_movie_file("mhm1", vec![0x35, 0x36, 0x37, 0x38]),
+            "mhm1",
+            "mpeg_h",
+            Some(2),
+            Some(48_000),
+        ),
+    ] {
+        let info = probe_detailed(&mut Cursor::new(file)).unwrap();
         let track = &info.tracks[0];
         assert_eq!(track.summary.codec, TrackCodec::Unknown);
         assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
-        assert_eq!(track.sample_entry_type, Some(fourcc("ec-3")));
-        assert_eq!(track.channel_count, Some(6));
-        assert_eq!(track.sample_rate, Some(48_000));
+        assert_eq!(track.sample_entry_type, Some(fourcc(sample_entry_type)));
+        assert_eq!(track.channel_count, expected_channel_count);
+        assert_eq!(track.sample_rate, expected_sample_rate);
         assert_eq!(
             normalized_codec_family_name(
                 track.codec_family,
                 track.sample_entry_type,
                 track.original_format,
             ),
-            "unknown"
-        );
-    }
-
-    {
-        let mut reader = Cursor::new(build_ac4_movie_file());
-        let info = probe_detailed(&mut reader).unwrap();
-        let track = &info.tracks[0];
-        assert_eq!(track.summary.codec, TrackCodec::Unknown);
-        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
-        assert_eq!(track.sample_entry_type, Some(fourcc("ac-4")));
-        assert_eq!(track.channel_count, Some(2));
-        assert_eq!(track.sample_rate, Some(48_000));
-        assert_eq!(
-            normalized_codec_family_name(
-                track.codec_family,
-                track.sample_entry_type,
-                track.original_format,
-            ),
-            "unknown"
+            expected_family_name
         );
     }
 
@@ -839,52 +911,20 @@ fn probe_detailed_surfaces_new_sample_entry_types_without_new_family_variants() 
             "avs3"
         );
     }
-
-    {
-        let mut reader = Cursor::new(build_flac_movie_file());
-        let info = probe_detailed(&mut reader).unwrap();
-        let track = &info.tracks[0];
-        assert_eq!(track.summary.codec, TrackCodec::Unknown);
-        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
-        assert_eq!(track.sample_entry_type, Some(fourcc("fLaC")));
-        assert_eq!(track.channel_count, Some(2));
-        assert_eq!(track.sample_rate, Some(48_000));
-        assert_eq!(
-            normalized_codec_family_name(
-                track.codec_family,
-                track.sample_entry_type,
-                track.original_format,
-            ),
-            "flac"
-        );
-    }
-
-    {
-        let mut reader = Cursor::new(build_mha1_movie_file());
-        let info = probe_detailed(&mut reader).unwrap();
-        let track = &info.tracks[0];
-        assert_eq!(track.summary.codec, TrackCodec::Unknown);
-        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
-        assert_eq!(track.sample_entry_type, Some(fourcc("mha1")));
-        assert_eq!(track.channel_count, Some(2));
-        assert_eq!(track.sample_rate, Some(48_000));
-        assert_eq!(
-            normalized_codec_family_name(
-                track.codec_family,
-                track.sample_entry_type,
-                track.original_format,
-            ),
-            "mpeg_h"
-        );
-    }
 }
 
 #[test]
-fn probe_codec_detailed_keeps_unknown_codec_details_for_new_family_strings() {
+fn probe_codec_detailed_keeps_unknown_codec_details_for_additive_family_strings() {
     for file in [
-        build_avs3_movie_file(),
+        build_ec3_movie_file(),
+        build_ac4_movie_file(),
+        build_simple_audio_movie_file("alac", 2, 48_000, 1_024, 4, Vec::new(), vec![0x40; 4]),
+        build_simple_audio_movie_file("dtsc", 2, 48_000, 1_024, 4, Vec::new(), vec![0x41; 4]),
         build_flac_movie_file(),
+        build_simple_audio_movie_file("iamf", 2, 48_000, 1_024, 4, Vec::new(), vec![0x42; 4]),
         build_mha1_movie_file(),
+        build_mpeg_h_audio_movie_file("mhm1", vec![0x43, 0x44, 0x45, 0x46]),
+        build_avs3_movie_file(),
     ] {
         let info = probe_codec_detailed(&mut Cursor::new(file)).unwrap();
         let track = &info.tracks[0];
@@ -2171,11 +2211,14 @@ fn build_encrypted_video_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
     encode_supported_box(&Trak, &[tkhd, mdia].concat())
 }
 
-fn build_single_track_movie_file(
+fn build_single_track_movie_file<F>(
     compatible_brands: Vec<FourCc>,
-    track_builder: fn(&[u64; 1]) -> Vec<u8>,
+    track_builder: F,
     mdat_payload: Vec<u8>,
-) -> Vec<u8> {
+) -> Vec<u8>
+where
+    F: Fn(&[u64; 1]) -> Vec<u8>,
+{
     let ftyp = encode_supported_box(
         &Ftyp {
             major_brand: fourcc("isom"),
@@ -2201,6 +2244,53 @@ fn build_single_track_moov(track: Vec<u8>) -> Vec<u8> {
     mvhd.next_track_id = 2;
     let mvhd = encode_supported_box(&mvhd, &[]);
     encode_supported_box(&Moov, &[mvhd, track].concat())
+}
+
+fn build_simple_audio_movie_file(
+    sample_entry_type: &str,
+    channel_count: u16,
+    sample_rate: u16,
+    sample_duration: u32,
+    sample_size: u32,
+    sample_entry_children: Vec<u8>,
+    mdat_payload: Vec<u8>,
+) -> Vec<u8> {
+    let sample_entry_type = sample_entry_type.to_string();
+    let compatible_brands = vec![fourcc("isom"), fourcc("iso8"), fourcc(&sample_entry_type)];
+    build_single_track_movie_file(
+        compatible_brands,
+        move |chunk_offsets| {
+            let sample_entry = encode_supported_box(
+                &audio_sample_entry_with_type(
+                    &sample_entry_type,
+                    channel_count,
+                    u32::from(sample_rate),
+                ),
+                &sample_entry_children,
+            );
+            build_single_sample_audio_trak(
+                1,
+                u32::from(sample_rate),
+                sample_duration,
+                sample_entry,
+                chunk_offsets,
+                sample_size,
+            )
+        },
+        mdat_payload,
+    )
+}
+
+fn build_mpeg_h_audio_movie_file(sample_entry_type: &str, mdat_payload: Vec<u8>) -> Vec<u8> {
+    build_simple_audio_movie_file(
+        sample_entry_type,
+        2,
+        48_000,
+        1_024,
+        4,
+        encode_supported_box(&mha_config(), &[]),
+        mdat_payload,
+    )
 }
 
 fn build_hevc_movie_file() -> Vec<u8> {

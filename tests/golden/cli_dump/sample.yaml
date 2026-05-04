@@ -1176,17 +1176,11 @@ boxes:
                     value_kind: bytes
                     value:
                       - 3
-                      - 128
-                      - 128
-                      - 128
                       - 37
                       - 0
                       - 2
                       - 0
                       - 4
-                      - 128
-                      - 128
-                      - 128
                       - 23
                       - 64
                       - 21
@@ -1202,9 +1196,6 @@ boxes:
                       - 41
                       - 74
                       - 5
-                      - 128
-                      - 128
-                      - 128
                       - 5
                       - 18
                       - 16
@@ -1212,9 +1203,6 @@ boxes:
                       - 229
                       - 0
                       - 6
-                      - 128
-                      - 128
-                      - 128
                       - 1
                       - 2
                     display_value: '[{Tag=ESDescr Size=37 ESID=2 StreamDependenceFlag=false UrlFlag=false OcrStreamFlag=false StreamPriority=0}, {Tag=DecoderConfigDescr Size=23 ObjectTypeIndication=0x40 StreamType=5 UpStream=false Reserved=true BufferSizeDB=0 MaxBitrate=10570 AvgBitrate=10570}, {Tag=DecSpecificInfo Size=5 Data=[0x12, 0x10, 0x56, 0xe5, 0x0]}, {Tag=SLConfigDescr Size=1 Data=[0x2]}]'
