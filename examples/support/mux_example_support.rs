@@ -17,7 +17,7 @@ use mp4forge::mux::{
 };
 
 #[derive(Clone, Copy)]
-pub struct TestMuxSample<'a> {
+struct TestMuxSample<'a> {
     pub bytes: &'a [u8],
     pub duration: u32,
     pub composition_time_offset: i32,
@@ -41,7 +41,38 @@ pub fn write_temp_file(prefix: &str, extension: &str, data: &[u8]) -> PathBuf {
     path
 }
 
-pub fn write_single_track_mp4_input(
+pub fn write_test_flac_file(prefix: &str, frame_payload: &[u8]) -> PathBuf {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"fLaC");
+    bytes.push(0x80);
+    bytes.extend_from_slice(&34_u32.to_be_bytes()[1..]);
+    bytes.extend_from_slice(&build_flac_streaminfo_block(48_000, 2, 16, 1_024));
+    bytes.extend_from_slice(frame_payload);
+    write_temp_file(prefix, "flac", &bytes)
+}
+
+pub fn write_test_av1_ivf_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    write_test_ivf_file(
+        prefix,
+        *b"AV01",
+        IvfHeaderFields {
+            width,
+            height,
+            timescale: 1_000,
+            timestamp_scale: 1,
+        },
+        frame_timestamps,
+        frame_payloads,
+    )
+}
+
+fn write_single_track_mp4_input(
     prefix: &str,
     file_config: &MuxFileConfig,
     track_config: MuxTrackConfig,
@@ -139,6 +170,72 @@ pub fn build_audio_input_file_with_timing(
     )
 }
 
+#[derive(Clone, Copy)]
+struct IvfHeaderFields {
+    width: u16,
+    height: u16,
+    timescale: u32,
+    timestamp_scale: u32,
+}
+
+fn write_test_ivf_file(
+    prefix: &str,
+    codec_fourcc: [u8; 4],
+    header: IvfHeaderFields,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    assert_eq!(frame_timestamps.len(), frame_payloads.len());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"DKIF");
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&32_u16.to_le_bytes());
+    bytes.extend_from_slice(&codec_fourcc);
+    bytes.extend_from_slice(&header.width.to_le_bytes());
+    bytes.extend_from_slice(&header.height.to_le_bytes());
+    bytes.extend_from_slice(&header.timescale.to_le_bytes());
+    bytes.extend_from_slice(&header.timestamp_scale.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(frame_payloads.len())
+            .expect("frame count fits")
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    for (timestamp, payload) in frame_timestamps.iter().zip(frame_payloads.iter()) {
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("frame size fits")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&timestamp.to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
+    write_temp_file(prefix, "ivf", &bytes)
+}
+
+fn build_flac_streaminfo_block(
+    sample_rate: u32,
+    channel_count: u8,
+    bits_per_sample: u8,
+    total_samples: u64,
+) -> [u8; 34] {
+    let mut block = [0_u8; 34];
+    block[0..2].copy_from_slice(&0x0400_u16.to_be_bytes());
+    block[2..4].copy_from_slice(&0x0400_u16.to_be_bytes());
+    block[10] = u8::try_from((sample_rate >> 12) & 0xFF).expect("rate nibble fits");
+    block[11] = u8::try_from((sample_rate >> 4) & 0xFF).expect("rate byte fits");
+    block[12] = (u8::try_from(sample_rate & 0x0F).expect("rate low nibble fits") << 4)
+        | (((channel_count - 1) & 0x07) << 1)
+        | (((bits_per_sample - 1) >> 4) & 0x01);
+    block[13] = (((bits_per_sample - 1) & 0x0F) << 4)
+        | u8::try_from((total_samples >> 32) & 0x0F).expect("sample-count nibble fits");
+    block[14] = u8::try_from((total_samples >> 24) & 0xFF).expect("sample-count byte fits");
+    block[15] = u8::try_from((total_samples >> 16) & 0xFF).expect("sample-count byte fits");
+    block[16] = u8::try_from((total_samples >> 8) & 0xFF).expect("sample-count byte fits");
+    block[17] = u8::try_from(total_samples & 0xFF).expect("sample-count byte fits");
+    block
+}
+
 pub fn build_video_input_file(
     prefix: &str,
     major_brand: FourCc,
@@ -208,7 +305,7 @@ pub fn build_text_input_file(prefix: &str, major_brand: FourCc) -> PathBuf {
     output_path
 }
 
-pub fn audio_sample_entry_box_with_type(box_type: &str) -> Vec<u8> {
+fn audio_sample_entry_box_with_type(box_type: &str) -> Vec<u8> {
     encode_supported_box(
         &AudioSampleEntry {
             sample_entry: SampleEntry {
@@ -224,7 +321,7 @@ pub fn audio_sample_entry_box_with_type(box_type: &str) -> Vec<u8> {
     )
 }
 
-pub fn video_sample_entry_box_with_type(box_type: &str) -> Vec<u8> {
+fn video_sample_entry_box_with_type(box_type: &str) -> Vec<u8> {
     encode_supported_box(
         &VisualSampleEntry {
             sample_entry: SampleEntry {

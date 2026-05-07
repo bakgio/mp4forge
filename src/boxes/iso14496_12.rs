@@ -1453,6 +1453,7 @@ simple_container_box!(Tref, *b"tref");
 raw_data_box!(Free, *b"free");
 raw_data_box!(Skip, *b"skip");
 raw_data_box!(Mdat, *b"mdat");
+raw_data_box!(Chnl, *b"chnl");
 
 /// Closed-caption sample-data box that preserves its payload bytes verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -10390,6 +10391,102 @@ impl CodecBox for AudioSampleEntry {
             with_dynamic_presence()
         ),
     ]);
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        const AUDIO_SAMPLE_ENTRY_HEADER_SIZE: usize = 28;
+        const QUICKTIME_VENDOR_ENTRY_TYPES: [FourCc; 3] = [
+            FourCc::from_bytes(*b"ipcm"),
+            FourCc::from_bytes(*b"fpcm"),
+            FourCc::from_bytes(*b"spex"),
+        ];
+
+        let start = reader.stream_position()?;
+        let payload_len = usize::try_from(payload_size)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
+        if payload.len() < AUDIO_SAMPLE_ENTRY_HEADER_SIZE {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+
+        if read_u16(&payload, 0) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0A",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 2) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0B",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 4) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0C",
+                constant: "0",
+            });
+        }
+
+        self.sample_entry.data_reference_index = read_u16(&payload, 6);
+        self.entry_version = read_u16(&payload, 8);
+        let allow_quicktime_vendor_words = self.entry_version == 0
+            && QUICKTIME_VENDOR_ENTRY_TYPES.contains(&self.sample_entry.box_type);
+        if !allow_quicktime_vendor_words {
+            if read_u16(&payload, 10) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1A",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 12) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1B",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 14) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1C",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 22) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved2",
+                    constant: "0",
+                });
+            }
+        }
+
+        self.channel_count = read_u16(&payload, 16);
+        self.sample_size = read_u16(&payload, 18);
+        self.pre_defined = read_u16(&payload, 20);
+        self.sample_rate = read_u32(&payload, 24);
+        self.quicktime_data = match self.entry_version {
+            1 => payload
+                .get(AUDIO_SAMPLE_ENTRY_HEADER_SIZE..AUDIO_SAMPLE_ENTRY_HEADER_SIZE + 16)
+                .ok_or_else(|| invalid_value("QuickTimeData", "payload is too short"))?
+                .to_vec(),
+            2 => payload
+                .get(AUDIO_SAMPLE_ENTRY_HEADER_SIZE..AUDIO_SAMPLE_ENTRY_HEADER_SIZE + 36)
+                .ok_or_else(|| invalid_value("QuickTimeData", "payload is too short"))?
+                .to_vec(),
+            _ => Vec::new(),
+        };
+
+        let consumed = AUDIO_SAMPLE_ENTRY_HEADER_SIZE
+            + match self.entry_version {
+                1 => 16,
+                2 => 36,
+                _ => 0,
+            };
+        reader.seek(SeekFrom::Start(start + consumed as u64))?;
+        Ok(Some(consumed as u64))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11313,8 +11410,8 @@ impl CodecBox for HEVCDecoderConfiguration {
         codec_field!("BitDepthChromaMinus8", 11, with_bit_width(3), as_hex()),
         codec_field!("AvgFrameRate", 12, with_bit_width(16)),
         codec_field!("ConstantFrameRate", 13, with_bit_width(2), as_hex()),
-        codec_field!("NumTemporalLayers", 14, with_bit_width(2), as_hex()),
-        codec_field!("TemporalIdNested", 15, with_bit_width(2), as_hex()),
+        codec_field!("NumTemporalLayers", 14, with_bit_width(3), as_hex()),
+        codec_field!("TemporalIdNested", 15, with_bit_width(1), as_hex()),
         codec_field!("LengthSizeMinusOne", 16, with_bit_width(2), as_hex()),
         codec_field!("NumOfNaluArrays", 17, with_bit_width(8), as_hex()),
         codec_field!(
@@ -11359,11 +11456,11 @@ impl CodecBox for HEVCDecoderConfiguration {
         if self.constant_frame_rate > 0x03 {
             return Err(invalid_value("ConstantFrameRate", "value does not fit in 2 bits").into());
         }
-        if self.num_temporal_layers > 0x03 {
-            return Err(invalid_value("NumTemporalLayers", "value does not fit in 2 bits").into());
+        if self.num_temporal_layers > 0x07 {
+            return Err(invalid_value("NumTemporalLayers", "value does not fit in 3 bits").into());
         }
-        if self.temporal_id_nested > 0x03 {
-            return Err(invalid_value("TemporalIdNested", "value does not fit in 2 bits").into());
+        if self.temporal_id_nested > 0x01 {
+            return Err(invalid_value("TemporalIdNested", "value does not fit in 1 bit").into());
         }
         if self.length_size_minus_one > 0x03 {
             return Err(invalid_value("LengthSizeMinusOne", "value does not fit in 2 bits").into());
@@ -11396,7 +11493,7 @@ impl CodecBox for HEVCDecoderConfiguration {
         payload.extend_from_slice(&self.avg_frame_rate.to_be_bytes());
         payload.push(
             (self.constant_frame_rate << 6)
-                | (self.num_temporal_layers << 4)
+                | (self.num_temporal_layers << 3)
                 | (self.temporal_id_nested << 2)
                 | self.length_size_minus_one,
         );
@@ -11504,8 +11601,8 @@ impl CodecBox for HEVCDecoderConfiguration {
 
             let layer_header = payload[offset];
             self.constant_frame_rate = layer_header >> 6;
-            self.num_temporal_layers = (layer_header >> 4) & 0x03;
-            self.temporal_id_nested = (layer_header >> 2) & 0x03;
+            self.num_temporal_layers = (layer_header >> 3) & 0x07;
+            self.temporal_id_nested = (layer_header >> 2) & 0x01;
             self.length_size_minus_one = layer_header & 0x03;
             offset += 1;
 
@@ -11525,6 +11622,131 @@ impl CodecBox for HEVCDecoderConfiguration {
 
         Ok(Some(payload_size))
     }
+}
+
+/// Generic media sample entry used by subtitle-style or other non-audio or non-visual handlers.
+///
+/// The typed header only carries the shared sample-entry fields. Any codec-specific payload or
+/// child boxes remain outside this struct and are encoded through the normal child-box path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenericMediaSampleEntry {
+    pub sample_entry: SampleEntry,
+}
+
+impl FieldHooks for GenericMediaSampleEntry {}
+
+impl ImmutableBox for GenericMediaSampleEntry {
+    fn box_type(&self) -> FourCc {
+        self.sample_entry.box_type
+    }
+}
+
+impl MutableBox for GenericMediaSampleEntry {}
+
+impl AnyTypeBox for GenericMediaSampleEntry {
+    fn set_box_type(&mut self, box_type: FourCc) {
+        self.sample_entry.box_type = box_type;
+    }
+}
+
+impl FieldValueRead for GenericMediaSampleEntry {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "DataReferenceIndex" => Ok(FieldValue::Unsigned(u64::from(
+                self.sample_entry.data_reference_index,
+            ))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for GenericMediaSampleEntry {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("DataReferenceIndex", FieldValue::Unsigned(value)) => {
+                self.sample_entry.data_reference_index = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for GenericMediaSampleEntry {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Reserved0A", 0, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0B", 1, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0C", 2, with_bit_width(16), with_constant("0")),
+        codec_field!("DataReferenceIndex", 3, with_bit_width(16)),
+    ]);
+}
+
+/// DVB subtitle decoder configuration carried by `dvsC` child boxes under `dvbs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DvsC {
+    /// DVB subtitle composition page identifier.
+    pub composition_page_id: u16,
+    /// DVB subtitle ancillary page identifier.
+    pub ancillary_page_id: u16,
+    /// DVB subtitle service type.
+    pub subtitle_type: u8,
+}
+
+impl FieldHooks for DvsC {}
+
+impl ImmutableBox for DvsC {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"dvsC")
+    }
+}
+
+impl MutableBox for DvsC {}
+
+impl FieldValueRead for DvsC {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "CompositionPageID" => Ok(FieldValue::Unsigned(u64::from(self.composition_page_id))),
+            "AncillaryPageID" => Ok(FieldValue::Unsigned(u64::from(self.ancillary_page_id))),
+            "SubtitleType" => Ok(FieldValue::Unsigned(u64::from(self.subtitle_type))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for DvsC {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("CompositionPageID", FieldValue::Unsigned(value)) => {
+                self.composition_page_id = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("AncillaryPageID", FieldValue::Unsigned(value)) => {
+                self.ancillary_page_id = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("SubtitleType", FieldValue::Unsigned(value)) => {
+                self.subtitle_type = u8_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for DvsC {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("CompositionPageID", 0, with_bit_width(16)),
+        codec_field!("AncillaryPageID", 1, with_bit_width(16)),
+        codec_field!("SubtitleType", 2, with_bit_width(8)),
+    ]);
 }
 
 /// XML subtitle sample entry that stores namespace and schema strings.
@@ -11803,6 +12025,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Mime>(FourCc::from_bytes(*b"mime"));
     registry.register::<Nmhd>(FourCc::from_bytes(*b"nmhd"));
     registry.register::<Prft>(FourCc::from_bytes(*b"prft"));
+    registry.register::<Chnl>(FourCc::from_bytes(*b"chnl"));
     registry.register::<Minf>(FourCc::from_bytes(*b"minf"));
     registry.register::<Moof>(FourCc::from_bytes(*b"moof"));
     registry.register::<Moov>(FourCc::from_bytes(*b"moov"));
@@ -11816,24 +12039,40 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
         FourCc::from_bytes(*b"alac"),
         is_audio_sample_entry_root_context,
     );
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"samr"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sawb"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sqcp"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sevc"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ssmv"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b".mp3"));
     registry.register_contextual_any::<OpaqueCodecSpecificData>(
         FourCc::from_bytes(*b"alac"),
         is_audio_sample_entry_child_context,
     );
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"spex"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsc"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtse"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsh"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsl"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsm"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsx"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsy"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"iamf"));
-    registry.register_contextual_any::<OpaqueCodecSpecificData>(
-        FourCc::from_bytes(*b"ddts"),
-        is_audio_sample_entry_child_context,
-    );
-    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"udts"));
+    registry.register::<crate::boxes::dts::Ddts>(FourCc::from_bytes(*b"ddts"));
+    registry.register::<crate::boxes::dts::Udts>(FourCc::from_bytes(*b"udts"));
+    registry.register::<crate::boxes::iamf::Iacb>(FourCc::from_bytes(*b"iacb"));
     registry.register_dynamic_any::<AudioSampleEntry>(matches_audio_sample_entry_context);
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbs"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbt"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"mp4s"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"H263"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MJPG"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"PNG "));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"jpeg"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mp4v"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"s263"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"png "));
+    registry.register::<DvsC>(FourCc::from_bytes(*b"dvsC"));
     registry.register::<Pasp>(FourCc::from_bytes(*b"pasp"));
     registry.register::<Saio>(FourCc::from_bytes(*b"saio"));
     registry.register::<Saiz>(FourCc::from_bytes(*b"saiz"));

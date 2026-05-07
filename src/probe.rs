@@ -14,9 +14,9 @@ use crate::boxes::av1::AV1CodecConfiguration;
 use crate::boxes::etsi_ts_102_366::Dac3;
 use crate::boxes::iso14496_12::{
     AVCDecoderConfiguration, AudioSampleEntry, Btrt, Clap, Co64, CoLL, Colr, Ctts, Elng,
-    EventMessageSampleEntry, Fiel, HEVCDecoderConfiguration, Mvhd, Pasp, SmDm, Stco, Stsc, Stsz,
-    Stts, TextSubtitleSampleEntry, Tfdt, Tfhd, Tkhd, Trun, VisualSampleEntry,
-    XMLSubtitleSampleEntry,
+    EventMessageSampleEntry, Fiel, GenericMediaSampleEntry, HEVCDecoderConfiguration, Mvhd, Pasp,
+    SmDm, Stco, Stsc, Stsz, Stts, TextSubtitleSampleEntry, Tfdt, Tfhd, Tkhd, Trun,
+    VisualSampleEntry, XMLSubtitleSampleEntry,
 };
 use crate::boxes::iso14496_12::{Frma, Hdlr, Schm};
 use crate::boxes::iso14496_14::Esds;
@@ -65,7 +65,13 @@ const AV01: FourCc = FourCc::from_bytes(*b"av01");
 const AV1C: FourCc = FourCc::from_bytes(*b"av1C");
 const VP08: FourCc = FourCc::from_bytes(*b"vp08");
 const VP09: FourCc = FourCc::from_bytes(*b"vp09");
+const VP10: FourCc = FourCc::from_bytes(*b"vp10");
 const VPCC: FourCc = FourCc::from_bytes(*b"vpcC");
+const H263_ENTRY_ALIAS: FourCc = FourCc::from_bytes(*b"H263");
+const JPEG_ENTRY: FourCc = FourCc::from_bytes(*b"jpeg");
+const MJPG_ENTRY_ALIAS: FourCc = FourCc::from_bytes(*b"MJPG");
+const PNG_ENTRY: FourCc = FourCc::from_bytes(*b"png ");
+const PNG_ENTRY_ALIAS: FourCc = FourCc::from_bytes(*b"PNG ");
 const ENCV: FourCc = FourCc::from_bytes(*b"encv");
 const BTRT: FourCc = FourCc::from_bytes(*b"btrt");
 const CLAP: FourCc = FourCc::from_bytes(*b"clap");
@@ -75,7 +81,16 @@ const FIEL: FourCc = FourCc::from_bytes(*b"fiel");
 const PASP: FourCc = FourCc::from_bytes(*b"pasp");
 const SMDM: FourCc = FourCc::from_bytes(*b"SmDm");
 const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
+const MP4V: FourCc = FourCc::from_bytes(*b"mp4v");
+const DOT_MP3: FourCc = FourCc::from_bytes(*b".mp3");
 const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
+const SPEX: FourCc = FourCc::from_bytes(*b"spex");
+const SAMR: FourCc = FourCc::from_bytes(*b"samr");
+const SAWB: FourCc = FourCc::from_bytes(*b"sawb");
+const SQCP: FourCc = FourCc::from_bytes(*b"sqcp");
+const SEVC: FourCc = FourCc::from_bytes(*b"sevc");
+const SSMV: FourCc = FourCc::from_bytes(*b"ssmv");
+const S263: FourCc = FourCc::from_bytes(*b"s263");
 const DOPS: FourCc = FourCc::from_bytes(*b"dOps");
 const AC_3: FourCc = FourCc::from_bytes(*b"ac-3");
 const EC_3: FourCc = FourCc::from_bytes(*b"ec-3");
@@ -84,12 +99,14 @@ const DEC3: FourCc = FourCc::from_bytes(*b"dec3");
 const AC_4: FourCc = FourCc::from_bytes(*b"ac-4");
 const DAC4: FourCc = FourCc::from_bytes(*b"dac4");
 const ALAC: FourCc = FourCc::from_bytes(*b"alac");
+const MLPA: FourCc = FourCc::from_bytes(*b"mlpa");
 const DTSC: FourCc = FourCc::from_bytes(*b"dtsc");
 const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
 const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
 const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
 const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
 const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
+const DTSY: FourCc = FourCc::from_bytes(*b"dtsy");
 const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
 const DFLA: FourCc = FourCc::from_bytes(*b"dfLa");
 const IAMF: FourCc = FourCc::from_bytes(*b"iamf");
@@ -104,6 +121,9 @@ const PCMC: FourCc = FourCc::from_bytes(*b"pcmC");
 const WAVE: FourCc = FourCc::from_bytes(*b"wave");
 const ESDS: FourCc = FourCc::from_bytes(*b"esds");
 const ENCA: FourCc = FourCc::from_bytes(*b"enca");
+const DVBS: FourCc = FourCc::from_bytes(*b"dvbs");
+const DVBT: FourCc = FourCc::from_bytes(*b"dvbt");
+const MP4S: FourCc = FourCc::from_bytes(*b"mp4s");
 const STPP: FourCc = FourCc::from_bytes(*b"stpp");
 const SBTT: FourCc = FourCc::from_bytes(*b"sbtt");
 const WVTT: FourCc = FourCc::from_bytes(*b"wvtt");
@@ -927,14 +947,31 @@ pub fn normalized_codec_family_name(
 ) -> &'static str {
     match codec_family {
         TrackCodecFamily::Unknown => match original_format.or(sample_entry_type) {
+            Some(VVC1 | VVI1) => "vvc",
             Some(AVS3) => "avs3",
             Some(EC_3) => "eac3",
             Some(AC_4) => "ac4",
             Some(ALAC) => "alac",
-            Some(DTSC | DTSE | DTSH | DTSL | DTSM | DTSX) => "dts",
+            Some(DOT_MP3) => "mp3",
+            Some(SPEX) => "speex",
+            Some(SAMR) => "amr",
+            Some(SAWB) => "amr_wb",
+            Some(SQCP) => "qcelp",
+            Some(SEVC) => "evrc",
+            Some(SSMV) => "smv",
+            Some(MLPA) => "truehd",
+            Some(DTSC | DTSE | DTSH | DTSL | DTSM | DTSX | DTSY) => "dts",
             Some(FLAC) => "flac",
             Some(IAMF) => "iamf",
             Some(MHA1 | MHA2 | MHM1 | MHM2) => "mpeg_h",
+            Some(JPEG_ENTRY | MJPG_ENTRY_ALIAS) => "jpeg",
+            Some(S263 | H263_ENTRY_ALIAS) => "h263",
+            Some(MP4V) => "mpeg4_visual",
+            Some(PNG_ENTRY | PNG_ENTRY_ALIAS) => "png",
+            Some(VP10) => "vp10",
+            Some(DVBS) => "dvb_subtitle",
+            Some(DVBT) => "dvb_teletext",
+            Some(MP4S) => "subpicture",
             Some(STPP) => "xml_subtitle",
             Some(SBTT) => "text_subtitle",
             Some(WVTT) => "webvtt",
@@ -2067,11 +2104,31 @@ fn root_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
 
 fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
     let visual_sample_entries = [
-        AVC1, HEV1, HVC1, DVHE, DVH1, VVC1, VVI1, AVS3, AV01, VP08, VP09, ENCV,
+        AVC1,
+        HEV1,
+        HVC1,
+        DVHE,
+        DVH1,
+        VVC1,
+        VVI1,
+        AVS3,
+        AV01,
+        JPEG_ENTRY,
+        MJPG_ENTRY_ALIAS,
+        MP4V,
+        S263,
+        H263_ENTRY_ALIAS,
+        PNG_ENTRY,
+        PNG_ENTRY_ALIAS,
+        VP08,
+        VP09,
+        VP10,
+        ENCV,
     ];
     let audio_sample_entries = [
-        MP4A, OPUS, AC_3, EC_3, AC_4, ALAC, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, FLAC, IAMF, MHA1,
-        MHA2, MHM1, MHM2, IPCM, FPCM, ENCA,
+        MP4A, DOT_MP3, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, AC_3, EC_3, AC_4, ALAC, MLPA,
+        DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2, MHM1, MHM2, IPCM, FPCM,
+        ENCA,
     ];
     let mut paths = vec![
         BoxPath::from([TKHD]),
@@ -2097,10 +2154,20 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, AVS3, AV3C]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AV01]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AV01, AV1C]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, JPEG_ENTRY]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MJPG_ENTRY_ALIAS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MP4V]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MP4V, ESDS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, S263]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, H263_ENTRY_ALIAS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, PNG_ENTRY]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, PNG_ENTRY_ALIAS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VP08]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VP08, VPCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VP09]),
         BoxPath::from([MDIA, MINF, STBL, STSD, VP09, VPCC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, VP10]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, VP10, VPCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, AVCC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCV, HVCC]),
@@ -2113,8 +2180,15 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4A]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4A, ESDS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4A, WAVE, ESDS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DOT_MP3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS, DOPS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, SPEX]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, SAMR]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, SAWB]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, SQCP]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, SEVC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, SSMV]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_3, DAC3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, EC_3]),
@@ -2122,12 +2196,14 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_4]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_4, DAC4]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ALAC]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MLPA]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSE]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSH]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSL]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSM]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSX]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTSY]),
         BoxPath::from([MDIA, MINF, STBL, STSD, FLAC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, FLAC, DFLA]),
         BoxPath::from([MDIA, MINF, STBL, STSD, IAMF]),
@@ -2157,6 +2233,8 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, ENCA, SINF, SCHM]),
         BoxPath::from([MDIA, MINF, STBL, STSD, STPP]),
         BoxPath::from([MDIA, MINF, STBL, STSD, SBTT]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DVBS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DVBT]),
         BoxPath::from([MDIA, MINF, STBL, STSD, WVTT]),
         BoxPath::from([MDIA, MINF, STBL, STSD, EVTE]),
         BoxPath::from([MDIA, MINF, STBL, STSD, EVTE, BTRT]),
@@ -2448,6 +2526,22 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(AV01);
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
+            JPEG_ENTRY | MJPG_ENTRY_ALIAS => {
+                track.sample_entry_type = Some(extracted.info.box_type());
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            MP4V => {
+                track.sample_entry_type = Some(MP4V);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            S263 | H263_ENTRY_ALIAS => {
+                track.sample_entry_type = Some(extracted.info.box_type());
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            PNG_ENTRY | PNG_ENTRY_ALIAS => {
+                track.sample_entry_type = Some(extracted.info.box_type());
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
             AV1C => {
                 av1c = Some(downcast_clone::<AV1CodecConfiguration>(&extracted)?);
             }
@@ -2459,6 +2553,10 @@ fn parse_trak_rich_details(
             VP09 => {
                 track.codec_family = TrackCodecFamily::Vp9;
                 track.sample_entry_type = Some(VP09);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            VP10 => {
+                track.sample_entry_type = Some(VP10);
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
             VPCC => {
@@ -2476,6 +2574,10 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(MP4A);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
+            DOT_MP3 => {
+                track.sample_entry_type = Some(DOT_MP3);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
             ENCA => {
                 track.summary.codec = TrackCodec::Mp4a;
                 track.summary.encrypted = true;
@@ -2485,6 +2587,30 @@ fn parse_trak_rich_details(
             OPUS => {
                 track.codec_family = TrackCodecFamily::Opus;
                 track.sample_entry_type = Some(OPUS);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            SPEX => {
+                track.sample_entry_type = Some(SPEX);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            SAMR => {
+                track.sample_entry_type = Some(SAMR);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            SAWB => {
+                track.sample_entry_type = Some(SAWB);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            SQCP => {
+                track.sample_entry_type = Some(SQCP);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            SEVC => {
+                track.sample_entry_type = Some(SEVC);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            SSMV => {
+                track.sample_entry_type = Some(SSMV);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             DOPS => {
@@ -2505,6 +2631,10 @@ fn parse_trak_rich_details(
             }
             ALAC => {
                 track.sample_entry_type = Some(ALAC);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            MLPA => {
+                track.sample_entry_type = Some(MLPA);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             DTSC => {
@@ -2529,6 +2659,10 @@ fn parse_trak_rich_details(
             }
             DTSX => {
                 track.sample_entry_type = Some(DTSX);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTSY => {
+                track.sample_entry_type = Some(DTSY);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             FLAC => {
@@ -2582,6 +2716,18 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(SBTT);
                 text_subtitle_sample_entry =
                     Some(downcast_clone::<TextSubtitleSampleEntry>(&extracted)?);
+            }
+            DVBS => {
+                track.sample_entry_type = Some(DVBS);
+                let _ = downcast_clone::<GenericMediaSampleEntry>(&extracted)?;
+            }
+            DVBT => {
+                track.sample_entry_type = Some(DVBT);
+                let _ = downcast_clone::<GenericMediaSampleEntry>(&extracted)?;
+            }
+            MP4S => {
+                track.sample_entry_type = Some(MP4S);
+                let _ = downcast_clone::<GenericMediaSampleEntry>(&extracted)?;
             }
             EVTE => {
                 track.sample_entry_type = Some(EVTE);
@@ -2826,6 +2972,7 @@ fn codec_family_from_sample_entry(sample_entry_type: FourCc) -> TrackCodecFamily
         OPUS => TrackCodecFamily::Opus,
         AC_3 => TrackCodecFamily::Ac3,
         IPCM | FPCM => TrackCodecFamily::Pcm,
+        MP4S => TrackCodecFamily::Unknown,
         STPP => TrackCodecFamily::XmlSubtitle,
         SBTT => TrackCodecFamily::TextSubtitle,
         WVTT => TrackCodecFamily::WebVtt,

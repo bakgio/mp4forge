@@ -327,6 +327,7 @@ fn validate_divide_reader_accepts_supported_broader_audio_families() {
         ("dtsl", build_dtsl_divide_input_file(), "dtsl"),
         ("dtsm", build_dtsm_divide_input_file(), "dtsm"),
         ("dtsx", build_dtsx_divide_input_file(), "dtsx"),
+        ("dtsy", build_dtsy_divide_input_file(), "dtsy"),
         ("flac", build_flac_divide_input_file(), "fLaC"),
         ("iamf", build_iamf_divide_input_file(), "iamf"),
         ("mha1", build_mha1_divide_input_file(), "mha1"),
@@ -551,6 +552,7 @@ fn divide_command_writes_supported_broader_audio_family_outputs() {
         ("dtsl", build_dtsl_divide_input_file(), "dtsl"),
         ("dtsm", build_dtsm_divide_input_file(), "dtsm"),
         ("dtsx", build_dtsx_divide_input_file(), "dtsx"),
+        ("dtsy", build_dtsy_divide_input_file(), "dtsy"),
         ("flac", build_flac_divide_input_file(), "fLaC"),
         ("iamf", build_iamf_divide_input_file(), "iamf"),
         ("mha1", build_mha1_divide_input_file(), "mha1"),
@@ -910,6 +912,13 @@ fn build_dtsm_divide_input_file() -> Vec<u8> {
 fn build_dtsx_divide_input_file() -> Vec<u8> {
     build_fragmented_input_file(
         vec![build_dtsx_trak(1, 6)],
+        vec![build_track_segment(1, 0, 1_000, 6)],
+    )
+}
+
+fn build_dtsy_divide_input_file() -> Vec<u8> {
+    build_fragmented_input_file(
+        vec![build_dtsy_trak(1, 6)],
         vec![build_track_segment(1, 0, 1_000, 6)],
     )
 }
@@ -1315,6 +1324,10 @@ fn build_dtsm_trak(track_id: u32, channel_count: u16) -> Vec<u8> {
 
 fn build_dtsx_trak(track_id: u32, channel_count: u16) -> Vec<u8> {
     build_audio_trak_with_type_and_children(track_id, "dtsx", channel_count, 48_000, 6, &[])
+}
+
+fn build_dtsy_trak(track_id: u32, channel_count: u16) -> Vec<u8> {
+    build_audio_trak_with_type_and_children(track_id, "dtsy", channel_count, 48_000, 6, &[])
 }
 
 fn build_flac_trak(track_id: u32, channel_count: u16) -> Vec<u8> {

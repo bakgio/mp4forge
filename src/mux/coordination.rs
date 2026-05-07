@@ -173,6 +173,67 @@ where
     build_duration_chunk_sample_counts_with_start_time(track_id, sample_durations, target_ticks, 0)
 }
 
+pub(crate) fn build_capped_duration_chunk_sample_counts<I>(
+    track_id: u32,
+    sample_durations: I,
+    target_ticks: u64,
+) -> Result<Vec<u32>, MuxError>
+where
+    I: IntoIterator<Item = u32>,
+{
+    let mut counts = Vec::new();
+    let mut current_count = 0_u32;
+    let mut current_duration = 0_u64;
+    for duration in sample_durations {
+        let duration = u64::from(duration);
+        if current_count != 0
+            && current_duration
+                .checked_add(duration)
+                .ok_or(MuxError::LayoutOverflow("chunk duration"))?
+                > target_ticks
+        {
+            counts.push(current_count);
+            current_count = 0;
+            current_duration = 0;
+        }
+        current_count = current_count
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("chunk sample count"))?;
+        current_duration = current_duration
+            .checked_add(duration)
+            .ok_or(MuxError::LayoutOverflow("chunk duration"))?;
+    }
+    if current_count != 0 {
+        counts.push(current_count);
+    }
+    if counts.is_empty() {
+        return Err(MuxError::InvalidChunkPlan {
+            track_id,
+            message: "no chunk boundaries were produced".to_string(),
+        });
+    }
+    Ok(counts)
+}
+
+pub(crate) fn rebalance_small_multi_audio_chunk_sample_counts(chunk_sample_counts: &mut [u32]) {
+    if chunk_sample_counts.len() != 3 {
+        return;
+    }
+
+    let last_index = chunk_sample_counts.len() - 1;
+    let previous_index = last_index - 1;
+    if chunk_sample_counts[0] != chunk_sample_counts[previous_index]
+        || chunk_sample_counts[previous_index] > 4
+    {
+        return;
+    }
+
+    while chunk_sample_counts[last_index] + 1 < chunk_sample_counts[previous_index] {
+        chunk_sample_counts[previous_index] -= 1;
+        chunk_sample_counts[last_index] += 1;
+    }
+}
+
 pub(crate) fn build_duration_chunk_sample_counts_with_start_time<I>(
     track_id: u32,
     sample_durations: I,
@@ -315,6 +376,27 @@ mod tests {
         let counts = build_duration_chunk_sample_counts(7, [10_u32, 10, 10], 15).unwrap();
 
         assert_eq!(counts, vec![2, 1]);
+    }
+
+    #[test]
+    fn capped_duration_chunk_counts_split_before_overshoot() {
+        let counts = build_capped_duration_chunk_sample_counts(
+            7,
+            std::iter::repeat_n(1_024_u32, 45),
+            22_050,
+        )
+        .unwrap();
+
+        assert_eq!(counts, vec![21, 21, 3]);
+    }
+
+    #[test]
+    fn rebalance_small_multi_audio_chunk_counts_only_adjusts_retained_three_chunk_shape() {
+        let mut counts = vec![4, 4, 2];
+
+        rebalance_small_multi_audio_chunk_sample_counts(&mut counts);
+
+        assert_eq!(counts, vec![4, 3, 3]);
     }
 
     #[test]

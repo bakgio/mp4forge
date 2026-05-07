@@ -31,6 +31,7 @@ use crate::queue::{OrderedWorkQueue, QueueWorkItem};
 use crate::writer::WriterError;
 
 mod coordination;
+mod demux;
 pub(crate) mod event;
 mod import;
 mod mp4;
@@ -40,67 +41,43 @@ pub mod sample_reader;
 
 use coordination::MuxCoordinationPlan;
 pub(crate) use coordination::{
-    MuxDurationBoundaryKind, TrackCoordinationDirective, build_duration_chunk_sample_counts,
-    build_duration_chunk_sample_counts_with_start_time,
+    MuxDurationBoundaryKind, TrackCoordinationDirective, build_capped_duration_chunk_sample_counts,
+    build_duration_chunk_sample_counts, build_duration_chunk_sample_counts_with_start_time,
     build_sync_aligned_segment_chunk_sample_counts,
+    rebalance_small_multi_audio_chunk_sample_counts,
 };
 pub(crate) use event::{MuxEventCursor, MuxEventGraph, MuxSampleEvent};
+pub use import::mux_into_path;
+#[cfg(feature = "async")]
+pub use import::mux_into_path_async;
 pub use import::mux_to_path;
 #[cfg(feature = "async")]
 pub use import::mux_to_path_async;
 
-/// One named parameter carried inside a widened `mux` track specification.
-///
-/// Raw track forms may carry optional `name=value` pairs after `#`, separated by commas. The
-/// parser preserves those pairs in order so later codec-specific importers can validate or consume
-/// them without widening the top-level CLI surface.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MuxTrackParameter {
-    name: String,
-    value: String,
-}
-
-impl MuxTrackParameter {
-    /// Creates one raw track parameter with the provided `name` and `value`.
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-        }
-    }
-
-    /// Returns the parameter name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the parameter value.
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-}
-
-/// One codec-family prefix accepted by widened raw mux track specs.
-///
-/// The additive `mux` surface now uses explicit codec prefixes instead of the older generic
-/// `video:` and `audio:` aliases as its authoritative public model. Self-describing families such
-/// as H.264, H.265, AAC, MP3, AC-3, E-AC-3, and AC-4 parse their native framing directly, while
-/// broader raw families accept explicit `#key=value` layout parameters when the source bytes are
-/// not self-describing enough to derive one safe MP4 sample-entry shape automatically.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MuxRawCodec {
+pub(crate) enum MuxRawCodec {
     /// AV1 elementary input.
     Av1,
+    /// MPEG-4 Part 2 elementary input.
+    Mp4v,
+    /// H.263 elementary input.
+    H263,
     /// H.264 or AVC elementary input.
     H264,
     /// H.265 or HEVC elementary input.
     H265,
+    /// H.266 or VVC elementary input.
+    Vvc,
     /// VP8 elementary input.
     Vp8,
     /// VP9 elementary input.
     Vp9,
+    /// VP10 elementary input.
+    Vp10,
     /// AAC input.
     Aac,
+    /// AAC LATM input.
+    Latm,
     /// MP3 input.
     Mp3,
     /// AC-3 input.
@@ -109,99 +86,74 @@ pub enum MuxRawCodec {
     Eac3,
     /// AC-4 input.
     Ac4,
+    /// AMR narrowband input.
+    Amr,
+    /// AMR wideband input.
+    AmrWb,
+    /// QCP-wrapped voice input carrying QCELP, EVRC, or SMV frames.
+    Qcp,
+    /// JPEG still-image input.
+    Jpeg,
+    /// PNG still-image input.
+    Png,
+    /// WAVE or PCM input.
+    Pcm,
+    /// DTS core input.
+    Dts,
+    /// Dolby TrueHD input.
+    Truehd,
     /// ALAC input.
     Alac,
-    /// DTS Core input.
-    Dtsc,
-    /// DTS Express input.
-    Dtse,
-    /// DTS-HD High Resolution input.
-    Dtsh,
-    /// DTS-HD Master Audio input.
-    Dtsl,
-    /// DTS-HD MA or LBR extension input.
-    Dtsm,
-    /// DTS:X input.
-    Dtsx,
     /// FLAC input.
     Flac,
+    /// IAMF elementary input.
+    Iamf,
+    /// MPEG-H AudioMux input.
+    MpegH,
     /// Opus input.
     Opus,
-    /// IAMF input.
-    Iamf,
-    /// MPEG-H `mha1` input.
-    Mha1,
-    /// MPEG-H `mhm1` input.
-    Mhm1,
+    /// Vorbis input.
+    Vorbis,
+    /// Speex input.
+    Speex,
+    /// Theora input.
+    Theora,
 }
 
 impl MuxRawCodec {
-    /// Returns the canonical CLI prefix for this raw codec.
     pub const fn prefix(&self) -> &'static str {
         match self {
             Self::Av1 => "av1",
+            Self::Mp4v => "mp4v",
+            Self::H263 => "h263",
             Self::H264 => "h264",
             Self::H265 => "h265",
+            Self::Vvc => "vvc",
             Self::Vp8 => "vp8",
             Self::Vp9 => "vp9",
+            Self::Vp10 => "vp10",
             Self::Aac => "aac",
+            Self::Latm => "latm",
             Self::Mp3 => "mp3",
             Self::Ac3 => "ac3",
             Self::Eac3 => "ec3",
             Self::Ac4 => "ac4",
+            Self::Amr => "amr",
+            Self::AmrWb => "amr-wb",
+            Self::Qcp => "qcp",
+            Self::Jpeg => "jpeg",
+            Self::Png => "png",
+            Self::Pcm => "pcm",
+            Self::Dts => "dts",
+            Self::Truehd => "truehd",
             Self::Alac => "alac",
-            Self::Dtsc => "dtsc",
-            Self::Dtse => "dtse",
-            Self::Dtsh => "dtsh",
-            Self::Dtsl => "dtsl",
-            Self::Dtsm => "dtsm",
-            Self::Dtsx => "dtsx",
             Self::Flac => "flac",
-            Self::Opus => "opus",
             Self::Iamf => "iamf",
-            Self::Mha1 => "mha1",
-            Self::Mhm1 => "mhm1",
-        }
-    }
-
-    /// Returns whether this raw codec family is video.
-    pub const fn is_video(&self) -> bool {
-        matches!(
-            self,
-            Self::Av1 | Self::H264 | Self::H265 | Self::Vp8 | Self::Vp9
-        )
-    }
-
-    /// Returns whether this raw codec family is audio.
-    pub const fn is_audio(&self) -> bool {
-        !self.is_video()
-    }
-
-    fn from_prefix(prefix: &str) -> Option<Self> {
-        match prefix {
-            "av1" => Some(Self::Av1),
-            "h264" | "video" => Some(Self::H264),
-            "h265" => Some(Self::H265),
-            "vp8" => Some(Self::Vp8),
-            "vp9" => Some(Self::Vp9),
-            "aac" | "audio" => Some(Self::Aac),
-            "mp3" => Some(Self::Mp3),
-            "ac3" => Some(Self::Ac3),
-            "ec3" => Some(Self::Eac3),
-            "ac4" => Some(Self::Ac4),
-            "alac" => Some(Self::Alac),
-            "dtsc" => Some(Self::Dtsc),
-            "dtse" => Some(Self::Dtse),
-            "dtsh" => Some(Self::Dtsh),
-            "dtsl" => Some(Self::Dtsl),
-            "dtsm" => Some(Self::Dtsm),
-            "dtsx" => Some(Self::Dtsx),
-            "flac" => Some(Self::Flac),
-            "opus" => Some(Self::Opus),
-            "iamf" => Some(Self::Iamf),
-            "mha1" => Some(Self::Mha1),
-            "mhm1" => Some(Self::Mhm1),
-            _ => None,
+            Self::MpegH => "mhas",
+            Self::Opus => "opus",
+            Self::Vorbis => "vorbis",
+            Self::Speex => "speex",
+            Self::Theora => "theora",
         }
     }
 }
@@ -226,53 +178,48 @@ pub enum MuxMp4TrackSelector {
 
 /// One validated public track specification for the mux task surface.
 ///
-/// The widened `mux` grammar now uses one repeated track-spec model for both CLI and library
-/// callers:
-/// - raw imports: `<codec>:PATH[#key=value[,key=value...]]`
-/// - MP4 selectors: `PATH.mp4#video`, `PATH.mp4#audio`, `PATH.mp4#audio:N`, `PATH.mp4#text`,
-///   `PATH.mp4#text:N`, `PATH.mp4#track:ID`
+/// The current path-first `mux` grammar uses one repeated track-spec model for both CLI and
+/// library callers:
+/// - path-only imports: `PATH`
+/// - path plus selector: `PATH#video`, `PATH#audio`, `PATH#audio:N`, `PATH#text`,
+///   `PATH#text:N`, `PATH#track:ID`
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MuxTrackSpec {
-    /// Import one typed raw input from `path`.
-    Raw {
-        /// The raw codec family chosen by the public prefix.
-        codec: MuxRawCodec,
+    /// Import one input path, optionally selecting one track when the source is containerized.
+    Path {
         /// The filesystem path to import.
         path: PathBuf,
-        /// Optional typed parameters carried inside the track spec.
-        parameters: Vec<MuxTrackParameter>,
-    },
-    /// Select one track from an MP4 source file.
-    Mp4 {
-        /// The MP4 source path.
-        path: PathBuf,
-        /// The public selector to resolve inside that MP4 source.
-        selector: MuxMp4TrackSelector,
+        /// The optional public selector to resolve inside that source.
+        selector: Option<MuxMp4TrackSelector>,
     },
 }
 
 impl MuxTrackSpec {
-    /// Creates one raw track specification from `codec` and `path`.
-    pub fn raw(codec: MuxRawCodec, path: impl Into<PathBuf>) -> Self {
-        Self::Raw {
-            codec,
+    /// Creates one path-first track specification from `path`.
+    pub fn path(path: impl Into<PathBuf>) -> Self {
+        Self::Path {
             path: path.into(),
-            parameters: Vec::new(),
+            selector: None,
         }
     }
 
-    /// Creates one MP4 track specification from `path` and `selector`.
-    pub fn mp4(path: impl Into<PathBuf>, selector: MuxMp4TrackSelector) -> Self {
-        Self::Mp4 {
+    /// Creates one path-first track specification from `path` and `selector`.
+    pub fn selected(path: impl Into<PathBuf>, selector: MuxMp4TrackSelector) -> Self {
+        Self::Path {
             path: path.into(),
-            selector,
+            selector: Some(selector),
         }
+    }
+
+    /// Creates one compatibility selected track specification from `path` and `selector`.
+    pub fn mp4(path: impl Into<PathBuf>, selector: MuxMp4TrackSelector) -> Self {
+        Self::selected(path, selector)
     }
 
     /// Returns the filesystem path referenced by this track specification.
-    pub fn path(&self) -> &Path {
+    pub fn input_path(&self) -> &Path {
         match self {
-            Self::Raw { path, .. } | Self::Mp4 { path, .. } => path.as_path(),
+            Self::Path { path, .. } => path.as_path(),
         }
     }
 }
@@ -281,89 +228,46 @@ impl FromStr for MuxTrackSpec {
     type Err = MuxError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Some((prefix, remainder)) = value.split_once(':')
-            && let Some(codec) = MuxRawCodec::from_prefix(prefix)
-        {
-            let (path, parameters) = if let Some((path, parameter_text)) = remainder.split_once('#')
-            {
-                (path, parse_track_parameters(value, parameter_text)?)
-            } else {
-                (remainder, Vec::new())
-            };
+        if value.is_empty() {
+            return Err(MuxError::InvalidTrackSpec {
+                spec: value.to_string(),
+                message: "missing input path".to_string(),
+            });
+        }
+
+        if let Some((path, selector_text)) = value.rsplit_once('#') {
             if path.is_empty() {
                 return Err(MuxError::InvalidTrackSpec {
                     spec: value.to_string(),
-                    message: format!("missing input path after `{prefix}:`"),
+                    message: "missing input path before `#`".to_string(),
                 });
             }
-            return Ok(Self::Raw {
-                codec,
+            let selector = parse_mp4_track_selector(value, selector_text)?;
+            return Ok(Self::Path {
                 path: PathBuf::from(path),
-                parameters,
+                selector: Some(selector),
             });
         }
 
-        let Some((path, selector)) = value.rsplit_once('#') else {
-            return Err(MuxError::InvalidTrackSpec {
-                spec: value.to_string(),
-                message: "expected `<codec>:PATH[#key=value[,key=value...]]` or `PATH.mp4#video`, `PATH.mp4#audio`, `PATH.mp4#audio:N`, `PATH.mp4#text`, `PATH.mp4#text:N`, or `PATH.mp4#track:ID`".to_string(),
-            });
-        };
-        if path.is_empty() {
-            return Err(MuxError::InvalidTrackSpec {
-                spec: value.to_string(),
-                message: "missing MP4 input path before `#`".to_string(),
-            });
-        }
-        let selector = parse_mp4_track_selector(value, selector)?;
-        Ok(Self::Mp4 {
-            path: PathBuf::from(path),
-            selector,
-        })
+        Ok(Self::path(value))
     }
-}
-
-fn parse_track_parameters(
-    spec: &str,
-    parameter_text: &str,
-) -> Result<Vec<MuxTrackParameter>, MuxError> {
-    if parameter_text.is_empty() {
-        return Err(MuxError::InvalidTrackSpec {
-            spec: spec.to_string(),
-            message: "expected at least one `name=value` parameter after `#`".to_string(),
-        });
-    }
-    let mut parameters = Vec::new();
-    for part in parameter_text.split(',') {
-        let Some((name, value)) = part.split_once('=') else {
-            return Err(MuxError::InvalidTrackSpec {
-                spec: spec.to_string(),
-                message: format!("invalid track parameter `{part}`; expected `name=value`"),
-            });
-        };
-        if name.is_empty() || value.is_empty() {
-            return Err(MuxError::InvalidTrackSpec {
-                spec: spec.to_string(),
-                message: format!(
-                    "invalid track parameter `{part}`; expected non-empty `name=value`"
-                ),
-            });
-        }
-        if parameters
-            .iter()
-            .any(|parameter: &MuxTrackParameter| parameter.name == name)
-        {
-            return Err(MuxError::InvalidTrackSpec {
-                spec: spec.to_string(),
-                message: format!("duplicate track parameter `{name}`"),
-            });
-        }
-        parameters.push(MuxTrackParameter::new(name, value));
-    }
-    Ok(parameters)
 }
 
 fn parse_mp4_track_selector(spec: &str, selector: &str) -> Result<MuxMp4TrackSelector, MuxError> {
+    if selector.is_empty() {
+        return Err(MuxError::InvalidTrackSpec {
+            spec: spec.to_string(),
+            message:
+                "expected one selector after `#`, such as `video`, `audio`, `text`, or `track:ID`"
+                    .to_string(),
+        });
+    }
+    if selector.contains('=') || selector.contains(',') {
+        return Err(MuxError::InvalidTrackSpec {
+            spec: spec.to_string(),
+            message: "public mux track specs only allow selector suffixes such as `#video`, `#audio`, `#text`, or `#track:ID`; raw `#name=value` parameters are no longer accepted".to_string(),
+        });
+    }
     if selector == "video" {
         return Ok(MuxMp4TrackSelector::Video);
     }
@@ -481,15 +385,41 @@ impl MuxOutputLayout {
     }
 }
 
+/// Destination mode used by the public mux request surface.
+///
+/// The force-new mode writes one newly created output file to a caller-supplied path. The
+/// destination-path mode follows an update-or-create model: if the destination already exists as
+/// an MP4, its tracks are preserved and additional tracks are imported into it; otherwise the same
+/// path is treated as the newly created output file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum MuxDestinationMode {
+    /// Write one newly created output file supplied separately to the file-backed helpers.
+    #[default]
+    CreateNew,
+    /// Preserve one destination MP4 when it already exists, or create it at the same path.
+    UpdateOrCreateDestination,
+}
+
+impl MuxDestinationMode {
+    /// Returns the public destination-mode label used by CLI parsing and diagnostics.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::CreateNew => "create-new",
+            Self::UpdateOrCreateDestination => "update-or-create-destination",
+        }
+    }
+}
+
 /// One high-level mux request aligned with the public CLI surface.
 ///
-/// The narrowed public `mux` surface now centers on repeated [`MuxTrackSpec`] values, one output
-/// path supplied separately to the file-backed helpers, one explicit output layout, and at most
-/// one duration-boundary mode.
+/// The narrowed public `mux` surface now centers on repeated [`MuxTrackSpec`] values, one
+/// caller-supplied destination path, one explicit output layout, and at most one
+/// duration-boundary mode.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MuxRequest {
     tracks: Vec<MuxTrackSpec>,
     output_layout: MuxOutputLayout,
+    destination_mode: MuxDestinationMode,
     duration_mode: Option<MuxDurationMode>,
 }
 
@@ -499,6 +429,7 @@ impl MuxRequest {
         Self {
             tracks,
             output_layout: MuxOutputLayout::Flat,
+            destination_mode: MuxDestinationMode::CreateNew,
             duration_mode: None,
         }
     }
@@ -513,6 +444,11 @@ impl MuxRequest {
         self.output_layout
     }
 
+    /// Returns the destination mode requested by the caller.
+    pub const fn destination_mode(&self) -> MuxDestinationMode {
+        self.destination_mode
+    }
+
     /// Returns the configured public duration-boundary mode, if any.
     pub const fn duration_mode(&self) -> Option<MuxDurationMode> {
         self.duration_mode
@@ -521,6 +457,12 @@ impl MuxRequest {
     /// Returns a copy of this request with one explicit container layout configured.
     pub const fn with_output_layout(mut self, output_layout: MuxOutputLayout) -> Self {
         self.output_layout = output_layout;
+        self
+    }
+
+    /// Returns a copy of this request with one explicit destination mode configured.
+    pub const fn with_destination_mode(mut self, destination_mode: MuxDestinationMode) -> Self {
+        self.destination_mode = destination_mode;
         self
     }
 
@@ -753,6 +695,7 @@ pub struct MuxFileConfig {
     major_brand: FourCc,
     minor_version: u32,
     compatible_brands: Vec<FourCc>,
+    auto_flat_profile: bool,
 }
 
 impl MuxFileConfig {
@@ -765,6 +708,7 @@ impl MuxFileConfig {
             major_brand: FourCc::from_bytes(*b"isom"),
             minor_version: 0,
             compatible_brands: vec![FourCc::from_bytes(*b"isom"), FourCc::from_bytes(*b"mp42")],
+            auto_flat_profile: false,
         }
     }
 
@@ -810,6 +754,15 @@ impl MuxFileConfig {
     /// Returns a copy of this configuration with one extra compatible brand.
     pub fn with_compatible_brand(mut self, brand: FourCc) -> Self {
         self.add_compatible_brand(brand);
+        self
+    }
+
+    pub(crate) const fn auto_flat_profile(&self) -> bool {
+        self.auto_flat_profile
+    }
+
+    pub(crate) const fn with_auto_flat_profile(mut self, auto_flat_profile: bool) -> Self {
+        self.auto_flat_profile = auto_flat_profile;
         self
     }
 }
@@ -859,7 +812,32 @@ pub struct MuxTrackConfig {
     track_width: u16,
     track_height: u16,
     volume: i16,
+    edit_media_time: Option<u64>,
+    sample_roll_distance: Option<i16>,
     sample_entry_box: Vec<u8>,
+    sync_sample_table_mode: SyncSampleTableMode,
+    stsc_run_encoding_mode: StscRunEncodingMode,
+    flat_timing_override: Option<FlatTimingOverride>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncSampleTableMode {
+    Auto,
+    ForceEmpty,
+    ForceAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StscRunEncodingMode {
+    CollapseIdentical,
+    PreserveTerminalBoundary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlatTimingOverride {
+    pub(crate) sample_durations: Vec<u32>,
+    pub(crate) media_duration: u64,
+    pub(crate) presentation_duration: u64,
 }
 
 impl MuxTrackConfig {
@@ -874,7 +852,12 @@ impl MuxTrackConfig {
             track_width: 0,
             track_height: 0,
             volume: 0x0100,
+            edit_media_time: None,
+            sample_roll_distance: None,
             sample_entry_box,
+            sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
+            flat_timing_override: None,
         }
     }
 
@@ -895,7 +878,12 @@ impl MuxTrackConfig {
             track_width: width,
             track_height: height,
             volume: 0,
+            edit_media_time: None,
+            sample_roll_distance: None,
             sample_entry_box,
+            sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
+            flat_timing_override: None,
         }
     }
 
@@ -916,7 +904,12 @@ impl MuxTrackConfig {
             track_width: width,
             track_height: height,
             volume: 0,
+            edit_media_time: None,
+            sample_roll_distance: None,
             sample_entry_box,
+            sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
+            flat_timing_override: None,
         }
     }
 
@@ -937,7 +930,12 @@ impl MuxTrackConfig {
             track_width: width,
             track_height: height,
             volume: 0,
+            edit_media_time: None,
+            sample_roll_distance: None,
             sample_entry_box,
+            sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
+            flat_timing_override: None,
         }
     }
 
@@ -981,6 +979,15 @@ impl MuxTrackConfig {
         self.volume
     }
 
+    /// Returns the optional media-time trim that should be written into one edit list.
+    pub const fn edit_media_time(&self) -> Option<u64> {
+        self.edit_media_time
+    }
+
+    pub(crate) const fn sample_roll_distance(&self) -> Option<i16> {
+        self.sample_roll_distance
+    }
+
     /// Returns the full encoded sample-entry box written under `stsd`.
     pub fn sample_entry_box(&self) -> &[u8] {
         &self.sample_entry_box
@@ -1001,6 +1008,49 @@ impl MuxTrackConfig {
     /// Returns a copy of this configuration with a different fixed-point 8.8 track volume.
     pub const fn with_volume(mut self, volume: i16) -> Self {
         self.volume = volume;
+        self
+    }
+
+    /// Returns a copy of this configuration with one edit-list media-time trim.
+    pub const fn with_edit_media_time(mut self, edit_media_time: u64) -> Self {
+        self.edit_media_time = Some(edit_media_time);
+        self
+    }
+
+    pub(crate) const fn with_sample_roll_distance(mut self, sample_roll_distance: i16) -> Self {
+        self.sample_roll_distance = Some(sample_roll_distance);
+        self
+    }
+
+    pub(crate) const fn with_sync_sample_table_mode(
+        mut self,
+        sync_sample_table_mode: SyncSampleTableMode,
+    ) -> Self {
+        self.sync_sample_table_mode = sync_sample_table_mode;
+        self
+    }
+
+    pub(crate) const fn stsc_run_encoding_mode(&self) -> StscRunEncodingMode {
+        self.stsc_run_encoding_mode
+    }
+
+    pub(crate) const fn with_stsc_run_encoding_mode(
+        mut self,
+        stsc_run_encoding_mode: StscRunEncodingMode,
+    ) -> Self {
+        self.stsc_run_encoding_mode = stsc_run_encoding_mode;
+        self
+    }
+
+    pub(crate) fn flat_timing_override(&self) -> Option<&FlatTimingOverride> {
+        self.flat_timing_override.as_ref()
+    }
+
+    pub(crate) fn with_flat_timing_override(
+        mut self,
+        flat_timing_override: FlatTimingOverride,
+    ) -> Self {
+        self.flat_timing_override = Some(flat_timing_override);
         self
     }
 }
@@ -1025,6 +1075,8 @@ pub enum MuxError {
         layout: &'static str,
         message: String,
     },
+    /// One explicit destination mode conflicts with the current request shape.
+    InvalidDestinationMode { mode: &'static str, message: String },
     /// The output path conflicts with one of the supplied input paths.
     OutputPathConflict { output: PathBuf, input: PathBuf },
     /// One track timeline could not be normalized onto the selected movie timescale exactly.
@@ -1127,6 +1179,9 @@ impl fmt::Display for MuxError {
             }
             Self::InvalidOutputLayout { layout, message } => {
                 write!(f, "invalid mux layout `{layout}`: {message}")
+            }
+            Self::InvalidDestinationMode { mode, message } => {
+                write!(f, "invalid mux destination mode `{mode}`: {message}")
             }
             Self::OutputPathConflict { output, input } => write!(
                 f,
@@ -1317,25 +1372,19 @@ pub(crate) fn plan_staged_media_items_with_coordination(
     }
 
     let queue = OrderedWorkQueue::new(queue_items);
-    let mut planned_items = Vec::with_capacity(queue.iter().len());
+    let mut items_by_track = BTreeMap::<u32, Vec<MuxStagedMediaItem>>::new();
     let mut track_state = BTreeMap::<u32, MuxTrackPlanState>::new();
-    let mut total_payload_size = 0_u64;
 
     for item in queue.iter() {
-        planned_items.push(MuxPlannedMediaItem {
-            staged: item.staged,
-            output_offset: total_payload_size,
-        });
-
-        total_payload_size = total_payload_size
-            .checked_add(u64::from(item.staged.data_size))
-            .ok_or(MuxError::PayloadSizeOverflow)?;
-
         let end_decode_time = item
             .staged
             .decode_time
             .checked_add(u64::from(item.staged.duration))
             .ok_or(MuxError::PayloadSizeOverflow)?;
+        items_by_track
+            .entry(item.staged.track_id)
+            .or_default()
+            .push(item.staged);
         track_state
             .entry(item.staged.track_id)
             .and_modify(|state| {
@@ -1362,6 +1411,8 @@ pub(crate) fn plan_staged_media_items_with_coordination(
 
     let coordination =
         MuxCoordinationPlan::from_track_plans(&track_plans, coordination_directives)?;
+    let (planned_items, total_payload_size) =
+        build_planned_items_from_tracks(&items_by_track, &coordination, interleave_policy)?;
     let event_graph = MuxEventGraph::from_plan(
         &planned_items,
         &track_plans,
@@ -1693,6 +1744,94 @@ struct MuxTrackPlanState {
     end_decode_time: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PlannedChunk {
+    order_key: PlannedChunkOrderKey,
+    track_id: u32,
+    start_index: usize,
+    end_index: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PlannedChunkOrderKey {
+    decode_time: u64,
+    track_id: u32,
+    source_index: usize,
+    data_offset: u64,
+}
+
+fn build_planned_items_from_tracks(
+    items_by_track: &BTreeMap<u32, Vec<MuxStagedMediaItem>>,
+    coordination: &MuxCoordinationPlan,
+    interleave_policy: MuxInterleavePolicy,
+) -> Result<(Vec<MuxPlannedMediaItem>, u64), MuxError> {
+    let mut chunks = Vec::new();
+    let total_sample_count = items_by_track.values().map(Vec::len).sum();
+    for (&track_id, items) in items_by_track {
+        let chunk_sample_counts = coordination.chunk_sample_counts(track_id)?;
+        let mut start_index = 0_usize;
+        for &samples_per_chunk in chunk_sample_counts {
+            let chunk_len = usize::try_from(samples_per_chunk)
+                .map_err(|_| MuxError::LayoutOverflow("chunk sample-count conversion"))?;
+            let end_index = start_index
+                .checked_add(chunk_len)
+                .ok_or(MuxError::LayoutOverflow("chunk sample indexing"))?;
+            let first_sample =
+                items
+                    .get(start_index)
+                    .ok_or_else(|| MuxError::InvalidChunkPlan {
+                        track_id,
+                        message: "chunk boundaries ran past the staged sample count".to_string(),
+                    })?;
+            chunks.push(PlannedChunk {
+                order_key: PlannedChunkOrderKey {
+                    decode_time: first_sample.decode_time(),
+                    track_id,
+                    source_index: first_sample.source_index(),
+                    data_offset: first_sample.data_offset(),
+                },
+                track_id,
+                start_index,
+                end_index,
+            });
+            start_index = end_index;
+        }
+        if start_index != items.len() {
+            return Err(MuxError::InvalidChunkPlan {
+                track_id,
+                message: "chunk boundaries did not cover every staged sample".to_string(),
+            });
+        }
+    }
+
+    match interleave_policy {
+        MuxInterleavePolicy::DecodeTime => {
+            chunks.sort_by_key(|chunk| chunk.order_key);
+        }
+    }
+
+    let mut planned_items = Vec::with_capacity(total_sample_count);
+    let mut total_payload_size = 0_u64;
+    for chunk in chunks {
+        let items = items_by_track
+            .get(&chunk.track_id)
+            .ok_or(MuxError::MissingTrackId {
+                track_id: chunk.track_id,
+            })?;
+        for staged in &items[chunk.start_index..chunk.end_index] {
+            planned_items.push(MuxPlannedMediaItem {
+                staged: *staged,
+                output_offset: total_payload_size,
+            });
+            total_payload_size = total_payload_size
+                .checked_add(u64::from(staged.data_size()))
+                .ok_or(MuxError::PayloadSizeOverflow)?;
+        }
+    }
+
+    Ok((planned_items, total_payload_size))
+}
+
 fn advance_progressive_source<R>(
     source: &mut R,
     source_index: usize,
@@ -1831,4 +1970,38 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinated_chunk_plans_keep_multi_sample_chunks_contiguous_in_output_order() {
+        let plan = plan_staged_media_items_with_coordination(
+            vec![
+                MuxStagedMediaItem::new(0, 1, 0, 10, 0, 4),
+                MuxStagedMediaItem::new(0, 1, 10, 10, 4, 4),
+                MuxStagedMediaItem::new(1, 2, 0, 10, 0, 3),
+                MuxStagedMediaItem::new(1, 2, 10, 10, 3, 3),
+            ],
+            MuxInterleavePolicy::DecodeTime,
+            vec![
+                TrackCoordinationDirective::new(1, vec![2]),
+                TrackCoordinationDirective::new(2, vec![2]),
+            ],
+        )
+        .unwrap();
+
+        let planned = plan.planned_items();
+        assert_eq!(planned.len(), 4);
+        assert_eq!(planned[0].staged().track_id(), 1);
+        assert_eq!(planned[1].staged().track_id(), 1);
+        assert_eq!(planned[2].staged().track_id(), 2);
+        assert_eq!(planned[3].staged().track_id(), 2);
+        assert_eq!(planned[0].output_offset(), 0);
+        assert_eq!(planned[1].output_offset(), 4);
+        assert_eq!(planned[2].output_offset(), 8);
+        assert_eq!(planned[3].output_offset(), 11);
+    }
 }

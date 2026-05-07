@@ -12,16 +12,17 @@ use mp4forge::boxes::etsi_ts_103_190::Dac4;
 use mp4forge::boxes::flac::{DfLa, FlacMetadataBlock};
 use mp4forge::boxes::iso14496_12::{
     AVCDecoderConfiguration, AlbumLoudnessInfo, AudioSampleEntry, Btrt, Clap, CoLL, Colr, Ctts,
-    CttsEntry, Edts, Elng, Elst, ElstEntry, Fiel, Frma, Ftyp, HEVCDecoderConfiguration, Hdlr,
-    LoudnessEntry, LoudnessMeasurement, Ludt, Mdhd, Mdia, Meta, Minf, Moof, Moov, Mvhd, Nmhd, Pasp,
-    Prft, SampleEntry, Schm, Sinf, SmDm, SphericalVideoV1Metadata, Stbl, Stco, Sthd, Stsc,
-    StscEntry, Stsd, Stsz, Stts, SttsEntry, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
-    TFHD_DEFAULT_SAMPLE_SIZE_PRESENT, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT,
-    TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, TextSubtitleSampleEntry, Tfdt, Tfhd,
-    Tkhd, TrackLoudnessInfo, Traf, Trak, Trun, TrunEntry, UUID_FRAGMENT_ABSOLUTE_TIMING,
-    UUID_FRAGMENT_RUN_TABLE, UUID_SAMPLE_ENCRYPTION, UUID_SPHERICAL_VIDEO_V1, Udta, Uuid,
-    UuidFragmentAbsoluteTiming, UuidFragmentRunEntry, UuidFragmentRunTable, UuidPayload,
-    VisualSampleEntry, XMLSubtitleSampleEntry,
+    CttsEntry, DvsC, Edts, Elng, Elst, ElstEntry, Fiel, Frma, Ftyp, GenericMediaSampleEntry,
+    HEVCDecoderConfiguration, Hdlr, LoudnessEntry, LoudnessMeasurement, Ludt, Mdhd, Mdia, Meta,
+    Minf, Moof, Moov, Mvhd, Nmhd, Pasp, Prft, SampleEntry, Schm, Sinf, SmDm,
+    SphericalVideoV1Metadata, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stsz, Stts, SttsEntry,
+    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+    TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
+    TRUN_SAMPLE_SIZE_PRESENT, TextSubtitleSampleEntry, Tfdt, Tfhd, Tkhd, TrackLoudnessInfo, Traf,
+    Trak, Trun, TrunEntry, UUID_FRAGMENT_ABSOLUTE_TIMING, UUID_FRAGMENT_RUN_TABLE,
+    UUID_SAMPLE_ENCRYPTION, UUID_SPHERICAL_VIDEO_V1, Udta, Uuid, UuidFragmentAbsoluteTiming,
+    UuidFragmentRunEntry, UuidFragmentRunTable, UuidPayload, VisualSampleEntry,
+    XMLSubtitleSampleEntry,
 };
 use mp4forge::boxes::iso14496_14::{
     DECODER_CONFIG_DESCRIPTOR_TAG, DECODER_SPECIFIC_INFO_TAG, DecoderConfigDescriptor, Descriptor,
@@ -829,6 +830,13 @@ fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
             Some(48_000),
         ),
         (
+            build_simple_audio_movie_file("dtsy", 2, 48_000, 1_024, 4, Vec::new(), vec![0x34; 4]),
+            "dtsy",
+            "dts",
+            Some(2),
+            Some(48_000),
+        ),
+        (
             build_flac_movie_file(),
             "fLaC",
             "flac",
@@ -836,12 +844,70 @@ fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
             Some(48_000),
         ),
         (
-            build_simple_audio_movie_file("iamf", 2, 48_000, 1_024, 4, Vec::new(), vec![0x34; 4]),
+            build_simple_audio_movie_file(".mp3", 2, 44_100, 1_152, 4, Vec::new(), vec![0x46; 4]),
+            ".mp3",
+            "mp3",
+            Some(2),
+            Some(44_100),
+        ),
+        (
+            build_simple_audio_movie_file("spex", 1, 16_000, 320, 4, Vec::new(), vec![0x47; 4]),
+            "spex",
+            "speex",
+            Some(1),
+            Some(16_000),
+        ),
+        (
+            build_simple_audio_movie_file("samr", 1, 8_000, 160, 4, Vec::new(), vec![0x4B; 4]),
+            "samr",
+            "amr",
+            Some(1),
+            Some(8_000),
+        ),
+        (
+            build_simple_audio_movie_file("sawb", 1, 16_000, 320, 4, Vec::new(), vec![0x4C; 4]),
+            "sawb",
+            "amr_wb",
+            Some(1),
+            Some(16_000),
+        ),
+        (
+            build_simple_audio_movie_file("sqcp", 1, 8_000, 160, 4, Vec::new(), vec![0x48; 4]),
+            "sqcp",
+            "qcelp",
+            Some(1),
+            Some(8_000),
+        ),
+        (
+            build_simple_audio_movie_file("sevc", 1, 8_000, 160, 4, Vec::new(), vec![0x49; 4]),
+            "sevc",
+            "evrc",
+            Some(1),
+            Some(8_000),
+        ),
+        (
+            build_simple_audio_movie_file("ssmv", 1, 8_000, 160, 4, Vec::new(), vec![0x4A; 4]),
+            "ssmv",
+            "smv",
+            Some(1),
+            Some(8_000),
+        ),
+        (
+            build_simple_audio_movie_file("mlpa", 2, 48_000, 40, 4, Vec::new(), vec![0x4D; 4]),
+            "mlpa",
+            "truehd",
+            Some(2),
+            Some(48_000),
+        ),
+        (
+            build_simple_audio_movie_file("iamf", 2, 48_000, 1_024, 4, Vec::new(), vec![0x35; 4]),
             "iamf",
             "iamf",
             Some(2),
             Some(48_000),
         ),
+        (build_dvbs_movie_file(), "dvbs", "dvb_subtitle", None, None),
+        (build_dvbt_movie_file(), "dvbt", "dvb_teletext", None, None),
         (
             build_mha1_movie_file(),
             "mha1",
@@ -850,7 +916,7 @@ fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
             Some(48_000),
         ),
         (
-            build_mpeg_h_audio_movie_file("mhm1", vec![0x35, 0x36, 0x37, 0x38]),
+            build_mpeg_h_audio_movie_file("mhm1", vec![0x36, 0x37, 0x38, 0x39]),
             "mhm1",
             "mpeg_h",
             Some(2),
@@ -875,6 +941,139 @@ fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
     }
 
     {
+        let mut reader = Cursor::new(build_simple_video_movie_file("mp4v", vec![0x3a; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("mp4v")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "mpeg4_visual"
+        );
+    }
+
+    {
+        let mut reader = Cursor::new(build_simple_video_movie_file("s263", vec![0x3b; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("s263")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "h263"
+        );
+    }
+
+    {
+        let mut reader = Cursor::new(build_simple_video_movie_file("H263", vec![0x3b; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("H263")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "h263"
+        );
+    }
+
+    {
+        let mut reader = Cursor::new(build_simple_video_movie_file("jpeg", vec![0x3d; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("jpeg")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "jpeg"
+        );
+    }
+
+    {
+        let mut reader = Cursor::new(build_simple_video_movie_file("MJPG", vec![0x3d; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("MJPG")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "jpeg"
+        );
+    }
+
+    {
+        let mut reader = Cursor::new(build_simple_video_movie_file("png ", vec![0x3c; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("png ")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "png"
+        );
+    }
+
+    {
+        let mut reader = Cursor::new(build_simple_video_movie_file("PNG ", vec![0x3c; 4]));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc("PNG ")));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "png"
+        );
+    }
+
+    {
         let mut reader = Cursor::new(build_vvc_movie_file());
         let info = probe_detailed(&mut reader).unwrap();
         let track = &info.tracks[0];
@@ -889,7 +1088,7 @@ fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
                 track.sample_entry_type,
                 track.original_format,
             ),
-            "unknown"
+            "vvc"
         );
     }
 
@@ -920,10 +1119,15 @@ fn probe_codec_detailed_keeps_unknown_codec_details_for_additive_family_strings(
         build_ac4_movie_file(),
         build_simple_audio_movie_file("alac", 2, 48_000, 1_024, 4, Vec::new(), vec![0x40; 4]),
         build_simple_audio_movie_file("dtsc", 2, 48_000, 1_024, 4, Vec::new(), vec![0x41; 4]),
+        build_simple_audio_movie_file("dtsy", 2, 48_000, 1_024, 4, Vec::new(), vec![0x42; 4]),
+        build_simple_audio_movie_file("spex", 1, 16_000, 320, 4, Vec::new(), vec![0x43; 4]),
         build_flac_movie_file(),
-        build_simple_audio_movie_file("iamf", 2, 48_000, 1_024, 4, Vec::new(), vec![0x42; 4]),
+        build_simple_audio_movie_file("iamf", 2, 48_000, 1_024, 4, Vec::new(), vec![0x44; 4]),
+        build_dvbs_movie_file(),
+        build_dvbt_movie_file(),
         build_mha1_movie_file(),
-        build_mpeg_h_audio_movie_file("mhm1", vec![0x43, 0x44, 0x45, 0x46]),
+        build_mpeg_h_audio_movie_file("mhm1", vec![0x45, 0x46, 0x47, 0x48]),
+        build_simple_video_movie_file("mp4v", vec![0x49; 4]),
         build_avs3_movie_file(),
     ] {
         let info = probe_codec_detailed(&mut Cursor::new(file)).unwrap();
@@ -2281,6 +2485,30 @@ fn build_simple_audio_movie_file(
     )
 }
 
+fn build_simple_video_movie_file(sample_entry_type: &str, mdat_payload: Vec<u8>) -> Vec<u8> {
+    let sample_entry_type = sample_entry_type.to_string();
+    let compatible_brands = vec![fourcc("isom"), fourcc("iso8"), fourcc(&sample_entry_type)];
+    build_single_track_movie_file(
+        compatible_brands,
+        move |chunk_offsets| {
+            let sample_entry = encode_supported_box(
+                &video_sample_entry_with_type(&sample_entry_type, 640, 360),
+                &[],
+            );
+            build_single_sample_video_trak(
+                1,
+                1_000,
+                1_000,
+                (640, 360),
+                sample_entry,
+                chunk_offsets,
+                4,
+            )
+        },
+        mdat_payload,
+    )
+}
+
 fn build_mpeg_h_audio_movie_file(sample_entry_type: &str, mdat_payload: Vec<u8>) -> Vec<u8> {
     build_simple_audio_movie_file(
         sample_entry_type,
@@ -2499,6 +2727,71 @@ fn build_wvtt_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
         1_000,
         1_000,
         null_media_header_box(),
+        sample_entry,
+        chunk_offsets,
+        4,
+    )
+}
+
+fn build_dvbs_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("dvbs")],
+        build_dvbs_trak,
+        vec![0x91, 0x92, 0x93, 0x94],
+    )
+}
+
+fn build_dvbs_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &GenericMediaSampleEntry {
+            sample_entry: SampleEntry {
+                box_type: fourcc("dvbs"),
+                data_reference_index: 1,
+            },
+        },
+        &encode_supported_box(
+            &DvsC {
+                composition_page_id: 0x0123,
+                ancillary_page_id: 0x0456,
+                subtitle_type: 0x10,
+            },
+            &[],
+        ),
+    );
+    build_single_sample_subtitle_trak(
+        1,
+        1_000,
+        1_000,
+        subtitle_media_header_box(),
+        sample_entry,
+        chunk_offsets,
+        4,
+    )
+}
+
+fn build_dvbt_movie_file() -> Vec<u8> {
+    build_single_track_movie_file(
+        vec![fourcc("isom"), fourcc("iso8"), fourcc("dvbt")],
+        build_dvbt_trak,
+        vec![0x95, 0x96, 0x97, 0x98],
+    )
+}
+
+fn build_dvbt_trak(chunk_offsets: &[u64; 1]) -> Vec<u8> {
+    let sample_entry = encode_supported_box(
+        &GenericMediaSampleEntry {
+            sample_entry: SampleEntry {
+                box_type: fourcc("dvbt"),
+                data_reference_index: 1,
+            },
+        },
+        &[],
+    );
+    build_single_sample_subtitle_trak(
+        1,
+        1_000,
+        1_000,
+        subtitle_media_header_box(),
         sample_entry,
         chunk_offsets,
         4,

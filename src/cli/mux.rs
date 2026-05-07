@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::mux::{
-    MuxDurationMode, MuxError, MuxOutputLayout, MuxRequest, MuxTrackSpec, mux_to_path,
+    MuxDestinationMode, MuxDurationMode, MuxError, MuxOutputLayout, MuxRequest, MuxTrackSpec,
+    mux_into_path, mux_to_path,
 };
 
 /// Runs the mux subcommand with `args`, writing failures to `stderr`.
@@ -35,25 +36,26 @@ where
 {
     writeln!(
         writer,
-        "USAGE: mp4forge mux --track <SPEC> [--track <SPEC> ...] [--layout <flat|fragmented>] [--segment_duration <SECONDS> | --fragment_duration <SECONDS>] OUTPUT"
+        "USAGE: mp4forge mux --track <SPEC> [--track <SPEC> ...] [--layout <flat|fragmented>] [--segment_duration <SECONDS> | --fragment_duration <SECONDS>] [--out <PATH>] [DEST]"
     )?;
     writeln!(writer)?;
     writeln!(writer, "OPTIONS:")?;
     writeln!(
         writer,
-        "  --track <SPEC>                Add one mux input using the widened track-spec grammar"
+        "  --track <SPEC>                Add one mux input using the path-first track-spec grammar"
+    )?;
+    writeln!(writer, "                               Path only: PATH")?;
+    writeln!(
+        writer,
+        "                               Select one MP4 track when needed with: PATH#video, PATH#audio, PATH#audio:N, PATH#text, PATH#text:N, PATH#track:ID"
     )?;
     writeln!(
         writer,
-        "                               Raw: <codec>:PATH[#key=value[,key=value...]]"
+        "                               Current path-only auto-detection covers MP4, VobSub, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported MPEG-PS MPEG audio streams plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS MPEG audio streams plus AC-3/E-AC-3 audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, VVC Annex B, IVF AV1/VP8/VP9/VP10, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, and CAF ALAC"
     )?;
     writeln!(
         writer,
-        "                               Some raw codecs require explicit layout parameters such as width/height or sample_rate/channel_count"
-    )?;
-    writeln!(
-        writer,
-        "                               MP4: PATH.mp4#video, PATH.mp4#audio, PATH.mp4#audio:N, PATH.mp4#text, PATH.mp4#text:N, PATH.mp4#track:ID"
+        "                               Broader DTS-family sample-entry variants remain supported through MP4 track import"
     )?;
     writeln!(
         writer,
@@ -67,10 +69,14 @@ where
         writer,
         "  --layout <flat|fragmented>   Choose the output container layout; defaults to flat"
     )?;
+    writeln!(
+        writer,
+        "  --out <PATH>                 Force one newly created output destination at PATH"
+    )?;
     writeln!(writer)?;
     writeln!(
         writer,
-        "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks and always writes one explicit output MP4 file. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode."
+        "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH`. Path-only MP4 inputs import all supported tracks unless you add one selector suffix."
     )
 }
 
@@ -108,19 +114,31 @@ impl From<MuxError> for MuxCliError {
 
 struct ParsedMuxArgs {
     request: MuxRequest,
-    output_path: PathBuf,
+    target: MuxCliTarget,
+}
+
+enum MuxCliTarget {
+    Destination(PathBuf),
+    Out(PathBuf),
 }
 
 fn run_inner(args: &[String]) -> Result<(), MuxCliError> {
     let parsed = parse_args(args)?;
-    mux_to_path(&parsed.request, &parsed.output_path)?;
+    match parsed.target {
+        MuxCliTarget::Destination(destination_path) => {
+            mux_into_path(&parsed.request, &destination_path)?
+        }
+        MuxCliTarget::Out(output_path) => mux_to_path(&parsed.request, &output_path)?,
+    }
     Ok(())
 }
 
 fn parse_args(args: &[String]) -> Result<ParsedMuxArgs, MuxCliError> {
     let mut tracks = Vec::new();
     let mut output_layout = MuxOutputLayout::Flat;
+    let mut destination_mode = MuxDestinationMode::UpdateOrCreateDestination;
     let mut duration_mode = None::<MuxDurationMode>;
+    let mut out_path = None::<PathBuf>;
     let mut positional = Vec::new();
     let mut index = 0usize;
 
@@ -173,6 +191,21 @@ fn parse_args(args: &[String]) -> Result<ParsedMuxArgs, MuxCliError> {
                 output_layout = parse_layout(value)?;
                 index += 2;
             }
+            "--out" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(MuxCliError::InvalidArgument(
+                        "missing value for --out".to_string(),
+                    ));
+                };
+                if out_path.is_some() {
+                    return Err(MuxCliError::InvalidArgument(
+                        "--out may only be supplied once".to_string(),
+                    ));
+                }
+                out_path = Some(PathBuf::from(value));
+                destination_mode = MuxDestinationMode::CreateNew;
+                index += 2;
+            }
             value if value.starts_with('-') => {
                 return Err(MuxCliError::InvalidArgument(format!(
                     "unknown mux option: {value}"
@@ -185,24 +218,28 @@ fn parse_args(args: &[String]) -> Result<ParsedMuxArgs, MuxCliError> {
         }
     }
 
-    if positional.len() != 1 {
+    if tracks.is_empty() {
         return Err(MuxCliError::UsageRequested);
     }
-    if tracks.is_empty() {
-        return Err(MuxCliError::InvalidArgument(
-            "at least one --track <SPEC> is required".to_string(),
-        ));
-    }
+    let target = match (out_path, positional.len()) {
+        (Some(path), 0) => MuxCliTarget::Out(path),
+        (Some(_), _) => {
+            return Err(MuxCliError::InvalidArgument(
+                "--out <PATH> may not be used together with a positional DEST path".to_string(),
+            ));
+        }
+        (None, 1) => MuxCliTarget::Destination(positional.remove(0)),
+        (None, _) => return Err(MuxCliError::UsageRequested),
+    };
 
-    let mut request = MuxRequest::new(tracks).with_output_layout(output_layout);
+    let mut request = MuxRequest::new(tracks)
+        .with_output_layout(output_layout)
+        .with_destination_mode(destination_mode);
     if let Some(duration_mode) = duration_mode {
         request = request.with_duration_mode(duration_mode);
     }
 
-    Ok(ParsedMuxArgs {
-        request,
-        output_path: positional.remove(0),
-    })
+    Ok(ParsedMuxArgs { request, target })
 }
 
 fn set_duration_mode(

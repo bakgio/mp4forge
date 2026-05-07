@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use mp4forge::FourCc;
-use mp4forge::boxes::threegpp::Udta3gppString;
+use mp4forge::boxes::threegpp::{D263, Damr, Devc, Dqcp, Dsmv, Udta3gppString};
 use mp4forge::boxes::{AnyTypeBox, default_registry};
 use mp4forge::codec::{CodecError, ImmutableBox, marshal, unmarshal, unmarshal_any};
 use mp4forge::stringify::stringify;
@@ -89,4 +89,137 @@ fn built_in_registry_only_registers_flat_safe_threegpp_types() {
             }
         }
     }
+}
+
+#[test]
+fn damr_roundtrips_and_is_registered() {
+    let payload = [0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x81, 0x03, 0x01];
+    let src = Damr {
+        vendor: 0,
+        decoder_version: 2,
+        mode_set: 0x0081,
+        mode_change_period: 3,
+        frames_per_sample: 1,
+    };
+    let expected = "Vendor=0 DecoderVersion=2 ModeSet=0x81 ModeChangePeriod=3 FramesPerSample=1";
+
+    let mut encoded = Vec::new();
+    let written = marshal(&mut encoded, &src, None).unwrap();
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(encoded, payload);
+
+    let mut decoded = Damr::default();
+    let mut reader = Cursor::new(payload.to_vec());
+    let read = unmarshal(&mut reader, payload.len() as u64, &mut decoded, None).unwrap();
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded, src);
+
+    let registry = default_registry();
+    assert!(registry.is_registered(FourCc::from_bytes(*b"damr")));
+    let mut any_reader = Cursor::new(payload.to_vec());
+    let (any_box, any_read) = unmarshal_any(
+        &mut any_reader,
+        payload.len() as u64,
+        FourCc::from_bytes(*b"damr"),
+        &registry,
+        None,
+    )
+    .unwrap();
+    assert_eq!(any_read, payload.len() as u64);
+    assert_eq!(any_box.as_any().downcast_ref::<Damr>().unwrap(), &src);
+    assert_eq!(stringify(&src, None).unwrap(), expected);
+}
+
+fn assert_voice_decoder_config_roundtrip<T>(
+    box_type: FourCc,
+    src: T,
+    payload: &[u8],
+    expected: &str,
+) where
+    T: Default
+        + PartialEq
+        + std::fmt::Debug
+        + ImmutableBox
+        + mp4forge::codec::MutableBox
+        + mp4forge::codec::FieldValueRead
+        + mp4forge::codec::FieldValueWrite
+        + mp4forge::codec::CodecBox
+        + 'static,
+{
+    let mut encoded = Vec::new();
+    let written = marshal(&mut encoded, &src, None).unwrap();
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(encoded, payload);
+
+    let mut decoded = T::default();
+    let mut reader = Cursor::new(payload.to_vec());
+    let read = unmarshal(&mut reader, payload.len() as u64, &mut decoded, None).unwrap();
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded, src);
+
+    let registry = default_registry();
+    assert!(registry.is_registered(box_type));
+    let mut any_reader = Cursor::new(payload.to_vec());
+    let (any_box, any_read) = unmarshal_any(
+        &mut any_reader,
+        payload.len() as u64,
+        box_type,
+        &registry,
+        None,
+    )
+    .unwrap();
+    assert_eq!(any_read, payload.len() as u64);
+    assert_eq!(any_box.as_any().downcast_ref::<T>().unwrap(), &src);
+    assert_eq!(stringify(&src, None).unwrap(), expected);
+}
+
+#[test]
+fn voice_decoder_config_boxes_roundtrip_and_are_registered() {
+    assert_voice_decoder_config_roundtrip(
+        FourCc::from_bytes(*b"dqcp"),
+        Dqcp {
+            vendor: 0,
+            decoder_version: 1,
+            frames_per_sample: 1,
+        },
+        &[0, 0, 0, 0, 1, 1],
+        "Vendor=0 DecoderVersion=1 FramesPerSample=1",
+    );
+    assert_voice_decoder_config_roundtrip(
+        FourCc::from_bytes(*b"devc"),
+        Devc {
+            vendor: 0,
+            decoder_version: 2,
+            frames_per_sample: 3,
+        },
+        &[0, 0, 0, 0, 2, 3],
+        "Vendor=0 DecoderVersion=2 FramesPerSample=3",
+    );
+    assert_voice_decoder_config_roundtrip(
+        FourCc::from_bytes(*b"dsmv"),
+        Dsmv {
+            vendor: 0,
+            decoder_version: 4,
+            frames_per_sample: 1,
+        },
+        &[0, 0, 0, 0, 4, 1],
+        "Vendor=0 DecoderVersion=4 FramesPerSample=1",
+    );
+}
+
+#[test]
+fn d263_roundtrips_and_is_registered() {
+    let payload = [0, 0, 0, 0, 1, 10, 0];
+    let src = D263 {
+        vendor: 0,
+        decoder_version: 1,
+        h263_level: 10,
+        h263_profile: 0,
+    };
+    assert_voice_decoder_config_roundtrip(
+        FourCc::from_bytes(*b"d263"),
+        src,
+        &payload,
+        "Vendor=0 DecoderVersion=1 H263Level=10 H263Profile=0",
+    );
 }

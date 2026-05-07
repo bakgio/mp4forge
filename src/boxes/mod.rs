@@ -9,12 +9,18 @@ use crate::codec::{CodecBox, DynCodecBox};
 pub mod av1;
 /// AVS3 sample-entry and decoder-configuration box definitions.
 pub mod avs3;
+/// Dolby audio sample-entry child box definitions.
+pub mod dolby;
+/// DTS sample-entry child box definitions.
+pub mod dts;
 /// ETSI TS 102 366 AC-3 sample-entry and decoder-configuration box definitions.
 pub mod etsi_ts_102_366;
 /// ETSI TS 103 190 AC-4 sample-entry and decoder-configuration box definitions.
 pub mod etsi_ts_103_190;
 /// FLAC sample-entry and decoder-configuration box definitions.
 pub mod flac;
+/// IAMF sample-entry child box definitions.
+pub mod iamf;
 /// ISMA Cryp protection-related box definitions.
 pub mod isma_cryp;
 /// ISO/IEC 14496-12 box definitions and codec support.
@@ -152,16 +158,23 @@ impl BoxLookupContext {
         const FREE_FORM: FourCc = FourCc::from_bytes(*b"----");
         const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
         const ENCA: FourCc = FourCc::from_bytes(*b"enca");
+        const SAMR: FourCc = FourCc::from_bytes(*b"samr");
+        const SAWB: FourCc = FourCc::from_bytes(*b"sawb");
+        const SQCP: FourCc = FourCc::from_bytes(*b"sqcp");
+        const SEVC: FourCc = FourCc::from_bytes(*b"sevc");
+        const SSMV: FourCc = FourCc::from_bytes(*b"ssmv");
         const ALAC: FourCc = FourCc::from_bytes(*b"alac");
         const AC_3: FourCc = FourCc::from_bytes(*b"ac-3");
         const EC_3: FourCc = FourCc::from_bytes(*b"ec-3");
         const AC_4: FourCc = FourCc::from_bytes(*b"ac-4");
+        const MLPA: FourCc = FourCc::from_bytes(*b"mlpa");
         const DTSC: FourCc = FourCc::from_bytes(*b"dtsc");
         const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
         const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
         const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
         const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
         const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
+        const DTSY: FourCc = FourCc::from_bytes(*b"dtsy");
         const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
         const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
         const IAMF: FourCc = FourCc::from_bytes(*b"iamf");
@@ -171,16 +184,23 @@ impl BoxLookupContext {
         if matches!(
             box_type,
             MP4A | ENCA
+                | SAMR
+                | SAWB
+                | SQCP
+                | SEVC
+                | SSMV
                 | ALAC
                 | AC_3
                 | EC_3
                 | AC_4
+                | MLPA
                 | DTSC
                 | DTSE
                 | DTSH
                 | DTSL
                 | DTSM
                 | DTSX
+                | DTSY
                 | FLAC
                 | OPUS
                 | IAMF
@@ -489,6 +509,7 @@ pub fn default_registry() -> BoxRegistry {
     threegpp::register_boxes(&mut registry);
     av1::register_boxes(&mut registry);
     avs3::register_boxes(&mut registry);
+    dolby::register_boxes(&mut registry);
     etsi_ts_102_366::register_boxes(&mut registry);
     etsi_ts_103_190::register_boxes(&mut registry);
     flac::register_boxes(&mut registry);

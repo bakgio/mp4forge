@@ -15,16 +15,25 @@
 //!
 //! Enable the optional `mux` feature when you want the additive mux task surface plus the retained
 //! low-level helpers underneath it. The mux surface exposes track-based `MuxRequest` helpers for
-//! sync and async real MP4 assembly, widened repeated track-spec parsing aligned with the
+//! sync and async real MP4 assembly, path-first repeated track-spec parsing aligned with the
 //! sync-only CLI, internal chunk and duration coordination on top of one mux event graph,
 //! retained low-level staged payload-copy helpers, and the public `mp4forge::mux::sample_reader`
 //! module built on staged mux plans. Those sample-reader helpers can also expose stable text or
-//! subtitle track identity when you construct them with companion `MuxTrackConfig` values. Raw
-//! codec-prefixed imports now cover the current widened codec set: self-describing families parse
-//! their native framing directly, while broader raw families accept explicit layout parameters
-//! when their source bytes are not self-describing enough to derive one safe MP4 sample-entry
-//! shape automatically. MP4-track merges keep covering the broader registered sample-entry
-//! families by preserving encoded sample-entry bytes from the source file.
+//! subtitle track identity when you construct them with companion `MuxTrackConfig` values. The
+//! current path-first mux surface accepts one repeated input path with optional selector suffixes
+//! such as `#video`, `#audio`, `#text`, or `#track:ID`. Path-only MP4 inputs import every
+//! supported track from that source, while the landed path-only raw auto-detection currently
+//! covers MP4, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported
+//! MPEG-PS MPEG audio streams plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported
+//! MPEG-TS MPEG audio streams plus AC-3/E-AC-3 audio plus MPEG-4 Part 2/H.264/H.265/VVC video
+//! streams, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core
+//! audio, Dolby TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-4 Part 2
+//! elementary video, H.264 Annex B, H.265 Annex B, VVC Annex B, IVF-backed AV1, IVF-backed VP8,
+//! IVF-backed VP9, IVF-backed VP10, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM,
+//! native FLAC, Ogg-backed FLAC, Ogg-backed Opus, Ogg-backed Vorbis, Ogg-backed Speex,
+//! Ogg-backed Theora, and CAF-backed ALAC. Broader DTS-family sample-entry variants remain
+//! supported through MP4 track import, and broader truthful demux-backed input paths continue to
+//! land behind that same public shape.
 
 #[cfg(test)]
 extern crate self as mp4forge;

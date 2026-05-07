@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "async")]
 use std::pin::Pin;
 #[cfg(feature = "async")]
 use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "async")]
 use tokio::fs::File as TokioFile;
@@ -17,22 +18,13 @@ use tokio::io::{
 use crate::FourCc;
 #[cfg(feature = "async")]
 use crate::async_io::AsyncReadSeek;
-use crate::bitio::BitReader;
-use crate::boxes::AnyTypeBox;
-use crate::boxes::etsi_ts_102_366::{Dac3, Dec3, Ec3Substream};
-use crate::boxes::etsi_ts_103_190::Dac4;
 use crate::boxes::iso14496_12::{
-    AVCDecoderConfiguration, AVCParameterSet, AudioSampleEntry, Co64, Ctts, Elst,
-    HEVCDecoderConfiguration, HEVCNalu, HEVCNaluArray, Hdlr, Mdhd, SampleEntry, Stco, Stsc, Stss,
-    Stsz, Stts, TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_BASE_IS_MOOF,
+    AudioSampleEntry, Btrt, Co64, Ctts, Elst, GenericMediaSampleEntry, Hdlr, Mdhd, SampleEntry,
+    Stco, Stsc, Stss, Stsz, Stts, TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_BASE_IS_MOOF,
     TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
     TFHD_DEFAULT_SAMPLE_SIZE_PRESENT, TRUN_DATA_OFFSET_PRESENT, TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
     TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
     TRUN_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, Tfhd, Tkhd, Trex, Trun, VisualSampleEntry,
-};
-use crate::boxes::iso14496_14::{
-    DECODER_CONFIG_DESCRIPTOR_TAG, DECODER_SPECIFIC_INFO_TAG, DecoderConfigDescriptor, Descriptor,
-    Esds,
 };
 use crate::codec::{CodecBox, ImmutableBox};
 use crate::extract::{
@@ -46,18 +38,48 @@ use crate::extract::{
 use crate::header::BoxInfo as HeaderInfo;
 use crate::walk::BoxPath;
 
+use super::demux::{
+    DetectedContainerPathKind, DetectedPathTrackKind, detect_caf_track_kind_sync,
+    detect_id3_wrapped_audio_from_prefix, detect_ogg_track_kind_sync,
+    detect_path_track_kind_from_prefix, id3v2_size_from_prefix, scan_ac3_file_sync,
+    scan_ac4_file_sync, scan_adts_file_sync, scan_amr_file_sync, scan_amr_wb_file_sync,
+    scan_av1_file_sync, scan_avi_source_sync, scan_caf_alac_file_sync, scan_dts_file_sync,
+    scan_eac3_file_sync, scan_flac_file_sync, scan_h263_file_sync, scan_iamf_file_sync,
+    scan_jpeg_file_sync, scan_latm_file_sync, scan_mhas_file_sync, scan_mp3_file_sync,
+    scan_mp4v_file_sync, scan_ogg_flac_file_sync, scan_ogg_opus_file_sync,
+    scan_ogg_speex_file_sync, scan_ogg_theora_file_sync, scan_ogg_vorbis_file_sync,
+    scan_pcm_file_sync, scan_png_file_sync, scan_program_stream_sync, scan_qcp_file_sync,
+    scan_transport_stream_sync, scan_truehd_file_sync, scan_vobsub_source_sync, scan_vp8_file_sync,
+    scan_vp9_file_sync, scan_vp10_file_sync, stage_annex_b_h264_sync, stage_annex_b_h265_sync,
+    stage_annex_b_vvc_sync,
+};
+#[cfg(feature = "async")]
+use super::demux::{
+    detect_caf_track_kind_async, detect_ogg_track_kind_async, scan_ac3_file_async,
+    scan_ac4_file_async, scan_adts_file_async, scan_amr_file_async, scan_amr_wb_file_async,
+    scan_av1_file_async, scan_avi_source_async, scan_caf_alac_file_async, scan_dts_file_async,
+    scan_eac3_file_async, scan_flac_file_async, scan_h263_file_async, scan_iamf_file_async,
+    scan_jpeg_file_async, scan_latm_file_async, scan_mhas_file_async, scan_mp3_file_async,
+    scan_mp4v_file_async, scan_ogg_flac_file_async, scan_ogg_opus_file_async,
+    scan_ogg_speex_file_async, scan_ogg_theora_file_async, scan_ogg_vorbis_file_async,
+    scan_pcm_file_async, scan_png_file_async, scan_program_stream_async, scan_qcp_file_async,
+    scan_transport_stream_async, scan_truehd_file_async, scan_vobsub_source_async,
+    scan_vp8_file_async, scan_vp9_file_async, scan_vp10_file_async, stage_annex_b_h264_async,
+    stage_annex_b_h265_async, stage_annex_b_vvc_async,
+};
 use super::mp4::write_fragmented_mp4_mux;
 #[cfg(feature = "async")]
 use super::mp4::write_fragmented_mp4_mux_async;
 #[cfg(feature = "async")]
 use super::write_mp4_mux_async;
 use super::{
-    MuxDurationBoundaryKind, MuxError, MuxFileConfig, MuxInterleavePolicy, MuxMp4TrackSelector,
-    MuxOutputLayout, MuxRawCodec, MuxRequest, MuxStagedMediaItem, MuxTrackConfig, MuxTrackKind,
-    MuxTrackParameter, MuxTrackSpec, TrackCoordinationDirective,
+    FlatTimingOverride, MuxDestinationMode, MuxDurationBoundaryKind, MuxError, MuxFileConfig,
+    MuxInterleavePolicy, MuxMp4TrackSelector, MuxOutputLayout, MuxRawCodec, MuxRequest,
+    MuxStagedMediaItem, MuxTrackConfig, MuxTrackKind, MuxTrackSpec, StscRunEncodingMode,
+    SyncSampleTableMode, TrackCoordinationDirective, build_capped_duration_chunk_sample_counts,
     build_duration_chunk_sample_counts, build_duration_chunk_sample_counts_with_start_time,
     build_sync_aligned_segment_chunk_sample_counts, plan_staged_media_items_with_coordination,
-    write_mp4_mux,
+    rebalance_small_multi_audio_chunk_sample_counts, write_mp4_mux,
 };
 
 const MOOV: FourCc = FourCc::from_bytes(*b"moov");
@@ -88,41 +110,45 @@ const VIDE: FourCc = FourCc::from_bytes(*b"vide");
 const SOUN: FourCc = FourCc::from_bytes(*b"soun");
 const TEXT: FourCc = FourCc::from_bytes(*b"text");
 const SUBT: FourCc = FourCc::from_bytes(*b"subt");
+const SUBP: FourCc = FourCc::from_bytes(*b"subp");
 const ENCV: FourCc = FourCc::from_bytes(*b"encv");
 const ENCA: FourCc = FourCc::from_bytes(*b"enca");
-const AV01: FourCc = FourCc::from_bytes(*b"av01");
-const VP08: FourCc = FourCc::from_bytes(*b"vp08");
 const NON_KEY_SAMPLE_FLAGS: u32 = 0x0001_0000;
-const VP09: FourCc = FourCc::from_bytes(*b"vp09");
-const DVHE: FourCc = FourCc::from_bytes(*b"dvhe");
-const DVH1: FourCc = FourCc::from_bytes(*b"dvh1");
-const ALAC: FourCc = FourCc::from_bytes(*b"alac");
-const DTSC: FourCc = FourCc::from_bytes(*b"dtsc");
-const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
-const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
-const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
-const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
-const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
-const DDTS: FourCc = FourCc::from_bytes(*b"ddts");
-const FLAC_ENTRY: FourCc = FourCc::from_bytes(*b"fLaC");
-const OPUS_ENTRY: FourCc = FourCc::from_bytes(*b"Opus");
-const IAMF_ENTRY: FourCc = FourCc::from_bytes(*b"iamf");
-const MHA1: FourCc = FourCc::from_bytes(*b"mha1");
-const MHM1: FourCc = FourCc::from_bytes(*b"mhm1");
-const DDTS_EXTRA_DATA: [u8; 7] = [0xe4, 0x7c, 0x00, 0x04, 0x00, 0x0f, 0x00];
-
-/// Opens the requested track specs, validates the narrowed mux request shape, and writes one
-/// output MP4 file to `output_path`.
+const AUTO_FLAT_INTERLEAVE_MILLISECONDS: u64 = 500;
+/// Opens the requested track specs, validates the narrowed mux request shape, and writes one newly
+/// created output MP4 file to `output_path`.
 ///
-/// This task-level helper is the sync programmatic companion to the `mp4forge mux` CLI surface.
-/// It accepts the same widened repeated-track grammar as the CLI, preserves the first MP4 input
-/// as the authoritative merge source when every input is itself an MP4, and rejects unsupported
+/// This task-level helper is the sync programmatic companion to the explicit `--out PATH` mux CLI
+/// surface. It always treats `output_path` as a newly created destination and rejects unsupported
 /// multi-video or duration-mode combinations explicitly.
 pub fn mux_to_path<P>(request: &MuxRequest, output_path: P) -> Result<(), MuxError>
 where
     P: AsRef<Path>,
 {
-    let prepared = prepare_request_sync(request, output_path.as_ref())?;
+    let request = request
+        .clone()
+        .with_destination_mode(MuxDestinationMode::CreateNew);
+    mux_to_path_inner(&request, output_path.as_ref())
+}
+
+/// Opens the requested track specs, preserves an existing MP4 destination when present, and
+/// otherwise creates one new output MP4 at `destination_path`.
+///
+/// When `destination_path` already exists and probes as MP4, this helper preserves that file's
+/// current tracks and imports the requested tracks into it. When the path does not exist or does
+/// not probe as MP4, the same path is treated as the newly created destination file.
+pub fn mux_into_path<P>(request: &MuxRequest, destination_path: P) -> Result<(), MuxError>
+where
+    P: AsRef<Path>,
+{
+    let request = request
+        .clone()
+        .with_destination_mode(MuxDestinationMode::UpdateOrCreateDestination);
+    mux_into_path_inner(&request, destination_path.as_ref())
+}
+
+fn mux_to_path_inner(request: &MuxRequest, output_path: &Path) -> Result<(), MuxError> {
+    let prepared = prepare_request_sync(request, output_path)?;
     let mut sources = prepared
         .source_specs
         .iter()
@@ -143,12 +169,29 @@ where
             &prepared.file_config,
             &prepared.track_configs,
             prepared.fragmented_single_sidx_reference,
-            &prepared.fragmented_edit_media_times,
             &prepared.plan,
         )?,
     }
     writer.flush()?;
     Ok(())
+}
+
+fn mux_into_path_inner(request: &MuxRequest, destination_path: &Path) -> Result<(), MuxError> {
+    if should_preserve_destination_mp4(destination_path) {
+        let amended_request = build_destination_preserving_request(request, destination_path)?;
+        let temp_path = create_update_temp_path(destination_path, request.destination_mode())?;
+        let write_result = mux_to_path_inner(&amended_request, &temp_path);
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        replace_output_path(&temp_path, destination_path)?;
+        return Ok(());
+    }
+    let create_new_request = request
+        .clone()
+        .with_destination_mode(MuxDestinationMode::CreateNew);
+    mux_to_path_inner(&create_new_request, destination_path)
 }
 
 #[cfg(feature = "async")]
@@ -162,7 +205,31 @@ pub async fn mux_to_path_async<P>(request: &MuxRequest, output_path: P) -> Resul
 where
     P: AsRef<Path>,
 {
-    let prepared = prepare_request_async(request, output_path.as_ref()).await?;
+    let request = request
+        .clone()
+        .with_destination_mode(MuxDestinationMode::CreateNew);
+    mux_to_path_async_inner(&request, output_path.as_ref()).await
+}
+
+/// Async companion to [`mux_into_path`] on the file-backed Tokio surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
+pub async fn mux_into_path_async<P>(
+    request: &MuxRequest,
+    destination_path: P,
+) -> Result<(), MuxError>
+where
+    P: AsRef<Path>,
+{
+    let request = request
+        .clone()
+        .with_destination_mode(MuxDestinationMode::UpdateOrCreateDestination);
+    mux_into_path_async_inner(&request, destination_path.as_ref()).await
+}
+
+#[cfg(feature = "async")]
+async fn mux_to_path_async_inner(request: &MuxRequest, output_path: &Path) -> Result<(), MuxError> {
+    let prepared = prepare_request_async(request, output_path).await?;
     let mut sources = Vec::with_capacity(prepared.source_specs.len());
     for spec in &prepared.source_specs {
         sources.push(AsyncMuxSource::open(spec).await?);
@@ -187,7 +254,6 @@ where
                 &prepared.file_config,
                 &prepared.track_configs,
                 prepared.fragmented_single_sidx_reference,
-                &prepared.fragmented_edit_media_times,
                 &prepared.plan,
             )
             .await?
@@ -197,12 +263,33 @@ where
     Ok(())
 }
 
+#[cfg(feature = "async")]
+async fn mux_into_path_async_inner(
+    request: &MuxRequest,
+    destination_path: &Path,
+) -> Result<(), MuxError> {
+    if should_preserve_destination_mp4(destination_path) {
+        let amended_request = build_destination_preserving_request(request, destination_path)?;
+        let temp_path = create_update_temp_path(destination_path, request.destination_mode())?;
+        let write_result = mux_to_path_async_inner(&amended_request, &temp_path).await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
+        }
+        replace_output_path_async(&temp_path, destination_path).await?;
+        return Ok(());
+    }
+    let create_new_request = request
+        .clone()
+        .with_destination_mode(MuxDestinationMode::CreateNew);
+    mux_to_path_async_inner(&create_new_request, destination_path).await
+}
+
 struct PreparedMuxRequest {
     output_layout: MuxOutputLayout,
     file_config: MuxFileConfig,
     track_configs: Vec<MuxTrackConfig>,
     fragmented_single_sidx_reference: bool,
-    fragmented_edit_media_times: Vec<Option<u64>>,
     plan: super::MuxPlan,
     source_specs: Vec<SourceSpec>,
 }
@@ -218,33 +305,35 @@ struct FragmentRunContext<'a> {
 #[derive(Clone)]
 enum SourceSpec {
     File(PathBuf),
-    TransformedAnnexB(TransformedAnnexBSourceSpec),
+    Segmented(SegmentedMuxSourceSpec),
 }
 
 #[derive(Clone)]
-struct TransformedAnnexBSourceSpec {
-    path: PathBuf,
-    segments: Vec<TransformedAnnexBSegment>,
-    total_size: u64,
+pub(in crate::mux) struct SegmentedMuxSourceSpec {
+    pub(in crate::mux) path: PathBuf,
+    pub(in crate::mux) segments: Vec<SegmentedMuxSourceSegment>,
+    pub(in crate::mux) total_size: u64,
 }
 
 #[derive(Clone)]
-struct TransformedAnnexBSegment {
-    logical_offset: u64,
-    data: TransformedAnnexBSegmentData,
+pub(in crate::mux) struct SegmentedMuxSourceSegment {
+    pub(in crate::mux) logical_offset: u64,
+    pub(in crate::mux) data: SegmentedMuxSourceSegmentData,
 }
 
 #[derive(Clone)]
-enum TransformedAnnexBSegmentData {
+pub(in crate::mux) enum SegmentedMuxSourceSegmentData {
     Prefix([u8; 4]),
+    Bytes(Vec<u8>),
     FileRange { source_offset: u64, size: u32 },
 }
 
-impl TransformedAnnexBSegment {
+impl SegmentedMuxSourceSegment {
     fn logical_size(&self) -> u64 {
         match &self.data {
-            TransformedAnnexBSegmentData::Prefix(_) => 4,
-            TransformedAnnexBSegmentData::FileRange { size, .. } => u64::from(*size),
+            SegmentedMuxSourceSegmentData::Prefix(_) => 4,
+            SegmentedMuxSourceSegmentData::Bytes(bytes) => u64::try_from(bytes.len()).unwrap(),
+            SegmentedMuxSourceSegmentData::FileRange { size, .. } => u64::from(*size),
         }
     }
 
@@ -253,8 +342,8 @@ impl TransformedAnnexBSegment {
     }
 }
 
-fn find_transformed_segment_index(
-    segments: &[TransformedAnnexBSegment],
+fn find_segmented_source_segment_index(
+    segments: &[SegmentedMuxSourceSegment],
     position: u64,
 ) -> Option<usize> {
     segments
@@ -279,13 +368,13 @@ fn seek_mux_source_position(position: u64, end: u64, target: SeekFrom) -> io::Re
     if next < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid seek before start of transformed mux source",
+            "invalid seek before start of segmented mux source",
         ));
     }
     u64::try_from(next).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid seek target for transformed mux source",
+            "invalid seek target for segmented mux source",
         )
     })
 }
@@ -296,12 +385,12 @@ struct SyncMuxSource {
 
 enum SyncMuxSourceInner {
     File(File),
-    TransformedAnnexB(TransformedSyncMuxSource),
+    Segmented(SegmentedSyncMuxSource),
 }
 
-struct TransformedSyncMuxSource {
+struct SegmentedSyncMuxSource {
     file: File,
-    segments: Vec<TransformedAnnexBSegment>,
+    segments: Vec<SegmentedMuxSourceSegment>,
     total_size: u64,
     position: u64,
     file_position: Option<u64>,
@@ -311,21 +400,19 @@ impl SyncMuxSource {
     fn open(spec: &SourceSpec) -> Result<Self, MuxError> {
         let inner = match spec {
             SourceSpec::File(path) => SyncMuxSourceInner::File(File::open(path)?),
-            SourceSpec::TransformedAnnexB(spec) => {
-                SyncMuxSourceInner::TransformedAnnexB(TransformedSyncMuxSource {
-                    file: File::open(&spec.path)?,
-                    segments: spec.segments.clone(),
-                    total_size: spec.total_size,
-                    position: 0,
-                    file_position: None,
-                })
-            }
+            SourceSpec::Segmented(spec) => SyncMuxSourceInner::Segmented(SegmentedSyncMuxSource {
+                file: File::open(&spec.path)?,
+                segments: spec.segments.clone(),
+                total_size: spec.total_size,
+                position: 0,
+                file_position: None,
+            }),
         };
         Ok(Self { inner })
     }
 }
 
-impl TransformedSyncMuxSource {
+impl SegmentedSyncMuxSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.position >= self.total_size {
             return Ok(0);
@@ -333,7 +420,8 @@ impl TransformedSyncMuxSource {
 
         let mut written = 0usize;
         while written < buf.len() && self.position < self.total_size {
-            let Some(segment_index) = find_transformed_segment_index(&self.segments, self.position)
+            let Some(segment_index) =
+                find_segmented_source_segment_index(&self.segments, self.position)
             else {
                 break;
             };
@@ -343,7 +431,7 @@ impl TransformedSyncMuxSource {
                     io::Error::new(io::ErrorKind::InvalidData, "logical offset overflow")
                 })?;
             match &segment.data {
-                TransformedAnnexBSegmentData::Prefix(prefix) => {
+                SegmentedMuxSourceSegmentData::Prefix(prefix) => {
                     let available = prefix.len().saturating_sub(segment_offset);
                     let to_copy = available.min(buf.len() - written);
                     buf[written..written + to_copy]
@@ -351,7 +439,15 @@ impl TransformedSyncMuxSource {
                     written += to_copy;
                     self.position += u64::try_from(to_copy).unwrap();
                 }
-                TransformedAnnexBSegmentData::FileRange {
+                SegmentedMuxSourceSegmentData::Bytes(bytes) => {
+                    let available = bytes.len().saturating_sub(segment_offset);
+                    let to_copy = available.min(buf.len() - written);
+                    buf[written..written + to_copy]
+                        .copy_from_slice(&bytes[segment_offset..segment_offset + to_copy]);
+                    written += to_copy;
+                    self.position += u64::try_from(to_copy).unwrap();
+                }
+                SegmentedMuxSourceSegmentData::FileRange {
                     source_offset,
                     size,
                 } => {
@@ -370,7 +466,7 @@ impl TransformedSyncMuxSource {
                     if read == 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            "truncated transformed mux source input",
+                            "truncated segmented mux source input",
                         ));
                     }
                     written += read;
@@ -392,7 +488,7 @@ impl Read for SyncMuxSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
             SyncMuxSourceInner::File(file) => file.read(buf),
-            SyncMuxSourceInner::TransformedAnnexB(source) => source.read(buf),
+            SyncMuxSourceInner::Segmented(source) => source.read(buf),
         }
     }
 }
@@ -401,7 +497,7 @@ impl Seek for SyncMuxSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match &mut self.inner {
             SyncMuxSourceInner::File(file) => file.seek(pos),
-            SyncMuxSourceInner::TransformedAnnexB(source) => source.seek(pos),
+            SyncMuxSourceInner::Segmented(source) => source.seek(pos),
         }
     }
 }
@@ -414,13 +510,13 @@ struct AsyncMuxSource {
 #[cfg(feature = "async")]
 enum AsyncMuxSourceInner {
     File(TokioFile),
-    TransformedAnnexB(TransformedAsyncMuxSource),
+    Segmented(SegmentedAsyncMuxSource),
 }
 
 #[cfg(feature = "async")]
-struct TransformedAsyncMuxSource {
+struct SegmentedAsyncMuxSource {
     file: TokioFile,
-    segments: Vec<TransformedAnnexBSegment>,
+    segments: Vec<SegmentedMuxSourceSegment>,
     total_size: u64,
     position: u64,
     file_position: Option<u64>,
@@ -432,8 +528,8 @@ impl AsyncMuxSource {
     async fn open(spec: &SourceSpec) -> Result<Self, MuxError> {
         let inner = match spec {
             SourceSpec::File(path) => AsyncMuxSourceInner::File(TokioFile::open(path).await?),
-            SourceSpec::TransformedAnnexB(spec) => {
-                AsyncMuxSourceInner::TransformedAnnexB(TransformedAsyncMuxSource {
+            SourceSpec::Segmented(spec) => {
+                AsyncMuxSourceInner::Segmented(SegmentedAsyncMuxSource {
                     file: TokioFile::open(&spec.path).await?,
                     segments: spec.segments.clone(),
                     total_size: spec.total_size,
@@ -448,7 +544,7 @@ impl AsyncMuxSource {
 }
 
 #[cfg(feature = "async")]
-impl TransformedAsyncMuxSource {
+impl SegmentedAsyncMuxSource {
     fn start_seek(&mut self, target: SeekFrom) -> io::Result<()> {
         self.position = seek_mux_source_position(self.position, self.total_size, target)?;
         Ok(())
@@ -467,7 +563,8 @@ impl TransformedAsyncMuxSource {
             return Poll::Ready(Ok(()));
         }
 
-        let Some(segment_index) = find_transformed_segment_index(&self.segments, self.position)
+        let Some(segment_index) =
+            find_segmented_source_segment_index(&self.segments, self.position)
         else {
             return Poll::Ready(Ok(()));
         };
@@ -475,14 +572,21 @@ impl TransformedAsyncMuxSource {
         let segment_offset = usize::try_from(self.position - segment.logical_offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "logical offset overflow"))?;
         match &segment.data {
-            TransformedAnnexBSegmentData::Prefix(prefix) => {
+            SegmentedMuxSourceSegmentData::Prefix(prefix) => {
                 let available = prefix.len().saturating_sub(segment_offset);
                 let to_copy = available.min(buf.remaining());
                 buf.put_slice(&prefix[segment_offset..segment_offset + to_copy]);
                 self.position += u64::try_from(to_copy).unwrap();
                 Poll::Ready(Ok(()))
             }
-            TransformedAnnexBSegmentData::FileRange {
+            SegmentedMuxSourceSegmentData::Bytes(bytes) => {
+                let available = bytes.len().saturating_sub(segment_offset);
+                let to_copy = available.min(buf.remaining());
+                buf.put_slice(&bytes[segment_offset..segment_offset + to_copy]);
+                self.position += u64::try_from(to_copy).unwrap();
+                Poll::Ready(Ok(()))
+            }
+            SegmentedMuxSourceSegmentData::FileRange {
                 source_offset,
                 size,
             } => {
@@ -519,7 +623,7 @@ impl TransformedAsyncMuxSource {
                         if read == 0 {
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
-                                "truncated transformed mux source input",
+                                "truncated segmented mux source input",
                             )));
                         }
                         buf.put_slice(temp.filled());
@@ -544,7 +648,7 @@ impl AsyncRead for AsyncMuxSource {
     ) -> Poll<io::Result<()>> {
         match &mut self.inner {
             AsyncMuxSourceInner::File(file) => Pin::new(file).poll_read(cx, buf),
-            AsyncMuxSourceInner::TransformedAnnexB(source) => source.poll_read_internal(cx, buf),
+            AsyncMuxSourceInner::Segmented(source) => source.poll_read_internal(cx, buf),
         }
     }
 }
@@ -554,14 +658,14 @@ impl AsyncSeek for AsyncMuxSource {
     fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         match &mut self.inner {
             AsyncMuxSourceInner::File(file) => Pin::new(file).start_seek(position),
-            AsyncMuxSourceInner::TransformedAnnexB(source) => source.start_seek(position),
+            AsyncMuxSourceInner::Segmented(source) => source.start_seek(position),
         }
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         match &mut self.inner {
             AsyncMuxSourceInner::File(file) => Pin::new(file).poll_complete(cx),
-            AsyncMuxSourceInner::TransformedAnnexB(source) => source.poll_complete(cx),
+            AsyncMuxSourceInner::Segmented(source) => source.poll_complete(cx),
         }
     }
 }
@@ -571,10 +675,12 @@ struct ImportedTrack {
     timescale: u32,
     language: [u8; 3],
     handler_name: String,
+    mux_policy: ImportedTrackMuxPolicy,
     width: u16,
     height: u16,
     sample_entry_box: Vec<u8>,
     source_edit_media_time: Option<u64>,
+    sample_roll_distance: Option<i16>,
     samples: Vec<ImportedSample>,
 }
 
@@ -588,37 +694,70 @@ struct ImportedSample {
     is_sync_sample: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::mux) enum FlatTimingOverrideKind {
+    None,
+    IamfSequencePresentation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::mux) struct ImportedTrackMuxPolicy {
+    sync_sample_table_mode: SyncSampleTableMode,
+    stsc_run_encoding_mode: StscRunEncodingMode,
+    flat_timing_override_kind: FlatTimingOverrideKind,
+}
+
+impl ImportedTrackMuxPolicy {
+    const DEFAULT: Self = Self {
+        sync_sample_table_mode: SyncSampleTableMode::Auto,
+        stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
+        flat_timing_override_kind: FlatTimingOverrideKind::None,
+    };
+}
+
 #[derive(Clone, Copy)]
-struct StagedSample {
-    data_offset: u64,
-    data_size: u32,
-    duration: u32,
-    composition_time_offset: i32,
-    is_sync_sample: bool,
+pub(in crate::mux) struct StagedSample {
+    pub(in crate::mux) data_offset: u64,
+    pub(in crate::mux) data_size: u32,
+    pub(in crate::mux) duration: u32,
+    pub(in crate::mux) composition_time_offset: i32,
+    pub(in crate::mux) is_sync_sample: bool,
 }
 
 #[derive(Clone)]
-struct TrackCandidate {
-    track_id: u32,
-    kind: MuxTrackKind,
-    timescale: u32,
-    language: [u8; 3],
-    handler_name: String,
-    width: u16,
-    height: u16,
-    sample_entry_box: Vec<u8>,
-    source_edit_media_time: Option<u64>,
-    samples: Vec<CandidateSample>,
+pub(in crate::mux) struct TrackCandidate {
+    pub(in crate::mux) track_id: u32,
+    pub(in crate::mux) kind: MuxTrackKind,
+    pub(in crate::mux) timescale: u32,
+    pub(in crate::mux) language: [u8; 3],
+    pub(in crate::mux) handler_name: String,
+    pub(in crate::mux) mux_policy: ImportedTrackMuxPolicy,
+    pub(in crate::mux) width: u16,
+    pub(in crate::mux) height: u16,
+    pub(in crate::mux) sample_entry_box: Vec<u8>,
+    pub(in crate::mux) source_edit_media_time: Option<u64>,
+    pub(in crate::mux) samples: Vec<CandidateSample>,
 }
 
 #[derive(Clone, Copy)]
-struct CandidateSample {
-    source_index: usize,
-    data_offset: u64,
-    data_size: u32,
-    duration: u32,
-    composition_time_offset: i32,
-    is_sync_sample: bool,
+pub(in crate::mux) struct CandidateSample {
+    pub(in crate::mux) source_index: usize,
+    pub(in crate::mux) data_offset: u64,
+    pub(in crate::mux) data_size: u32,
+    pub(in crate::mux) duration: u32,
+    pub(in crate::mux) composition_time_offset: i32,
+    pub(in crate::mux) is_sync_sample: bool,
+}
+
+pub(in crate::mux) struct CompositeTrackCandidate {
+    pub(in crate::mux) track: TrackCandidate,
+    pub(in crate::mux) source_spec: SegmentedMuxSourceSpec,
+}
+
+fn assign_candidate_source_index(track: &mut TrackCandidate, source_index: usize) {
+    for sample in &mut track.samples {
+        sample.source_index = source_index;
+    }
 }
 
 fn imported_samples_from_staged(
@@ -644,38 +783,85 @@ fn prepare_request_sync(
 ) -> Result<PreparedMuxRequest, MuxError> {
     validate_request_shape(request, output_path)?;
 
-    let all_mp4_inputs = request
-        .tracks()
-        .iter()
-        .all(|track| matches!(track, MuxTrackSpec::Mp4 { .. }));
+    let mut path_kinds = Vec::with_capacity(request.tracks().len());
+    let mut all_mp4_inputs = true;
+    for track in request.tracks() {
+        let kind = match track {
+            MuxTrackSpec::Path { path, .. } => detect_path_track_kind_sync(path)?,
+        };
+        if !matches!(kind, DetectedPathTrackKind::Mp4) {
+            all_mp4_inputs = false;
+        }
+        path_kinds.push(kind);
+    }
     let mut sources = SourceCatalog::default();
-    let mut mp4_cache = BTreeMap::<PathBuf, Mp4SourceMetadata>::new();
+    let mut mp4_cache = BTreeMap::<PathBuf, PathSourceMetadata>::new();
+    let mut avi_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut program_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut transport_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut vobsub_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut imported_tracks = Vec::new();
     let mut authority_file_config = None::<MuxFileConfig>;
 
-    for track in request.tracks() {
-        match track {
-            MuxTrackSpec::Raw {
-                codec,
-                path,
-                parameters,
-            } => {
-                let spec = display_track_spec(track);
-                imported_tracks.push(import_raw_track_sync(
-                    path,
-                    *codec,
-                    parameters,
-                    spec,
+    for (track, path_kind) in request.tracks().iter().zip(path_kinds.into_iter()) {
+        let MuxTrackSpec::Path { path, selector } = track;
+        let spec = display_track_spec(track);
+        let selector = *selector;
+        match path_kind {
+            DetectedPathTrackKind::Mp4 => {
+                let metadata = load_mp4_source_sync(path.as_path(), &mut mp4_cache, &mut sources)?;
+                if all_mp4_inputs && authority_file_config.is_none() {
+                    authority_file_config = metadata.file_config.clone();
+                }
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+                let metadata = load_avi_source_sync(path.as_path(), &mut avi_cache, &mut sources)?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+                let metadata = load_program_stream_source_sync(
+                    path.as_path(),
+                    &mut program_stream_cache,
+                    &mut sources,
+                )?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+                let metadata = load_transport_stream_source_sync(
+                    path.as_path(),
+                    &mut transport_stream_cache,
+                    &mut sources,
+                )?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+                let metadata =
+                    load_vobsub_source_sync(path.as_path(), &mut vobsub_cache, &mut sources)?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Raw(_)
+            | DetectedPathTrackKind::Mp4ImportOnly(_)
+            | DetectedPathTrackKind::Unknown => {
+                if let Some(selector) = selector {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec,
+                        message: format!(
+                            "selector `{}` only applies to containerized sources",
+                            format_mp4_selector(selector)
+                        ),
+                    });
+                }
+                imported_tracks.push(import_detected_path_raw_sync(
+                    path.as_path(),
+                    &spec,
                     &mut sources,
                 )?);
-            }
-            MuxTrackSpec::Mp4 { path, selector } => {
-                let spec = display_track_spec(track);
-                let metadata = load_mp4_source_sync(path, &mut mp4_cache, &mut sources)?;
-                if all_mp4_inputs && authority_file_config.is_none() {
-                    authority_file_config = Some(metadata.file_config.clone());
-                }
-                imported_tracks.push(select_mp4_track(metadata, *selector, spec)?);
             }
         }
     }
@@ -696,34 +882,88 @@ async fn prepare_request_async(
 ) -> Result<PreparedMuxRequest, MuxError> {
     validate_request_shape(request, output_path)?;
 
-    let all_mp4_inputs = request
-        .tracks()
-        .iter()
-        .all(|track| matches!(track, MuxTrackSpec::Mp4 { .. }));
+    let mut path_kinds = Vec::with_capacity(request.tracks().len());
+    let mut all_mp4_inputs = true;
+    for track in request.tracks() {
+        let kind = match track {
+            MuxTrackSpec::Path { path, .. } => detect_path_track_kind_async(path).await?,
+        };
+        if !matches!(kind, DetectedPathTrackKind::Mp4) {
+            all_mp4_inputs = false;
+        }
+        path_kinds.push(kind);
+    }
     let mut sources = SourceCatalog::default();
-    let mut mp4_cache = BTreeMap::<PathBuf, Mp4SourceMetadata>::new();
+    let mut mp4_cache = BTreeMap::<PathBuf, PathSourceMetadata>::new();
+    let mut avi_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut program_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut transport_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut vobsub_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut imported_tracks = Vec::new();
     let mut authority_file_config = None::<MuxFileConfig>;
 
-    for track in request.tracks() {
-        match track {
-            MuxTrackSpec::Raw {
-                codec,
-                path,
-                parameters,
-            } => {
-                let spec = display_track_spec(track);
-                imported_tracks.push(
-                    import_raw_track_async(path, *codec, parameters, spec, &mut sources).await?,
-                );
-            }
-            MuxTrackSpec::Mp4 { path, selector } => {
-                let spec = display_track_spec(track);
-                let metadata = load_mp4_source_async(path, &mut mp4_cache, &mut sources).await?;
+    for (track, path_kind) in request.tracks().iter().zip(path_kinds.into_iter()) {
+        let MuxTrackSpec::Path { path, selector } = track;
+        let spec = display_track_spec(track);
+        let selector = *selector;
+        match path_kind {
+            DetectedPathTrackKind::Mp4 => {
+                let metadata =
+                    load_mp4_source_async(path.as_path(), &mut mp4_cache, &mut sources).await?;
                 if all_mp4_inputs && authority_file_config.is_none() {
-                    authority_file_config = Some(metadata.file_config.clone());
+                    authority_file_config = metadata.file_config.clone();
                 }
-                imported_tracks.push(select_mp4_track(metadata, *selector, spec)?);
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+                let metadata =
+                    load_avi_source_async(path.as_path(), &mut avi_cache, &mut sources).await?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+                let metadata = load_program_stream_source_async(
+                    path.as_path(),
+                    &mut program_stream_cache,
+                    &mut sources,
+                )
+                .await?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+                let metadata = load_transport_stream_source_async(
+                    path.as_path(),
+                    &mut transport_stream_cache,
+                    &mut sources,
+                )
+                .await?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+                let metadata =
+                    load_vobsub_source_async(path.as_path(), &mut vobsub_cache, &mut sources)
+                        .await?;
+                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
+                imported_tracks.append(&mut selected);
+            }
+            DetectedPathTrackKind::Raw(_)
+            | DetectedPathTrackKind::Mp4ImportOnly(_)
+            | DetectedPathTrackKind::Unknown => {
+                if let Some(selector) = selector {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec,
+                        message: format!(
+                            "selector `{}` only applies to containerized sources",
+                            format_mp4_selector(selector)
+                        ),
+                    });
+                }
+                imported_tracks.push(
+                    import_detected_path_raw_async(path.as_path(), &spec, &mut sources).await?,
+                );
             }
         }
     }
@@ -752,7 +992,11 @@ fn finish_prepared_request(
         return Err(MuxError::MultipleVideoTracks { count: video_count });
     }
 
-    let movie_timescale = choose_movie_timescale(&imported_tracks, authority_file_config.as_ref())?;
+    let movie_timescale = choose_movie_timescale(
+        &imported_tracks,
+        authority_file_config.as_ref(),
+        request.output_layout(),
+    )?;
     let file_config = choose_file_config(movie_timescale, authority_file_config.as_ref());
     let duration_boundary_kind = request
         .duration_mode()
@@ -790,10 +1034,21 @@ fn finish_prepared_request(
     } else {
         None
     };
+    let auto_flat_interleave_target = if duration_target.is_none()
+        && request.output_layout() == MuxOutputLayout::Flat
+        && file_config.auto_flat_profile()
+    {
+        Some(auto_flat_interleave_target_ticks(movie_timescale))
+    } else {
+        None
+    };
+    let audio_track_count = imported_tracks
+        .iter()
+        .filter(|track| track.kind.is_audio())
+        .count();
 
     let mut staged_items = Vec::new();
     let mut track_configs = Vec::new();
-    let mut fragmented_edit_media_times = Vec::new();
     let mut coordination_directives = Vec::new();
     for (index, imported_track) in imported_tracks.iter().enumerate() {
         let track_id = u32::try_from(index + 1)
@@ -890,6 +1145,52 @@ fn finish_prepared_request(
                         .with_duration_boundaries(duration_boundary_kind),
                 );
             }
+        } else if let Some(target_ticks) = auto_flat_interleave_target {
+            if imported_track.kind.is_audio() {
+                let normalized_sample_durations = imported_track
+                    .samples
+                    .iter()
+                    .map(|sample| {
+                        scale_track_time_to_movie(
+                            track_id,
+                            i64::from(sample.duration),
+                            imported_track.timescale,
+                            movie_timescale,
+                        )
+                        .map(|duration| duration as u32)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !normalized_sample_durations.is_empty() {
+                    let mut chunk_sample_counts = build_capped_duration_chunk_sample_counts(
+                        track_id,
+                        normalized_sample_durations,
+                        target_ticks,
+                    )?;
+                    if audio_track_count > 1 {
+                        rebalance_small_multi_audio_chunk_sample_counts(&mut chunk_sample_counts);
+                    }
+                    coordination_directives.push(TrackCoordinationDirective::new(
+                        track_id,
+                        chunk_sample_counts,
+                    ));
+                }
+            } else if imported_track.kind == MuxTrackKind::Subtitle
+                && imported_track.sample_entry_box.get(4..8) == Some(b"mp4s".as_slice())
+                && !imported_track.samples.is_empty()
+            {
+                coordination_directives.push(TrackCoordinationDirective::new(
+                    track_id,
+                    vec![1; imported_track.samples.len()],
+                ));
+            } else if imported_track.kind.is_video() && !imported_track.samples.is_empty() {
+                coordination_directives.push(TrackCoordinationDirective::new(
+                    track_id,
+                    vec![
+                        u32::try_from(imported_track.samples.len())
+                            .map_err(|_| MuxError::LayoutOverflow("flat video chunk count"))?,
+                    ],
+                ));
+            }
         }
 
         for sample in &imported_track.samples {
@@ -951,9 +1252,27 @@ fn finish_prepared_request(
             ),
         }
         .with_language(imported_track.language)
-        .with_handler_name(imported_track.handler_name.clone());
+        .with_handler_name(imported_track.handler_name.clone())
+        .with_sync_sample_table_mode(sync_sample_table_mode_for_imported_track(imported_track))
+        .with_stsc_run_encoding_mode(stsc_run_encoding_mode_for_imported_track(imported_track));
+        let config = if let Some(edit_media_time) = imported_track.source_edit_media_time {
+            config.with_edit_media_time(edit_media_time)
+        } else {
+            config
+        };
+        let config = if let Some(sample_roll_distance) = imported_track.sample_roll_distance {
+            config.with_sample_roll_distance(sample_roll_distance)
+        } else {
+            config
+        };
+        let config = if let Some(flat_timing_override) =
+            flat_timing_override_for_imported_track(imported_track)
+        {
+            config.with_flat_timing_override(flat_timing_override)
+        } else {
+            config
+        };
         track_configs.push(config);
-        fragmented_edit_media_times.push(imported_track.source_edit_media_time);
     }
 
     let plan = plan_staged_media_items_with_coordination(
@@ -966,10 +1285,16 @@ fn finish_prepared_request(
         file_config,
         track_configs,
         fragmented_single_sidx_reference,
-        fragmented_edit_media_times,
         plan,
         source_specs: sources.specs,
     })
+}
+
+fn auto_flat_interleave_target_ticks(movie_timescale: u32) -> u64 {
+    u64::from(movie_timescale)
+        .saturating_mul(AUTO_FLAT_INTERLEAVE_MILLISECONDS)
+        .div_ceil(1_000)
+        .max(1)
 }
 
 #[derive(Default)]
@@ -990,27 +1315,42 @@ impl SourceCatalog {
         Ok(index)
     }
 
-    fn add_transformed_annex_b(
-        &mut self,
-        mut spec: TransformedAnnexBSourceSpec,
-    ) -> Result<usize, MuxError> {
+    fn add_segmented(&mut self, mut spec: SegmentedMuxSourceSpec) -> Result<usize, MuxError> {
         spec.path = absolute_path(&spec.path)?;
         let index = self.specs.len();
-        self.specs.push(SourceSpec::TransformedAnnexB(spec));
+        self.specs.push(SourceSpec::Segmented(spec));
         Ok(index)
     }
 }
 
-struct Mp4SourceMetadata {
-    file_config: MuxFileConfig,
+struct PathSourceMetadata {
+    file_config: Option<MuxFileConfig>,
     tracks: Vec<TrackCandidate>,
+}
+
+struct ContainerSourceMetadata {
+    tracks: Vec<TrackCandidate>,
+}
+
+fn materialize_composite_tracks(
+    sources: &mut SourceCatalog,
+    composite_tracks: Vec<CompositeTrackCandidate>,
+) -> Result<ContainerSourceMetadata, MuxError> {
+    let mut tracks = Vec::with_capacity(composite_tracks.len());
+    for composite in composite_tracks {
+        let source_index = sources.add_segmented(composite.source_spec)?;
+        let mut track = composite.track;
+        assign_candidate_source_index(&mut track, source_index);
+        tracks.push(track);
+    }
+    Ok(ContainerSourceMetadata { tracks })
 }
 
 fn load_mp4_source_sync<'a>(
     path: &Path,
-    cache: &'a mut BTreeMap<PathBuf, Mp4SourceMetadata>,
+    cache: &'a mut BTreeMap<PathBuf, PathSourceMetadata>,
     sources: &mut SourceCatalog,
-) -> Result<&'a Mp4SourceMetadata, MuxError> {
+) -> Result<&'a PathSourceMetadata, MuxError> {
     let absolute = absolute_path(path)?;
     if !cache.contains_key(&absolute) {
         let source_index = sources.add_file(&absolute)?;
@@ -1026,9 +1366,9 @@ fn load_mp4_source_sync<'a>(
 #[cfg(feature = "async")]
 async fn load_mp4_source_async<'a>(
     path: &Path,
-    cache: &'a mut BTreeMap<PathBuf, Mp4SourceMetadata>,
+    cache: &'a mut BTreeMap<PathBuf, PathSourceMetadata>,
     sources: &mut SourceCatalog,
-) -> Result<&'a Mp4SourceMetadata, MuxError> {
+) -> Result<&'a PathSourceMetadata, MuxError> {
     let absolute = absolute_path(path)?;
     if !cache.contains_key(&absolute) {
         let source_index = sources.add_file(&absolute)?;
@@ -1041,11 +1381,161 @@ async fn load_mp4_source_async<'a>(
     Ok(cache.get(&absolute).unwrap())
 }
 
+fn load_avi_source_sync<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let source_index = sources.add_file(&absolute)?;
+        let scanned =
+            scan_avi_source_sync(&absolute, &absolute.display().to_string(), source_index)?;
+        let mut tracks = scanned.tracks;
+        if !scanned.composite_tracks.is_empty() {
+            tracks.extend(materialize_composite_tracks(sources, scanned.composite_tracks)?.tracks);
+        }
+        cache.insert(absolute.clone(), ContainerSourceMetadata { tracks });
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+fn load_program_stream_source_sync<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        cache.insert(
+            absolute.clone(),
+            materialize_composite_tracks(
+                sources,
+                scan_program_stream_sync(&absolute, &absolute.display().to_string())?,
+            )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+fn load_transport_stream_source_sync<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        cache.insert(
+            absolute.clone(),
+            materialize_composite_tracks(
+                sources,
+                scan_transport_stream_sync(&absolute, &absolute.display().to_string())?,
+            )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+fn load_vobsub_source_sync<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        cache.insert(
+            absolute.clone(),
+            materialize_composite_tracks(
+                sources,
+                scan_vobsub_source_sync(&absolute, &absolute.display().to_string())?,
+            )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
+async fn load_avi_source_async<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let source_index = sources.add_file(&absolute)?;
+        let scanned =
+            scan_avi_source_async(&absolute, &absolute.display().to_string(), source_index).await?;
+        let mut tracks = scanned.tracks;
+        if !scanned.composite_tracks.is_empty() {
+            tracks.extend(materialize_composite_tracks(sources, scanned.composite_tracks)?.tracks);
+        }
+        cache.insert(absolute.clone(), ContainerSourceMetadata { tracks });
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
+async fn load_vobsub_source_async<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        cache.insert(
+            absolute.clone(),
+            materialize_composite_tracks(
+                sources,
+                scan_vobsub_source_async(&absolute, &absolute.display().to_string()).await?,
+            )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
+async fn load_program_stream_source_async<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        cache.insert(
+            absolute.clone(),
+            materialize_composite_tracks(
+                sources,
+                scan_program_stream_async(&absolute, &absolute.display().to_string()).await?,
+            )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
+async fn load_transport_stream_source_async<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        cache.insert(
+            absolute.clone(),
+            materialize_composite_tracks(
+                sources,
+                scan_transport_stream_async(&absolute, &absolute.display().to_string()).await?,
+            )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
 fn parse_mp4_source_sync<R>(
     path: &Path,
     source_index: usize,
     reader: &mut R,
-) -> Result<Mp4SourceMetadata, MuxError>
+) -> Result<PathSourceMetadata, MuxError>
 where
     R: Read + Seek,
 {
@@ -1058,8 +1548,8 @@ where
         }
     }
     populate_empty_fragmented_track_samples_sync(path, source_index, reader, &mut tracks)?;
-    Ok(Mp4SourceMetadata {
-        file_config,
+    Ok(PathSourceMetadata {
+        file_config: Some(file_config),
         tracks,
     })
 }
@@ -1069,7 +1559,7 @@ async fn parse_mp4_source_async<R>(
     path: &Path,
     source_index: usize,
     reader: &mut R,
-) -> Result<Mp4SourceMetadata, MuxError>
+) -> Result<PathSourceMetadata, MuxError>
 where
     R: AsyncReadSeek,
 {
@@ -1084,8 +1574,8 @@ where
         }
     }
     populate_empty_fragmented_track_samples_async(path, source_index, reader, &mut tracks).await?;
-    Ok(Mp4SourceMetadata {
-        file_config,
+    Ok(PathSourceMetadata {
+        file_config: Some(file_config),
         tracks,
     })
 }
@@ -1509,26 +1999,23 @@ fn effective_fragment_sample_flags(
 }
 
 fn select_mp4_track(
-    metadata: &Mp4SourceMetadata,
+    tracks: &[TrackCandidate],
     selector: MuxMp4TrackSelector,
     spec: String,
 ) -> Result<ImportedTrack, MuxError> {
     let selected = match selector {
-        MuxMp4TrackSelector::Video => metadata.tracks.iter().find(|track| track.kind.is_video()),
-        MuxMp4TrackSelector::Audio { occurrence } => metadata
-            .tracks
+        MuxMp4TrackSelector::Video => tracks.iter().find(|track| track.kind.is_video()),
+        MuxMp4TrackSelector::Audio { occurrence } => tracks
             .iter()
             .filter(|track| track.kind.is_audio())
             .nth(usize::try_from(occurrence.saturating_sub(1)).unwrap_or(usize::MAX)),
-        MuxMp4TrackSelector::Text { occurrence } => metadata
-            .tracks
+        MuxMp4TrackSelector::Text { occurrence } => tracks
             .iter()
             .filter(|track| track.kind.is_textual())
             .nth(usize::try_from(occurrence.saturating_sub(1)).unwrap_or(usize::MAX)),
-        MuxMp4TrackSelector::TrackId { track_id } => metadata
-            .tracks
-            .iter()
-            .find(|track| track.track_id == track_id),
+        MuxMp4TrackSelector::TrackId { track_id } => {
+            tracks.iter().find(|track| track.track_id == track_id)
+        }
     }
     .ok_or_else(|| MuxError::MissingTrackSelection { spec: spec.clone() })?;
 
@@ -1537,10 +2024,12 @@ fn select_mp4_track(
         timescale: selected.timescale,
         language: selected.language,
         handler_name: selected.handler_name.clone(),
+        mux_policy: selected.mux_policy,
         width: selected.width,
         height: selected.height,
         sample_entry_box: selected.sample_entry_box.clone(),
         source_edit_media_time: selected.source_edit_media_time,
+        sample_roll_distance: None,
         samples: selected
             .samples
             .iter()
@@ -1555,6 +2044,58 @@ fn select_mp4_track(
             .collect(),
     }
     .with_source_index_from_candidate(selected))
+}
+
+fn select_container_tracks(
+    tracks: &[TrackCandidate],
+    selector: Option<MuxMp4TrackSelector>,
+    spec: String,
+) -> Result<Vec<ImportedTrack>, MuxError> {
+    match selector {
+        Some(selector) => Ok(vec![select_mp4_track(tracks, selector, spec)?]),
+        None => {
+            let selected = tracks
+                .iter()
+                .filter(|track| {
+                    matches!(
+                        track.kind,
+                        MuxTrackKind::Video
+                            | MuxTrackKind::Audio
+                            | MuxTrackKind::Text
+                            | MuxTrackKind::Subtitle
+                    )
+                })
+                .map(|track| ImportedTrack {
+                    kind: track.kind,
+                    timescale: track.timescale,
+                    language: track.language,
+                    handler_name: track.handler_name.clone(),
+                    mux_policy: track.mux_policy,
+                    width: track.width,
+                    height: track.height,
+                    sample_entry_box: track.sample_entry_box.clone(),
+                    source_edit_media_time: track.source_edit_media_time,
+                    sample_roll_distance: None,
+                    samples: track
+                        .samples
+                        .iter()
+                        .map(|sample| ImportedSample {
+                            source_index: sample.source_index,
+                            data_offset: sample.data_offset,
+                            data_size: sample.data_size,
+                            duration: sample.duration,
+                            composition_time_offset: sample.composition_time_offset,
+                            is_sync_sample: sample.is_sync_sample,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(MuxError::MissingTrackSelection { spec });
+            }
+            Ok(selected)
+        }
+    }
 }
 
 trait ImportedTrackExt {
@@ -1847,7 +2388,7 @@ fn parse_track_candidate_from_components(
         VIDE => MuxTrackKind::Video,
         SOUN => MuxTrackKind::Audio,
         TEXT => MuxTrackKind::Text,
-        SUBT => MuxTrackKind::Subtitle,
+        SUBT | SUBP => MuxTrackKind::Subtitle,
         _ => return Ok(None),
     };
     let sample_entry_type = sample_entry.info.box_type();
@@ -1876,7 +2417,13 @@ fn parse_track_candidate_from_components(
     let chunk_offsets = select_chunk_offsets(stco.as_ref(), co64.as_ref(), path, tkhd.track_id)?;
     let sample_offsets =
         expand_sample_offsets(&stsc, &sample_sizes, &chunk_offsets, path, tkhd.track_id)?;
-    let sync_samples = expand_sync_samples(stss.as_ref(), sample_sizes.len(), path, tkhd.track_id)?;
+    let sync_samples = expand_sync_samples(
+        stss.as_ref(),
+        sample_entry_type,
+        sample_sizes.len(),
+        path,
+        tkhd.track_id,
+    )?;
 
     let language = decode_mdhd_language(mdhd.language);
     let mut samples = Vec::with_capacity(sample_sizes.len());
@@ -1897,15 +2444,11 @@ fn parse_track_candidate_from_components(
         timescale: mdhd.timescale,
         language,
         handler_name: if hdlr.name.is_empty() {
-            match kind {
-                MuxTrackKind::Audio => "SoundHandler".to_string(),
-                MuxTrackKind::Video => "VideoHandler".to_string(),
-                MuxTrackKind::Text => "TextHandler".to_string(),
-                MuxTrackKind::Subtitle => "SubtitleHandler".to_string(),
-            }
+            default_handler_name_for_kind(kind).to_string()
         } else {
             hdlr.name
         },
+        mux_policy: ImportedTrackMuxPolicy::DEFAULT,
         width,
         height,
         sample_entry_box,
@@ -1924,6 +2467,92 @@ fn fixed_16_16_to_u16(value: u32) -> u16 {
     u16::try_from(value >> 16).unwrap_or(u16::MAX)
 }
 
+const fn default_handler_name_for_kind(kind: MuxTrackKind) -> &'static str {
+    match kind {
+        MuxTrackKind::Audio => "SoundHandler",
+        MuxTrackKind::Video => "VideoHandler",
+        MuxTrackKind::Text => "TextHandler",
+        MuxTrackKind::Subtitle => "SubtitleHandler",
+    }
+}
+
+pub(in crate::mux) fn direct_ingest_handler_name(codec_label: &str) -> String {
+    let kind = match codec_label {
+        "h263" | "h264" | "h265" | "vvc" | "av1" | "vp8" | "vp9" | "mp4v" | "ogg-theora"
+        | "jpeg" | "png" => MuxTrackKind::Video,
+        "vobsub" => MuxTrackKind::Subtitle,
+        _ => MuxTrackKind::Audio,
+    };
+    default_handler_name_for_kind(kind).to_string()
+}
+
+pub(in crate::mux) fn direct_ingest_mux_policy(
+    codec_label: &str,
+    kind: MuxTrackKind,
+) -> ImportedTrackMuxPolicy {
+    let mut policy = ImportedTrackMuxPolicy::DEFAULT;
+    if kind.is_audio() || codec_label == "vobsub" {
+        policy.stsc_run_encoding_mode = StscRunEncodingMode::PreserveTerminalBoundary;
+    }
+    match codec_label {
+        "vp8" | "iamf" => {
+            policy.sync_sample_table_mode = SyncSampleTableMode::ForceEmpty;
+        }
+        "mhas" => {
+            policy.sync_sample_table_mode = SyncSampleTableMode::ForceAll;
+        }
+        _ => {}
+    }
+    if codec_label == "iamf" {
+        policy.flat_timing_override_kind = FlatTimingOverrideKind::IamfSequencePresentation;
+    }
+    policy
+}
+
+pub(in crate::mux) fn with_force_empty_sync_sample_table(
+    mut policy: ImportedTrackMuxPolicy,
+) -> ImportedTrackMuxPolicy {
+    policy.sync_sample_table_mode = SyncSampleTableMode::ForceEmpty;
+    policy
+}
+
+fn flat_timing_override_for_imported_track(
+    imported_track: &ImportedTrack,
+) -> Option<FlatTimingOverride> {
+    if imported_track.mux_policy.flat_timing_override_kind
+        != FlatTimingOverrideKind::IamfSequencePresentation
+        || imported_track.samples.is_empty()
+    {
+        return None;
+    }
+
+    let mut sample_durations = Vec::with_capacity(imported_track.samples.len());
+    if imported_track.samples.len() > 1 {
+        sample_durations.resize(imported_track.samples.len() - 1, 1);
+    }
+    sample_durations.push(u32::MAX);
+
+    let media_duration = u64::from(u32::MAX)
+        .checked_add(u64::try_from(imported_track.samples.len().saturating_sub(1)).ok()?)?;
+    Some(FlatTimingOverride {
+        sample_durations,
+        media_duration,
+        presentation_duration: media_duration,
+    })
+}
+
+fn sync_sample_table_mode_for_imported_track(
+    imported_track: &ImportedTrack,
+) -> SyncSampleTableMode {
+    imported_track.mux_policy.sync_sample_table_mode
+}
+
+fn stsc_run_encoding_mode_for_imported_track(
+    imported_track: &ImportedTrack,
+) -> StscRunEncodingMode {
+    imported_track.mux_policy.stsc_run_encoding_mode
+}
+
 fn import_raw_aac_sync(
     path: &Path,
     spec: String,
@@ -1931,22 +2560,18 @@ fn import_raw_aac_sync(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_adts_file_sync(path, &spec)?;
-    let sample_entry_box = build_aac_sample_entry_box(
-        parsed.audio_object_type,
-        parsed.sampling_frequency_index,
-        parsed.channel_configuration,
-        parsed.sample_rate,
-    )?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("aac"),
+        mux_policy: direct_ingest_mux_policy("aac", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -1959,22 +2584,111 @@ async fn import_raw_aac_async(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_adts_file_async(path, &spec).await?;
-    let sample_entry_box = build_aac_sample_entry_box(
-        parsed.audio_object_type,
-        parsed.sampling_frequency_index,
-        parsed.channel_configuration,
-        parsed.sample_rate,
-    )?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("aac"),
+        mux_policy: direct_ingest_mux_policy("aac", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_latm_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_latm_file_sync(path, &spec)?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("latm"),
+        mux_policy: direct_ingest_mux_policy("latm", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_latm_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_latm_file_async(path, &spec).await?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("latm"),
+        mux_policy: direct_ingest_mux_policy("latm", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_h263_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_h263_file_sync(path, &spec)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("h263"),
+        mux_policy: direct_ingest_mux_policy("h263", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_mp4v_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_mp4v_file_sync(path, &spec)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mp4v"),
+        mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -1985,18 +2699,68 @@ fn import_raw_h264_sync(
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     let staged = stage_annex_b_h264_sync(path, &spec)?;
-    let source_index = sources.add_transformed_annex_b(staged.transformed_source)?;
+    let source_index = sources.add_segmented(staged.segmented_source)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Video,
         timescale: staged.timescale,
         language: *b"und",
-        handler_name: "VideoHandler".to_string(),
-        width: staged.width,
-        height: staged.height,
+        handler_name: direct_ingest_handler_name("h264"),
+        mux_policy: direct_ingest_mux_policy("h264", MuxTrackKind::Video),
+        width: staged.track_width,
+        height: staged.track_height,
         sample_entry_box: staged.sample_entry_box,
-        source_edit_media_time: None,
+        source_edit_media_time: staged.source_edit_media_time,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(staged.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_h263_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_h263_file_async(path, &spec).await?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("h263"),
+        mux_policy: direct_ingest_mux_policy("h263", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_mp4v_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_mp4v_file_async(path, &spec).await?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mp4v"),
+        mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
 
@@ -2007,39 +2771,65 @@ async fn import_raw_h264_async(
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     let staged = stage_annex_b_h264_async(path, &spec).await?;
-    let source_index = sources.add_transformed_annex_b(staged.transformed_source)?;
+    let source_index = sources.add_segmented(staged.segmented_source)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Video,
         timescale: staged.timescale,
         language: *b"und",
-        handler_name: "VideoHandler".to_string(),
-        width: staged.width,
-        height: staged.height,
+        handler_name: direct_ingest_handler_name("h264"),
+        mux_policy: direct_ingest_mux_policy("h264", MuxTrackKind::Video),
+        width: staged.track_width,
+        height: staged.track_height,
         sample_entry_box: staged.sample_entry_box,
-        source_edit_media_time: None,
+        source_edit_media_time: staged.source_edit_media_time,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(staged.samples, source_index),
     })
 }
 
 fn import_raw_h265_sync(
     path: &Path,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
-    let staged = stage_annex_b_h265_sync(path, parameters, &spec)?;
-    let source_index = sources.add_transformed_annex_b(staged.transformed_source)?;
+    let staged = stage_annex_b_h265_sync(path, &spec)?;
+    let source_index = sources.add_segmented(staged.segmented_source)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Video,
         timescale: staged.timescale,
         language: *b"und",
-        handler_name: "VideoHandler".to_string(),
-        width: staged.width,
-        height: staged.height,
+        handler_name: direct_ingest_handler_name("h265"),
+        mux_policy: direct_ingest_mux_policy("h265", MuxTrackKind::Video),
+        width: staged.track_width,
+        height: staged.track_height,
         sample_entry_box: staged.sample_entry_box,
-        source_edit_media_time: None,
+        source_edit_media_time: staged.source_edit_media_time,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(staged.samples, source_index),
+    })
+}
+
+fn import_raw_vvc_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let staged = stage_annex_b_vvc_sync(path, &spec)?;
+    let source_index = sources.add_segmented(staged.segmented_source)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: staged.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("vvc"),
+        mux_policy: direct_ingest_mux_policy("vvc", MuxTrackKind::Video),
+        width: staged.track_width,
+        height: staged.track_height,
+        sample_entry_box: staged.sample_entry_box,
+        source_edit_media_time: staged.source_edit_media_time,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(staged.samples, source_index),
     })
 }
@@ -2047,22 +2837,47 @@ fn import_raw_h265_sync(
 #[cfg(feature = "async")]
 async fn import_raw_h265_async(
     path: &Path,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
-    let staged = stage_annex_b_h265_async(path, parameters, &spec).await?;
-    let source_index = sources.add_transformed_annex_b(staged.transformed_source)?;
+    let staged = stage_annex_b_h265_async(path, &spec).await?;
+    let source_index = sources.add_segmented(staged.segmented_source)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Video,
         timescale: staged.timescale,
         language: *b"und",
-        handler_name: "VideoHandler".to_string(),
-        width: staged.width,
-        height: staged.height,
+        handler_name: direct_ingest_handler_name("h265"),
+        mux_policy: direct_ingest_mux_policy("h265", MuxTrackKind::Video),
+        width: staged.track_width,
+        height: staged.track_height,
         sample_entry_box: staged.sample_entry_box,
-        source_edit_media_time: None,
+        source_edit_media_time: staged.source_edit_media_time,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(staged.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_vvc_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let staged = stage_annex_b_vvc_async(path, &spec).await?;
+    let source_index = sources.add_segmented(staged.segmented_source)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: staged.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("vvc"),
+        mux_policy: direct_ingest_mux_policy("vvc", MuxTrackKind::Video),
+        width: staged.track_width,
+        height: staged.track_height,
+        sample_entry_box: staged.sample_entry_box,
+        source_edit_media_time: staged.source_edit_media_time,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(staged.samples, source_index),
     })
 }
@@ -2074,17 +2889,18 @@ fn import_raw_mp3_sync(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_mp3_file_sync(path, &spec)?;
-    let sample_entry_box = build_mp3_sample_entry_box(parsed.sample_rate, parsed.channel_count)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("mp3"),
+        mux_policy: direct_ingest_mux_policy("mp3", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -2097,17 +2913,18 @@ async fn import_raw_mp3_async(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_mp3_file_async(path, &spec).await?;
-    let sample_entry_box = build_mp3_sample_entry_box(parsed.sample_rate, parsed.channel_count)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("mp3"),
+        mux_policy: direct_ingest_mux_policy("mp3", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -2119,17 +2936,18 @@ fn import_raw_ac3_sync(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_ac3_file_sync(path, &spec)?;
-    let sample_entry_box = build_ac3_sample_entry_box(&parsed)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("ac3"),
+        mux_policy: direct_ingest_mux_policy("ac3", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -2142,17 +2960,18 @@ async fn import_raw_ac3_async(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_ac3_file_async(path, &spec).await?;
-    let sample_entry_box = build_ac3_sample_entry_box(&parsed)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("ac3"),
+        mux_policy: direct_ingest_mux_policy("ac3", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -2164,17 +2983,18 @@ fn import_raw_eac3_sync(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_eac3_file_sync(path, &spec)?;
-    let sample_entry_box = build_eac3_sample_entry_box(&parsed)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("ec3"),
+        mux_policy: direct_ingest_mux_policy("ec3", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -2187,64 +3007,910 @@ async fn import_raw_eac3_async(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = scan_eac3_file_async(path, &spec).await?;
-    let sample_entry_box = build_eac3_sample_entry_box(&parsed)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name("ec3"),
+        mux_policy: direct_ingest_mux_policy("ec3", MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
 
 fn import_raw_ac4_sync(
     path: &Path,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
-    let parsed = scan_ac4_file_sync(path, parameters, &spec)?;
-    let sample_entry_box = build_ac4_sample_entry_box(&parsed)?;
+    let parsed = scan_ac4_file_sync(path, &spec)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.media_time_scale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ac4"),
+        mux_policy: direct_ingest_mux_policy("ac4", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_amr_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_amr_file_sync(path, &spec)?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name(parsed.handler_label),
+        mux_policy: direct_ingest_mux_policy(parsed.handler_label, MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_amr_wb_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_amr_wb_file_sync(path, &spec)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(parsed.handler_label),
+        mux_policy: direct_ingest_mux_policy(parsed.handler_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_qcp_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_qcp_file_sync(path, &spec)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(parsed.handler_label),
+        mux_policy: direct_ingest_mux_policy(parsed.handler_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_jpeg_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_jpeg_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("jpeg"),
+        mux_policy: direct_ingest_mux_policy("jpeg", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: vec![ImportedSample {
+            source_index,
+            data_offset: 0,
+            data_size: parsed.data_size,
+            duration: 1_000,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        }],
+    })
+}
+
+fn import_raw_png_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_png_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("png"),
+        mux_policy: direct_ingest_mux_policy("png", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: vec![ImportedSample {
+            source_index,
+            data_offset: 0,
+            data_size: parsed.data_size,
+            duration: 1_000,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        }],
+    })
+}
+
+fn import_raw_dts_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_dts_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.media_timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("dts"),
+        mux_policy: direct_ingest_mux_policy("dts", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_truehd_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_truehd_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("truehd"),
+        mux_policy: direct_ingest_mux_policy("truehd", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_wave_pcm_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_pcm_file_sync(path, &spec)?;
+    let sample_rate = parsed.sample_rate;
+    let samples = imported_pcm_samples(
+        source_index,
+        parsed.data_offset,
+        parsed.frame_size,
+        parsed.frame_count,
+    )?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("pcm"),
+        mux_policy: direct_ingest_mux_policy("pcm", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples,
     })
 }
 
 #[cfg(feature = "async")]
 async fn import_raw_ac4_async(
     path: &Path,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
-    let parsed = scan_ac4_file_async(path, parameters, &spec).await?;
-    let sample_entry_box = build_ac4_sample_entry_box(&parsed)?;
+    let parsed = scan_ac4_file_async(path, &spec).await?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.media_time_scale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ac4"),
+        mux_policy: direct_ingest_mux_policy("ac4", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_amr_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_amr_file_async(path, &spec).await?;
 
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.sample_rate,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
+        handler_name: direct_ingest_handler_name(parsed.handler_label),
+        mux_policy: direct_ingest_mux_policy(parsed.handler_label, MuxTrackKind::Audio),
         width: 0,
         height: 0,
-        sample_entry_box,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_amr_wb_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_amr_wb_file_async(path, &spec).await?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(parsed.handler_label),
+        mux_policy: direct_ingest_mux_policy(parsed.handler_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_qcp_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_qcp_file_async(path, &spec).await?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(parsed.handler_label),
+        mux_policy: direct_ingest_mux_policy(parsed.handler_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_jpeg_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_jpeg_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("jpeg"),
+        mux_policy: direct_ingest_mux_policy("jpeg", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: vec![ImportedSample {
+            source_index,
+            data_offset: 0,
+            data_size: parsed.data_size,
+            duration: 1_000,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        }],
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_png_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_png_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("png"),
+        mux_policy: direct_ingest_mux_policy("png", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: vec![ImportedSample {
+            source_index,
+            data_offset: 0,
+            data_size: parsed.data_size,
+            duration: 1_000,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        }],
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_truehd_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_truehd_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("truehd"),
+        mux_policy: direct_ingest_mux_policy("truehd", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_wave_pcm_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_pcm_file_async(path, &spec).await?;
+    let sample_rate = parsed.sample_rate;
+    let samples = imported_pcm_samples(
+        source_index,
+        parsed.data_offset,
+        parsed.frame_size,
+        parsed.frame_count,
+    )?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("pcm"),
+        mux_policy: direct_ingest_mux_policy("pcm", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples,
+    })
+}
+
+fn imported_pcm_samples(
+    source_index: usize,
+    data_offset: u64,
+    frame_size: u32,
+    frame_count: u32,
+) -> Result<Vec<ImportedSample>, MuxError> {
+    let mut data_offset = data_offset;
+    let mut samples = Vec::with_capacity(
+        usize::try_from(frame_count).map_err(|_| MuxError::LayoutOverflow("PCM frame count"))?,
+    );
+    for _ in 0..frame_count {
+        samples.push(ImportedSample {
+            source_index,
+            data_offset,
+            data_size: frame_size,
+            duration: 1,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        data_offset = data_offset
+            .checked_add(u64::from(frame_size))
+            .ok_or(MuxError::LayoutOverflow("PCM frame offset"))?;
+    }
+    Ok(samples)
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_dts_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_dts_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.media_timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("dts"),
+        mux_policy: direct_ingest_mux_policy("dts", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_flac_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    if path_starts_with_sync(path, b"OggS")? {
+        return import_ogg_flac_sync(path, spec, sources);
+    }
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_flac_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("flac"),
+        mux_policy: direct_ingest_mux_policy("flac", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_flac_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    if path_starts_with_async(path, b"OggS").await? {
+        return import_ogg_flac_async(path, spec, sources).await;
+    }
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_flac_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("flac"),
+        mux_policy: direct_ingest_mux_policy("flac", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_mhas_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_mhas_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mhas"),
+        mux_policy: direct_ingest_mux_policy("mhas", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_mhas_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_mhas_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mhas"),
+        mux_policy: direct_ingest_mux_policy("mhas", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_iamf_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_iamf_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("iamf"),
+        mux_policy: direct_ingest_mux_policy("iamf", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_iamf_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_iamf_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("iamf"),
+        mux_policy: direct_ingest_mux_policy("iamf", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_ogg_flac_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_flac_file_sync(path, &spec)?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-flac"),
+        mux_policy: direct_ingest_mux_policy("ogg-flac", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_ogg_flac_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_flac_file_async(path, &spec).await?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-flac"),
+        mux_policy: direct_ingest_mux_policy("ogg-flac", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_ogg_opus_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_opus_file_sync(path, &spec)?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: 48_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-opus"),
+        mux_policy: direct_ingest_mux_policy("ogg-opus", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: parsed.edit_media_time,
+        sample_roll_distance: parsed.sample_roll_distance,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_ogg_vorbis_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_vorbis_file_sync(path, &spec)?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-vorbis"),
+        mux_policy: direct_ingest_mux_policy("ogg-vorbis", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_ogg_speex_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_speex_file_sync(path, &spec)?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-speex"),
+        mux_policy: direct_ingest_mux_policy("ogg-speex", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_ogg_theora_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_theora_file_sync(path, &spec)?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-theora"),
+        mux_policy: direct_ingest_mux_policy("ogg-theora", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_ogg_opus_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_opus_file_async(path, &spec).await?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: 48_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-opus"),
+        mux_policy: direct_ingest_mux_policy("ogg-opus", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: parsed.edit_media_time,
+        sample_roll_distance: parsed.sample_roll_distance,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_caf_alac_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_caf_alac_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("caf-alac"),
+        mux_policy: direct_ingest_mux_policy("caf-alac", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_ogg_vorbis_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_vorbis_file_async(path, &spec).await?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-vorbis"),
+        mux_policy: direct_ingest_mux_policy("ogg-vorbis", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_ogg_speex_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_speex_file_async(path, &spec).await?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-speex"),
+        mux_policy: direct_ingest_mux_policy("ogg-speex", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_ogg_theora_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_ogg_theora_file_async(path, &spec).await?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("ogg-theora"),
+        mux_policy: direct_ingest_mux_policy("ogg-theora", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_caf_alac_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_caf_alac_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Audio,
+        timescale: parsed.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("caf-alac"),
+        mux_policy: direct_ingest_mux_policy("caf-alac", MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
@@ -2252,11 +3918,16 @@ async fn import_raw_ac4_async(
 fn choose_movie_timescale(
     imported_tracks: &[ImportedTrack],
     authority_file_config: Option<&MuxFileConfig>,
+    output_layout: MuxOutputLayout,
 ) -> Result<u32, MuxError> {
     let mut common = 1_u32;
     for track in imported_tracks {
         common = lcm_u32(common, track.timescale)
             .ok_or(MuxError::LayoutOverflow("movie timescale selection"))?;
+    }
+
+    if matches!(output_layout, MuxOutputLayout::Fragmented) {
+        return Ok(common.max(1));
     }
 
     let Some(authority_file_config) = authority_file_config else {
@@ -2279,12 +3950,13 @@ fn choose_file_config(
     authority_file_config: Option<&MuxFileConfig>,
 ) -> MuxFileConfig {
     let Some(authority_file_config) = authority_file_config else {
-        return MuxFileConfig::new(movie_timescale);
+        return MuxFileConfig::new(movie_timescale).with_auto_flat_profile(true);
     };
 
     let mut config = MuxFileConfig::new(movie_timescale)
         .with_major_brand(authority_file_config.major_brand())
-        .with_minor_version(authority_file_config.minor_version());
+        .with_minor_version(authority_file_config.minor_version())
+        .with_auto_flat_profile(false);
     for brand in authority_file_config.compatible_brands() {
         config.add_compatible_brand(*brand);
     }
@@ -2294,6 +3966,27 @@ fn choose_file_config(
 fn validate_request_shape(request: &MuxRequest, output_path: &Path) -> Result<(), MuxError> {
     if request.tracks().is_empty() {
         return Err(MuxError::MissingTrackSpecs);
+    }
+    if matches!(
+        request.destination_mode(),
+        MuxDestinationMode::UpdateOrCreateDestination
+    ) {
+        if !matches!(request.output_layout(), MuxOutputLayout::Flat) {
+            return Err(MuxError::InvalidDestinationMode {
+                mode: request.destination_mode().label(),
+                message: "the current destination-path mux mode only supports flat output; use `--out PATH` for create-new fragmented output".to_string(),
+            });
+        }
+        let output_absolute = absolute_path(output_path)?;
+        for track in request.tracks() {
+            let input_absolute = absolute_path(track.input_path())?;
+            if input_absolute == output_absolute {
+                return Err(MuxError::InvalidDestinationMode {
+                    mode: request.destination_mode().label(),
+                    message: "destination-path mux mode does not accept the destination file as an explicit input track".to_string(),
+                });
+            }
+        }
     }
     match (request.output_layout(), request.duration_mode()) {
         (MuxOutputLayout::Flat, Some(duration_mode)) => {
@@ -2323,13 +4016,14 @@ fn validate_request_shape(request: &MuxRequest, output_path: &Path) -> Result<()
     let video_count = request
         .tracks()
         .iter()
-        .filter(|track| match track {
-            MuxTrackSpec::Raw { codec, .. } => codec.is_video(),
-            MuxTrackSpec::Mp4 {
-                selector: MuxMp4TrackSelector::Video,
-                ..
-            } => true,
-            _ => false,
+        .filter(|track| {
+            matches!(
+                track,
+                MuxTrackSpec::Path {
+                    selector: Some(MuxMp4TrackSelector::Video),
+                    ..
+                }
+            )
         })
         .count();
     if video_count > 1 {
@@ -2338,7 +4032,7 @@ fn validate_request_shape(request: &MuxRequest, output_path: &Path) -> Result<()
 
     let output_absolute = absolute_path(output_path)?;
     for track in request.tracks() {
-        let input_absolute = absolute_path(track.path())?;
+        let input_absolute = absolute_path(track.input_path())?;
         if input_absolute == output_absolute {
             return Err(MuxError::OutputPathConflict {
                 output: output_absolute,
@@ -2349,32 +4043,112 @@ fn validate_request_shape(request: &MuxRequest, output_path: &Path) -> Result<()
     Ok(())
 }
 
-fn display_track_spec(track: &MuxTrackSpec) -> String {
-    match track {
-        MuxTrackSpec::Raw {
-            codec,
-            path,
-            parameters,
-        } => {
-            let mut spec = format!("{}:{}", codec.prefix(), path.display());
-            if !parameters.is_empty() {
-                spec.push('#');
-                spec.push_str(&format_track_parameters(parameters));
-            }
-            spec
+fn build_destination_preserving_request(
+    request: &MuxRequest,
+    destination_path: &Path,
+) -> Result<MuxRequest, MuxError> {
+    if !matches!(
+        request.destination_mode(),
+        MuxDestinationMode::UpdateOrCreateDestination
+    ) {
+        return Err(MuxError::InvalidDestinationMode {
+            mode: request.destination_mode().label(),
+            message: "request did not opt into the destination-path mux mode".to_string(),
+        });
+    }
+    let mut tracks = Vec::with_capacity(request.tracks().len() + 1);
+    tracks.push(MuxTrackSpec::path(destination_path.to_path_buf()));
+    tracks.extend(request.tracks().iter().cloned());
+    let mut amended = MuxRequest::new(tracks)
+        .with_output_layout(request.output_layout())
+        .with_destination_mode(MuxDestinationMode::CreateNew);
+    if let Some(duration_mode) = request.duration_mode() {
+        amended = amended.with_duration_mode(duration_mode);
+    }
+    Ok(amended)
+}
+
+fn should_preserve_destination_mp4(destination_path: &Path) -> bool {
+    is_mp4_like_path(destination_path)
+}
+
+fn create_update_temp_path(
+    output_path: &Path,
+    mode: MuxDestinationMode,
+) -> Result<PathBuf, MuxError> {
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| MuxError::InvalidDestinationMode {
+            mode: mode.label(),
+            message: format!(
+                "cannot derive a temporary rewrite path for `{}`",
+                output_path.display()
+            ),
+        })?;
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| MuxError::InvalidDestinationMode {
+            mode: mode.label(),
+            message: format!(
+                "cannot derive a temporary rewrite path for `{}`",
+                output_path.display()
+            ),
+        })?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MuxError::InvalidDestinationMode {
+            mode: mode.label(),
+            message: "system clock is earlier than the Unix epoch".to_string(),
+        })?
+        .as_nanos();
+    Ok(parent.join(format!("{file_name}.mp4forge-rewrite-{stamp}.tmp")))
+}
+
+fn replace_output_path(temp_path: &Path, output_path: &Path) -> Result<(), MuxError> {
+    let backup_path = temp_path.with_extension("backup");
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path)?;
+    }
+    std::fs::rename(output_path, &backup_path)?;
+    match std::fs::rename(temp_path, output_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(())
         }
-        MuxTrackSpec::Mp4 { path, selector } => {
-            format!("{}#{}", path.display(), format_mp4_selector(*selector))
+        Err(error) => {
+            let _ = std::fs::rename(&backup_path, output_path);
+            Err(MuxError::Io(error))
         }
     }
 }
 
-fn format_track_parameters(parameters: &[MuxTrackParameter]) -> String {
-    parameters
-        .iter()
-        .map(|parameter| format!("{}={}", parameter.name(), parameter.value()))
-        .collect::<Vec<_>>()
-        .join(",")
+#[cfg(feature = "async")]
+async fn replace_output_path_async(temp_path: &Path, output_path: &Path) -> Result<(), MuxError> {
+    let backup_path = temp_path.with_extension("backup");
+    if tokio::fs::try_exists(&backup_path).await? {
+        tokio::fs::remove_file(&backup_path).await?;
+    }
+    tokio::fs::rename(output_path, &backup_path).await?;
+    match tokio::fs::rename(temp_path, output_path).await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&backup_path).await;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = tokio::fs::rename(&backup_path, output_path).await;
+            Err(MuxError::Io(error))
+        }
+    }
+}
+
+fn display_track_spec(track: &MuxTrackSpec) -> String {
+    match track {
+        MuxTrackSpec::Path { path, selector } => match selector {
+            Some(selector) => format!("{}#{}", path.display(), format_mp4_selector(*selector)),
+            None => path.display().to_string(),
+        },
+    }
 }
 
 fn format_mp4_selector(selector: MuxMp4TrackSelector) -> String {
@@ -2388,53 +4162,327 @@ fn format_mp4_selector(selector: MuxMp4TrackSelector) -> String {
     }
 }
 
+fn detect_path_track_kind_sync(path: &Path) -> Result<DetectedPathTrackKind, MuxError> {
+    let mut file = File::open(path)?;
+    let mut prefix = [0_u8; 512];
+    let read = file.read(&mut prefix)?;
+    let prefix = &prefix[..read];
+    if prefix.starts_with(b"OggS") {
+        file.seek(SeekFrom::Start(0))?;
+        return detect_ogg_track_kind_sync(&mut file);
+    }
+    if prefix.starts_with(b"caff") {
+        file.seek(SeekFrom::Start(0))?;
+        return detect_caf_track_kind_sync(&mut file);
+    }
+    if let Some(kind) = detect_id3_wrapped_audio_sync(&mut file, prefix)? {
+        return Ok(kind);
+    }
+    if let Some(kind) = detect_vobsub_track_kind_sync(path, prefix)? {
+        return Ok(kind);
+    }
+    Ok(detect_path_track_kind_from_prefix(prefix))
+}
+
+fn is_mp4_like_path(path: &Path) -> bool {
+    matches!(
+        detect_path_track_kind_sync(path),
+        Ok(DetectedPathTrackKind::Mp4)
+    )
+}
+
+#[cfg(feature = "async")]
+async fn detect_path_track_kind_async(path: &Path) -> Result<DetectedPathTrackKind, MuxError> {
+    let mut file = TokioFile::open(path).await?;
+    let mut prefix = [0_u8; 512];
+    let read = file.read(&mut prefix).await?;
+    let prefix = &prefix[..read];
+    if prefix.starts_with(b"OggS") {
+        file.seek(SeekFrom::Start(0)).await?;
+        return detect_ogg_track_kind_async(&mut file).await;
+    }
+    if prefix.starts_with(b"caff") {
+        file.seek(SeekFrom::Start(0)).await?;
+        return detect_caf_track_kind_async(&mut file).await;
+    }
+    if let Some(kind) = detect_id3_wrapped_audio_async(&mut file, prefix).await? {
+        return Ok(kind);
+    }
+    if let Some(kind) = detect_vobsub_track_kind_async(path, prefix).await? {
+        return Ok(kind);
+    }
+    Ok(detect_path_track_kind_from_prefix(prefix))
+}
+
+fn detect_vobsub_track_kind_sync(
+    path: &Path,
+    prefix: &[u8],
+) -> Result<Option<DetectedPathTrackKind>, MuxError> {
+    if detect_path_track_kind_from_prefix(prefix)
+        == DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub)
+    {
+        return Ok(Some(DetectedPathTrackKind::Container(
+            DetectedContainerPathKind::VobSub,
+        )));
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    if extension.eq_ignore_ascii_case("sub") {
+        let idx_path = path.with_extension("idx");
+        if idx_path.is_file() && path_starts_with_sync(&idx_path, b"# VobSub")? {
+            return Ok(Some(DetectedPathTrackKind::Container(
+                DetectedContainerPathKind::VobSub,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "async")]
+async fn detect_vobsub_track_kind_async(
+    path: &Path,
+    prefix: &[u8],
+) -> Result<Option<DetectedPathTrackKind>, MuxError> {
+    if detect_path_track_kind_from_prefix(prefix)
+        == DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub)
+    {
+        return Ok(Some(DetectedPathTrackKind::Container(
+            DetectedContainerPathKind::VobSub,
+        )));
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    if extension.eq_ignore_ascii_case("sub") {
+        let idx_path = path.with_extension("idx");
+        if idx_path.is_file() && path_starts_with_async(&idx_path, b"# VobSub").await? {
+            return Ok(Some(DetectedPathTrackKind::Container(
+                DetectedContainerPathKind::VobSub,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn detect_id3_wrapped_audio_sync(
+    file: &mut File,
+    prefix: &[u8],
+) -> Result<Option<DetectedPathTrackKind>, MuxError> {
+    let Some(id3_offset) = id3v2_size_from_prefix(prefix) else {
+        return Ok(None);
+    };
+    if let Some(kind) = detect_id3_wrapped_audio_from_prefix(prefix, id3_offset) {
+        return Ok(Some(kind));
+    }
+    let mut header = [0_u8; 7];
+    file.seek(SeekFrom::Start(
+        u64::try_from(id3_offset).map_err(|_| MuxError::LayoutOverflow("ID3v2 size"))?,
+    ))?;
+    let read = file.read(&mut header)?;
+    Ok(detect_id3_wrapped_audio_from_prefix(&header[..read], 0))
+}
+
+#[cfg(feature = "async")]
+async fn detect_id3_wrapped_audio_async(
+    file: &mut TokioFile,
+    prefix: &[u8],
+) -> Result<Option<DetectedPathTrackKind>, MuxError> {
+    let Some(id3_offset) = id3v2_size_from_prefix(prefix) else {
+        return Ok(None);
+    };
+    if let Some(kind) = detect_id3_wrapped_audio_from_prefix(prefix, id3_offset) {
+        return Ok(Some(kind));
+    }
+    file.seek(SeekFrom::Start(
+        u64::try_from(id3_offset).map_err(|_| MuxError::LayoutOverflow("ID3v2 size"))?,
+    ))
+    .await?;
+    let mut header = [0_u8; 7];
+    let read = file.read(&mut header).await?;
+    Ok(detect_id3_wrapped_audio_from_prefix(&header[..read], 0))
+}
+
+fn path_starts_with_sync(path: &Path, signature: &[u8]) -> Result<bool, MuxError> {
+    let mut file = File::open(path)?;
+    let mut prefix = vec![0_u8; signature.len()];
+    let read = file.read(&mut prefix)?;
+    Ok(read == signature.len() && prefix == signature)
+}
+
+#[cfg(feature = "async")]
+async fn path_starts_with_async(path: &Path, signature: &[u8]) -> Result<bool, MuxError> {
+    let mut file = TokioFile::open(path).await?;
+    let mut prefix = vec![0_u8; signature.len()];
+    let read = file.read(&mut prefix).await?;
+    Ok(read == signature.len() && prefix == signature)
+}
+
+fn import_detected_path_raw_sync(
+    path: &Path,
+    spec: &str,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    match detect_path_track_kind_sync(path)? {
+        DetectedPathTrackKind::Raw(codec) => import_detected_raw_codec_sync(path, codec, spec, sources),
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected an AVI container on the raw-import path unexpectedly".to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message:
+                    "detected an MPEG program stream on the raw-import path unexpectedly"
+                        .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message:
+                    "detected an MPEG transport stream on the raw-import path unexpectedly"
+                        .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a VobSub source on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Mp4ImportOnly(kind) => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!(
+                "path-only mux import for `{kind}` is not supported; import this family from an MP4 source with `#audio` or `#track:ID` instead"
+            ),
+        }),
+        DetectedPathTrackKind::Mp4 => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "detected an MP4-style source on the raw-import path unexpectedly".to_string(),
+        }),
+        DetectedPathTrackKind::Unknown => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AC-3, E-AC-3, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn import_detected_path_raw_async(
+    path: &Path,
+    spec: &str,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    match detect_path_track_kind_async(path).await? {
+        DetectedPathTrackKind::Raw(codec) => {
+            import_detected_raw_codec_async(path, codec, spec, sources).await
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected an AVI container on the raw-import path unexpectedly".to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message:
+                    "detected an MPEG program stream on the raw-import path unexpectedly"
+                        .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message:
+                    "detected an MPEG transport stream on the raw-import path unexpectedly"
+                        .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a VobSub source on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Mp4ImportOnly(kind) => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!(
+                "path-only mux import for `{kind}` is not supported; import this family from an MP4 source with `#audio` or `#track:ID` instead"
+            ),
+        }),
+        DetectedPathTrackKind::Mp4 => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "detected an MP4-style source on the raw-import path unexpectedly".to_string(),
+        }),
+        DetectedPathTrackKind::Unknown => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AC-3, E-AC-3, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, DTS core audio, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string(),
+        }),
+    }
+}
+
+fn import_detected_raw_codec_sync(
+    path: &Path,
+    codec: MuxRawCodec,
+    spec: &str,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    import_raw_track_sync(path, codec, spec.to_string(), sources)
+}
+
+#[cfg(feature = "async")]
+async fn import_detected_raw_codec_async(
+    path: &Path,
+    codec: MuxRawCodec,
+    spec: &str,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    import_raw_track_async(path, codec, spec.to_string(), sources).await
+}
+
 fn import_raw_track_sync(
     path: &Path,
     codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     match codec {
-        MuxRawCodec::H264 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_h264_sync(path, spec, sources)
+        MuxRawCodec::Mp4v => import_raw_mp4v_sync(path, spec, sources),
+        MuxRawCodec::H263 => import_raw_h263_sync(path, spec, sources),
+        MuxRawCodec::H264 => import_raw_h264_sync(path, spec, sources),
+        MuxRawCodec::H265 => import_raw_h265_sync(path, spec, sources),
+        MuxRawCodec::Vvc => import_raw_vvc_sync(path, spec, sources),
+        MuxRawCodec::Av1 | MuxRawCodec::Vp8 | MuxRawCodec::Vp9 | MuxRawCodec::Vp10 => {
+            import_ivf_video_sync(path, codec, spec, sources)
         }
-        MuxRawCodec::H265 => import_raw_h265_sync(path, parameters, spec, sources),
-        MuxRawCodec::Av1 | MuxRawCodec::Vp8 | MuxRawCodec::Vp9 => {
-            import_parameterized_raw_video_sync(path, codec, parameters, spec, sources)
-        }
-        MuxRawCodec::Aac => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_aac_sync(path, spec, sources)
-        }
-        MuxRawCodec::Mp3 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_mp3_sync(path, spec, sources)
-        }
-        MuxRawCodec::Ac3 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_ac3_sync(path, spec, sources)
-        }
-        MuxRawCodec::Eac3 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_eac3_sync(path, spec, sources)
-        }
-        MuxRawCodec::Ac4 => import_raw_ac4_sync(path, parameters, spec, sources),
-        MuxRawCodec::Alac
-        | MuxRawCodec::Dtsc
-        | MuxRawCodec::Dtse
-        | MuxRawCodec::Dtsh
-        | MuxRawCodec::Dtsl
-        | MuxRawCodec::Dtsm
-        | MuxRawCodec::Dtsx
-        | MuxRawCodec::Flac
-        | MuxRawCodec::Opus
-        | MuxRawCodec::Iamf
-        | MuxRawCodec::Mha1
-        | MuxRawCodec::Mhm1 => {
-            import_parameterized_raw_audio_sync(path, codec, parameters, spec, sources)
-        }
+        MuxRawCodec::Aac => import_raw_aac_sync(path, spec, sources),
+        MuxRawCodec::Latm => import_raw_latm_sync(path, spec, sources),
+        MuxRawCodec::Mp3 => import_raw_mp3_sync(path, spec, sources),
+        MuxRawCodec::Ac3 => import_raw_ac3_sync(path, spec, sources),
+        MuxRawCodec::Eac3 => import_raw_eac3_sync(path, spec, sources),
+        MuxRawCodec::Ac4 => import_raw_ac4_sync(path, spec, sources),
+        MuxRawCodec::Amr => import_raw_amr_sync(path, spec, sources),
+        MuxRawCodec::AmrWb => import_raw_amr_wb_sync(path, spec, sources),
+        MuxRawCodec::Qcp => import_raw_qcp_sync(path, spec, sources),
+        MuxRawCodec::Jpeg => import_raw_jpeg_sync(path, spec, sources),
+        MuxRawCodec::Png => import_raw_png_sync(path, spec, sources),
+        MuxRawCodec::Pcm => import_wave_pcm_sync(path, spec, sources),
+        MuxRawCodec::Dts => import_raw_dts_sync(path, spec, sources),
+        MuxRawCodec::Truehd => import_raw_truehd_sync(path, spec, sources),
+        MuxRawCodec::Alac => import_caf_alac_sync(path, spec, sources),
+        MuxRawCodec::Flac => import_raw_flac_sync(path, spec, sources),
+        MuxRawCodec::Iamf => import_raw_iamf_sync(path, spec, sources),
+        MuxRawCodec::MpegH => import_raw_mhas_sync(path, spec, sources),
+        MuxRawCodec::Opus => import_ogg_opus_sync(path, spec, sources),
+        MuxRawCodec::Vorbis => import_ogg_vorbis_sync(path, spec, sources),
+        MuxRawCodec::Speex => import_ogg_speex_sync(path, spec, sources),
+        MuxRawCodec::Theora => import_ogg_theora_sync(path, spec, sources),
     }
 }
 
@@ -2442,198 +4490,70 @@ fn import_raw_track_sync(
 async fn import_raw_track_async(
     path: &Path,
     codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     match codec {
-        MuxRawCodec::H264 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_h264_async(path, spec, sources).await
+        MuxRawCodec::Mp4v => import_raw_mp4v_async(path, spec, sources).await,
+        MuxRawCodec::H263 => import_raw_h263_async(path, spec, sources).await,
+        MuxRawCodec::H264 => import_raw_h264_async(path, spec, sources).await,
+        MuxRawCodec::H265 => import_raw_h265_async(path, spec, sources).await,
+        MuxRawCodec::Vvc => import_raw_vvc_async(path, spec, sources).await,
+        MuxRawCodec::Av1 | MuxRawCodec::Vp8 | MuxRawCodec::Vp9 | MuxRawCodec::Vp10 => {
+            import_ivf_video_async(path, codec, spec, sources).await
         }
-        MuxRawCodec::H265 => import_raw_h265_async(path, parameters, spec, sources).await,
-        MuxRawCodec::Av1 | MuxRawCodec::Vp8 | MuxRawCodec::Vp9 => {
-            import_parameterized_raw_video_async(path, codec, parameters, spec, sources).await
-        }
-        MuxRawCodec::Aac => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_aac_async(path, spec, sources).await
-        }
-        MuxRawCodec::Mp3 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_mp3_async(path, spec, sources).await
-        }
-        MuxRawCodec::Ac3 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_ac3_async(path, spec, sources).await
-        }
-        MuxRawCodec::Eac3 => {
-            validate_no_raw_track_parameters(codec, parameters, &spec)?;
-            import_raw_eac3_async(path, spec, sources).await
-        }
-        MuxRawCodec::Ac4 => import_raw_ac4_async(path, parameters, spec, sources).await,
-        MuxRawCodec::Alac
-        | MuxRawCodec::Dtsc
-        | MuxRawCodec::Dtse
-        | MuxRawCodec::Dtsh
-        | MuxRawCodec::Dtsl
-        | MuxRawCodec::Dtsm
-        | MuxRawCodec::Dtsx
-        | MuxRawCodec::Flac
-        | MuxRawCodec::Opus
-        | MuxRawCodec::Iamf
-        | MuxRawCodec::Mha1
-        | MuxRawCodec::Mhm1 => {
-            import_parameterized_raw_audio_async(path, codec, parameters, spec, sources).await
-        }
+        MuxRawCodec::Aac => import_raw_aac_async(path, spec, sources).await,
+        MuxRawCodec::Latm => import_raw_latm_async(path, spec, sources).await,
+        MuxRawCodec::Mp3 => import_raw_mp3_async(path, spec, sources).await,
+        MuxRawCodec::Ac3 => import_raw_ac3_async(path, spec, sources).await,
+        MuxRawCodec::Eac3 => import_raw_eac3_async(path, spec, sources).await,
+        MuxRawCodec::Ac4 => import_raw_ac4_async(path, spec, sources).await,
+        MuxRawCodec::Amr => import_raw_amr_async(path, spec, sources).await,
+        MuxRawCodec::AmrWb => import_raw_amr_wb_async(path, spec, sources).await,
+        MuxRawCodec::Qcp => import_raw_qcp_async(path, spec, sources).await,
+        MuxRawCodec::Jpeg => import_raw_jpeg_async(path, spec, sources).await,
+        MuxRawCodec::Png => import_raw_png_async(path, spec, sources).await,
+        MuxRawCodec::Pcm => import_wave_pcm_async(path, spec, sources).await,
+        MuxRawCodec::Dts => import_raw_dts_async(path, spec, sources).await,
+        MuxRawCodec::Truehd => import_raw_truehd_async(path, spec, sources).await,
+        MuxRawCodec::Alac => import_caf_alac_async(path, spec, sources).await,
+        MuxRawCodec::Flac => import_raw_flac_async(path, spec, sources).await,
+        MuxRawCodec::Iamf => import_raw_iamf_async(path, spec, sources).await,
+        MuxRawCodec::MpegH => import_raw_mhas_async(path, spec, sources).await,
+        MuxRawCodec::Opus => import_ogg_opus_async(path, spec, sources).await,
+        MuxRawCodec::Vorbis => import_ogg_vorbis_async(path, spec, sources).await,
+        MuxRawCodec::Speex => import_ogg_speex_async(path, spec, sources).await,
+        MuxRawCodec::Theora => import_ogg_theora_async(path, spec, sources).await,
     }
 }
 
-fn validate_no_raw_track_parameters(
-    codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<(), MuxError> {
-    if parameters.is_empty() {
-        return Ok(());
-    }
-    Err(MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!(
-            "raw `{}` imports do not accept `#name=value` parameters yet",
-            codec.prefix()
-        ),
-    })
-}
-
-fn collect_raw_track_parameters(
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<BTreeMap<String, String>, MuxError> {
-    let mut collected = BTreeMap::new();
-    for parameter in parameters {
-        let name = parameter.name().to_string();
-        if collected
-            .insert(name.clone(), parameter.value().to_string())
-            .is_some()
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("duplicate raw track parameter `{name}`"),
-            });
-        }
-    }
-    Ok(collected)
-}
-
-fn take_optional_raw_parameter(
-    parameters: &mut BTreeMap<String, String>,
-    name: &str,
-) -> Option<String> {
-    parameters.remove(name)
-}
-
-fn take_required_raw_parameter(
-    parameters: &mut BTreeMap<String, String>,
-    codec: MuxRawCodec,
-    name: &str,
-    spec: &str,
-) -> Result<String, MuxError> {
-    take_optional_raw_parameter(parameters, name).ok_or_else(|| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!(
-            "raw `{}` imports require the `{name}` parameter",
-            codec.prefix()
-        ),
-    })
-}
-
-fn take_optional_raw_u32_parameter(
-    parameters: &mut BTreeMap<String, String>,
-    codec: MuxRawCodec,
-    name: &str,
-    spec: &str,
-) -> Result<Option<u32>, MuxError> {
-    let Some(value) = take_optional_raw_parameter(parameters, name) else {
-        return Ok(None);
-    };
-    Ok(Some(parse_raw_u32_parameter(codec, name, &value, spec)?))
-}
-
-fn take_required_raw_u32_parameter(
-    parameters: &mut BTreeMap<String, String>,
-    codec: MuxRawCodec,
-    name: &str,
-    spec: &str,
-) -> Result<u32, MuxError> {
-    let value = take_required_raw_parameter(parameters, codec, name, spec)?;
-    parse_raw_u32_parameter(codec, name, &value, spec)
-}
-
-fn parse_raw_u32_parameter(
-    codec: MuxRawCodec,
-    name: &str,
-    value: &str,
-    spec: &str,
-) -> Result<u32, MuxError> {
-    let parsed = value
-        .parse::<u32>()
-        .map_err(|_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!(
-                "raw `{}` parameter `{name}` must be a non-negative integer, not `{value}`",
-                codec.prefix()
-            ),
-        })?;
-    if parsed == 0 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!(
-                "raw `{}` parameter `{name}` must be non-zero",
-                codec.prefix()
-            ),
-        });
-    }
-    Ok(parsed)
-}
-
-fn parse_hex_parameter_bytes(
-    codec: MuxRawCodec,
-    name: &str,
-    value: &str,
-    spec: &str,
-) -> Result<Vec<u8>, MuxError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!(
-                "raw `{}` parameter `{name}` must contain an even number of hexadecimal digits",
-                codec.prefix()
-            ),
-        });
-    }
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    let rendered = value.as_bytes();
-    for index in (0..rendered.len()).step_by(2) {
-        let pair = &value[index..index + 2];
-        bytes.push(
-            u8::from_str_radix(pair, 16).map_err(|_| MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!(
-                    "raw `{}` parameter `{name}` contains invalid hexadecimal byte `{pair}`",
-                    codec.prefix()
-                ),
-            })?,
-        );
-    }
-    Ok(bytes)
-}
-
-fn build_generic_visual_sample_entry_box(
+pub(in crate::mux) fn build_visual_sample_entry_box(
     sample_entry_type: FourCc,
     width: u16,
     height: u16,
+    child_boxes: &[Vec<u8>],
 ) -> Result<Vec<u8>, MuxError> {
+    build_visual_sample_entry_box_with_compressor_name(
+        sample_entry_type,
+        width,
+        height,
+        &[],
+        child_boxes,
+    )
+}
+
+pub(in crate::mux) fn build_visual_sample_entry_box_with_compressor_name(
+    sample_entry_type: FourCc,
+    width: u16,
+    height: u16,
+    compressor_name: &[u8],
+    child_boxes: &[Vec<u8>],
+) -> Result<Vec<u8>, MuxError> {
+    let mut compressorname = [0_u8; 32];
+    let visible_len = compressor_name.len().min(31);
+    compressorname[0] =
+        u8::try_from(visible_len).map_err(|_| MuxError::LayoutOverflow("compressor name"))?;
+    compressorname[1..1 + visible_len].copy_from_slice(&compressor_name[..visible_len]);
     super::mp4::encode_typed_box(
         &VisualSampleEntry {
             sample_entry: SampleEntry {
@@ -2645,15 +4565,16 @@ fn build_generic_visual_sample_entry_box(
             horizresolution: 72_u32 << 16,
             vertresolution: 72_u32 << 16,
             frame_count: 1,
+            compressorname,
             depth: 0x0018,
             pre_defined3: -1,
             ..VisualSampleEntry::default()
         },
-        &[],
+        &child_boxes.concat(),
     )
 }
 
-fn build_generic_audio_sample_entry_box(
+pub(in crate::mux) fn build_generic_audio_sample_entry_box(
     sample_entry_type: FourCc,
     sample_rate: u32,
     channel_count: u16,
@@ -2675,283 +4596,227 @@ fn build_generic_audio_sample_entry_box(
     )
 }
 
-fn build_parameterized_raw_audio_sample_entry_children(
-    codec: MuxRawCodec,
-    sample_rate: u32,
-    sample_size: u16,
-) -> Result<Vec<Vec<u8>>, MuxError> {
-    if matches!(
-        codec,
-        MuxRawCodec::Dtsc
-            | MuxRawCodec::Dtse
-            | MuxRawCodec::Dtsh
-            | MuxRawCodec::Dtsl
-            | MuxRawCodec::Dtsm
-            | MuxRawCodec::Dtsx
-    ) {
-        return Ok(vec![build_ddts_box(sample_rate, sample_size)?]);
+pub(in crate::mux) fn build_generic_media_sample_entry_box(
+    sample_entry_type: FourCc,
+    child_boxes: &[Vec<u8>],
+) -> Result<Vec<u8>, MuxError> {
+    super::mp4::encode_typed_box(
+        &GenericMediaSampleEntry {
+            sample_entry: SampleEntry {
+                box_type: sample_entry_type,
+                data_reference_index: 1,
+            },
+        },
+        &child_boxes.concat(),
+    )
+}
+
+pub(in crate::mux) fn build_btrt_from_sample_sizes<I>(
+    samples: I,
+    timescale: u32,
+) -> Result<Btrt, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    if timescale == 0 {
+        return Ok(Btrt::default());
     }
-    Ok(Vec::new())
-}
 
-fn build_ddts_box(sample_rate: u32, sample_size: u16) -> Result<Vec<u8>, MuxError> {
-    let pcm_sample_depth =
-        u8::try_from(sample_size).map_err(|_| MuxError::LayoutOverflow("ddts pcm sample depth"))?;
-    let mut payload = Vec::with_capacity(20);
-    payload.extend_from_slice(&sample_rate.to_be_bytes());
-    payload.extend_from_slice(&0_u32.to_be_bytes());
-    payload.extend_from_slice(&0_u32.to_be_bytes());
-    payload.push(pcm_sample_depth);
-    payload.extend_from_slice(&DDTS_EXTRA_DATA);
-    super::mp4::encode_raw_box(DDTS, &payload)
-}
-
-fn parameterized_raw_video_sample_entry_type(codec: MuxRawCodec) -> FourCc {
-    match codec {
-        MuxRawCodec::Av1 => AV01,
-        MuxRawCodec::Vp8 => VP08,
-        MuxRawCodec::Vp9 => VP09,
-        _ => unreachable!("only parameterized raw video codecs use this helper"),
+    let mut saw_sample = false;
+    let mut buffer_size_db = 0_u32;
+    let mut total_payload_bytes = 0_u64;
+    let mut total_duration = 0_u64;
+    let mut max_window_payload_bytes = 0_u64;
+    let mut current_window_payload_bytes = 0_u64;
+    let mut window_start_decode_time = 0_u64;
+    let mut sample_decode_time = 0_u64;
+    for (data_size, duration) in samples {
+        saw_sample = true;
+        buffer_size_db = buffer_size_db.max(data_size);
+        total_payload_bytes = total_payload_bytes
+            .checked_add(u64::from(data_size))
+            .ok_or(MuxError::LayoutOverflow("audio total payload bytes"))?;
+        total_duration = total_duration
+            .checked_add(u64::from(duration))
+            .ok_or(MuxError::LayoutOverflow("audio total duration"))?;
+        current_window_payload_bytes = current_window_payload_bytes
+            .checked_add(u64::from(data_size))
+            .ok_or(MuxError::LayoutOverflow("audio bitrate window payload"))?;
+        if sample_decode_time > window_start_decode_time.saturating_add(u64::from(timescale)) {
+            max_window_payload_bytes = max_window_payload_bytes.max(current_window_payload_bytes);
+            window_start_decode_time = sample_decode_time;
+            current_window_payload_bytes = 0;
+        }
+        sample_decode_time = sample_decode_time
+            .checked_add(u64::from(duration))
+            .ok_or(MuxError::LayoutOverflow("audio decode time"))?;
     }
-}
-
-fn parameterized_raw_audio_sample_entry_type(codec: MuxRawCodec) -> FourCc {
-    match codec {
-        MuxRawCodec::Alac => ALAC,
-        MuxRawCodec::Dtsc => DTSC,
-        MuxRawCodec::Dtse => DTSE,
-        MuxRawCodec::Dtsh => DTSH,
-        MuxRawCodec::Dtsl => DTSL,
-        MuxRawCodec::Dtsm => DTSM,
-        MuxRawCodec::Dtsx => DTSX,
-        MuxRawCodec::Flac => FLAC_ENTRY,
-        MuxRawCodec::Opus => OPUS_ENTRY,
-        MuxRawCodec::Iamf => IAMF_ENTRY,
-        MuxRawCodec::Mha1 => MHA1,
-        MuxRawCodec::Mhm1 => MHM1,
-        _ => unreachable!("only parameterized raw audio codecs use this helper"),
+    if !saw_sample || total_duration == 0 {
+        return Ok(Btrt::default());
     }
+
+    let avg_bitrate = total_payload_bytes
+        .checked_mul(8)
+        .and_then(|bits| bits.checked_mul(u64::from(timescale)))
+        .ok_or(MuxError::LayoutOverflow("audio average bitrate"))?
+        / total_duration;
+    let avg_bitrate = avg_bitrate & !7;
+
+    let max_bitrate = if max_window_payload_bytes == 0 {
+        avg_bitrate
+    } else {
+        max_window_payload_bytes
+            .checked_mul(8)
+            .ok_or(MuxError::LayoutOverflow("audio maximum bitrate"))?
+    };
+
+    Ok(Btrt {
+        buffer_size_db,
+        max_bitrate: u32::try_from(max_bitrate)
+            .map_err(|_| MuxError::LayoutOverflow("audio maximum bitrate"))?,
+        avg_bitrate: u32::try_from(avg_bitrate)
+            .map_err(|_| MuxError::LayoutOverflow("audio average bitrate"))?,
+    })
 }
 
-fn import_parameterized_raw_video_sync(
+fn import_ivf_video_sync(
     path: &Path,
     codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
-    let data_size = std::fs::metadata(path)?.len();
-    import_parameterized_raw_video_from_file(path, data_size, codec, parameters, spec, sources)
-}
-
-#[cfg(feature = "async")]
-async fn import_parameterized_raw_video_async(
-    path: &Path,
-    codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
-    spec: String,
-    sources: &mut SourceCatalog,
-) -> Result<ImportedTrack, MuxError> {
-    let data_size = tokio::fs::metadata(path).await?.len();
-    import_parameterized_raw_video_from_file(path, data_size, codec, parameters, spec, sources)
-}
-
-fn import_parameterized_raw_video_from_file(
-    path: &Path,
-    data_size: u64,
-    codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
-    spec: String,
-    sources: &mut SourceCatalog,
-) -> Result<ImportedTrack, MuxError> {
-    if data_size == 0 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.clone(),
-            message: format!("raw `{}` input contained no sample bytes", codec.prefix()),
-        });
-    }
-
-    let mut parameters = collect_raw_track_parameters(parameters, &spec)?;
-    let width = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        codec,
-        "width",
-        &spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.clone(),
-        message: format!(
-            "raw `{}` parameter `width` does not fit in u16",
-            codec.prefix()
-        ),
-    })?;
-    let height = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        codec,
-        "height",
-        &spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.clone(),
-        message: format!(
-            "raw `{}` parameter `height` does not fit in u16",
-            codec.prefix()
-        ),
-    })?;
-    let timescale = take_optional_raw_u32_parameter(&mut parameters, codec, "timescale", &spec)?
-        .unwrap_or(1_000);
-    let sample_duration =
-        take_optional_raw_u32_parameter(&mut parameters, codec, "sample_duration", &spec)?
-            .unwrap_or(timescale);
-    reject_unknown_raw_parameters(codec, &spec, &parameters)?;
-
     let source_index = sources.add_file(path)?;
-    let sample_entry_box = build_generic_visual_sample_entry_box(
-        parameterized_raw_video_sample_entry_type(codec),
-        width,
-        height,
-    )?;
-    let data_size = u32::try_from(data_size)
-        .map_err(|_| MuxError::LayoutOverflow("parameterized raw video sample size"))?;
-
+    let parsed = match codec {
+        MuxRawCodec::Av1 => scan_av1_file_sync(path, &spec)?,
+        MuxRawCodec::Vp8 => scan_vp8_file_sync(path, &spec)?,
+        MuxRawCodec::Vp9 => scan_vp9_file_sync(path, &spec)?,
+        MuxRawCodec::Vp10 => scan_vp10_file_sync(path, &spec)?,
+        _ => unreachable!("only IVF-backed codecs use this import helper"),
+    };
     Ok(ImportedTrack {
         kind: MuxTrackKind::Video,
-        timescale,
+        timescale: parsed.timescale,
         language: *b"und",
-        handler_name: "VideoHandler".to_string(),
-        width,
-        height,
-        sample_entry_box,
+        handler_name: direct_ingest_handler_name(match codec {
+            MuxRawCodec::Av1 => "av1",
+            MuxRawCodec::Vp8 => "vp8",
+            MuxRawCodec::Vp9 => "vp9",
+            MuxRawCodec::Vp10 => "vp10",
+            _ => unreachable!("only IVF-backed codecs use this import helper"),
+        }),
+        mux_policy: direct_ingest_mux_policy(
+            match codec {
+                MuxRawCodec::Av1 => "av1",
+                MuxRawCodec::Vp8 => "vp8",
+                MuxRawCodec::Vp9 => "vp9",
+                MuxRawCodec::Vp10 => "vp10",
+                _ => unreachable!("only IVF-backed codecs use this import helper"),
+            },
+            MuxTrackKind::Video,
+        ),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
-        samples: vec![ImportedSample {
-            source_index,
-            data_offset: 0,
-            data_size,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        }],
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
     })
-}
-
-fn import_parameterized_raw_audio_sync(
-    path: &Path,
-    codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
-    spec: String,
-    sources: &mut SourceCatalog,
-) -> Result<ImportedTrack, MuxError> {
-    let data_size = std::fs::metadata(path)?.len();
-    import_parameterized_raw_audio_from_file(path, data_size, codec, parameters, spec, sources)
 }
 
 #[cfg(feature = "async")]
-async fn import_parameterized_raw_audio_async(
+async fn import_ivf_video_async(
     path: &Path,
     codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
-    let data_size = tokio::fs::metadata(path).await?.len();
-    import_parameterized_raw_audio_from_file(path, data_size, codec, parameters, spec, sources)
-}
-
-fn import_parameterized_raw_audio_from_file(
-    path: &Path,
-    data_size: u64,
-    codec: MuxRawCodec,
-    parameters: &[MuxTrackParameter],
-    spec: String,
-    sources: &mut SourceCatalog,
-) -> Result<ImportedTrack, MuxError> {
-    if data_size == 0 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.clone(),
-            message: format!("raw `{}` input contained no sample bytes", codec.prefix()),
-        });
-    }
-
-    let mut parameters = collect_raw_track_parameters(parameters, &spec)?;
-    let sample_rate =
-        take_required_raw_u32_parameter(&mut parameters, codec, "sample_rate", &spec)?;
-    let channel_count = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        codec,
-        "channel_count",
-        &spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.clone(),
-        message: format!(
-            "raw `{}` parameter `channel_count` does not fit in u16",
-            codec.prefix()
-        ),
-    })?;
-    let sample_duration =
-        take_optional_raw_u32_parameter(&mut parameters, codec, "sample_duration", &spec)?
-            .unwrap_or(sample_rate);
-    let sample_size =
-        match take_optional_raw_u32_parameter(&mut parameters, codec, "sample_size", &spec)? {
-            Some(value) => u16::try_from(value).map_err(|_| MuxError::UnsupportedTrackImport {
-                spec: spec.clone(),
-                message: format!(
-                    "raw `{}` parameter `sample_size` does not fit in u16",
-                    codec.prefix()
-                ),
-            })?,
-            None => 16,
-        };
-    reject_unknown_raw_parameters(codec, &spec, &parameters)?;
-
     let source_index = sources.add_file(path)?;
-    let sample_entry_children =
-        build_parameterized_raw_audio_sample_entry_children(codec, sample_rate, sample_size)?;
-    let sample_entry_box = build_generic_audio_sample_entry_box(
-        parameterized_raw_audio_sample_entry_type(codec),
-        sample_rate,
-        channel_count,
-        sample_size,
-        &sample_entry_children,
-    )?;
-    let data_size = u32::try_from(data_size)
-        .map_err(|_| MuxError::LayoutOverflow("parameterized raw audio sample size"))?;
-
+    let parsed = match codec {
+        MuxRawCodec::Av1 => scan_av1_file_async(path, &spec).await?,
+        MuxRawCodec::Vp8 => scan_vp8_file_async(path, &spec).await?,
+        MuxRawCodec::Vp9 => scan_vp9_file_async(path, &spec).await?,
+        MuxRawCodec::Vp10 => scan_vp10_file_async(path, &spec).await?,
+        _ => unreachable!("only IVF-backed codecs use this import helper"),
+    };
     Ok(ImportedTrack {
-        kind: MuxTrackKind::Audio,
-        timescale: sample_rate,
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
         language: *b"und",
-        handler_name: "SoundHandler".to_string(),
-        width: 0,
-        height: 0,
-        sample_entry_box,
+        handler_name: direct_ingest_handler_name(match codec {
+            MuxRawCodec::Av1 => "av1",
+            MuxRawCodec::Vp8 => "vp8",
+            MuxRawCodec::Vp9 => "vp9",
+            MuxRawCodec::Vp10 => "vp10",
+            _ => unreachable!("only IVF-backed codecs use this import helper"),
+        }),
+        mux_policy: direct_ingest_mux_policy(
+            match codec {
+                MuxRawCodec::Av1 => "av1",
+                MuxRawCodec::Vp8 => "vp8",
+                MuxRawCodec::Vp9 => "vp9",
+                MuxRawCodec::Vp10 => "vp10",
+                _ => unreachable!("only IVF-backed codecs use this import helper"),
+            },
+            MuxTrackKind::Video,
+        ),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
         source_edit_media_time: None,
-        samples: vec![ImportedSample {
-            source_index,
-            data_offset: 0,
-            data_size,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        }],
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
     })
 }
 
-fn reject_unknown_raw_parameters(
-    codec: MuxRawCodec,
+#[derive(Clone, Copy)]
+pub(in crate::mux) struct SourceFileSpan {
+    pub(in crate::mux) source_offset: u64,
+    pub(in crate::mux) size: u32,
+}
+
+pub(in crate::mux) fn read_exact_at_sync(
+    file: &mut File,
+    offset: u64,
+    buf: &mut [u8],
     spec: &str,
-    parameters: &BTreeMap<String, String>,
+    truncated_message: &'static str,
 ) -> Result<(), MuxError> {
-    if let Some((name, _)) = parameters.iter().next() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!(
-                "raw `{}` imports do not support the `{name}` parameter",
-                codec.prefix()
-            ),
-        });
+    file.seek(SeekFrom::Start(offset))?;
+    match file.read_exact(buf) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: truncated_message.to_string(),
+            })
+        }
+        Err(error) => Err(MuxError::Io(error)),
     }
-    Ok(())
+}
+
+pub(in crate::mux) fn read_spans_sync(
+    file: &mut File,
+    spans: &[SourceFileSpan],
+    total_size: u32,
+    spec: &str,
+    truncated_message: &'static str,
+) -> Result<Vec<u8>, MuxError> {
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(total_size)
+            .map_err(|_| MuxError::LayoutOverflow("packet byte capacity"))?,
+    );
+    for span in spans {
+        let mut chunk = vec![0_u8; usize::try_from(span.size).unwrap()];
+        read_exact_at_sync(
+            file,
+            span.source_offset,
+            &mut chunk,
+            spec,
+            truncated_message,
+        )?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, MuxError> {
@@ -3275,6 +5140,7 @@ fn expand_sample_offsets(
 
 fn expand_sync_samples(
     stss: Option<&Stss>,
+    sample_entry_type: FourCc,
     sample_count: usize,
     path: &Path,
     track_id: u32,
@@ -3282,6 +5148,15 @@ fn expand_sync_samples(
     let Some(stss) = stss else {
         return Ok(vec![true; sample_count]);
     };
+    if stss.entry_count == 0
+        && matches!(
+            sample_entry_type,
+            value if value == FourCc::from_bytes(*b"vp08")
+                || value == FourCc::from_bytes(*b"vp09")
+        )
+    {
+        return Ok(vec![true; sample_count]);
+    }
     let mut sync = vec![false; sample_count];
     for sample_number in &stss.sample_number {
         let index = usize::try_from(sample_number.saturating_sub(1)).map_err(|_| {
@@ -3412,838 +5287,8 @@ where
     Ok(config)
 }
 
-struct ParsedAdtsTrack {
-    audio_object_type: u8,
-    sampling_frequency_index: u8,
-    sample_rate: u32,
-    channel_configuration: u16,
-    samples: Vec<StagedSample>,
-}
-
-fn scan_adts_file_sync(path: &Path, spec: &str) -> Result<ParsedAdtsTrack, MuxError> {
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u8, u8, u32, u16)>;
-    while offset < file_size {
-        if file_size - offset < 7 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated ADTS header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 7];
-        read_exact_at_sync(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated ADTS header",
-        )?;
-        if header[0] != 0xFF || header[1] & 0xF0 != 0xF0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing ADTS sync word at byte offset {offset}"),
-            });
-        }
-
-        let protection_absent = header[1] & 0x01 != 0;
-        let header_length = if protection_absent { 7 } else { 9 };
-        if file_size - offset < u64::from(header_length as u32) {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated ADTS header".to_string(),
-            });
-        }
-        let profile = ((header[2] >> 6) & 0x03) + 1;
-        let sampling_frequency_index = (header[2] >> 2) & 0x0F;
-        let channel_configuration = u16::from((header[2] & 0x01) << 2 | ((header[3] >> 6) & 0x03));
-        let sample_rate = adts_sample_rate(sampling_frequency_index).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!(
-                    "unsupported ADTS sampling-frequency index {sampling_frequency_index}"
-                ),
-            }
-        })?;
-        let frame_length = usize::from(
-            ((u16::from(header[3] & 0x03)) << 11)
-                | (u16::from(header[4]) << 3)
-                | u16::from(header[5] >> 5),
-        );
-        let raw_blocks = u32::from(header[6] & 0x03) + 1;
-        if frame_length < header_length
-            || offset
-                .checked_add(u64::try_from(frame_length).unwrap_or(u64::MAX))
-                .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated ADTS frame at byte offset {offset}"),
-            });
-        }
-
-        let descriptor = (
-            profile,
-            sampling_frequency_index,
-            sample_rate,
-            channel_configuration,
-        );
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message:
-                        "AAC frames changed profile, sample rate, or channel layout mid-stream"
-                            .to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-
-        let payload_size = frame_length - header_length;
-        samples.push(StagedSample {
-            data_offset: offset + u64::from(header_length as u32),
-            data_size: u32::try_from(payload_size)
-                .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
-            duration: 1024 * raw_blocks,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(
-                u64::try_from(frame_length)
-                    .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
-            )
-            .ok_or(MuxError::LayoutOverflow("AAC frame offset"))?;
-    }
-    let (audio_object_type, sampling_frequency_index, sample_rate, channel_configuration) =
-        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AAC input contained no ADTS frames".to_string(),
-        })?;
-    Ok(ParsedAdtsTrack {
-        audio_object_type,
-        sampling_frequency_index,
-        sample_rate,
-        channel_configuration,
-        samples,
-    })
-}
-
 #[cfg(feature = "async")]
-async fn scan_adts_file_async(path: &Path, spec: &str) -> Result<ParsedAdtsTrack, MuxError> {
-    let mut file = TokioFile::open(path).await?;
-    let file_size = file.metadata().await?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u8, u8, u32, u16)>;
-    while offset < file_size {
-        if file_size - offset < 7 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated ADTS header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 7];
-        read_exact_at_async(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated ADTS header",
-        )
-        .await?;
-        if header[0] != 0xFF || header[1] & 0xF0 != 0xF0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing ADTS sync word at byte offset {offset}"),
-            });
-        }
-
-        let protection_absent = header[1] & 0x01 != 0;
-        let header_length = if protection_absent { 7 } else { 9 };
-        if file_size - offset < u64::from(header_length as u32) {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated ADTS header".to_string(),
-            });
-        }
-        let profile = ((header[2] >> 6) & 0x03) + 1;
-        let sampling_frequency_index = (header[2] >> 2) & 0x0F;
-        let channel_configuration = u16::from((header[2] & 0x01) << 2 | ((header[3] >> 6) & 0x03));
-        let sample_rate = adts_sample_rate(sampling_frequency_index).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!(
-                    "unsupported ADTS sampling-frequency index {sampling_frequency_index}"
-                ),
-            }
-        })?;
-        let frame_length = usize::from(
-            ((u16::from(header[3] & 0x03)) << 11)
-                | (u16::from(header[4]) << 3)
-                | u16::from(header[5] >> 5),
-        );
-        let raw_blocks = u32::from(header[6] & 0x03) + 1;
-        if frame_length < header_length
-            || offset
-                .checked_add(u64::try_from(frame_length).unwrap_or(u64::MAX))
-                .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated ADTS frame at byte offset {offset}"),
-            });
-        }
-
-        let descriptor = (
-            profile,
-            sampling_frequency_index,
-            sample_rate,
-            channel_configuration,
-        );
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message:
-                        "AAC frames changed profile, sample rate, or channel layout mid-stream"
-                            .to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-
-        let payload_size = frame_length - header_length;
-        samples.push(StagedSample {
-            data_offset: offset + u64::from(header_length as u32),
-            data_size: u32::try_from(payload_size)
-                .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
-            duration: 1024 * raw_blocks,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(
-                u64::try_from(frame_length)
-                    .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
-            )
-            .ok_or(MuxError::LayoutOverflow("AAC frame offset"))?;
-    }
-
-    let (audio_object_type, sampling_frequency_index, sample_rate, channel_configuration) =
-        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AAC input contained no ADTS frames".to_string(),
-        })?;
-    Ok(ParsedAdtsTrack {
-        audio_object_type,
-        sampling_frequency_index,
-        sample_rate,
-        channel_configuration,
-        samples,
-    })
-}
-
-fn build_aac_sample_entry_box(
-    audio_object_type: u8,
-    sampling_frequency_index: u8,
-    channel_configuration: u16,
-    sample_rate: u32,
-) -> Result<Vec<u8>, MuxError> {
-    let mut mp4a = AudioSampleEntry::default();
-    mp4a.set_box_type(FourCc::from_bytes(*b"mp4a"));
-    mp4a.sample_entry = SampleEntry {
-        box_type: FourCc::from_bytes(*b"mp4a"),
-        data_reference_index: 1,
-    };
-    mp4a.channel_count = channel_configuration;
-    mp4a.sample_size = 16;
-    mp4a.sample_rate = sample_rate << 16;
-
-    super::mp4::encode_typed_box(
-        &mp4a,
-        &super::mp4::encode_typed_box(
-            &aac_profile_esds(
-                audio_object_type,
-                sampling_frequency_index,
-                channel_configuration,
-            ),
-            &[],
-        )?,
-    )
-}
-
-const fn adts_sample_rate(index: u8) -> Option<u32> {
-    match index {
-        0 => Some(96_000),
-        1 => Some(88_200),
-        2 => Some(64_000),
-        3 => Some(48_000),
-        4 => Some(44_100),
-        5 => Some(32_000),
-        6 => Some(24_000),
-        7 => Some(22_050),
-        8 => Some(16_000),
-        9 => Some(12_000),
-        10 => Some(11_025),
-        11 => Some(8_000),
-        12 => Some(7_350),
-        _ => None,
-    }
-}
-
-fn aac_profile_esds(
-    audio_object_type: u8,
-    sampling_frequency_index: u8,
-    channel_configuration: u16,
-) -> Esds {
-    let audio_specific_config = build_aac_audio_specific_config(
-        audio_object_type,
-        sampling_frequency_index,
-        channel_configuration,
-    );
-    let mut esds = Esds::default();
-    esds.descriptors = vec![
-        Descriptor {
-            tag: DECODER_CONFIG_DESCRIPTOR_TAG,
-            size: 13,
-            decoder_config_descriptor: Some(DecoderConfigDescriptor {
-                object_type_indication: 0x40,
-                stream_type: 5,
-                reserved: true,
-                ..DecoderConfigDescriptor::default()
-            }),
-            ..Descriptor::default()
-        },
-        Descriptor {
-            tag: DECODER_SPECIFIC_INFO_TAG,
-            size: audio_specific_config.len() as u32,
-            data: audio_specific_config,
-            ..Descriptor::default()
-        },
-    ];
-    esds
-}
-
-fn build_aac_audio_specific_config(
-    audio_object_type: u8,
-    sampling_frequency_index: u8,
-    channel_configuration: u16,
-) -> Vec<u8> {
-    let config = ((u16::from(audio_object_type) & 0x1F) << 11)
-        | ((u16::from(sampling_frequency_index) & 0x0F) << 7)
-        | ((channel_configuration & 0x0F) << 3);
-    vec![(config >> 8) as u8, (config & 0xFF) as u8]
-}
-
-fn mpeg_audio_esds(object_type_indication: u8) -> Esds {
-    let mut esds = Esds::default();
-    esds.descriptors = vec![Descriptor {
-        tag: DECODER_CONFIG_DESCRIPTOR_TAG,
-        size: 13,
-        decoder_config_descriptor: Some(DecoderConfigDescriptor {
-            object_type_indication,
-            stream_type: 5,
-            reserved: true,
-            ..DecoderConfigDescriptor::default()
-        }),
-        ..Descriptor::default()
-    }];
-    esds
-}
-
-struct ParsedMp3Track {
-    sample_rate: u32,
-    channel_count: u16,
-    samples: Vec<StagedSample>,
-}
-
-fn scan_mp3_file_sync(path: &Path, spec: &str) -> Result<ParsedMp3Track, MuxError> {
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u32, u16, u32)>;
-    while offset < file_size {
-        if let Some(next_offset) = skip_id3v2_tag_sync(&mut file, file_size, offset, spec)? {
-            offset = next_offset;
-            continue;
-        }
-        if skip_trailing_id3v1_tag_offset(file_size, offset, &mut file)? {
-            break;
-        }
-        if file_size - offset < 4 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated MP3 frame header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 4];
-        read_exact_at_sync(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated MP3 frame header",
-        )?;
-        if header[0] != 0xFF || header[1] & 0xE0 != 0xE0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing MP3 sync word at byte offset {offset}"),
-            });
-        }
-        let version_id = (header[1] >> 3) & 0x03;
-        if version_id == 0x01 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("reserved MP3 MPEG version at byte offset {offset}"),
-            });
-        }
-        let layer = (header[1] >> 1) & 0x03;
-        if layer != 0x01 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "the current raw MP3 mux importer only supports MPEG Layer III frames"
-                    .to_string(),
-            });
-        }
-        let bitrate_index = (header[2] >> 4) & 0x0F;
-        if bitrate_index == 0 || bitrate_index == 0x0F {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported MP3 bitrate index {bitrate_index}"),
-            });
-        }
-        let sample_rate_index = (header[2] >> 2) & 0x03;
-        let sample_rate = mp3_sample_rate(version_id, sample_rate_index).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported MP3 sample-rate index {sample_rate_index}"),
-            }
-        })?;
-        let bitrate_bps = mp3_bitrate_bps(version_id, bitrate_index).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported MP3 bitrate index {bitrate_index}"),
-            }
-        })?;
-        let padding = u32::from((header[2] >> 1) & 0x01);
-        let channel_count = if (header[3] >> 6) == 0x03 { 1 } else { 2 };
-        let sample_duration = if version_id == 0x03 { 1152 } else { 576 };
-        let frame_length = if version_id == 0x03 {
-            ((144_u32 * bitrate_bps) / sample_rate).saturating_add(padding)
-        } else {
-            ((72_u32 * bitrate_bps) / sample_rate).saturating_add(padding)
-        };
-        if frame_length < 4 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "MP3 frame length underflowed the header size".to_string(),
-            });
-        }
-        let frame_length = usize::try_from(frame_length)
-            .map_err(|_| MuxError::LayoutOverflow("MP3 frame length"))?;
-        if offset
-            .checked_add(u64::try_from(frame_length).unwrap_or(u64::MAX))
-            .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated MP3 frame at byte offset {offset}"),
-            });
-        }
-        let descriptor = (sample_rate, channel_count, sample_duration);
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: "MP3 frames changed sample rate or channel layout mid-stream"
-                        .to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: u32::try_from(frame_length)
-                .map_err(|_| MuxError::LayoutOverflow("MP3 frame size"))?,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(
-                u64::try_from(frame_length)
-                    .map_err(|_| MuxError::LayoutOverflow("MP3 frame length"))?,
-            )
-            .ok_or(MuxError::LayoutOverflow("MP3 frame offset"))?;
-    }
-
-    let (sample_rate, channel_count, _sample_duration) =
-        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "MP3 input contained no MPEG audio frames".to_string(),
-        })?;
-    Ok(ParsedMp3Track {
-        sample_rate,
-        channel_count,
-        samples,
-    })
-}
-
-#[cfg(feature = "async")]
-async fn scan_mp3_file_async(path: &Path, spec: &str) -> Result<ParsedMp3Track, MuxError> {
-    let mut file = TokioFile::open(path).await?;
-    let file_size = file.metadata().await?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u32, u16, u32)>;
-    while offset < file_size {
-        if let Some(next_offset) = skip_id3v2_tag_async(&mut file, file_size, offset, spec).await? {
-            offset = next_offset;
-            continue;
-        }
-        if skip_trailing_id3v1_tag_offset_async(file_size, offset, &mut file).await? {
-            break;
-        }
-        if file_size - offset < 4 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated MP3 frame header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 4];
-        read_exact_at_async(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated MP3 frame header",
-        )
-        .await?;
-        if header[0] != 0xFF || header[1] & 0xE0 != 0xE0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing MP3 sync word at byte offset {offset}"),
-            });
-        }
-        let version_id = (header[1] >> 3) & 0x03;
-        if version_id == 0x01 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("reserved MP3 MPEG version at byte offset {offset}"),
-            });
-        }
-        let layer = (header[1] >> 1) & 0x03;
-        if layer != 0x01 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "the current raw MP3 mux importer only supports MPEG Layer III frames"
-                    .to_string(),
-            });
-        }
-        let bitrate_index = (header[2] >> 4) & 0x0F;
-        if bitrate_index == 0 || bitrate_index == 0x0F {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported MP3 bitrate index {bitrate_index}"),
-            });
-        }
-        let sample_rate_index = (header[2] >> 2) & 0x03;
-        let sample_rate = mp3_sample_rate(version_id, sample_rate_index).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported MP3 sample-rate index {sample_rate_index}"),
-            }
-        })?;
-        let bitrate_bps = mp3_bitrate_bps(version_id, bitrate_index).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported MP3 bitrate index {bitrate_index}"),
-            }
-        })?;
-        let padding = u32::from((header[2] >> 1) & 0x01);
-        let channel_count = if (header[3] >> 6) == 0x03 { 1 } else { 2 };
-        let sample_duration = if version_id == 0x03 { 1152 } else { 576 };
-        let frame_length = if version_id == 0x03 {
-            ((144_u32 * bitrate_bps) / sample_rate).saturating_add(padding)
-        } else {
-            ((72_u32 * bitrate_bps) / sample_rate).saturating_add(padding)
-        };
-        if frame_length < 4 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "MP3 frame length underflowed the header size".to_string(),
-            });
-        }
-        let frame_length = usize::try_from(frame_length)
-            .map_err(|_| MuxError::LayoutOverflow("MP3 frame length"))?;
-        if offset
-            .checked_add(u64::try_from(frame_length).unwrap_or(u64::MAX))
-            .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated MP3 frame at byte offset {offset}"),
-            });
-        }
-        let descriptor = (sample_rate, channel_count, sample_duration);
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: "MP3 frames changed sample rate or channel layout mid-stream"
-                        .to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: u32::try_from(frame_length)
-                .map_err(|_| MuxError::LayoutOverflow("MP3 frame size"))?,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(
-                u64::try_from(frame_length)
-                    .map_err(|_| MuxError::LayoutOverflow("MP3 frame length"))?,
-            )
-            .ok_or(MuxError::LayoutOverflow("MP3 frame offset"))?;
-    }
-
-    let (sample_rate, channel_count, _sample_duration) =
-        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "MP3 input contained no MPEG audio frames".to_string(),
-        })?;
-    Ok(ParsedMp3Track {
-        sample_rate,
-        channel_count,
-        samples,
-    })
-}
-
-fn build_mp3_sample_entry_box(sample_rate: u32, channel_count: u16) -> Result<Vec<u8>, MuxError> {
-    let mut mp4a = AudioSampleEntry::default();
-    mp4a.set_box_type(FourCc::from_bytes(*b"mp4a"));
-    mp4a.sample_entry = SampleEntry {
-        box_type: FourCc::from_bytes(*b"mp4a"),
-        data_reference_index: 1,
-    };
-    mp4a.channel_count = channel_count;
-    mp4a.sample_size = 16;
-    mp4a.sample_rate = sample_rate << 16;
-
-    super::mp4::encode_typed_box(
-        &mp4a,
-        &super::mp4::encode_typed_box(&mpeg_audio_esds(0x6B), &[])?,
-    )
-}
-
-fn skip_id3v2_tag(header: &[u8], spec: &str) -> Result<Option<usize>, MuxError> {
-    if header.len() < 10 {
-        return Ok(None);
-    }
-    if &header[..3] != b"ID3" {
-        return Ok(None);
-    }
-    if header[6..10].iter().any(|byte| byte & 0x80 != 0) {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "ID3v2 tag uses a non-synchsafe size field".to_string(),
-        });
-    }
-    let tag_size = (usize::from(header[6]) << 21)
-        | (usize::from(header[7]) << 14)
-        | (usize::from(header[8]) << 7)
-        | usize::from(header[9]);
-    let footer_size = if header[5] & 0x10 != 0 { 10 } else { 0 };
-    let total_size = 10_usize
-        .checked_add(tag_size)
-        .and_then(|size| size.checked_add(footer_size))
-        .ok_or(MuxError::LayoutOverflow("ID3 tag size"))?;
-    Ok(Some(total_size))
-}
-
-fn skip_id3v2_tag_sync(
-    file: &mut File,
-    file_size: u64,
-    offset: u64,
-    spec: &str,
-) -> Result<Option<u64>, MuxError> {
-    if file_size - offset < 10 {
-        return Ok(None);
-    }
-    let mut header = [0_u8; 10];
-    read_exact_at_sync(
-        file,
-        offset,
-        &mut header,
-        spec,
-        "truncated ID3v2 tag ahead of MPEG audio frames",
-    )?;
-    skip_id3v2_tag(&header, spec)?
-        .map(|size| {
-            offset
-                .checked_add(
-                    u64::try_from(size).map_err(|_| MuxError::LayoutOverflow("ID3 tag size"))?,
-                )
-                .ok_or(MuxError::LayoutOverflow("ID3 tag offset"))
-        })
-        .transpose()
-}
-
-#[cfg(feature = "async")]
-async fn skip_id3v2_tag_async(
-    file: &mut TokioFile,
-    file_size: u64,
-    offset: u64,
-    spec: &str,
-) -> Result<Option<u64>, MuxError> {
-    if file_size - offset < 10 {
-        return Ok(None);
-    }
-    let mut header = [0_u8; 10];
-    read_exact_at_async(
-        file,
-        offset,
-        &mut header,
-        spec,
-        "truncated ID3v2 tag ahead of MPEG audio frames",
-    )
-    .await?;
-    skip_id3v2_tag(&header, spec)?
-        .map(|size| {
-            offset
-                .checked_add(
-                    u64::try_from(size).map_err(|_| MuxError::LayoutOverflow("ID3 tag size"))?,
-                )
-                .ok_or(MuxError::LayoutOverflow("ID3 tag offset"))
-        })
-        .transpose()
-}
-
-fn skip_trailing_id3v1_tag(header: &[u8]) -> bool {
-    header.len() == 128 && &header[..3] == b"TAG"
-}
-
-fn skip_trailing_id3v1_tag_offset(
-    file_size: u64,
-    offset: u64,
-    file: &mut File,
-) -> Result<bool, MuxError> {
-    if offset + 128 != file_size {
-        return Ok(false);
-    }
-    let mut tag = [0_u8; 128];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut tag)?;
-    Ok(skip_trailing_id3v1_tag(&tag))
-}
-
-#[cfg(feature = "async")]
-async fn skip_trailing_id3v1_tag_offset_async(
-    file_size: u64,
-    offset: u64,
-    file: &mut TokioFile,
-) -> Result<bool, MuxError> {
-    if offset + 128 != file_size {
-        return Ok(false);
-    }
-    let mut tag = [0_u8; 128];
-    file.seek(SeekFrom::Start(offset)).await?;
-    file.read_exact(&mut tag).await?;
-    Ok(skip_trailing_id3v1_tag(&tag))
-}
-
-const fn mp3_sample_rate(version_id: u8, sample_rate_index: u8) -> Option<u32> {
-    let base = match sample_rate_index {
-        0 => 44_100,
-        1 => 48_000,
-        2 => 32_000,
-        _ => return None,
-    };
-    match version_id {
-        0x03 => Some(base),
-        0x02 => Some(base / 2),
-        0x00 => Some(base / 4),
-        _ => None,
-    }
-}
-
-const fn mp3_bitrate_bps(version_id: u8, bitrate_index: u8) -> Option<u32> {
-    let kbps = match version_id {
-        0x03 => match bitrate_index {
-            1 => 32,
-            2 => 40,
-            3 => 48,
-            4 => 56,
-            5 => 64,
-            6 => 80,
-            7 => 96,
-            8 => 112,
-            9 => 128,
-            10 => 160,
-            11 => 192,
-            12 => 224,
-            13 => 256,
-            14 => 320,
-            _ => return None,
-        },
-        0x02 | 0x00 => match bitrate_index {
-            1 => 8,
-            2 => 16,
-            3 => 24,
-            4 => 32,
-            5 => 40,
-            6 => 48,
-            7 => 56,
-            8 => 64,
-            9 => 80,
-            10 => 96,
-            11 => 112,
-            12 => 128,
-            13 => 144,
-            14 => 160,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some(kbps * 1_000)
-}
-
-fn read_exact_at_sync(
-    file: &mut File,
-    offset: u64,
-    buf: &mut [u8],
-    spec: &str,
-    truncated_message: &'static str,
-) -> Result<(), MuxError> {
-    file.seek(SeekFrom::Start(offset))?;
-    match file.read_exact(buf) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: truncated_message.to_string(),
-            })
-        }
-        Err(error) => Err(MuxError::Io(error)),
-    }
-}
-
-#[cfg(feature = "async")]
-async fn read_exact_at_async(
+pub(in crate::mux) async fn read_exact_at_async(
     file: &mut TokioFile,
     offset: u64,
     buf: &mut [u8],
@@ -4263,2312 +5308,29 @@ async fn read_exact_at_async(
     }
 }
 
-struct IndexedAnnexBTrack {
-    transformed_source: TransformedAnnexBSourceSpec,
-    width: u16,
-    height: u16,
-    timescale: u32,
-    sample_entry_box: Vec<u8>,
-    samples: Vec<StagedSample>,
-}
-
-struct AnnexBNal {
-    source_offset: u64,
-    bytes: Vec<u8>,
-}
-
-struct ParsedH265Parameters {
-    width: u16,
-    height: u16,
-    sample_entry_type: FourCc,
-    timescale: u32,
-    sample_duration: u32,
-}
-
-struct H265StageState {
-    vps_list: Vec<Vec<u8>>,
-    sps_list: Vec<Vec<u8>>,
-    pps_list: Vec<Vec<u8>>,
-    samples: Vec<StagedSample>,
-    segments: Vec<TransformedAnnexBSegment>,
-    current_sample_offset: Option<u64>,
-    current_sample_size: u32,
-    current_sync: bool,
-    logical_size: u64,
-}
-
-impl H265StageState {
-    fn new() -> Self {
-        Self {
-            vps_list: Vec::new(),
-            sps_list: Vec::new(),
-            pps_list: Vec::new(),
-            samples: Vec::new(),
-            segments: Vec::new(),
-            current_sample_offset: None,
-            current_sample_size: 0,
-            current_sync: false,
-            logical_size: 0,
-        }
-    }
-
-    fn finish_current_sample(&mut self) {
-        if let Some(data_offset) = self.current_sample_offset.take() {
-            self.samples.push(StagedSample {
-                data_offset,
-                data_size: self.current_sample_size,
-                duration: 0,
-                composition_time_offset: 0,
-                is_sync_sample: self.current_sync,
-            });
-            self.current_sample_size = 0;
-            self.current_sync = false;
-        }
-    }
-
-    fn append_sample_nal(
-        &mut self,
-        source_offset: u64,
-        source_size: u32,
-        is_sync_sample: bool,
-    ) -> Result<(), MuxError> {
-        if self.current_sample_offset.is_none() {
-            self.current_sample_offset = Some(self.logical_size);
-        }
-        let prefix = source_size.to_be_bytes();
-        self.segments.push(TransformedAnnexBSegment {
-            logical_offset: self.logical_size,
-            data: TransformedAnnexBSegmentData::Prefix(prefix),
-        });
-        self.logical_size = self
-            .logical_size
-            .checked_add(4)
-            .ok_or(MuxError::LayoutOverflow("raw H.265 transformed payload"))?;
-        self.segments.push(TransformedAnnexBSegment {
-            logical_offset: self.logical_size,
-            data: TransformedAnnexBSegmentData::FileRange {
-                source_offset,
-                size: source_size,
-            },
-        });
-        self.current_sample_size = self
-            .current_sample_size
-            .checked_add(
-                4_u32
-                    .checked_add(source_size)
-                    .ok_or(MuxError::LayoutOverflow(
-                        "raw H.265 transformed sample size",
-                    ))?,
-            )
-            .ok_or(MuxError::LayoutOverflow("raw H.265 staged sample size"))?;
-        self.logical_size = self
-            .logical_size
-            .checked_add(u64::from(source_size))
-            .ok_or(MuxError::LayoutOverflow("raw H.265 transformed payload"))?;
-        self.current_sync |= is_sync_sample;
-        Ok(())
-    }
-}
-
-fn parse_h265_raw_parameters(
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<ParsedH265Parameters, MuxError> {
-    let mut parameters = collect_raw_track_parameters(parameters, spec)?;
-    let width = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::H265,
-        "width",
-        spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: "raw `h265` parameter `width` does not fit in u16".to_string(),
-    })?;
-    let height = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::H265,
-        "height",
-        spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: "raw `h265` parameter `height` does not fit in u16".to_string(),
-    })?;
-    let sample_entry_type = take_optional_raw_parameter(&mut parameters, "sample_entry")
-        .unwrap_or_else(|| "hvc1".into());
-    let sample_entry_type = match sample_entry_type.as_str() {
-        "hvc1" => FourCc::from_bytes(*b"hvc1"),
-        "hev1" => FourCc::from_bytes(*b"hev1"),
-        "dvh1" => DVH1,
-        "dvhe" => DVHE,
-        other => {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!(
-                    "raw `h265` parameter `sample_entry` must be `hvc1`, `hev1`, `dvh1`, or `dvhe`, not `{other}`"
-                ),
-            });
-        }
-    };
-    let timescale =
-        take_optional_raw_u32_parameter(&mut parameters, MuxRawCodec::H265, "timescale", spec)?
-            .unwrap_or(0);
-    let sample_duration = take_optional_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::H265,
-        "sample_duration",
-        spec,
-    )?
-    .unwrap_or(0);
-    reject_unknown_raw_parameters(MuxRawCodec::H265, spec, &parameters)?;
-    Ok(ParsedH265Parameters {
-        width,
-        height,
-        sample_entry_type,
-        timescale,
-        sample_duration,
-    })
-}
-
-fn stage_annex_b_h265_sync(
-    path: &Path,
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<IndexedAnnexBTrack, MuxError> {
-    let parsed_parameters = parse_h265_raw_parameters(parameters, spec)?;
-    let mut file = File::open(path)?;
-    let mut scanner = AnnexBNalScanner::default();
-    let mut state = H265StageState::new();
-    let mut chunk = [0_u8; 16 * 1024];
-
-    loop {
-        let read = file.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        scanner.push(&chunk[..read], |nal| stage_h265_nal(&mut state, nal))?;
-    }
-    scanner.finish(|nal| stage_h265_nal(&mut state, nal))?;
-    finalize_h265_staged_track(path, parsed_parameters, state, spec)
-}
-
 #[cfg(feature = "async")]
-async fn stage_annex_b_h265_async(
-    path: &Path,
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<IndexedAnnexBTrack, MuxError> {
-    let parsed_parameters = parse_h265_raw_parameters(parameters, spec)?;
-    let mut file = TokioFile::open(path).await?;
-    let mut scanner = AnnexBNalScanner::default();
-    let mut state = H265StageState::new();
-    let mut chunk = [0_u8; 16 * 1024];
-
-    loop {
-        let read = file.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        for nal in scanner.collect(&chunk[..read]) {
-            stage_h265_nal(&mut state, nal)?;
-        }
-    }
-    for nal in scanner.finish_collect() {
-        stage_h265_nal(&mut state, nal)?;
-    }
-    finalize_h265_staged_track(path, parsed_parameters, state, spec)
-}
-
-fn stage_h265_nal(state: &mut H265StageState, nal: AnnexBNal) -> Result<(), MuxError> {
-    if nal.bytes.len() < 2 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: "h265".to_string(),
-            message: "H.265 NAL units must be at least two bytes long".to_string(),
-        });
-    }
-    let nal_type = hevc_nal_type(&nal.bytes);
-    match nal_type {
-        32 => push_unique_nal(&mut state.vps_list, nal.bytes),
-        33 => push_unique_nal(&mut state.sps_list, nal.bytes),
-        34 => push_unique_nal(&mut state.pps_list, nal.bytes),
-        35 => state.finish_current_sample(),
-        _ => {
-            let nal_len = u32::try_from(nal.bytes.len())
-                .map_err(|_| MuxError::LayoutOverflow("H.265 NAL length"))?;
-            state.append_sample_nal(nal.source_offset, nal_len, is_hevc_sync_nal_type(nal_type))?;
-        }
-    }
-    Ok(())
-}
-
-fn finalize_h265_staged_track(
-    path: &Path,
-    parsed_parameters: ParsedH265Parameters,
-    mut state: H265StageState,
-    spec: &str,
-) -> Result<IndexedAnnexBTrack, MuxError> {
-    state.finish_current_sample();
-    if state.vps_list.is_empty() || state.sps_list.is_empty() || state.pps_list.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.265 input must include VPS, SPS, and PPS NAL units".to_string(),
-        });
-    }
-    if state.samples.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.265 input contained parameter sets but no media samples".to_string(),
-        });
-    }
-
-    let timescale = if parsed_parameters.timescale != 0 {
-        parsed_parameters.timescale
-    } else if state.samples.len() == 1 {
-        1
-    } else {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message:
-                "multi-sample H.265 inputs currently require explicit `timescale` and `sample_duration` parameters"
-                    .to_string(),
-        });
-    };
-    let sample_duration = if parsed_parameters.sample_duration != 0 {
-        parsed_parameters.sample_duration
-    } else if state.samples.len() == 1 {
-        1
-    } else {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message:
-                "multi-sample H.265 inputs currently require explicit `timescale` and `sample_duration` parameters"
-                    .to_string(),
-        });
-    };
-    for sample in &mut state.samples {
-        sample.duration = sample_duration;
-    }
-    let sps_info = parse_h265_sps_configuration(&state.sps_list[0], spec)?;
-    let sample_entry_box = build_h265_sample_entry_box(
-        parsed_parameters.sample_entry_type,
-        parsed_parameters.width,
-        parsed_parameters.height,
-        &sps_info,
-        &state.vps_list,
-        &state.sps_list,
-        &state.pps_list,
-    )?;
-
-    Ok(IndexedAnnexBTrack {
-        transformed_source: TransformedAnnexBSourceSpec {
-            path: path.to_path_buf(),
-            segments: state.segments,
-            total_size: state.logical_size,
-        },
-        width: parsed_parameters.width,
-        height: parsed_parameters.height,
-        timescale,
-        sample_entry_box,
-        samples: state.samples,
-    })
-}
-
-fn build_h265_sample_entry_box(
-    sample_entry_type: FourCc,
-    width: u16,
-    height: u16,
-    sps_info: &H265SpsInfo,
-    vps_list: &[Vec<u8>],
-    sps_list: &[Vec<u8>],
-    pps_list: &[Vec<u8>],
-) -> Result<Vec<u8>, MuxError> {
-    let mut sample_entry = VisualSampleEntry::default();
-    sample_entry.set_box_type(sample_entry_type);
-    sample_entry.sample_entry = SampleEntry {
-        box_type: sample_entry_type,
-        data_reference_index: 1,
-    };
-    sample_entry.width = width;
-    sample_entry.height = height;
-    sample_entry.horizresolution = 72_u32 << 16;
-    sample_entry.vertresolution = 72_u32 << 16;
-    sample_entry.frame_count = 1;
-    sample_entry.depth = 0x0018;
-    sample_entry.pre_defined3 = -1;
-
-    let nalu_arrays = [(&vps_list, 32_u8), (&sps_list, 33_u8), (&pps_list, 34_u8)]
-        .into_iter()
-        .map(|(group, nalu_type)| -> Result<HEVCNaluArray, MuxError> {
-            Ok(HEVCNaluArray {
-                completeness: true,
-                reserved: false,
-                nalu_type,
-                num_nalus: u16::try_from(group.len())
-                    .map_err(|_| MuxError::LayoutOverflow("HEVC NAL count"))?,
-                nalus: group
-                    .iter()
-                    .map(|nal| -> Result<HEVCNalu, MuxError> {
-                        Ok(HEVCNalu {
-                            length: u16::try_from(nal.len())
-                                .map_err(|_| MuxError::LayoutOverflow("HEVC NAL length"))?,
-                            nal_unit: nal.clone(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    super::mp4::encode_typed_box(
-        &sample_entry,
-        &super::mp4::encode_typed_box(
-            &HEVCDecoderConfiguration {
-                configuration_version: 1,
-                general_profile_space: sps_info.general_profile_space,
-                general_tier_flag: sps_info.general_tier_flag,
-                general_profile_idc: sps_info.general_profile_idc,
-                general_profile_compatibility: sps_info.general_profile_compatibility,
-                general_constraint_indicator: sps_info.general_constraint_indicator,
-                general_level_idc: sps_info.general_level_idc,
-                min_spatial_segmentation_idc: 0,
-                parallelism_type: 0,
-                chroma_format_idc: sps_info.chroma_format_idc,
-                bit_depth_luma_minus8: sps_info.bit_depth_luma_minus8,
-                bit_depth_chroma_minus8: sps_info.bit_depth_chroma_minus8,
-                avg_frame_rate: 0,
-                constant_frame_rate: 0,
-                num_temporal_layers: sps_info.num_temporal_layers,
-                temporal_id_nested: sps_info.temporal_id_nested,
-                length_size_minus_one: 3,
-                num_of_nalu_arrays: u8::try_from(nalu_arrays.len())
-                    .map_err(|_| MuxError::LayoutOverflow("HEVC NAL array count"))?,
-                nalu_arrays,
-            },
-            &[],
-        )?,
-    )
-}
-
-fn push_unique_nal(existing: &mut Vec<Vec<u8>>, nal: Vec<u8>) {
-    if !existing.iter().any(|entry| entry == &nal) {
-        existing.push(nal);
-    }
-}
-
-const fn hevc_nal_type(nal: &[u8]) -> u8 {
-    (nal[0] >> 1) & 0x3F
-}
-
-const fn is_hevc_sync_nal_type(nal_type: u8) -> bool {
-    matches!(nal_type, 16..=21)
-}
-
-struct H265SpsInfo {
-    general_profile_space: u8,
-    general_tier_flag: bool,
-    general_profile_idc: u8,
-    general_profile_compatibility: [bool; 32],
-    general_constraint_indicator: [u8; 6],
-    general_level_idc: u8,
-    chroma_format_idc: u8,
-    bit_depth_luma_minus8: u8,
-    bit_depth_chroma_minus8: u8,
-    num_temporal_layers: u8,
-    temporal_id_nested: u8,
-}
-
-fn parse_h265_sps_configuration(nal: &[u8], spec: &str) -> Result<H265SpsInfo, MuxError> {
-    if nal.len() < 3 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.265 SPS NAL is too short".to_string(),
-        });
-    }
-    let rbsp = nal_to_rbsp(&nal[2..]);
-    let mut reader = BitReader::new(Cursor::new(rbsp));
-    let _sps_video_parameter_set_id = read_bits_u8_labeled(&mut reader, 4, spec, "H.265")?;
-    let max_sub_layers_minus1 = read_bits_u8_labeled(&mut reader, 3, spec, "H.265")?;
-    let temporal_id_nested = u8::from(read_bit_labeled(&mut reader, spec, "H.265")?);
-    let general_profile_space = read_bits_u8_labeled(&mut reader, 2, spec, "H.265")?;
-    let general_tier_flag = read_bit_labeled(&mut reader, spec, "H.265")?;
-    let general_profile_idc = read_bits_u8_labeled(&mut reader, 5, spec, "H.265")?;
-    let mut general_profile_compatibility = [false; 32];
-    for entry in &mut general_profile_compatibility {
-        *entry = read_bit_labeled(&mut reader, spec, "H.265")?;
-    }
-    let mut general_constraint_indicator = [0_u8; 6];
-    for entry in &mut general_constraint_indicator {
-        *entry = read_bits_u8_labeled(&mut reader, 8, spec, "H.265")?;
-    }
-    let general_level_idc = read_bits_u8_labeled(&mut reader, 8, spec, "H.265")?;
-
-    let mut sub_layer_profile_present_flags =
-        Vec::with_capacity(usize::from(max_sub_layers_minus1));
-    let mut sub_layer_level_present_flags = Vec::with_capacity(usize::from(max_sub_layers_minus1));
-    for _ in 0..max_sub_layers_minus1 {
-        sub_layer_profile_present_flags.push(read_bit_labeled(&mut reader, spec, "H.265")?);
-        sub_layer_level_present_flags.push(read_bit_labeled(&mut reader, spec, "H.265")?);
-    }
-    if max_sub_layers_minus1 > 0 {
-        for _ in max_sub_layers_minus1..8 {
-            skip_bits_labeled(&mut reader, 2, spec, "H.265")?;
-        }
-    }
-    for (profile_present, level_present) in sub_layer_profile_present_flags
-        .into_iter()
-        .zip(sub_layer_level_present_flags)
-    {
-        if profile_present {
-            skip_bits_labeled(&mut reader, 88, spec, "H.265")?;
-        }
-        if level_present {
-            skip_bits_labeled(&mut reader, 8, spec, "H.265")?;
-        }
-    }
-
-    let _sps_seq_parameter_set_id = read_ue_labeled(&mut reader, spec, "H.265")?;
-    let chroma_format_idc =
-        u8::try_from(read_ue_labeled(&mut reader, spec, "H.265")?).map_err(|_| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "H.265 chroma format does not fit in u8".to_string(),
-            }
-        })?;
-    if chroma_format_idc == 3 {
-        let _separate_colour_plane_flag = read_bit_labeled(&mut reader, spec, "H.265")?;
-    }
-    let _pic_width_in_luma_samples = read_ue_labeled(&mut reader, spec, "H.265")?;
-    let _pic_height_in_luma_samples = read_ue_labeled(&mut reader, spec, "H.265")?;
-    if read_bit_labeled(&mut reader, spec, "H.265")? {
-        let _conf_win_left_offset = read_ue_labeled(&mut reader, spec, "H.265")?;
-        let _conf_win_right_offset = read_ue_labeled(&mut reader, spec, "H.265")?;
-        let _conf_win_top_offset = read_ue_labeled(&mut reader, spec, "H.265")?;
-        let _conf_win_bottom_offset = read_ue_labeled(&mut reader, spec, "H.265")?;
-    }
-    let bit_depth_luma_minus8 = u8::try_from(read_ue_labeled(&mut reader, spec, "H.265")?)
-        .map_err(|_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.265 luma bit depth does not fit in u8".to_string(),
-        })?;
-    let bit_depth_chroma_minus8 = u8::try_from(read_ue_labeled(&mut reader, spec, "H.265")?)
-        .map_err(|_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.265 chroma bit depth does not fit in u8".to_string(),
-        })?;
-
-    Ok(H265SpsInfo {
-        general_profile_space,
-        general_tier_flag,
-        general_profile_idc,
-        general_profile_compatibility,
-        general_constraint_indicator,
-        general_level_idc,
-        chroma_format_idc,
-        bit_depth_luma_minus8,
-        bit_depth_chroma_minus8,
-        num_temporal_layers: max_sub_layers_minus1.saturating_add(1),
-        temporal_id_nested,
-    })
-}
-
-struct ParsedAc3Track {
-    sample_rate: u32,
-    channel_count: u16,
-    fscod: u8,
-    bsid: u8,
-    bsmod: u8,
-    acmod: u8,
-    lfe_on: u8,
-    bit_rate_code: u8,
-    samples: Vec<StagedSample>,
-}
-
-fn scan_ac3_file_sync(path: &Path, spec: &str) -> Result<ParsedAc3Track, MuxError> {
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u32, u16, u8, u8, u8, u8, u8)>;
-    while offset < file_size {
-        if file_size - offset < 8 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated AC-3 syncframe header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 8];
-        read_exact_at_sync(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated AC-3 syncframe header",
-        )?;
-        if header[0] != 0x0B || header[1] != 0x77 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing AC-3 sync word at byte offset {offset}"),
-            });
-        }
-        let fscod = header[4] >> 6;
-        if fscod == 0x03 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "reserved AC-3 sample-rate code".to_string(),
-            });
-        }
-        let frmsizecod = header[4] & 0x3F;
-        let frame_size = ac3_frame_size_bytes(fscod, frmsizecod).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported AC-3 frame-size code {frmsizecod}"),
-            }
-        })?;
-        let frame_size_u64 = u64::from(frame_size);
-        if offset
-            .checked_add(frame_size_u64)
-            .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated AC-3 syncframe at byte offset {offset}"),
-            });
-        }
-        let bsid = (header[5] >> 3) & 0x1F;
-        let bsmod = header[5] & 0x07;
-        let mut reader = BitReader::new(Cursor::new(&header[6..8]));
-        let acmod = read_bits_u8_labeled(&mut reader, 3, spec, "AC-3")?;
-        if acmod & 0x01 != 0 && acmod != 0x01 {
-            skip_bits_labeled(&mut reader, 2, spec, "AC-3")?;
-        }
-        if acmod & 0x04 != 0 {
-            skip_bits_labeled(&mut reader, 2, spec, "AC-3")?;
-        }
-        if acmod == 0x02 {
-            skip_bits_labeled(&mut reader, 2, spec, "AC-3")?;
-        }
-        let lfe_on = u8::from(read_bit_labeled(&mut reader, spec, "AC-3")?);
-        let sample_rate =
-            ac3_sample_rate(fscod).ok_or_else(|| MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported AC-3 sample-rate code {fscod}"),
-            })?;
-        let channel_count = ac3_channel_count(acmod, lfe_on != 0).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported AC-3 channel mode {acmod}"),
-            }
-        })?;
-        let descriptor = (
-            sample_rate,
-            channel_count,
-            bsid,
-            bsmod,
-            acmod,
-            lfe_on,
-            frmsizecod >> 1,
-        );
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: "AC-3 syncframes changed decoder configuration mid-stream".to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: frame_size,
-            duration: 1536,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(frame_size_u64)
-            .ok_or(MuxError::LayoutOverflow("AC-3 frame offset"))?;
-    }
-
-    let (sample_rate, channel_count, bsid, bsmod, acmod, lfe_on, bit_rate_code) = expected
-        .ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AC-3 input contained no syncframes".to_string(),
-        })?;
-    Ok(ParsedAc3Track {
-        sample_rate,
-        channel_count,
-        fscod: match sample_rate {
-            48_000 => 0,
-            44_100 => 1,
-            32_000 => 2,
-            _ => unreachable!(),
-        },
-        bsid,
-        bsmod,
-        acmod,
-        lfe_on,
-        bit_rate_code,
-        samples,
-    })
-}
-
-#[cfg(feature = "async")]
-async fn scan_ac3_file_async(path: &Path, spec: &str) -> Result<ParsedAc3Track, MuxError> {
-    let mut file = TokioFile::open(path).await?;
-    let file_size = file.metadata().await?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u32, u16, u8, u8, u8, u8, u8)>;
-    while offset < file_size {
-        if file_size - offset < 8 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated AC-3 syncframe header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 8];
-        read_exact_at_async(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated AC-3 syncframe header",
-        )
-        .await?;
-        if header[0] != 0x0B || header[1] != 0x77 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing AC-3 sync word at byte offset {offset}"),
-            });
-        }
-        let fscod = header[4] >> 6;
-        if fscod == 0x03 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "reserved AC-3 sample-rate code".to_string(),
-            });
-        }
-        let frmsizecod = header[4] & 0x3F;
-        let frame_size = ac3_frame_size_bytes(fscod, frmsizecod).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported AC-3 frame-size code {frmsizecod}"),
-            }
-        })?;
-        let frame_size_u64 = u64::from(frame_size);
-        if offset
-            .checked_add(frame_size_u64)
-            .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated AC-3 syncframe at byte offset {offset}"),
-            });
-        }
-        let bsid = (header[5] >> 3) & 0x1F;
-        let bsmod = header[5] & 0x07;
-        let mut reader = BitReader::new(Cursor::new(&header[6..8]));
-        let acmod = read_bits_u8_labeled(&mut reader, 3, spec, "AC-3")?;
-        if acmod & 0x01 != 0 && acmod != 0x01 {
-            skip_bits_labeled(&mut reader, 2, spec, "AC-3")?;
-        }
-        if acmod & 0x04 != 0 {
-            skip_bits_labeled(&mut reader, 2, spec, "AC-3")?;
-        }
-        if acmod == 0x02 {
-            skip_bits_labeled(&mut reader, 2, spec, "AC-3")?;
-        }
-        let lfe_on = u8::from(read_bit_labeled(&mut reader, spec, "AC-3")?);
-        let sample_rate =
-            ac3_sample_rate(fscod).ok_or_else(|| MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported AC-3 sample-rate code {fscod}"),
-            })?;
-        let channel_count = ac3_channel_count(acmod, lfe_on != 0).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported AC-3 channel mode {acmod}"),
-            }
-        })?;
-        let descriptor = (
-            sample_rate,
-            channel_count,
-            bsid,
-            bsmod,
-            acmod,
-            lfe_on,
-            frmsizecod / 2,
-        );
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: "AC-3 syncframes changed decoder configuration mid-stream".to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: frame_size,
-            duration: 1536,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(frame_size_u64)
-            .ok_or(MuxError::LayoutOverflow("AC-3 frame offset"))?;
-    }
-
-    let (sample_rate, channel_count, bsid, bsmod, acmod, lfe_on, bit_rate_code) = expected
-        .ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AC-3 input contained no syncframes".to_string(),
-        })?;
-    Ok(ParsedAc3Track {
-        sample_rate,
-        channel_count,
-        fscod: match sample_rate {
-            48_000 => 0,
-            44_100 => 1,
-            32_000 => 2,
-            _ => unreachable!(),
-        },
-        bsid,
-        bsmod,
-        acmod,
-        lfe_on,
-        bit_rate_code,
-        samples,
-    })
-}
-
-fn build_ac3_sample_entry_box(parsed: &ParsedAc3Track) -> Result<Vec<u8>, MuxError> {
-    let mut sample_entry = AudioSampleEntry::default();
-    sample_entry.set_box_type(FourCc::from_bytes(*b"ac-3"));
-    sample_entry.sample_entry = SampleEntry {
-        box_type: FourCc::from_bytes(*b"ac-3"),
-        data_reference_index: 1,
-    };
-    sample_entry.channel_count = parsed.channel_count;
-    sample_entry.sample_size = 16;
-    sample_entry.sample_rate = parsed.sample_rate << 16;
-
-    super::mp4::encode_typed_box(
-        &sample_entry,
-        &super::mp4::encode_typed_box(
-            &Dac3 {
-                fscod: parsed.fscod,
-                bsid: parsed.bsid,
-                bsmod: parsed.bsmod,
-                acmod: parsed.acmod,
-                lfe_on: parsed.lfe_on,
-                bit_rate_code: parsed.bit_rate_code,
-            },
-            &[],
-        )?,
-    )
-}
-
-const fn ac3_sample_rate(fscod: u8) -> Option<u32> {
-    match fscod {
-        0 => Some(48_000),
-        1 => Some(44_100),
-        2 => Some(32_000),
-        _ => None,
-    }
-}
-
-fn ac3_frame_size_bytes(fscod: u8, frmsizecod: u8) -> Option<u32> {
-    const AC3_FRAME_SIZE_WORDS: [[u16; 3]; 38] = [
-        [96, 69, 64],
-        [96, 70, 64],
-        [120, 87, 80],
-        [120, 88, 80],
-        [144, 104, 96],
-        [144, 105, 96],
-        [168, 121, 112],
-        [168, 122, 112],
-        [192, 139, 128],
-        [192, 140, 128],
-        [240, 174, 160],
-        [240, 175, 160],
-        [288, 208, 192],
-        [288, 209, 192],
-        [336, 243, 224],
-        [336, 244, 224],
-        [384, 278, 256],
-        [384, 279, 256],
-        [480, 348, 320],
-        [480, 349, 320],
-        [576, 417, 384],
-        [576, 418, 384],
-        [672, 487, 448],
-        [672, 488, 448],
-        [768, 557, 512],
-        [768, 558, 512],
-        [960, 696, 640],
-        [960, 697, 640],
-        [1152, 835, 768],
-        [1152, 836, 768],
-        [1344, 975, 896],
-        [1344, 976, 896],
-        [1536, 1114, 1024],
-        [1536, 1115, 1024],
-        [1728, 1253, 1152],
-        [1728, 1254, 1152],
-        [1920, 1393, 1280],
-        [1920, 1394, 1280],
-    ];
-    let frame_words = *AC3_FRAME_SIZE_WORDS.get(usize::from(frmsizecod))?;
-    let sample_rate_index = match fscod {
-        0 => 2,
-        1 => 1,
-        2 => 0,
-        _ => return None,
-    };
-    Some(u32::from(frame_words[sample_rate_index]) * 2)
-}
-
-const fn ac3_channel_count(acmod: u8, lfe_on: bool) -> Option<u16> {
-    let base = match acmod {
-        0 => 2,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 3,
-        5 => 4,
-        6 => 4,
-        7 => 5,
-        _ => return None,
-    };
-    Some(base + if lfe_on { 1 } else { 0 })
-}
-
-struct ParsedEac3Track {
-    sample_rate: u32,
-    channel_count: u16,
-    fscod: u8,
-    bsid: u8,
-    bsmod: u8,
-    acmod: u8,
-    lfe_on: u8,
-    data_rate: u16,
-    samples: Vec<StagedSample>,
-}
-
-fn scan_eac3_file_sync(path: &Path, spec: &str) -> Result<ParsedEac3Track, MuxError> {
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u32, u16, u8, u8, u8, u8)>;
-    let mut data_rate = 0_u16;
-    while offset < file_size {
-        if file_size - offset < 6 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated E-AC-3 syncframe header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 6];
-        read_exact_at_sync(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated E-AC-3 syncframe header",
-        )?;
-        if header[0] != 0x0B || header[1] != 0x77 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing E-AC-3 sync word at byte offset {offset}"),
-            });
-        }
-        let mut reader = BitReader::new(Cursor::new(&header[2..]));
-        let stream_type = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-        if stream_type != 0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "the current raw E-AC-3 importer only supports independent substreams"
-                    .to_string(),
-            });
-        }
-        let _substream_id = read_bits_u8_labeled(&mut reader, 3, spec, "E-AC-3")?;
-        let frame_size_words_minus_one = read_bits_u16_labeled(&mut reader, 11, spec, "E-AC-3")?;
-        let frame_size = u64::from(frame_size_words_minus_one.saturating_add(1))
-            .checked_mul(2)
-            .ok_or(MuxError::LayoutOverflow("E-AC-3 frame size"))?;
-        if offset
-            .checked_add(frame_size)
-            .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated E-AC-3 syncframe at byte offset {offset}"),
-            });
-        }
-        let fscod = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-        let (sample_rate, sample_duration) = if fscod == 0x03 {
-            let fscod2 = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-            let sample_rate = match fscod2 {
-                0 => 24_000,
-                1 => 22_050,
-                2 => 16_000,
-                _ => {
-                    return Err(MuxError::UnsupportedTrackImport {
-                        spec: spec.to_string(),
-                        message: format!("unsupported E-AC-3 half-rate code {fscod2}"),
-                    });
-                }
-            };
-            (sample_rate, 1536)
-        } else {
-            let numblkscod = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-            let sample_rate =
-                ac3_sample_rate(fscod).ok_or_else(|| MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: format!("unsupported E-AC-3 sample-rate code {fscod}"),
-                })?;
-            let sample_duration = match numblkscod {
-                0 => 256,
-                1 => 512,
-                2 => 768,
-                3 => 1536,
-                _ => unreachable!(),
-            };
-            (sample_rate, sample_duration)
-        };
-        let acmod = read_bits_u8_labeled(&mut reader, 3, spec, "E-AC-3")?;
-        let lfe_on = u8::from(read_bit_labeled(&mut reader, spec, "E-AC-3")?);
-        let bsid = read_bits_u8_labeled(&mut reader, 5, spec, "E-AC-3")?;
-        let channel_count = ac3_channel_count(acmod, lfe_on != 0).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported E-AC-3 channel mode {acmod}"),
-            }
-        })?;
-        let descriptor = (sample_rate, channel_count, bsid, 0, acmod, lfe_on);
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: "E-AC-3 syncframes changed decoder configuration mid-stream"
-                        .to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-        data_rate = u16::try_from(
-            ((frame_size * 8 * u64::from(sample_rate)) / u64::from(sample_duration))
-                .div_ceil(1_000),
-        )
-        .map_err(|_| MuxError::LayoutOverflow("E-AC-3 data_rate"))?;
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: u32::try_from(frame_size)
-                .map_err(|_| MuxError::LayoutOverflow("E-AC-3 frame size"))?,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(frame_size)
-            .ok_or(MuxError::LayoutOverflow("E-AC-3 frame offset"))?;
-    }
-
-    let (sample_rate, channel_count, bsid, bsmod, acmod, lfe_on) =
-        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "E-AC-3 input contained no syncframes".to_string(),
-        })?;
-    Ok(ParsedEac3Track {
-        sample_rate,
-        channel_count,
-        fscod: match sample_rate {
-            48_000 => 0,
-            44_100 => 1,
-            32_000 => 2,
-            _ => 3,
-        },
-        bsid,
-        bsmod,
-        acmod,
-        lfe_on,
-        data_rate,
-        samples,
-    })
-}
-
-#[cfg(feature = "async")]
-async fn scan_eac3_file_async(path: &Path, spec: &str) -> Result<ParsedEac3Track, MuxError> {
-    let mut file = TokioFile::open(path).await?;
-    let file_size = file.metadata().await?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    let mut expected = None::<(u32, u16, u8, u8, u8, u8)>;
-    let mut data_rate = 0_u16;
-    while offset < file_size {
-        if file_size - offset < 6 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated E-AC-3 syncframe header".to_string(),
-            });
-        }
-        let mut header = [0_u8; 6];
-        read_exact_at_async(
-            &mut file,
-            offset,
-            &mut header,
-            spec,
-            "truncated E-AC-3 syncframe header",
-        )
-        .await?;
-        if header[0] != 0x0B || header[1] != 0x77 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("missing E-AC-3 sync word at byte offset {offset}"),
-            });
-        }
-        let mut reader = BitReader::new(Cursor::new(&header[2..]));
-        let stream_type = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-        if stream_type != 0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "the current raw E-AC-3 importer only supports independent substreams"
-                    .to_string(),
-            });
-        }
-        let _substream_id = read_bits_u8_labeled(&mut reader, 3, spec, "E-AC-3")?;
-        let frame_size_words_minus_one = read_bits_u16_labeled(&mut reader, 11, spec, "E-AC-3")?;
-        let frame_size = u64::from(frame_size_words_minus_one.saturating_add(1))
-            .checked_mul(2)
-            .ok_or(MuxError::LayoutOverflow("E-AC-3 frame size"))?;
-        if offset
-            .checked_add(frame_size)
-            .is_none_or(|end| end > file_size)
-        {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated E-AC-3 syncframe at byte offset {offset}"),
-            });
-        }
-        let fscod = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-        let (sample_rate, sample_duration) = if fscod == 0x03 {
-            let fscod2 = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-            let sample_rate = match fscod2 {
-                0 => 24_000,
-                1 => 22_050,
-                2 => 16_000,
-                _ => {
-                    return Err(MuxError::UnsupportedTrackImport {
-                        spec: spec.to_string(),
-                        message: format!("unsupported E-AC-3 half-rate code {fscod2}"),
-                    });
-                }
-            };
-            (sample_rate, 1536)
-        } else {
-            let numblkscod = read_bits_u8_labeled(&mut reader, 2, spec, "E-AC-3")?;
-            let sample_rate =
-                ac3_sample_rate(fscod).ok_or_else(|| MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: format!("unsupported E-AC-3 sample-rate code {fscod}"),
-                })?;
-            let sample_duration = match numblkscod {
-                0 => 256,
-                1 => 512,
-                2 => 768,
-                3 => 1536,
-                _ => unreachable!(),
-            };
-            (sample_rate, sample_duration)
-        };
-        let acmod = read_bits_u8_labeled(&mut reader, 3, spec, "E-AC-3")?;
-        let lfe_on = u8::from(read_bit_labeled(&mut reader, spec, "E-AC-3")?);
-        let bsid = read_bits_u8_labeled(&mut reader, 5, spec, "E-AC-3")?;
-        let channel_count = ac3_channel_count(acmod, lfe_on != 0).ok_or_else(|| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("unsupported E-AC-3 channel mode {acmod}"),
-            }
-        })?;
-        let descriptor = (sample_rate, channel_count, bsid, 0, acmod, lfe_on);
-        if let Some(expected) = expected {
-            if expected != descriptor {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: "E-AC-3 syncframes changed decoder configuration mid-stream"
-                        .to_string(),
-                });
-            }
-        } else {
-            expected = Some(descriptor);
-        }
-        data_rate = u16::try_from(
-            ((frame_size * 8 * u64::from(sample_rate)) / u64::from(sample_duration))
-                .div_ceil(1_000),
-        )
-        .map_err(|_| MuxError::LayoutOverflow("E-AC-3 data_rate"))?;
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: u32::try_from(frame_size)
-                .map_err(|_| MuxError::LayoutOverflow("E-AC-3 frame size"))?,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(frame_size)
-            .ok_or(MuxError::LayoutOverflow("E-AC-3 frame offset"))?;
-    }
-
-    let (sample_rate, channel_count, bsid, bsmod, acmod, lfe_on) =
-        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "E-AC-3 input contained no syncframes".to_string(),
-        })?;
-    Ok(ParsedEac3Track {
-        sample_rate,
-        channel_count,
-        fscod: match sample_rate {
-            48_000 => 0,
-            44_100 => 1,
-            32_000 => 2,
-            _ => 3,
-        },
-        bsid,
-        bsmod,
-        acmod,
-        lfe_on,
-        data_rate,
-        samples,
-    })
-}
-
-fn build_eac3_sample_entry_box(parsed: &ParsedEac3Track) -> Result<Vec<u8>, MuxError> {
-    let mut sample_entry = AudioSampleEntry::default();
-    sample_entry.set_box_type(FourCc::from_bytes(*b"ec-3"));
-    sample_entry.sample_entry = SampleEntry {
-        box_type: FourCc::from_bytes(*b"ec-3"),
-        data_reference_index: 1,
-    };
-    sample_entry.channel_count = parsed.channel_count;
-    sample_entry.sample_size = 16;
-    sample_entry.sample_rate = parsed.sample_rate << 16;
-
-    super::mp4::encode_typed_box(
-        &sample_entry,
-        &super::mp4::encode_typed_box(
-            &Dec3 {
-                data_rate: parsed.data_rate,
-                num_ind_sub: 0,
-                ec3_substreams: vec![Ec3Substream {
-                    fscod: parsed.fscod,
-                    bsid: parsed.bsid,
-                    asvc: 0,
-                    bsmod: parsed.bsmod,
-                    acmod: parsed.acmod,
-                    lfe_on: parsed.lfe_on,
-                    num_dep_sub: 0,
-                    chan_loc: 0,
-                }],
-                reserved: Vec::new(),
-            },
-            &[],
-        )?,
-    )
-}
-
-struct ParsedAc4Track {
-    sample_rate: u32,
-    channel_count: u16,
-    dac4_data: Vec<u8>,
-    samples: Vec<StagedSample>,
-}
-
-fn scan_ac4_file_sync(
-    path: &Path,
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<ParsedAc4Track, MuxError> {
-    let mut parameters = collect_raw_track_parameters(parameters, spec)?;
-    let sample_rate =
-        take_required_raw_u32_parameter(&mut parameters, MuxRawCodec::Ac4, "sample_rate", spec)?;
-    let channel_count = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::Ac4,
-        "channel_count",
-        spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: "raw `ac4` parameter `channel_count` does not fit in u16".to_string(),
-    })?;
-    let sample_duration = take_required_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::Ac4,
-        "sample_duration",
-        spec,
-    )?;
-    let dac4_data = match take_optional_raw_parameter(&mut parameters, "dac4") {
-        Some(value) => parse_hex_parameter_bytes(MuxRawCodec::Ac4, "dac4", &value, spec)?,
-        None => Vec::new(),
-    };
-    reject_unknown_raw_parameters(MuxRawCodec::Ac4, spec, &parameters)?;
-
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    while offset < file_size {
-        let frame_size = read_ac4_frame_size_sync(&mut file, file_size, offset, spec)?;
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: u32::try_from(frame_size)
-                .map_err(|_| MuxError::LayoutOverflow("AC-4 frame size"))?,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(frame_size)
-            .ok_or(MuxError::LayoutOverflow("AC-4 frame offset"))?;
-    }
-    if samples.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AC-4 input contained no syncframes".to_string(),
-        });
-    }
-    Ok(ParsedAc4Track {
-        sample_rate,
-        channel_count,
-        dac4_data,
-        samples,
-    })
-}
-
-#[cfg(feature = "async")]
-async fn scan_ac4_file_async(
-    path: &Path,
-    parameters: &[MuxTrackParameter],
-    spec: &str,
-) -> Result<ParsedAc4Track, MuxError> {
-    let mut parameters = collect_raw_track_parameters(parameters, spec)?;
-    let sample_rate =
-        take_required_raw_u32_parameter(&mut parameters, MuxRawCodec::Ac4, "sample_rate", spec)?;
-    let channel_count = u16::try_from(take_required_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::Ac4,
-        "channel_count",
-        spec,
-    )?)
-    .map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: "raw `ac4` parameter `channel_count` does not fit in u16".to_string(),
-    })?;
-    let sample_duration = take_required_raw_u32_parameter(
-        &mut parameters,
-        MuxRawCodec::Ac4,
-        "sample_duration",
-        spec,
-    )?;
-    let dac4_data = match take_optional_raw_parameter(&mut parameters, "dac4") {
-        Some(value) => parse_hex_parameter_bytes(MuxRawCodec::Ac4, "dac4", &value, spec)?,
-        None => Vec::new(),
-    };
-    reject_unknown_raw_parameters(MuxRawCodec::Ac4, spec, &parameters)?;
-
-    let mut file = TokioFile::open(path).await?;
-    let file_size = file.metadata().await?.len();
-    let mut offset = 0_u64;
-    let mut samples = Vec::new();
-    while offset < file_size {
-        let frame_size = read_ac4_frame_size_async(&mut file, file_size, offset, spec).await?;
-        samples.push(StagedSample {
-            data_offset: offset,
-            data_size: u32::try_from(frame_size)
-                .map_err(|_| MuxError::LayoutOverflow("AC-4 frame size"))?,
-            duration: sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        offset = offset
-            .checked_add(frame_size)
-            .ok_or(MuxError::LayoutOverflow("AC-4 frame offset"))?;
-    }
-    if samples.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AC-4 input contained no syncframes".to_string(),
-        });
-    }
-    Ok(ParsedAc4Track {
-        sample_rate,
-        channel_count,
-        dac4_data,
-        samples,
-    })
-}
-
-fn read_ac4_frame_size_sync(
-    file: &mut File,
-    file_size: u64,
-    offset: u64,
-    spec: &str,
-) -> Result<u64, MuxError> {
-    let mut header = [0_u8; 7];
-    if file_size - offset < 4 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "truncated AC-4 syncframe header".to_string(),
-        });
-    }
-    read_exact_at_sync(
-        file,
-        offset,
-        &mut header[..4],
-        spec,
-        "truncated AC-4 syncframe header",
-    )?;
-    parse_ac4_frame_size(&header, file_size, offset, spec)
-}
-
-#[cfg(feature = "async")]
-async fn read_ac4_frame_size_async(
+pub(in crate::mux) async fn read_spans_async(
     file: &mut TokioFile,
-    file_size: u64,
-    offset: u64,
+    spans: &[SourceFileSpan],
+    total_size: u32,
     spec: &str,
-) -> Result<u64, MuxError> {
-    let mut header = [0_u8; 7];
-    if file_size - offset < 4 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "truncated AC-4 syncframe header".to_string(),
-        });
-    }
-    read_exact_at_async(
-        file,
-        offset,
-        &mut header[..4],
-        spec,
-        "truncated AC-4 syncframe header",
-    )
-    .await?;
-    if u16::from_be_bytes([header[2], header[3]]) == 0xFFFF {
-        if file_size - offset < 7 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "truncated extended AC-4 syncframe header".to_string(),
-            });
-        }
+    truncated_message: &'static str,
+) -> Result<Vec<u8>, MuxError> {
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(total_size)
+            .map_err(|_| MuxError::LayoutOverflow("packet byte capacity"))?,
+    );
+    for span in spans {
+        let mut chunk = vec![0_u8; usize::try_from(span.size).unwrap()];
         read_exact_at_async(
             file,
-            offset,
-            &mut header,
+            span.source_offset,
+            &mut chunk,
             spec,
-            "truncated extended AC-4 syncframe header",
+            truncated_message,
         )
         .await?;
+        bytes.extend_from_slice(&chunk);
     }
-    parse_ac4_frame_size(&header, file_size, offset, spec)
-}
-
-fn parse_ac4_frame_size(
-    header: &[u8; 7],
-    file_size: u64,
-    offset: u64,
-    spec: &str,
-) -> Result<u64, MuxError> {
-    let syncword = u16::from_be_bytes([header[0], header[1]]);
-    if syncword != 0xAC40 && syncword != 0xAC41 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("missing AC-4 sync word at byte offset {offset}"),
-        });
-    }
-    let size_code = u16::from_be_bytes([header[2], header[3]]);
-    let (header_size, frame_payload_size) = if size_code == 0xFFFF {
-        (
-            7_u64,
-            u64::from(header[4]) << 16 | u64::from(header[5]) << 8 | u64::from(header[6]),
-        )
-    } else {
-        (4_u64, u64::from(size_code))
-    };
-    let mut frame_size = header_size
-        .checked_add(frame_payload_size)
-        .ok_or(MuxError::LayoutOverflow("AC-4 frame size"))?;
-    if frame_size <= header_size {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "AC-4 syncframes must carry payload bytes".to_string(),
-        });
-    }
-    if offset
-        .checked_add(frame_size)
-        .is_none_or(|end| end > file_size)
-    {
-        if size_code != 0xFFFF {
-            let alternate_frame_size = u64::from(size_code)
-                .checked_add(2)
-                .ok_or(MuxError::LayoutOverflow("AC-4 alternate frame size"))?;
-            if alternate_frame_size > header_size
-                && offset
-                    .checked_add(alternate_frame_size)
-                    .is_some_and(|end| end <= file_size)
-            {
-                frame_size = alternate_frame_size;
-            } else {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message: format!("truncated AC-4 syncframe at byte offset {offset}"),
-                });
-            }
-        } else {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("truncated AC-4 syncframe at byte offset {offset}"),
-            });
-        }
-    }
-    Ok(frame_size)
-}
-
-fn build_ac4_sample_entry_box(parsed: &ParsedAc4Track) -> Result<Vec<u8>, MuxError> {
-    let mut sample_entry = AudioSampleEntry::default();
-    sample_entry.set_box_type(FourCc::from_bytes(*b"ac-4"));
-    sample_entry.sample_entry = SampleEntry {
-        box_type: FourCc::from_bytes(*b"ac-4"),
-        data_reference_index: 1,
-    };
-    sample_entry.channel_count = parsed.channel_count;
-    sample_entry.sample_size = 16;
-    sample_entry.sample_rate = parsed.sample_rate << 16;
-
-    super::mp4::encode_typed_box(
-        &sample_entry,
-        &super::mp4::encode_typed_box(
-            &Dac4 {
-                data: parsed.dac4_data.clone(),
-            },
-            &[],
-        )?,
-    )
-}
-
-struct H264StageState {
-    sps_list: Vec<Vec<u8>>,
-    pps_list: Vec<Vec<u8>>,
-    samples: Vec<StagedSample>,
-    segments: Vec<TransformedAnnexBSegment>,
-    current_sample_offset: Option<u64>,
-    current_sample_size: u32,
-    logical_size: u64,
-}
-
-impl H264StageState {
-    fn new() -> Self {
-        Self {
-            sps_list: Vec::new(),
-            pps_list: Vec::new(),
-            samples: Vec::new(),
-            segments: Vec::new(),
-            current_sample_offset: None,
-            current_sample_size: 0,
-            logical_size: 0,
-        }
-    }
-
-    fn finish_current_sample(&mut self) {
-        if let Some(data_offset) = self.current_sample_offset.take() {
-            self.samples.push(StagedSample {
-                data_offset,
-                data_size: self.current_sample_size,
-                duration: 0,
-                composition_time_offset: 0,
-                is_sync_sample: true,
-            });
-            self.current_sample_size = 0;
-        }
-    }
-
-    fn append_sample_nal(&mut self, source_offset: u64, source_size: u32) -> Result<(), MuxError> {
-        if self.current_sample_offset.is_none() {
-            self.current_sample_offset = Some(self.logical_size);
-        }
-        let prefix = source_size.to_be_bytes();
-        self.segments.push(TransformedAnnexBSegment {
-            logical_offset: self.logical_size,
-            data: TransformedAnnexBSegmentData::Prefix(prefix),
-        });
-        self.logical_size = self
-            .logical_size
-            .checked_add(4)
-            .ok_or(MuxError::LayoutOverflow("raw H.264 transformed payload"))?;
-        self.segments.push(TransformedAnnexBSegment {
-            logical_offset: self.logical_size,
-            data: TransformedAnnexBSegmentData::FileRange {
-                source_offset,
-                size: source_size,
-            },
-        });
-        self.current_sample_size = self
-            .current_sample_size
-            .checked_add(
-                4_u32
-                    .checked_add(source_size)
-                    .ok_or(MuxError::LayoutOverflow(
-                        "raw H.264 transformed sample size",
-                    ))?,
-            )
-            .ok_or(MuxError::LayoutOverflow("raw H.264 staged sample size"))?;
-        self.logical_size = self
-            .logical_size
-            .checked_add(u64::from(source_size))
-            .ok_or(MuxError::LayoutOverflow("raw H.264 transformed payload"))?;
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct AnnexBNalScanner {
-    buffer: Vec<u8>,
-    buffer_start_offset: u64,
-    next_input_offset: u64,
-}
-
-impl AnnexBNalScanner {
-    fn push<F>(&mut self, chunk: &[u8], mut on_nal: F) -> Result<(), MuxError>
-    where
-        F: FnMut(AnnexBNal) -> Result<(), MuxError>,
-    {
-        for nal in self.collect(chunk) {
-            on_nal(nal)?;
-        }
-        Ok(())
-    }
-
-    fn finish<F>(&mut self, mut on_nal: F) -> Result<(), MuxError>
-    where
-        F: FnMut(AnnexBNal) -> Result<(), MuxError>,
-    {
-        for nal in self.finish_collect() {
-            on_nal(nal)?;
-        }
-        Ok(())
-    }
-
-    fn collect(&mut self, chunk: &[u8]) -> Vec<AnnexBNal> {
-        if self.buffer.is_empty() {
-            self.buffer_start_offset = self.next_input_offset;
-        }
-        self.buffer.extend_from_slice(chunk);
-        self.next_input_offset = self
-            .next_input_offset
-            .saturating_add(u64::try_from(chunk.len()).unwrap());
-        self.drain_available()
-    }
-
-    fn finish_collect(&mut self) -> Vec<AnnexBNal> {
-        let mut nals = self.drain_available();
-        if let Some((start, start_len)) = find_annex_b_start_code(&self.buffer) {
-            let data_start = start + start_len;
-            if data_start < self.buffer.len() {
-                let mut data_end = self.buffer.len();
-                while data_end > data_start && self.buffer[data_end - 1] == 0 {
-                    data_end -= 1;
-                }
-                if data_end > data_start {
-                    nals.push(AnnexBNal {
-                        source_offset: self.buffer_start_offset
-                            + u64::try_from(data_start).unwrap(),
-                        bytes: self.buffer[data_start..data_end].to_vec(),
-                    });
-                }
-            }
-        }
-        self.buffer.clear();
-        nals
-    }
-
-    fn drain_available(&mut self) -> Vec<AnnexBNal> {
-        let mut nals = Vec::new();
-        loop {
-            let Some((first_start, first_len)) = find_annex_b_start_code(&self.buffer) else {
-                if self.buffer.len() > 3 {
-                    let retain_from = self.buffer.len() - 3;
-                    self.buffer.drain(..retain_from);
-                    self.buffer_start_offset += u64::try_from(retain_from).unwrap();
-                }
-                break;
-            };
-            if first_start > 0 {
-                self.buffer.drain(..first_start);
-                self.buffer_start_offset += u64::try_from(first_start).unwrap();
-                continue;
-            }
-            let Some((next_start, _)) = find_annex_b_start_code(&self.buffer[first_len..])
-                .map(|(start, len)| (start + first_len, len))
-            else {
-                break;
-            };
-            let data_start = first_len;
-            let mut data_end = next_start;
-            while data_end > data_start && self.buffer[data_end - 1] == 0 {
-                data_end -= 1;
-            }
-            if data_end > data_start {
-                nals.push(AnnexBNal {
-                    source_offset: self.buffer_start_offset + u64::try_from(data_start).unwrap(),
-                    bytes: self.buffer[data_start..data_end].to_vec(),
-                });
-            }
-            self.buffer.drain(..next_start);
-            self.buffer_start_offset += u64::try_from(next_start).unwrap();
-        }
-        nals
-    }
-}
-
-fn find_annex_b_start_code(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut index = 0usize;
-    while index + 2 < bytes.len() {
-        if index + 3 < bytes.len() && bytes[index..].starts_with(&[0, 0, 0, 1]) {
-            return Some((index, 4));
-        }
-        if bytes[index..].starts_with(&[0, 0, 1]) {
-            return Some((index, 3));
-        }
-        index += 1;
-    }
-    None
-}
-
-fn stage_annex_b_h264_sync(path: &Path, spec: &str) -> Result<IndexedAnnexBTrack, MuxError> {
-    let mut file = File::open(path)?;
-    let mut scanner = AnnexBNalScanner::default();
-    let mut state = H264StageState::new();
-    let mut chunk = [0_u8; 16 * 1024];
-
-    loop {
-        let read = file.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        scanner.push(&chunk[..read], |nal| stage_h264_nal(&mut state, nal))?;
-    }
-    scanner.finish(|nal| stage_h264_nal(&mut state, nal))?;
-    finalize_h264_staged_track(path, state, spec)
-}
-
-#[cfg(feature = "async")]
-async fn stage_annex_b_h264_async(path: &Path, spec: &str) -> Result<IndexedAnnexBTrack, MuxError> {
-    let mut file = TokioFile::open(path).await?;
-    let mut scanner = AnnexBNalScanner::default();
-    let mut state = H264StageState::new();
-    let mut chunk = [0_u8; 16 * 1024];
-
-    loop {
-        let read = file.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        for nal in scanner.collect(&chunk[..read]) {
-            stage_h264_nal(&mut state, nal)?;
-        }
-    }
-    for nal in scanner.finish_collect() {
-        stage_h264_nal(&mut state, nal)?;
-    }
-    finalize_h264_staged_track(path, state, spec)
-}
-
-fn stage_h264_nal(state: &mut H264StageState, nal: AnnexBNal) -> Result<(), MuxError> {
-    if nal.bytes.is_empty() {
-        return Ok(());
-    }
-    let nal_type = nal.bytes[0] & 0x1F;
-    match nal_type {
-        7 => push_unique_nal(&mut state.sps_list, nal.bytes),
-        8 => push_unique_nal(&mut state.pps_list, nal.bytes),
-        9 => state.finish_current_sample(),
-        _ => {
-            let nal_len = u32::try_from(nal.bytes.len())
-                .map_err(|_| MuxError::LayoutOverflow("H.264 NAL length"))?;
-            state.append_sample_nal(nal.source_offset, nal_len)?;
-        }
-    }
-    Ok(())
-}
-
-fn finalize_h264_staged_track(
-    path: &Path,
-    mut state: H264StageState,
-    spec: &str,
-) -> Result<IndexedAnnexBTrack, MuxError> {
-    state.finish_current_sample();
-    if state.sps_list.is_empty() || state.pps_list.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.264 input must include SPS and PPS NAL units".to_string(),
-        });
-    }
-    if state.samples.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.264 input contained parameter sets but no media samples".to_string(),
-        });
-    }
-
-    let sps_info = parse_h264_sps(&state.sps_list[0], spec)?;
-    let (timescale, sample_duration) = match (
-        sps_info.timing_time_scale,
-        sps_info.timing_num_units_in_tick,
-    ) {
-        (Some(time_scale), Some(num_units_in_tick))
-            if time_scale != 0 && num_units_in_tick != 0 =>
-        {
-            (time_scale, num_units_in_tick.saturating_mul(2))
-        }
-        _ if state.samples.len() == 1 => (1, 1),
-        _ => {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message:
-                    "multi-sample H.264 inputs currently require timing info in SPS VUI parameters"
-                        .to_string(),
-            });
-        }
-    };
-    for sample in &mut state.samples {
-        sample.duration = sample_duration;
-    }
-
-    let sample_entry_box =
-        build_h264_sample_entry_box(&sps_info, &state.sps_list, &state.pps_list)?;
-    Ok(IndexedAnnexBTrack {
-        transformed_source: TransformedAnnexBSourceSpec {
-            path: path.to_path_buf(),
-            segments: state.segments,
-            total_size: state.logical_size,
-        },
-        width: sps_info.width,
-        height: sps_info.height,
-        timescale,
-        sample_entry_box,
-        samples: state.samples,
-    })
-}
-
-fn build_h264_sample_entry_box(
-    sps_info: &H264SpsInfo,
-    sequence_parameter_sets: &[Vec<u8>],
-    picture_parameter_sets: &[Vec<u8>],
-) -> Result<Vec<u8>, MuxError> {
-    let mut avc1 = VisualSampleEntry::default();
-    avc1.set_box_type(FourCc::from_bytes(*b"avc1"));
-    avc1.sample_entry = SampleEntry {
-        box_type: FourCc::from_bytes(*b"avc1"),
-        data_reference_index: 1,
-    };
-    avc1.width = sps_info.width;
-    avc1.height = sps_info.height;
-    avc1.horizresolution = 72_u32 << 16;
-    avc1.vertresolution = 72_u32 << 16;
-    avc1.frame_count = 1;
-    avc1.depth = 0x0018;
-    avc1.pre_defined3 = -1;
-
-    let avcc = AVCDecoderConfiguration {
-        configuration_version: 1,
-        profile: sps_info.profile,
-        profile_compatibility: sps_info.profile_compatibility,
-        level: sps_info.level,
-        length_size_minus_one: 3,
-        num_of_sequence_parameter_sets: u8::try_from(sequence_parameter_sets.len())
-            .map_err(|_| MuxError::LayoutOverflow("AVC SPS count"))?,
-        sequence_parameter_sets: sequence_parameter_sets
-            .iter()
-            .map(|nal| -> Result<AVCParameterSet, MuxError> {
-                Ok(AVCParameterSet {
-                    length: u16::try_from(nal.len())
-                        .map_err(|_| MuxError::LayoutOverflow("AVC SPS length"))?,
-                    nal_unit: nal.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        num_of_picture_parameter_sets: u8::try_from(picture_parameter_sets.len())
-            .map_err(|_| MuxError::LayoutOverflow("AVC PPS count"))?,
-        picture_parameter_sets: picture_parameter_sets
-            .iter()
-            .map(|nal| -> Result<AVCParameterSet, MuxError> {
-                Ok(AVCParameterSet {
-                    length: u16::try_from(nal.len())
-                        .map_err(|_| MuxError::LayoutOverflow("AVC PPS length"))?,
-                    nal_unit: nal.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        high_profile_fields_enabled: sps_info.high_profile_fields_enabled,
-        chroma_format: sps_info.chroma_format,
-        bit_depth_luma_minus8: sps_info.bit_depth_luma_minus8,
-        bit_depth_chroma_minus8: sps_info.bit_depth_chroma_minus8,
-        num_of_sequence_parameter_set_ext: 0,
-        sequence_parameter_sets_ext: Vec::new(),
-    };
-    super::mp4::encode_typed_box(&avc1, &super::mp4::encode_typed_box(&avcc, &[])?)
-}
-
-struct H264SpsInfo {
-    width: u16,
-    height: u16,
-    profile: u8,
-    profile_compatibility: u8,
-    level: u8,
-    high_profile_fields_enabled: bool,
-    chroma_format: u8,
-    bit_depth_luma_minus8: u8,
-    bit_depth_chroma_minus8: u8,
-    timing_time_scale: Option<u32>,
-    timing_num_units_in_tick: Option<u32>,
-}
-
-fn parse_h264_sps(nal: &[u8], spec: &str) -> Result<H264SpsInfo, MuxError> {
-    if nal.len() < 4 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.264 SPS NAL is too short".to_string(),
-        });
-    }
-    let profile = nal[1];
-    let rbsp = nal_to_rbsp(&nal[1..]);
-    let mut reader = BitReader::new(Cursor::new(rbsp));
-    let profile_idc = read_bits_u8(&mut reader, 8, spec)?;
-    let profile_compatibility_bits = read_bits_u8(&mut reader, 8, spec)?;
-    let level_idc = read_bits_u8(&mut reader, 8, spec)?;
-    let _seq_parameter_set_id = read_ue(&mut reader, spec)?;
-
-    let mut chroma_format_idc = 1_u8;
-    let mut bit_depth_luma_minus8 = 0_u8;
-    let mut bit_depth_chroma_minus8 = 0_u8;
-    let mut high_profile_fields_enabled = false;
-    if matches!(
-        profile_idc,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    ) {
-        high_profile_fields_enabled = true;
-        chroma_format_idc = u8::try_from(read_ue(&mut reader, spec)?).map_err(|_| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "H.264 chroma format does not fit in u8".to_string(),
-            }
-        })?;
-        if chroma_format_idc == 3 {
-            let _separate_colour_plane_flag = read_bit(&mut reader, spec)?;
-        }
-        bit_depth_luma_minus8 = u8::try_from(read_ue(&mut reader, spec)?).map_err(|_| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "H.264 luma bit depth does not fit in u8".to_string(),
-            }
-        })?;
-        bit_depth_chroma_minus8 = u8::try_from(read_ue(&mut reader, spec)?).map_err(|_| {
-            MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "H.264 chroma bit depth does not fit in u8".to_string(),
-            }
-        })?;
-        let _qpprime_y_zero_transform_bypass_flag = read_bit(&mut reader, spec)?;
-        let seq_scaling_matrix_present_flag = read_bit(&mut reader, spec)?;
-        if seq_scaling_matrix_present_flag {
-            let count = if chroma_format_idc != 3 { 8 } else { 12 };
-            for index in 0..count {
-                if read_bit(&mut reader, spec)? {
-                    skip_scaling_list(&mut reader, if index < 6 { 16 } else { 64 }, spec)?;
-                }
-            }
-        }
-    }
-
-    let _log2_max_frame_num_minus4 = read_ue(&mut reader, spec)?;
-    let pic_order_cnt_type = read_ue(&mut reader, spec)?;
-    if pic_order_cnt_type == 0 {
-        let _log2_max_pic_order_cnt_lsb_minus4 = read_ue(&mut reader, spec)?;
-    } else if pic_order_cnt_type == 1 {
-        let _delta_pic_order_always_zero_flag = read_bit(&mut reader, spec)?;
-        let _offset_for_non_ref_pic = read_se(&mut reader, spec)?;
-        let _offset_for_top_to_bottom_field = read_se(&mut reader, spec)?;
-        let cycle = read_ue(&mut reader, spec)?;
-        for _ in 0..cycle {
-            let _ = read_se(&mut reader, spec)?;
-        }
-    }
-    let _max_num_ref_frames = read_ue(&mut reader, spec)?;
-    let _gaps_in_frame_num_value_allowed_flag = read_bit(&mut reader, spec)?;
-    let pic_width_in_mbs_minus1 = read_ue(&mut reader, spec)?;
-    let pic_height_in_map_units_minus1 = read_ue(&mut reader, spec)?;
-    let frame_mbs_only_flag = read_bit(&mut reader, spec)?;
-    if !frame_mbs_only_flag {
-        let _mb_adaptive_frame_field_flag = read_bit(&mut reader, spec)?;
-    }
-    let _direct_8x8_inference_flag = read_bit(&mut reader, spec)?;
-    let frame_cropping_flag = read_bit(&mut reader, spec)?;
-    let (
-        frame_crop_left_offset,
-        frame_crop_right_offset,
-        frame_crop_top_offset,
-        frame_crop_bottom_offset,
-    ) = if frame_cropping_flag {
-        (
-            read_ue(&mut reader, spec)?,
-            read_ue(&mut reader, spec)?,
-            read_ue(&mut reader, spec)?,
-            read_ue(&mut reader, spec)?,
-        )
-    } else {
-        (0, 0, 0, 0)
-    };
-
-    let vui_parameters_present_flag = read_bit(&mut reader, spec)?;
-    let (timing_num_units_in_tick, timing_time_scale) = if vui_parameters_present_flag {
-        parse_vui_timing(&mut reader, spec)?
-    } else {
-        (None, None)
-    };
-
-    let sub_width_c = match chroma_format_idc {
-        0 | 3 => 1_u32,
-        _ => 2_u32,
-    };
-    let sub_height_c = match chroma_format_idc {
-        0 => {
-            if frame_mbs_only_flag {
-                1
-            } else {
-                2
-            }
-        }
-        1 => {
-            if frame_mbs_only_flag {
-                2
-            } else {
-                4
-            }
-        }
-        2 | 3 => {
-            if frame_mbs_only_flag {
-                1
-            } else {
-                2
-            }
-        }
-        _ => 1,
-    };
-    let crop_unit_x = if chroma_format_idc == 0 {
-        1
-    } else {
-        sub_width_c
-    };
-    let crop_unit_y = if chroma_format_idc == 0 {
-        if frame_mbs_only_flag { 2 } else { 4 }
-    } else {
-        sub_height_c
-    };
-
-    let width = ((pic_width_in_mbs_minus1 + 1) * 16)
-        .saturating_sub((frame_crop_left_offset + frame_crop_right_offset) * crop_unit_x);
-    let height =
-        ((pic_height_in_map_units_minus1 + 1) * 16 * if frame_mbs_only_flag { 1 } else { 2 })
-            .saturating_sub((frame_crop_top_offset + frame_crop_bottom_offset) * crop_unit_y);
-
-    Ok(H264SpsInfo {
-        width: u16::try_from(width).map_err(|_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.264 SPS width does not fit in u16".to_string(),
-        })?,
-        height: u16::try_from(height).map_err(|_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "H.264 SPS height does not fit in u16".to_string(),
-        })?,
-        profile,
-        profile_compatibility: profile_compatibility_bits,
-        level: level_idc,
-        high_profile_fields_enabled,
-        chroma_format: chroma_format_idc,
-        bit_depth_luma_minus8,
-        bit_depth_chroma_minus8,
-        timing_time_scale,
-        timing_num_units_in_tick,
-    })
-}
-
-fn nal_to_rbsp(nal: &[u8]) -> Vec<u8> {
-    let mut rbsp = Vec::with_capacity(nal.len());
-    let mut zero_count = 0_u8;
-    for &byte in nal {
-        if zero_count == 2 && byte == 0x03 {
-            zero_count = 0;
-            continue;
-        }
-        rbsp.push(byte);
-        if byte == 0 {
-            zero_count = zero_count.saturating_add(1);
-        } else {
-            zero_count = 0;
-        }
-    }
-    rbsp
-}
-
-fn parse_vui_timing<R>(
-    reader: &mut BitReader<R>,
-    spec: &str,
-) -> Result<(Option<u32>, Option<u32>), MuxError>
-where
-    R: Read,
-{
-    if read_bit(reader, spec)? {
-        let aspect_ratio_idc = read_bits_u8(reader, 8, spec)?;
-        if aspect_ratio_idc == 255 {
-            let _sar_width = read_bits_u16(reader, 16, spec)?;
-            let _sar_height = read_bits_u16(reader, 16, spec)?;
-        }
-    }
-    if read_bit(reader, spec)? {
-        let _overscan_appropriate_flag = read_bit(reader, spec)?;
-    }
-    if read_bit(reader, spec)? {
-        let _video_format = read_bits_u8(reader, 3, spec)?;
-        let _video_full_range_flag = read_bit(reader, spec)?;
-        if read_bit(reader, spec)? {
-            let _colour_primaries = read_bits_u8(reader, 8, spec)?;
-            let _transfer_characteristics = read_bits_u8(reader, 8, spec)?;
-            let _matrix_coefficients = read_bits_u8(reader, 8, spec)?;
-        }
-    }
-    if read_bit(reader, spec)? {
-        let _chroma_sample_loc_type_top_field = read_ue(reader, spec)?;
-        let _chroma_sample_loc_type_bottom_field = read_ue(reader, spec)?;
-    }
-    if read_bit(reader, spec)? {
-        let num_units_in_tick = read_bits_u32(reader, 32, spec)?;
-        let time_scale = read_bits_u32(reader, 32, spec)?;
-        let _fixed_frame_rate_flag = read_bit(reader, spec)?;
-        return Ok((Some(num_units_in_tick), Some(time_scale)));
-    }
-    Ok((None, None))
-}
-
-fn skip_scaling_list<R>(reader: &mut BitReader<R>, size: usize, spec: &str) -> Result<(), MuxError>
-where
-    R: Read,
-{
-    let mut last_scale = 8_i32;
-    let mut next_scale = 8_i32;
-    for _ in 0..size {
-        if next_scale != 0 {
-            let delta_scale = read_se(reader, spec)?;
-            next_scale = (last_scale + delta_scale + 256) % 256;
-        }
-        last_scale = if next_scale == 0 {
-            last_scale
-        } else {
-            next_scale
-        };
-    }
-    Ok(())
-}
-
-fn skip_bits_labeled<R>(
-    reader: &mut BitReader<R>,
-    width: usize,
-    spec: &str,
-    label: &str,
-) -> Result<(), MuxError>
-where
-    R: Read,
-{
-    let _ = reader
-        .read_bits(width)
-        .map_err(|error| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("failed to read {label} bitstream: {error}"),
-        })?;
-    Ok(())
-}
-
-fn read_bit_labeled<R>(reader: &mut BitReader<R>, spec: &str, label: &str) -> Result<bool, MuxError>
-where
-    R: Read,
-{
-    reader
-        .read_bit()
-        .map_err(|error| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("failed to read {label} bitstream: {error}"),
-        })
-}
-
-fn read_bits_u8_labeled<R>(
-    reader: &mut BitReader<R>,
-    width: usize,
-    spec: &str,
-    label: &str,
-) -> Result<u8, MuxError>
-where
-    R: Read,
-{
-    let bits = reader
-        .read_bits(width)
-        .map_err(|error| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("failed to read {label} bitstream: {error}"),
-        })?;
-    let mut value = 0_u16;
-    for byte in bits {
-        value = (value << 8) | u16::from(byte);
-    }
-    u8::try_from(value).map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!("{label} bitfield does not fit in u8"),
-    })
-}
-
-fn read_bits_u16_labeled<R>(
-    reader: &mut BitReader<R>,
-    width: usize,
-    spec: &str,
-    label: &str,
-) -> Result<u16, MuxError>
-where
-    R: Read,
-{
-    let bits = reader
-        .read_bits(width)
-        .map_err(|error| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("failed to read {label} bitstream: {error}"),
-        })?;
-    let mut value = 0_u32;
-    for byte in bits {
-        value = (value << 8) | u32::from(byte);
-    }
-    u16::try_from(value).map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!("{label} bitfield does not fit in u16"),
-    })
-}
-
-fn read_bits_u32_labeled<R>(
-    reader: &mut BitReader<R>,
-    width: usize,
-    spec: &str,
-    label: &str,
-) -> Result<u32, MuxError>
-where
-    R: Read,
-{
-    let bits = reader
-        .read_bits(width)
-        .map_err(|error| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("failed to read {label} bitstream: {error}"),
-        })?;
-    let mut value = 0_u64;
-    for byte in bits {
-        value = (value << 8) | u64::from(byte);
-    }
-    u32::try_from(value).map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!("{label} bitfield does not fit in u32"),
-    })
-}
-
-fn read_ue_labeled<R>(reader: &mut BitReader<R>, spec: &str, label: &str) -> Result<u32, MuxError>
-where
-    R: Read,
-{
-    let mut leading_zero_bits = 0_u32;
-    while !read_bit_labeled(reader, spec, label)? {
-        leading_zero_bits = leading_zero_bits
-            .checked_add(1)
-            .ok_or(MuxError::LayoutOverflow("Exp-Golomb prefix"))?;
-        if leading_zero_bits > 31 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!("{label} Exp-Golomb value is too large"),
-            });
-        }
-    }
-    if leading_zero_bits == 0 {
-        return Ok(0);
-    }
-    let suffix = read_bits_u32_labeled(reader, leading_zero_bits as usize, spec, label)?;
-    Ok((1_u32 << leading_zero_bits) - 1 + suffix)
-}
-
-fn read_se_labeled<R>(reader: &mut BitReader<R>, spec: &str, label: &str) -> Result<i32, MuxError>
-where
-    R: Read,
-{
-    let code_num = read_ue_labeled(reader, spec, label)?;
-    let magnitude =
-        i32::try_from(code_num.div_ceil(2)).map_err(|_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("{label} signed Exp-Golomb value is too large"),
-        })?;
-    if code_num % 2 == 0 {
-        Ok(-magnitude)
-    } else {
-        Ok(magnitude)
-    }
-}
-
-fn read_bit<R>(reader: &mut BitReader<R>, spec: &str) -> Result<bool, MuxError>
-where
-    R: Read,
-{
-    read_bit_labeled(reader, spec, "H.264")
-}
-
-fn read_bits_u8<R>(reader: &mut BitReader<R>, width: usize, spec: &str) -> Result<u8, MuxError>
-where
-    R: Read,
-{
-    read_bits_u8_labeled(reader, width, spec, "H.264")
-}
-
-fn read_bits_u16<R>(reader: &mut BitReader<R>, width: usize, spec: &str) -> Result<u16, MuxError>
-where
-    R: Read,
-{
-    read_bits_u16_labeled(reader, width, spec, "H.264")
-}
-
-fn read_bits_u32<R>(reader: &mut BitReader<R>, width: usize, spec: &str) -> Result<u32, MuxError>
-where
-    R: Read,
-{
-    read_bits_u32_labeled(reader, width, spec, "H.264")
-}
-
-fn read_ue<R>(reader: &mut BitReader<R>, spec: &str) -> Result<u32, MuxError>
-where
-    R: Read,
-{
-    read_ue_labeled(reader, spec, "H.264")
-}
-
-fn read_se<R>(reader: &mut BitReader<R>, spec: &str) -> Result<i32, MuxError>
-where
-    R: Read,
-{
-    read_se_labeled(reader, spec, "H.264")
+    Ok(bytes)
 }

@@ -170,14 +170,13 @@ fn decode_metadata_blocks(
         });
     }
 
-    if blocks
-        .last()
-        .is_some_and(|block| !block.last_metadata_block_flag)
+    if let Some(last_block) = blocks.last_mut()
+        && !last_block.last_metadata_block_flag
     {
-        return Err(invalid_value(
-            field_name,
-            "final metadata block flag must be set",
-        ));
+        // Some files terminate the serialized metadata chain cleanly without setting the final
+        // flag on the last block. Treat the payload boundary as authoritative while keeping
+        // encode-time validation strict.
+        last_block.last_metadata_block_flag = true;
     }
 
     Ok(blocks)

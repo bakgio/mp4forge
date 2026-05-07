@@ -57,6 +57,9 @@ use mp4forge::mux::{
 use mp4forge::walk::BoxPath;
 use mp4forge::{BoxInfo, FourCc};
 
+#[cfg(feature = "mux")]
+const TS_PACKET_SIZE: usize = 188;
+
 pub fn encode_supported_box<B>(box_value: &B, children: &[u8]) -> Vec<u8>
 where
     B: CodecBox,
@@ -79,12 +82,16 @@ pub fn fourcc(value: &str) -> FourCc {
 }
 
 pub fn write_temp_file(prefix: &str, data: &[u8]) -> PathBuf {
+    write_temp_file_with_extension(prefix, "mp4", data)
+}
+
+pub fn write_temp_file_with_extension(prefix: &str, extension: &str, data: &[u8]) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "mp4forge-{prefix}-{}-{unique}.mp4",
+        "mp4forge-{prefix}-{}-{unique}.{extension}",
         std::process::id()
     ));
     fs::write(&path, data).unwrap();
@@ -158,10 +165,48 @@ pub fn write_test_adts_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
 }
 
 #[cfg(feature = "mux")]
+/// Writes one deterministic AAC-LC LATM file for direct-ingest mux tests.
+pub fn write_test_latm_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        bytes.extend_from_slice(&build_test_latm_frame(index != 0, payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+/// Writes one deterministic USAC LATM file for direct-ingest mux tests.
+pub fn write_test_usac_latm_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        bytes.extend_from_slice(&build_test_usac_latm_frame(index != 0, payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_truehd_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_test_truehd_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
 pub fn write_test_mp3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
     let mut bytes = Vec::new();
     for payload in payloads {
         bytes.extend_from_slice(&build_mp3_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_mp3_44100_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_mp3_frame_44100(payload));
     }
     write_temp_file(prefix, &bytes)
 }
@@ -207,31 +252,1641 @@ pub fn write_test_eac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
 }
 
 #[cfg(feature = "mux")]
-pub fn write_test_ac4_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+pub fn write_test_ac4_file(prefix: &str, frame_count: usize) -> PathBuf {
     let mut bytes = Vec::new();
+    let frame = decode_test_hex_bytes(TEST_AC4_FRAME_HEX);
+    for _ in 0..frame_count {
+        bytes.extend_from_slice(&frame);
+        bytes.extend_from_slice(&[0, 0]);
+    }
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "mp4forge-{prefix}-{}-{unique}.ac4",
+        std::process::id()
+    ));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_amr_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"#!AMR\n");
     for payload in payloads {
-        bytes.extend_from_slice(&build_ac4_frame(payload));
+        bytes.extend_from_slice(&build_test_amr_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_amr_wb_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"#!AMR-WB\n");
+    for payload in payloads {
+        bytes.extend_from_slice(&build_test_amr_wb_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestQcpCodecKind {
+    Qcelp,
+    Evrc,
+    Smv,
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_qcp_constant_file(
+    prefix: &str,
+    codec: TestQcpCodecKind,
+    payloads: &[&[u8]],
+) -> PathBuf {
+    assert!(!payloads.is_empty());
+    let packet_size = u16::try_from(payloads[0].len()).unwrap();
+    assert!(packet_size > 0);
+    for payload in payloads.iter().skip(1) {
+        assert_eq!(payload.len(), usize::from(packet_size));
+    }
+    let packets = payloads
+        .iter()
+        .map(|payload| payload.to_vec())
+        .collect::<Vec<_>>();
+    write_temp_file(
+        prefix,
+        &build_test_qcp_file_bytes(
+            TestQcpFileSpec {
+                codec,
+                decoder_version: 0,
+                packet_size,
+                block_size: 160,
+                sample_rate: 8_000,
+                rate_entries: &[],
+                rate_flag: 0,
+            },
+            &packets,
+        ),
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_qcp_variable_file(
+    prefix: &str,
+    codec: TestQcpCodecKind,
+    packets: &[(u8, &[u8])],
+) -> PathBuf {
+    assert!(!packets.is_empty());
+    let mut rate_entries = Vec::new();
+    for (rate_index, payload) in packets {
+        assert!(!payload.is_empty());
+        let packet_size = u8::try_from(payload.len()).unwrap();
+        if let Some(existing) = rate_entries
+            .iter()
+            .find(|(existing_index, _)| *existing_index == *rate_index)
+        {
+            assert_eq!(existing.1, packet_size);
+        } else {
+            rate_entries.push((*rate_index, packet_size));
+        }
+    }
+    assert!(rate_entries.len() <= 8);
+    let packet_bytes = packets
+        .iter()
+        .map(|(rate_index, payload)| {
+            let mut packet = Vec::with_capacity(payload.len() + 1);
+            packet.push(*rate_index);
+            packet.extend_from_slice(payload);
+            packet
+        })
+        .collect::<Vec<_>>();
+    write_temp_file(
+        prefix,
+        &build_test_qcp_file_bytes(
+            TestQcpFileSpec {
+                codec,
+                decoder_version: 0,
+                packet_size: 0,
+                block_size: 160,
+                sample_rate: 8_000,
+                rate_entries: &rate_entries,
+                rate_flag: 1,
+            },
+            &packet_bytes,
+        ),
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_dts_file(prefix: &str, frame_count: usize) -> PathBuf {
+    let mut bytes = Vec::new();
+    for index in 0..frame_count {
+        bytes.extend_from_slice(&build_dts_frame(index));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_flac_file(prefix: &str, frame_payload: &[u8]) -> PathBuf {
+    write_test_flac_file_with_frames(prefix, &[frame_payload])
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_flac_file_with_frames(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    write_test_flac_file_with_frames_and_block_size(prefix, 48_000, 1_024, frame_payloads)
+}
+
+#[cfg(feature = "mux")]
+/// Writes a deterministic native FLAC file whose authored frame headers expose `block_size` and
+/// `sample_rate` directly, so mux tests can model longer retained audio frame timing shapes.
+pub fn write_test_flac_file_with_frames_and_block_size(
+    prefix: &str,
+    sample_rate: u32,
+    block_size: u32,
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    assert!(!frame_payloads.is_empty());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"fLaC");
+    bytes.push(0x80);
+    bytes.extend_from_slice(&34_u32.to_be_bytes()[1..]);
+    bytes.extend_from_slice(&build_flac_streaminfo_block(
+        sample_rate,
+        2,
+        16,
+        u64::try_from(frame_payloads.len()).unwrap() * u64::from(block_size),
+    ));
+    for payload in frame_payloads {
+        bytes.extend_from_slice(&build_test_flac_frame_with_block_size(payload, block_size));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ogg_flac_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x464C_4143_u32;
+    let mut bytes = Vec::new();
+    let mut header_packet = Vec::new();
+    header_packet.extend_from_slice(b"fLaC");
+    header_packet.push(0x80);
+    header_packet.extend_from_slice(&34_u32.to_be_bytes()[1..]);
+    header_packet.extend_from_slice(&build_flac_streaminfo_block(
+        48_000,
+        2,
+        16,
+        u64::try_from(frame_payloads.len()).unwrap() * 1_024,
+    ));
+    bytes.extend_from_slice(&build_ogg_page(serial, 0, 0x02, 0, &[header_packet]));
+    let mut granule_position = 0_u64;
+    for (index, payload) in frame_payloads.iter().enumerate() {
+        let frame = build_test_flac_frame(payload);
+        granule_position += 1_024;
+        let header_type = if index + 1 == frame_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 2).unwrap(),
+            header_type,
+            granule_position,
+            &[frame],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ogg_flac_mapping_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x4F47_464C_u32;
+    let mut bytes = Vec::new();
+    let total_samples = u64::try_from(frame_payloads.len()).unwrap() * 1_024;
+    let mut header_packet = Vec::new();
+    header_packet.push(0x7F);
+    header_packet.extend_from_slice(b"FLAC");
+    header_packet.push(1);
+    header_packet.push(0);
+    header_packet.extend_from_slice(&1_u16.to_be_bytes());
+    header_packet.extend_from_slice(b"fLaC");
+    header_packet.push(0x00);
+    header_packet.extend_from_slice(&34_u32.to_be_bytes()[1..]);
+    header_packet.extend_from_slice(&build_flac_streaminfo_block(48_000, 2, 16, total_samples));
+    bytes.extend_from_slice(&build_ogg_page(serial, 0, 0x02, 0, &[header_packet]));
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        1,
+        0,
+        0,
+        &[build_flac_vorbis_comment_block()],
+    ));
+    let mut granule_position = 0_u64;
+    for (index, payload) in frame_payloads.iter().enumerate() {
+        let frame = build_test_flac_frame(payload);
+        granule_position += 1_024;
+        let header_type = if index + 1 == frame_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 1).unwrap(),
+            header_type,
+            granule_position,
+            &[frame],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ogg_opus_file(prefix: &str, audio_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x4F50_5553_u32;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        0,
+        0x02,
+        0,
+        &[build_opus_head_packet(2)],
+    ));
+    bytes.extend_from_slice(&build_ogg_page(serial, 1, 0, 0, &[b"OpusTags".to_vec()]));
+    let mut granule_position = 0_u64;
+    for (index, payload) in audio_payloads.iter().enumerate() {
+        let mut packet = vec![0x00];
+        packet.extend_from_slice(payload);
+        granule_position += 480;
+        let header_type = if index + 1 == audio_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 2).unwrap(),
+            header_type,
+            granule_position,
+            &[packet],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_wave_pcm_file(prefix: &str, frames: &[[i16; 2]]) -> PathBuf {
+    let channel_count = 2_u16;
+    let sample_rate = 48_000_u32;
+    let bits_per_sample = 16_u16;
+    let block_align = channel_count * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+
+    let mut data = Vec::with_capacity(frames.len() * usize::from(block_align));
+    for frame in frames {
+        for sample in frame {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+
+    let fmt_chunk_size = 16_u32;
+    let data_chunk_size = u32::try_from(data.len()).unwrap();
+    let riff_size = 4_u32
+        .checked_add(8 + fmt_chunk_size)
+        .and_then(|value| value.checked_add(8 + data_chunk_size))
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&fmt_chunk_size.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&channel_count.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_chunk_size.to_le_bytes());
+    bytes.extend_from_slice(&data);
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aiff_pcm_file(prefix: &str, frames: &[[i16; 2]]) -> PathBuf {
+    write_test_aiff_like_pcm_file(prefix, frames, None)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aifc_pcm_file(prefix: &str, frames: &[[i16; 2]]) -> PathBuf {
+    write_test_aiff_like_pcm_file(prefix, frames, Some(*b"twos"))
+}
+
+#[cfg(feature = "mux")]
+fn write_test_aiff_like_pcm_file(
+    prefix: &str,
+    frames: &[[i16; 2]],
+    compression: Option<[u8; 4]>,
+) -> PathBuf {
+    let channel_count = 2_u16;
+    let sample_rate = 48_000_u32;
+    let bits_per_sample = 16_u16;
+
+    let mut data = Vec::with_capacity(frames.len() * usize::from(channel_count) * 2);
+    for frame in frames {
+        for sample in frame {
+            data.extend_from_slice(&sample.to_be_bytes());
+        }
+    }
+
+    let mut comm_payload = Vec::new();
+    comm_payload.extend_from_slice(&channel_count.to_be_bytes());
+    comm_payload.extend_from_slice(&u32::try_from(frames.len()).unwrap().to_be_bytes());
+    comm_payload.extend_from_slice(&bits_per_sample.to_be_bytes());
+    comm_payload.extend_from_slice(&encode_aiff_extended_sample_rate(sample_rate));
+    if let Some(compression) = compression {
+        comm_payload.extend_from_slice(&compression);
+    }
+
+    let mut ssnd_payload = Vec::new();
+    ssnd_payload.extend_from_slice(&0_u32.to_be_bytes());
+    ssnd_payload.extend_from_slice(&0_u32.to_be_bytes());
+    ssnd_payload.extend_from_slice(&data);
+
+    let form_type = if compression.is_some() {
+        *b"AIFC"
+    } else {
+        *b"AIFF"
+    };
+    let mut bytes = Vec::new();
+    let total_size = 4 + (8 + comm_payload.len()) + (8 + ssnd_payload.len());
+    bytes.extend_from_slice(b"FORM");
+    bytes.extend_from_slice(&u32::try_from(total_size).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&form_type);
+    bytes.extend_from_slice(b"COMM");
+    bytes.extend_from_slice(&u32::try_from(comm_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&comm_payload);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&u32::try_from(ssnd_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&ssnd_payload);
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+fn encode_aiff_extended_sample_rate(sample_rate: u32) -> [u8; 10] {
+    let msb_index = 31_u32 - sample_rate.leading_zeros();
+    let exponent = 16383_u16 + u16::try_from(msb_index).unwrap();
+    let mantissa = u64::from(sample_rate) << (63 - msb_index);
+
+    let mut bytes = [0_u8; 10];
+    bytes[..2].copy_from_slice(&exponent.to_be_bytes());
+    bytes[2..].copy_from_slice(&mantissa.to_be_bytes());
+    bytes
+}
+
+#[cfg(feature = "mux")]
+pub struct TestAviPcmStream<'a> {
+    pub sample_rate: u32,
+    pub channel_count: u16,
+    pub bits_per_sample: u16,
+    pub chunks: &'a [&'a [u8]],
+}
+
+#[cfg(feature = "mux")]
+pub struct TestAviMp4vStream<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub frame_scale: u32,
+    pub frame_rate: u32,
+    pub compression: [u8; 4],
+    pub decoder_specific_info: &'a [u8],
+    pub frames: &'a [&'a [u8]],
+}
+
+#[cfg(feature = "mux")]
+pub struct TestAviH264Stream<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub frame_scale: u32,
+    pub frame_rate: u32,
+    pub compression: [u8; 4],
+    pub sample_payloads: &'a [&'a [u8]],
+}
+
+#[cfg(feature = "mux")]
+pub struct TestAviAvc1Stream<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub frame_scale: u32,
+    pub frame_rate: u32,
+    pub sample_payloads: &'a [&'a [u8]],
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_mp3_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    payloads: &[&[u8]],
+) -> PathBuf {
+    let frames = payloads
+        .iter()
+        .map(|payload| build_mp3_frame(payload))
+        .collect::<Vec<_>>();
+    let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    write_test_avi_framed_audio_file(prefix, 0x0055, sample_rate, channel_count, 16, &frame_refs)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_ac3_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    payloads: &[&[u8]],
+) -> PathBuf {
+    let frames = payloads
+        .iter()
+        .map(|payload| build_ac3_frame(payload))
+        .collect::<Vec<_>>();
+    let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    write_test_avi_framed_audio_file(prefix, 0x2000, sample_rate, channel_count, 16, &frame_refs)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_pcm_file(prefix: &str, streams: &[TestAviPcmStream<'_>]) -> PathBuf {
+    let avih = build_test_avi_avih_payload(
+        streams.len(),
+        streams
+            .iter()
+            .flat_map(|stream| stream.chunks.iter().map(|chunk| chunk.len()))
+            .max()
+            .unwrap_or(0),
+    );
+    let mut hdrl_children = encode_riff_chunk(*b"avih", &avih);
+    for (index, stream) in streams.iter().enumerate() {
+        hdrl_children.extend_from_slice(&encode_riff_list(
+            *b"strl",
+            &build_test_avi_pcm_stream_list(index, stream),
+        ));
+    }
+    let hdrl = encode_riff_list(*b"hdrl", &hdrl_children);
+    let movi = encode_riff_list(*b"movi", &build_test_avi_movi_payload(streams));
+
+    let mut riff_payload = Vec::new();
+    riff_payload.extend_from_slice(b"AVI ");
+    riff_payload.extend_from_slice(&hdrl);
+    riff_payload.extend_from_slice(&movi);
+    write_temp_file(prefix, &encode_riff_chunk(*b"RIFF", &riff_payload))
+}
+
+#[cfg(feature = "mux")]
+struct TestAviVideoFileSpec<'a> {
+    width: u16,
+    height: u16,
+    frame_scale: u32,
+    frame_rate: u32,
+    compression: [u8; 4],
+    decoder_specific_info: &'a [u8],
+    frames: &'a [&'a [u8]],
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_h263_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_scale: u32,
+    frame_rate: u32,
+    sample_payloads: &[&[u8]],
+) -> PathBuf {
+    let frames = sample_payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| build_test_h263_frame(u8::try_from(index).unwrap(), payload))
+        .collect::<Vec<_>>();
+    let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    write_test_avi_video_file(
+        prefix,
+        TestAviVideoFileSpec {
+            width,
+            height,
+            frame_scale,
+            frame_rate,
+            compression: *b"H263",
+            decoder_specific_info: &[],
+            frames: &frame_refs,
+        },
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_jpeg_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_scale: u32,
+    frame_rate: u32,
+    frames: &[&[u8]],
+) -> PathBuf {
+    write_test_avi_video_file(
+        prefix,
+        TestAviVideoFileSpec {
+            width,
+            height,
+            frame_scale,
+            frame_rate,
+            compression: *b"MJPG",
+            decoder_specific_info: &[],
+            frames,
+        },
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_png_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_scale: u32,
+    frame_rate: u32,
+    frames: &[&[u8]],
+) -> PathBuf {
+    write_test_avi_video_file(
+        prefix,
+        TestAviVideoFileSpec {
+            width,
+            height,
+            frame_scale,
+            frame_rate,
+            compression: *b"PNG ",
+            decoder_specific_info: &[],
+            frames,
+        },
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_mp4v_file(prefix: &str, stream: &TestAviMp4vStream<'_>) -> PathBuf {
+    let avih = build_test_avi_avih_payload(
+        1,
+        stream
+            .frames
+            .iter()
+            .map(|frame| frame.len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut hdrl_children = encode_riff_chunk(*b"avih", &avih);
+    hdrl_children.extend_from_slice(&encode_riff_list(
+        *b"strl",
+        &build_test_avi_mp4v_stream_list(stream),
+    ));
+    let hdrl = encode_riff_list(*b"hdrl", &hdrl_children);
+    let movi = encode_riff_list(*b"movi", &build_test_avi_mp4v_movi_payload(stream));
+
+    let mut riff_payload = Vec::new();
+    riff_payload.extend_from_slice(b"AVI ");
+    riff_payload.extend_from_slice(&hdrl);
+    riff_payload.extend_from_slice(&movi);
+    write_temp_file(prefix, &encode_riff_chunk(*b"RIFF", &riff_payload))
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_h264_file(prefix: &str, stream: &TestAviH264Stream<'_>) -> PathBuf {
+    let frames = build_test_h264_annexb_chunks(stream.sample_payloads);
+    let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let avih = build_test_avi_avih_payload(
+        1,
+        frame_refs
+            .iter()
+            .map(|frame| frame.len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut hdrl_children = encode_riff_chunk(*b"avih", &avih);
+    hdrl_children.extend_from_slice(&encode_riff_list(
+        *b"strl",
+        &build_test_avi_video_stream_list(
+            stream.width,
+            stream.height,
+            stream.frame_scale,
+            stream.frame_rate,
+            stream.compression,
+            &[],
+            &frame_refs,
+        ),
+    ));
+    let hdrl = encode_riff_list(*b"hdrl", &hdrl_children);
+    let movi = encode_riff_list(*b"movi", &build_test_avi_video_movi_payload(&frame_refs));
+
+    let mut riff_payload = Vec::new();
+    riff_payload.extend_from_slice(b"AVI ");
+    riff_payload.extend_from_slice(&hdrl);
+    riff_payload.extend_from_slice(&movi);
+    write_temp_file(prefix, &encode_riff_chunk(*b"RIFF", &riff_payload))
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_avi_avc1_file(prefix: &str, stream: &TestAviAvc1Stream<'_>) -> PathBuf {
+    let frames = build_test_h264_avc1_chunks(stream.sample_payloads);
+    let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let avih = build_test_avi_avih_payload(
+        1,
+        frame_refs
+            .iter()
+            .map(|frame| frame.len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut hdrl_children = encode_riff_chunk(*b"avih", &avih);
+    hdrl_children.extend_from_slice(&encode_riff_list(
+        *b"strl",
+        &build_test_avi_video_stream_list(
+            stream.width,
+            stream.height,
+            stream.frame_scale,
+            stream.frame_rate,
+            *b"AVC1",
+            &build_test_avcc_decoder_specific_info(),
+            &frame_refs,
+        ),
+    ));
+    let hdrl = encode_riff_list(*b"hdrl", &hdrl_children);
+    let movi = encode_riff_list(*b"movi", &build_test_avi_video_movi_payload(&frame_refs));
+
+    let mut riff_payload = Vec::new();
+    riff_payload.extend_from_slice(b"AVI ");
+    riff_payload.extend_from_slice(&hdrl);
+    riff_payload.extend_from_slice(&movi);
+    write_temp_file(prefix, &encode_riff_chunk(*b"RIFF", &riff_payload))
+}
+
+#[cfg(feature = "mux")]
+fn write_test_avi_framed_audio_file(
+    prefix: &str,
+    format_tag: u16,
+    sample_rate: u32,
+    channel_count: u16,
+    bits_per_sample: u16,
+    frames: &[&[u8]],
+) -> PathBuf {
+    let avih =
+        build_test_avi_avih_payload(1, frames.iter().map(|frame| frame.len()).max().unwrap_or(0));
+    let mut hdrl_children = encode_riff_chunk(*b"avih", &avih);
+    hdrl_children.extend_from_slice(&encode_riff_list(
+        *b"strl",
+        &build_test_avi_framed_audio_stream_list(
+            format_tag,
+            sample_rate,
+            channel_count,
+            bits_per_sample,
+            frames,
+        ),
+    ));
+    let hdrl = encode_riff_list(*b"hdrl", &hdrl_children);
+    let movi = encode_riff_list(*b"movi", &build_test_avi_audio_movi_payload(frames));
+
+    let mut riff_payload = Vec::new();
+    riff_payload.extend_from_slice(b"AVI ");
+    riff_payload.extend_from_slice(&hdrl);
+    riff_payload.extend_from_slice(&movi);
+    write_temp_file(prefix, &encode_riff_chunk(*b"RIFF", &riff_payload))
+}
+
+#[cfg(feature = "mux")]
+fn write_test_avi_video_file(prefix: &str, spec: TestAviVideoFileSpec<'_>) -> PathBuf {
+    let avih = build_test_avi_avih_payload(
+        1,
+        spec.frames
+            .iter()
+            .map(|frame| frame.len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut hdrl_children = encode_riff_chunk(*b"avih", &avih);
+    hdrl_children.extend_from_slice(&encode_riff_list(
+        *b"strl",
+        &build_test_avi_video_stream_list(
+            spec.width,
+            spec.height,
+            spec.frame_scale,
+            spec.frame_rate,
+            spec.compression,
+            spec.decoder_specific_info,
+            spec.frames,
+        ),
+    ));
+    let hdrl = encode_riff_list(*b"hdrl", &hdrl_children);
+    let movi = encode_riff_list(*b"movi", &build_test_avi_video_movi_payload(spec.frames));
+
+    let mut riff_payload = Vec::new();
+    riff_payload.extend_from_slice(b"AVI ");
+    riff_payload.extend_from_slice(&hdrl);
+    riff_payload.extend_from_slice(&movi);
+    write_temp_file(prefix, &encode_riff_chunk(*b"RIFF", &riff_payload))
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_mp4v_file(prefix: &str, bytes: &[u8]) -> PathBuf {
+    write_temp_file(prefix, bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_mp4v_decoder_specific_info(width: u16, height: u16) -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, 1, 8);
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, 1, 4);
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, 0, 2);
+    writer.write_bit(true).unwrap();
+    write_test_bits_u64(&mut writer, 1_000, 16);
+    writer.write_bit(true).unwrap();
+    writer.write_bit(false).unwrap();
+    writer.write_bit(true).unwrap();
+    write_test_bits_u64(&mut writer, u64::from(width), 13);
+    writer.write_bit(true).unwrap();
+    write_test_bits_u64(&mut writer, u64::from(height), 13);
+    writer.write_bit(true).unwrap();
+    align_test_bit_writer(&mut writer);
+
+    let mut bytes = vec![0x00, 0x00, 0x01, 0x20];
+    bytes.extend_from_slice(&writer.into_inner().unwrap());
+    bytes
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_mp3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = build_test_program_stream_pack_header();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_test_program_stream_mp3_pes_packet(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_ac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = build_test_program_stream_pack_header();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_test_program_stream_ac3_pes_packet(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_mp4v_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = build_test_program_stream_pack_header();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_test_program_stream_mp4v_pes_packet(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_h264_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = build_test_program_stream_pack_header();
+    bytes.extend_from_slice(&build_test_program_stream_video_pes_packet(
+        &build_test_h264_annexb_bytes(sample_payloads),
+    ));
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_h265_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = build_test_program_stream_pack_header();
+    bytes.extend_from_slice(&build_test_program_stream_video_pes_packet(
+        &build_test_h265_annexb_bytes(sample_payloads),
+    ));
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_vvc_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = build_test_program_stream_pack_header();
+    let raw_vvc = fixture_path("mux/raw_vvc_idr.vvc");
+    let mut annex_b = fs::read(raw_vvc).unwrap();
+    for extra in sample_payloads {
+        annex_b.extend_from_slice(extra);
+    }
+    bytes.extend_from_slice(&build_test_program_stream_video_pes_packet(&annex_b));
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_mp3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in payloads {
+        let pes_packet = build_test_transport_stream_mp3_pes_packet(payload);
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_ac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_stream_type(
+        continuity_counter,
+        0x81,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in payloads {
+        let pes_packet =
+            build_test_transport_stream_private_data_pes_packet(&build_ac3_frame(payload));
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_eac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_stream_type(
+        continuity_counter,
+        0x84,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in payloads {
+        let pes_packet =
+            build_test_transport_stream_private_data_pes_packet(&build_eac3_frame(payload));
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_mp4v_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_stream_type(
+        continuity_counter,
+        0x10,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in payloads {
+        let pes_packet = build_test_transport_stream_mp4v_pes_packet(payload);
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_h264_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_stream_type(
+        continuity_counter,
+        0x1B,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    let pes_packet = build_test_transport_stream_video_pes_packet(&build_test_h264_annexb_bytes(
+        sample_payloads,
+    ));
+    bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+        0x0101,
+        &mut continuity_counter,
+        &pes_packet,
+    ));
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_h265_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_stream_type(
+        continuity_counter,
+        0x24,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    let pes_packet = build_test_transport_stream_video_pes_packet(&build_test_h265_annexb_bytes(
+        sample_payloads,
+    ));
+    bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+        0x0101,
+        &mut continuity_counter,
+        &pes_packet,
+    ));
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_vvc_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_stream_type(
+        continuity_counter,
+        0x33,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    let raw_vvc = fixture_path("mux/raw_vvc_idr.vvc");
+    let mut annex_b = fs::read(raw_vvc).unwrap();
+    for extra in sample_payloads {
+        annex_b.extend_from_slice(extra);
+    }
+    let pes_packet = build_test_transport_stream_video_pes_packet(&annex_b);
+    bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+        0x0101,
+        &mut continuity_counter,
+        &pes_packet,
+    ));
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_dvb_subtitle_file(
+    prefix: &str,
+    subtitle_payloads: &[&[u8]],
+) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_private_data(
+        continuity_counter,
+        &build_test_transport_stream_dvb_subtitle_descriptor(*b"eng", 0x10, 0x0123, 0x0456),
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in subtitle_payloads {
+        let pes_packet = build_test_transport_stream_private_data_pes_packet(payload);
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_transport_stream_dvb_teletext_file(
+    prefix: &str,
+    teletext_payloads: &[&[u8]],
+) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_pat_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet_for_private_data(
+        continuity_counter,
+        &build_test_transport_stream_dvb_teletext_descriptor(*b"eng", 0x10, 0x01),
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in teletext_payloads {
+        let pes_packet = build_test_transport_stream_private_data_pes_packet(payload);
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_vobsub_files(
+    prefix: &str,
+    start_times_ms: &[u32],
+    sample_payloads: &[&[u8]],
+) -> (PathBuf, PathBuf) {
+    assert_eq!(start_times_ms.len(), sample_payloads.len());
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("mp4forge-{prefix}-{}-{unique}", std::process::id()));
+    let idx_path = base.with_extension("idx");
+    let sub_path = base.with_extension("sub");
+
+    let mut sub_bytes = Vec::new();
+    let mut positions = Vec::with_capacity(sample_payloads.len());
+    for (start_ms, payload) in start_times_ms
+        .iter()
+        .copied()
+        .zip(sample_payloads.iter().copied())
+    {
+        let filepos = u64::try_from(sub_bytes.len()).unwrap();
+        positions.push((start_ms, filepos));
+        let packet = build_test_vobsub_packet(payload);
+        sub_bytes.extend_from_slice(&packetize_test_vobsub_subpicture(
+            u64::from(start_ms) * 90,
+            0x20,
+            &packet,
+        ));
+    }
+
+    let mut idx = String::from("# VobSub index file, v7 (do not modify this line!)\n#\n");
+    idx.push_str("size: 720x480\n");
+    idx.push_str(
+        "palette: 000000, 101010, 202020, 303030, 404040, 505050, 606060, 707070, 808080, 909090, A0A0A0, B0B0B0, C0C0C0, D0D0D0, E0E0E0, F0F0F0\n",
+    );
+    idx.push_str("id: en, index: 0\n");
+    for (start_ms, filepos) in positions {
+        idx.push_str(&format!(
+            "timestamp: {}, filepos: {:09X}\n",
+            format_vobsub_timestamp_ms(start_ms),
+            filepos
+        ));
+    }
+
+    fs::write(&idx_path, idx.as_bytes()).unwrap();
+    fs::write(&sub_path, &sub_bytes).unwrap();
+    (idx_path, sub_path)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_program_stream_vobsub_file(
+    prefix: &str,
+    start_times_ms: &[u32],
+    sample_payloads: &[&[u8]],
+) -> PathBuf {
+    assert_eq!(start_times_ms.len(), sample_payloads.len());
+
+    let mut bytes = build_test_program_stream_pack_header();
+    for (start_ms, payload) in start_times_ms
+        .iter()
+        .copied()
+        .zip(sample_payloads.iter().copied())
+    {
+        let packet = build_test_vobsub_packet(payload);
+        bytes.extend_from_slice(&build_test_program_stream_vobsub_pes_packet(
+            u64::from(start_ms) * 90,
+            0x20,
+            &packet,
+        ));
+    }
+    write_temp_file_with_extension(prefix, "ps", &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ogg_vorbis_file(prefix: &str, audio_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x564F_5242_u32;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        0,
+        0x02,
+        0,
+        &[build_vorbis_identification_packet()],
+    ));
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        1,
+        0,
+        0,
+        &[build_vorbis_comment_packet()],
+    ));
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        2,
+        0,
+        0,
+        &[build_vorbis_setup_packet()],
+    ));
+    let mut granule_position = 0_u64;
+    for (index, payload) in audio_payloads.iter().enumerate() {
+        granule_position += 64;
+        let header_type = if index + 1 == audio_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 3).unwrap(),
+            header_type,
+            granule_position,
+            &[build_vorbis_audio_packet(payload)],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+fn format_vobsub_timestamp_ms(total_ms: u32) -> String {
+    let hours = total_ms / 3_600_000;
+    let minutes = (total_ms / 60_000) % 60;
+    let seconds = (total_ms / 1_000) % 60;
+    let milliseconds = total_ms % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}:{milliseconds:03}")
+}
+
+#[cfg(feature = "mux")]
+fn build_test_vobsub_packet(payload: &[u8]) -> Vec<u8> {
+    let control_offset = 4_u16 + u16::try_from(payload.len()).unwrap();
+    let packet_size = control_offset + 6;
+    let mut packet = Vec::with_capacity(usize::from(packet_size));
+    packet.extend_from_slice(&packet_size.to_be_bytes());
+    packet.extend_from_slice(&control_offset.to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet.extend_from_slice(&0_u16.to_be_bytes());
+    packet.extend_from_slice(&control_offset.to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0xFF]);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn packetize_test_vobsub_subpicture(pts: u64, substream_id: u8, data: &[u8]) -> Vec<u8> {
+    let ptsbuf = [
+        (((pts >> 29) & 0x0E) as u8) | 0x21,
+        ((pts >> 22) & 0xFF) as u8,
+        (((pts >> 14) & 0xFE) as u8) | 0x01,
+        ((pts >> 7) & 0xFF) as u8,
+        (((pts << 1) & 0xFE) as u8) | 0x01,
+    ];
+    let mut packetized = Vec::new();
+    let mut remaining = data;
+    let mut emit_pts = true;
+    while !remaining.is_empty() {
+        let mut sector = [0_u8; 0x800];
+        sector[..5].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x40]);
+
+        let mut write = 14usize;
+        sector[write..write + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBD]);
+        write += 4;
+
+        let mut data_len = sector.len() - 14 - 4 - 2 - 3 - 1;
+        if emit_pts {
+            data_len -= 5;
+        }
+        let mut pad_len = 0usize;
+        if remaining.len() <= data_len {
+            pad_len = data_len - remaining.len();
+            data_len = remaining.len();
+        }
+
+        let pes_header_extension_len =
+            if emit_pts { 5 } else { 0 } + usize::from(pad_len < 6) * pad_len;
+        let pes_packet_size =
+            3 + if emit_pts { 5 } else { 0 } + 1 + data_len + if pad_len < 6 { pad_len } else { 0 };
+        sector[write..write + 2]
+            .copy_from_slice(&(u16::try_from(pes_packet_size).unwrap()).to_be_bytes());
+        write += 2;
+        sector[write] = 0x80;
+        sector[write + 1] = if emit_pts { 0x80 } else { 0x00 };
+        sector[write + 2] = u8::try_from(pes_header_extension_len).unwrap();
+        write += 3;
+
+        if emit_pts {
+            sector[write..write + 5].copy_from_slice(&ptsbuf);
+            write += 5;
+        }
+
+        if pad_len < 6 {
+            write += pad_len;
+        }
+
+        sector[write] = substream_id;
+        write += 1;
+        sector[write..write + data_len].copy_from_slice(&remaining[..data_len]);
+        write += data_len;
+        remaining = &remaining[data_len..];
+
+        if pad_len >= 6 {
+            let stream_padding = pad_len - 6;
+            sector[write..write + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBE]);
+            sector[write + 4..write + 6]
+                .copy_from_slice(&(u16::try_from(stream_padding).unwrap()).to_be_bytes());
+        }
+
+        packetized.extend_from_slice(&sector);
+        emit_pts = false;
+    }
+    packetized
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ogg_speex_file(prefix: &str, audio_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x5350_5858_u32;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        0,
+        0x02,
+        0,
+        &[build_speex_header_packet()],
+    ));
+    bytes.extend_from_slice(&build_ogg_page(serial, 1, 0, 0, &[b"SpeexTags".to_vec()]));
+    let mut granule_position = 0_u64;
+    for (index, payload) in audio_payloads.iter().enumerate() {
+        granule_position += 160;
+        let header_type = if index + 1 == audio_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 2).unwrap(),
+            header_type,
+            granule_position,
+            &[payload.to_vec()],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_ogg_theora_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x5448_454F_u32;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        0,
+        0x02,
+        0,
+        &[build_theora_identification_packet(4, 3)],
+    ));
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        1,
+        0,
+        0,
+        &[build_theora_comment_packet()],
+    ));
+    bytes.extend_from_slice(&build_ogg_page(
+        serial,
+        2,
+        0,
+        0,
+        &[build_theora_setup_packet()],
+    ));
+    let mut granule_position = 0_u64;
+    for (index, payload) in frame_payloads.iter().enumerate() {
+        granule_position += 1;
+        let header_type = if index + 1 == frame_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 3).unwrap(),
+            header_type,
+            granule_position,
+            &[build_theora_frame_packet(payload)],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+/// Writes one deterministic 1x1 JPEG fixture for direct-ingest mux tests.
+pub fn write_test_jpeg_file(prefix: &str) -> PathBuf {
+    write_temp_file(prefix, include_bytes!("../fixtures/generated-1x1.jpg"))
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_png_file(prefix: &str) -> PathBuf {
+    write_temp_file(
+        prefix,
+        &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, b'I', b'D', b'A', b'T', 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+        ],
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_iamf_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_test_iamf_obu(
+        31,
+        &build_test_iamf_sequence_header_payload(),
+    ));
+    bytes.extend_from_slice(&build_test_iamf_obu(
+        0,
+        &build_test_iamf_codec_config_payload(),
+    ));
+    bytes.extend_from_slice(&build_test_iamf_obu(
+        1,
+        &build_test_iamf_audio_element_payload(),
+    ));
+    for payload in frame_payloads {
+        bytes.extend_from_slice(&build_test_iamf_obu(4, &[]));
+        bytes.extend_from_slice(&build_test_iamf_obu(5, payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_caf_alac_file(prefix: &str, packets: &[&[u8]]) -> PathBuf {
+    assert!(!packets.is_empty());
+    let bytes_per_packet = u32::try_from(packets[0].len()).unwrap();
+    assert!(bytes_per_packet > 0);
+    for packet in &packets[1..] {
+        assert_eq!(packet.len(), usize::try_from(bytes_per_packet).unwrap());
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"caff");
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+
+    let desc_payload = build_caf_alac_description_chunk(bytes_per_packet, 1_024, 2, 16, 48_000.0);
+    bytes.extend_from_slice(b"desc");
+    bytes.extend_from_slice(&u64::try_from(desc_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&desc_payload);
+
+    let cookie = b"alac-cookie";
+    bytes.extend_from_slice(b"kuki");
+    bytes.extend_from_slice(&u64::try_from(cookie.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(cookie);
+
+    let mut data_payload =
+        Vec::with_capacity(4 + packets.iter().map(|packet| packet.len()).sum::<usize>());
+    data_payload.extend_from_slice(&0_u32.to_be_bytes());
+    for packet in packets {
+        data_payload.extend_from_slice(packet);
+    }
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&u64::try_from(data_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&data_payload);
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_caf_alac_variable_packet_file(prefix: &str, packets: &[&[u8]]) -> PathBuf {
+    assert!(!packets.is_empty());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"caff");
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+
+    let desc_payload = build_caf_alac_description_chunk(0, 4_096, 0, 0, 44_100.0);
+    bytes.extend_from_slice(b"desc");
+    bytes.extend_from_slice(&u64::try_from(desc_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&desc_payload);
+
+    let cookie = build_caf_alac_magic_cookie(4_096, 16, 1, 44_100);
+    bytes.extend_from_slice(b"kuki");
+    bytes.extend_from_slice(&u64::try_from(cookie.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&cookie);
+
+    let chan_payload = 0_u32.to_be_bytes();
+    bytes.extend_from_slice(b"chan");
+    bytes.extend_from_slice(&u64::try_from(chan_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&chan_payload);
+
+    let mut data_payload =
+        Vec::with_capacity(4 + packets.iter().map(|packet| packet.len()).sum::<usize>());
+    data_payload.extend_from_slice(&0_u32.to_be_bytes());
+    for packet in packets {
+        data_payload.extend_from_slice(packet);
+    }
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&u64::try_from(data_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&data_payload);
+
+    let packet_table = build_caf_packet_table(
+        u64::try_from(packets.len()).unwrap(),
+        u64::try_from(packets.len()).unwrap() * 4_096,
+        0,
+        0,
+        &packets
+            .iter()
+            .map(|packet| u32::try_from(packet.len()).unwrap())
+            .collect::<Vec<_>>(),
+    );
+    bytes.extend_from_slice(b"pakt");
+    bytes.extend_from_slice(&u64::try_from(packet_table.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&packet_table);
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_mhas_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_mhas_packet(6, &[0xA5]));
+    bytes.extend_from_slice(&build_mhas_packet(1, &build_test_mhas_config_payload()));
+    for payload in frame_payloads {
+        let mut frame_payload = Vec::with_capacity(payload.len() + 1);
+        frame_payload.push(0x80);
+        frame_payload.extend_from_slice(payload);
+        bytes.extend_from_slice(&build_mhas_packet(2, &frame_payload));
     }
     write_temp_file(prefix, &bytes)
 }
 
 #[cfg(feature = "mux")]
 pub fn write_test_h265_annexb_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    write_temp_file(prefix, &build_test_h265_annexb_bytes(sample_payloads))
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_h264_annexb_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    write_temp_file(prefix, &build_test_h264_annexb_bytes(sample_payloads))
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h264_annexb_bytes(sample_payloads: &[&[u8]]) -> Vec<u8> {
+    build_test_h264_annexb_chunks(sample_payloads)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h264_annexb_chunks(sample_payloads: &[&[u8]]) -> Vec<Vec<u8>> {
+    const START_CODE: &[u8] = &[0, 0, 0, 1];
+    const SPS: &[u8] = &[
+        0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x41, 0x41, 0x9f, 0x9f, 0x01, 0x6c, 0x80, 0x00, 0x00,
+        0x03, 0x00, 0x80, 0x00, 0x00, 0x0a, 0x07, 0x8a, 0x14, 0xcb,
+    ];
+    const PPS: &[u8] = &[0x68, 0xeb, 0xec, 0xb2, 0x2c];
+    const AUD: &[u8] = &[0x09, 0xf0];
+
+    let mut chunks = Vec::with_capacity(sample_payloads.len());
+    for (index, payload) in sample_payloads.iter().enumerate() {
+        let mut chunk = Vec::new();
+        if index == 0 {
+            for nal in [SPS, PPS] {
+                chunk.extend_from_slice(START_CODE);
+                chunk.extend_from_slice(nal);
+            }
+        } else {
+            chunk.extend_from_slice(START_CODE);
+            chunk.extend_from_slice(AUD);
+        }
+        chunk.extend_from_slice(START_CODE);
+        chunk.extend_from_slice(&[0x65, 0x80]);
+        chunk.extend_from_slice(payload);
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h264_avc1_chunks(sample_payloads: &[&[u8]]) -> Vec<Vec<u8>> {
+    sample_payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let nal = if index == 0 {
+                build_test_h264_idr_nal(payload)
+            } else {
+                build_test_h264_non_idr_nal(payload)
+            };
+            let mut chunk = Vec::with_capacity(4 + nal.len());
+            chunk.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
+            chunk.extend_from_slice(&nal);
+            chunk
+        })
+        .collect()
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h264_idr_nal(payload: &[u8]) -> Vec<u8> {
+    let mut nal = Vec::with_capacity(payload.len() + 2);
+    nal.extend_from_slice(&[0x65, 0x80]);
+    nal.extend_from_slice(payload);
+    nal
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h264_non_idr_nal(payload: &[u8]) -> Vec<u8> {
+    let mut nal = Vec::with_capacity(payload.len() + 2);
+    nal.extend_from_slice(&[0x41, 0x80]);
+    nal.extend_from_slice(payload);
+    nal
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avcc_decoder_specific_info() -> Vec<u8> {
+    const SPS: &[u8] = &[
+        0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x41, 0x41, 0x9f, 0x9f, 0x01, 0x6c, 0x80, 0x00, 0x00,
+        0x03, 0x00, 0x80, 0x00, 0x00, 0x0a, 0x07, 0x8a, 0x14, 0xcb,
+    ];
+    const PPS: &[u8] = &[0x68, 0xeb, 0xec, 0xb2, 0x2c];
+
+    let mut bytes = vec![1, SPS[1], SPS[2], SPS[3], 0xFF, 0xE1];
+    bytes.extend_from_slice(&u16::try_from(SPS.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(SPS);
+    bytes.push(1);
+    bytes.extend_from_slice(&u16::try_from(PPS.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(PPS);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_h263_file(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for (index, payload) in sample_payloads.iter().enumerate() {
+        bytes.extend_from_slice(&build_test_h263_frame(
+            u8::try_from(index).unwrap(),
+            payload,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h263_frame(temporal_reference: u8, payload: &[u8]) -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut writer, 0x20, 22);
+    write_test_bits_u64(&mut writer, u64::from(temporal_reference), 8);
+    write_test_bits_u64(&mut writer, 0, 5);
+    write_test_bits_u64(&mut writer, 2, 3);
+    write_test_bits_u64(&mut writer, 0, 2);
+    let mut bytes = writer.into_inner().unwrap();
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_h265_annexb_file_with_timing(prefix: &str, sample_payloads: &[&[u8]]) -> PathBuf {
+    write_test_h265_annexb_file_with_sps(
+        prefix,
+        &[
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x24, 0x1f, 0x26, 0x59, 0x99, 0xa4,
+            0x93, 0x2b, 0xff, 0xc0, 0xd5, 0xc0, 0xd6, 0x40, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40,
+            0x00, 0x00, 0x06, 0x02,
+        ],
+        sample_payloads,
+    )
+}
+
+#[cfg(feature = "mux")]
+fn write_test_h265_annexb_file_with_sps(
+    prefix: &str,
+    sps: &[u8],
+    sample_payloads: &[&[u8]],
+) -> PathBuf {
+    write_temp_file(
+        prefix,
+        &build_test_h265_annexb_bytes_with_sps(sps, sample_payloads),
+    )
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h265_annexb_bytes(sample_payloads: &[&[u8]]) -> Vec<u8> {
+    build_test_h265_annexb_bytes_with_sps(
+        &[
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x66, 0x69, 0x24,
+            0xca, 0xe0, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x80,
+        ],
+        sample_payloads,
+    )
+}
+
+#[cfg(feature = "mux")]
+fn build_test_h265_annexb_bytes_with_sps(sps: &[u8], sample_payloads: &[&[u8]]) -> Vec<u8> {
     const START_CODE: &[u8] = &[0, 0, 0, 1];
     const AUD: &[u8] = &[0x46, 0x01, 0x50];
     const VPS: &[u8] = &[
         0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
         0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0x99, 0x98, 0x09,
     ];
-    const SPS: &[u8] = &[
-        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
-        0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x66, 0x69, 0x24, 0xca, 0xe0,
-        0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x80,
-    ];
     const PPS: &[u8] = &[0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40];
 
     let mut bytes = Vec::new();
-    for nal in [VPS, SPS, PPS] {
+    for nal in [VPS, sps, PPS] {
         bytes.extend_from_slice(START_CODE);
         bytes.extend_from_slice(nal);
     }
@@ -244,7 +1899,999 @@ pub fn write_test_h265_annexb_file(prefix: &str, sample_payloads: &[&[u8]]) -> P
         bytes.extend_from_slice(&[0x26, 0x01]);
         bytes.extend_from_slice(payload);
     }
+    bytes
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_av1_ivf_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    write_test_ivf_file(
+        prefix,
+        *b"AV01",
+        IvfHeaderFields {
+            width,
+            height,
+            timescale: 1_000,
+            timestamp_scale: 1,
+        },
+        frame_timestamps,
+        frame_payloads,
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_vp8_ivf_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    write_test_ivf_file(
+        prefix,
+        *b"VP80",
+        IvfHeaderFields {
+            width,
+            height,
+            timescale: 1_000,
+            timestamp_scale: 1,
+        },
+        frame_timestamps,
+        frame_payloads,
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_vp9_ivf_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    write_test_ivf_file(
+        prefix,
+        *b"VP90",
+        IvfHeaderFields {
+            width,
+            height,
+            timescale: 1_000,
+            timestamp_scale: 1,
+        },
+        frame_timestamps,
+        frame_payloads,
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_vp10_ivf_file(
+    prefix: &str,
+    width: u16,
+    height: u16,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    write_test_ivf_file(
+        prefix,
+        *b"VP10",
+        IvfHeaderFields {
+            width,
+            height,
+            timescale: 1_000,
+            timestamp_scale: 1,
+        },
+        frame_timestamps,
+        frame_payloads,
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_av1_sequence_header_obu(width: u16, height: u16) -> Vec<u8> {
+    let mut payload_writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut payload_writer, 0, 3);
+    payload_writer.write_bit(true).unwrap();
+    payload_writer.write_bit(true).unwrap();
+    write_test_bits_u64(&mut payload_writer, 0, 5);
+    write_test_bits_u64(&mut payload_writer, 9, 4);
+    write_test_bits_u64(&mut payload_writer, 8, 4);
+    write_test_bits_u64(&mut payload_writer, u64::from(width.saturating_sub(1)), 10);
+    write_test_bits_u64(&mut payload_writer, u64::from(height.saturating_sub(1)), 9);
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut payload_writer, 0, 2);
+    payload_writer.write_bit(false).unwrap();
+    payload_writer.write_bit(false).unwrap();
+    align_test_bit_writer(&mut payload_writer);
+    let payload = payload_writer.into_inner().unwrap();
+
+    let mut obu = Vec::with_capacity(2 + payload.len());
+    obu.push(0x0A);
+    obu.push(u8::try_from(payload.len()).unwrap());
+    obu.extend_from_slice(&payload);
+    obu
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_vp8_keyframe(width: u16, height: u16, profile: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(10 + payload.len());
+    let first_partition_size = u32::try_from(payload.len()).unwrap();
+    let frame_tag =
+        (u32::from(profile & 0x07) << 1) | (1 << 4) | ((first_partition_size & 0x7FFFF) << 5);
+    frame.extend_from_slice(&[
+        u8::try_from(frame_tag & 0xFF).unwrap(),
+        u8::try_from((frame_tag >> 8) & 0xFF).unwrap(),
+        u8::try_from((frame_tag >> 16) & 0xFF).unwrap(),
+    ]);
+    frame.extend_from_slice(&[0x9D, 0x01, 0x2A]);
+    frame.extend_from_slice(&(width & 0x3FFF).to_le_bytes());
+    frame.extend_from_slice(&(height & 0x3FFF).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_vp9_keyframe(width: u16, height: u16, profile: u8) -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut writer, 0b10, 2);
+    writer.write_bit(profile & 0x01 != 0).unwrap();
+    writer.write_bit(profile & 0x02 != 0).unwrap();
+    if profile == 3 {
+        writer.write_bit(false).unwrap();
+    }
+    writer.write_bit(false).unwrap();
+    writer.write_bit(false).unwrap();
+    writer.write_bit(true).unwrap();
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, 0x49_83_42, 24);
+    if profile >= 2 {
+        writer.write_bit(false).unwrap();
+    }
+    write_test_bits_u64(&mut writer, 1, 3);
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, u64::from(width.saturating_sub(1)), 16);
+    write_test_bits_u64(&mut writer, u64::from(height.saturating_sub(1)), 16);
+    writer.write_bit(false).unwrap();
+    align_test_bit_writer(&mut writer);
+    writer.into_inner().unwrap()
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_vp10_keyframe(width: u16, height: u16, profile: u8) -> Vec<u8> {
+    build_test_vp9_keyframe(width, height, profile)
+}
+
+#[cfg(feature = "mux")]
+struct IvfHeaderFields {
+    width: u16,
+    height: u16,
+    timescale: u32,
+    timestamp_scale: u32,
+}
+
+#[cfg(feature = "mux")]
+fn write_test_ivf_file(
+    prefix: &str,
+    codec_fourcc: [u8; 4],
+    header: IvfHeaderFields,
+    frame_timestamps: &[u64],
+    frame_payloads: &[&[u8]],
+) -> PathBuf {
+    assert_eq!(frame_timestamps.len(), frame_payloads.len());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"DKIF");
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&32_u16.to_le_bytes());
+    bytes.extend_from_slice(&codec_fourcc);
+    bytes.extend_from_slice(&header.width.to_le_bytes());
+    bytes.extend_from_slice(&header.height.to_le_bytes());
+    bytes.extend_from_slice(&header.timescale.to_le_bytes());
+    bytes.extend_from_slice(&header.timestamp_scale.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(frame_payloads.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    for (timestamp, payload) in frame_timestamps.iter().zip(frame_payloads.iter()) {
+        bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&timestamp.to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
     write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+fn build_flac_streaminfo_block(
+    sample_rate: u32,
+    channel_count: u8,
+    bits_per_sample: u8,
+    total_samples: u64,
+) -> [u8; 34] {
+    assert!(sample_rate > 0 && sample_rate < (1 << 20));
+    assert!((1..=8).contains(&channel_count));
+    assert!((1..=32).contains(&bits_per_sample));
+    assert!(total_samples < (1_u64 << 36));
+
+    let mut block = [0_u8; 34];
+    block[0..2].copy_from_slice(&0x0400_u16.to_be_bytes());
+    block[2..4].copy_from_slice(&0x0400_u16.to_be_bytes());
+    block[10] = u8::try_from((sample_rate >> 12) & 0xFF).unwrap();
+    block[11] = u8::try_from((sample_rate >> 4) & 0xFF).unwrap();
+    block[12] = (u8::try_from(sample_rate & 0x0F).unwrap() << 4)
+        | (((channel_count - 1) & 0x07) << 1)
+        | (((bits_per_sample - 1) >> 4) & 0x01);
+    block[13] =
+        (((bits_per_sample - 1) & 0x0F) << 4) | u8::try_from((total_samples >> 32) & 0x0F).unwrap();
+    block[14] = u8::try_from((total_samples >> 24) & 0xFF).unwrap();
+    block[15] = u8::try_from((total_samples >> 16) & 0xFF).unwrap();
+    block[16] = u8::try_from((total_samples >> 8) & 0xFF).unwrap();
+    block[17] = u8::try_from(total_samples & 0xFF).unwrap();
+    block
+}
+
+#[cfg(feature = "mux")]
+fn build_test_amr_frame(payload: &[u8]) -> Vec<u8> {
+    build_test_amr_like_frame(7, 31, payload)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_latm_frame(use_same_stream_mux: bool, payload: &[u8]) -> Vec<u8> {
+    build_test_latm_frame_with_audio_object_type(use_same_stream_mux, payload, 2)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_usac_latm_frame(use_same_stream_mux: bool, payload: &[u8]) -> Vec<u8> {
+    build_test_latm_frame_with_audio_object_type(use_same_stream_mux, payload, 42)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_latm_frame_with_audio_object_type(
+    use_same_stream_mux: bool,
+    payload: &[u8],
+    audio_object_type: u8,
+) -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    writer.write_bit(use_same_stream_mux).unwrap();
+    if !use_same_stream_mux {
+        writer.write_bit(false).unwrap();
+        writer.write_bit(true).unwrap();
+        write_test_bits_u64(&mut writer, 0, 6);
+        write_test_bits_u64(&mut writer, 0, 4);
+        write_test_bits_u64(&mut writer, 0, 3);
+        write_test_latm_audio_specific_config(&mut writer, audio_object_type, 3, 2);
+        write_test_bits_u64(&mut writer, 0, 8);
+        writer.write_bit(false).unwrap();
+        writer.write_bit(false).unwrap();
+    }
+    write_test_latm_payload_length(&mut writer, payload.len());
+    for byte in payload {
+        write_test_bits_u64(&mut writer, u64::from(*byte), 8);
+    }
+    align_test_bit_writer(&mut writer);
+    let body = writer.into_inner().unwrap();
+    let mux_size = u16::try_from(body.len()).unwrap();
+    assert!(mux_size < 0x2000);
+
+    let mut frame = Vec::with_capacity(3 + body.len());
+    frame.push(0x56);
+    frame.push(0xE0 | u8::try_from((mux_size >> 8) & 0x1F).unwrap());
+    frame.push(u8::try_from(mux_size & 0x00FF).unwrap());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn write_test_latm_audio_specific_config(
+    writer: &mut BitWriter<Vec<u8>>,
+    audio_object_type: u8,
+    sample_rate_index: u8,
+    channel_configuration: u8,
+) {
+    if audio_object_type >= 32 {
+        write_test_bits_u64(writer, 31, 5);
+        write_test_bits_u64(writer, u64::from(audio_object_type - 32), 6);
+    } else {
+        write_test_bits_u64(writer, u64::from(audio_object_type), 5);
+    }
+    write_test_bits_u64(writer, u64::from(sample_rate_index), 4);
+    write_test_bits_u64(writer, u64::from(channel_configuration), 4);
+    write_test_bits_u64(writer, 0, 3);
+}
+
+#[cfg(feature = "mux")]
+fn write_test_latm_payload_length(writer: &mut BitWriter<Vec<u8>>, payload_len: usize) {
+    let mut remaining = payload_len;
+    while remaining >= 255 {
+        write_test_bits_u64(writer, 255, 8);
+        remaining -= 255;
+    }
+    write_test_bits_u64(writer, u64::try_from(remaining).unwrap(), 8);
+}
+
+#[cfg(feature = "mux")]
+fn build_test_truehd_frame(payload: &[u8]) -> Vec<u8> {
+    const TRUEHD_TEST_FRAME_HEADER_BYTES: usize = 20;
+
+    let frame_size = u16::try_from(TRUEHD_TEST_FRAME_HEADER_BYTES + payload.len()).unwrap();
+    assert_eq!(frame_size & 1, 0, "TrueHD test frame size must be even");
+
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut writer, 0, 4);
+    write_test_bits_u64(&mut writer, u64::from(frame_size / 2), 12);
+    write_test_bits_u64(&mut writer, 0, 16);
+    write_test_bits_u64(&mut writer, 0xF872_6FBA, 32);
+    write_test_bits_u64(&mut writer, 0, 4);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 2);
+    write_test_bits_u64(&mut writer, 0, 2);
+    write_test_bits_u64(&mut writer, 0, 2);
+    write_test_bits_u64(&mut writer, 0, 5);
+    write_test_bits_u64(&mut writer, 0, 2);
+    write_test_bits_u64(&mut writer, 0, 13);
+    write_test_bits_u64(&mut writer, 0xB752, 16);
+    write_test_bits_u64(&mut writer, 0, 16);
+    write_test_bits_u64(&mut writer, 0, 16);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 120, 15);
+    align_test_bit_writer(&mut writer);
+    let mut frame = writer.into_inner().unwrap();
+    assert_eq!(frame.len(), TRUEHD_TEST_FRAME_HEADER_BYTES);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_test_amr_wb_frame(payload: &[u8]) -> Vec<u8> {
+    build_test_amr_like_frame(8, 60, payload)
+}
+
+#[cfg(feature = "mux")]
+struct TestQcpFileSpec<'a> {
+    codec: TestQcpCodecKind,
+    decoder_version: u8,
+    packet_size: u16,
+    block_size: u16,
+    sample_rate: u16,
+    rate_entries: &'a [(u8, u8)],
+    rate_flag: u32,
+}
+
+#[cfg(feature = "mux")]
+fn build_test_qcp_file_bytes(spec: TestQcpFileSpec<'_>, packets: &[Vec<u8>]) -> Vec<u8> {
+    let mut fmt_payload = Vec::with_capacity(150);
+    fmt_payload.push(1);
+    fmt_payload.push(0);
+    fmt_payload.extend_from_slice(test_qcp_codec_guid(spec.codec));
+    fmt_payload.extend_from_slice(&u16::from(spec.decoder_version).to_le_bytes());
+    let mut name = [0_u8; 80];
+    let label: &[u8] = match spec.codec {
+        TestQcpCodecKind::Qcelp => b"QCELP",
+        TestQcpCodecKind::Evrc => b"EVRC",
+        TestQcpCodecKind::Smv => b"SMV",
+    };
+    name[..label.len()].copy_from_slice(label);
+    fmt_payload.extend_from_slice(&name);
+    let avg_bps = if packets.is_empty() {
+        0
+    } else {
+        let avg = packets
+            .iter()
+            .map(|packet| packet.len() as u64)
+            .sum::<u64>()
+            * 8
+            * u64::from(spec.sample_rate)
+            / (u64::from(spec.block_size) * u64::try_from(packets.len()).unwrap());
+        u16::try_from(avg).unwrap_or(u16::MAX)
+    };
+    fmt_payload.extend_from_slice(&avg_bps.to_le_bytes());
+    fmt_payload.extend_from_slice(&spec.packet_size.to_le_bytes());
+    fmt_payload.extend_from_slice(&spec.block_size.to_le_bytes());
+    fmt_payload.extend_from_slice(&spec.sample_rate.to_le_bytes());
+    fmt_payload.extend_from_slice(&16_u16.to_le_bytes());
+    fmt_payload.extend_from_slice(
+        &u32::try_from(spec.rate_entries.len())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    for index in 0..8 {
+        if let Some((rate_index, payload_size)) = spec.rate_entries.get(index) {
+            fmt_payload.push(*payload_size);
+            fmt_payload.push(*rate_index);
+        } else {
+            fmt_payload.extend_from_slice(&[0, 0]);
+        }
+    }
+    fmt_payload.extend_from_slice(&[0_u8; 20]);
+    debug_assert_eq!(fmt_payload.len(), 150);
+
+    let mut vrat_payload = Vec::with_capacity(8);
+    vrat_payload.extend_from_slice(&spec.rate_flag.to_le_bytes());
+    vrat_payload.extend_from_slice(&u32::from(spec.packet_size).to_le_bytes());
+
+    let mut data_payload = Vec::new();
+    for packet in packets {
+        data_payload.extend_from_slice(packet);
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(b"QLCM");
+    append_test_riff_chunk(&mut bytes, b"fmt ", &fmt_payload);
+    append_test_riff_chunk(&mut bytes, b"vrat", &vrat_payload);
+    append_test_riff_chunk(&mut bytes, b"data", &data_payload);
+    let riff_size = u32::try_from(bytes.len() - 8).unwrap();
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn append_test_riff_chunk(bytes: &mut Vec<u8>, chunk_type: &[u8; 4], payload: &[u8]) {
+    bytes.extend_from_slice(chunk_type);
+    bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(payload);
+    if !payload.len().is_multiple_of(2) {
+        bytes.push(0);
+    }
+}
+
+#[cfg(feature = "mux")]
+fn test_qcp_codec_guid(codec: TestQcpCodecKind) -> &'static [u8; 16] {
+    match codec {
+        TestQcpCodecKind::Qcelp => {
+            b"\x41\x6D\x7F\x5E\x15\xB1\xD0\x11\xBA\x91\x00\x80\x5F\xB4\xB9\x7E"
+        }
+        TestQcpCodecKind::Evrc => {
+            b"\x8D\xD4\x89\xE6\x76\x90\xB5\x46\x91\xEF\x73\x6A\x51\x00\xCE\xB4"
+        }
+        TestQcpCodecKind::Smv => {
+            b"\x75\x2B\x7C\x8D\x97\xA7\x46\xED\x98\x5E\xD5\x3C\x8C\xC7\x5F\x84"
+        }
+    }
+}
+
+#[cfg(feature = "mux")]
+fn build_test_amr_like_frame(frame_type: u8, payload_len: usize, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + payload_len);
+    frame.push((frame_type & 0x0F) << 3);
+    frame.extend((0..payload_len).map(|index| payload.get(index).copied().unwrap_or(index as u8)));
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_flac_vorbis_comment_block() -> Vec<u8> {
+    let mut block = Vec::new();
+    block.push(0x84);
+    block.extend_from_slice(&8_u32.to_be_bytes()[1..]);
+    block.extend_from_slice(&0_u32.to_le_bytes());
+    block.extend_from_slice(&0_u32.to_le_bytes());
+    block
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_flac_frame(seed_payload: &[u8]) -> Vec<u8> {
+    build_test_flac_frame_with_block_size(seed_payload, 1_024)
+}
+
+#[cfg(feature = "mux")]
+pub fn build_test_flac_frame_with_block_size(seed_payload: &[u8], block_size: u32) -> Vec<u8> {
+    assert!((1..=u32::from(u16::MAX) + 1).contains(&block_size));
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut writer, 0x7FFC, 15);
+    writer.write_bit(false).unwrap();
+    if block_size == 1_024 {
+        write_test_bits_u64(&mut writer, 10, 4);
+    } else {
+        write_test_bits_u64(&mut writer, 7, 4);
+    }
+    write_test_bits_u64(&mut writer, 0, 4);
+    write_test_bits_u64(&mut writer, 1, 4);
+    write_test_bits_u64(&mut writer, 4, 3);
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, 0, 8);
+    if block_size != 1_024 {
+        write_test_bits_u64(&mut writer, u64::from(block_size - 1), 16);
+    }
+    align_test_bit_writer(&mut writer);
+    let mut frame = writer.into_inner().unwrap();
+    let header_crc = flac_crc8_for_test(&frame);
+    frame.push(header_crc);
+
+    let left_sample = u16::from(*seed_payload.first().unwrap_or(&0x11));
+    let right_sample = u16::from(*seed_payload.get(1).unwrap_or(&0x22));
+
+    let mut subframe_writer = BitWriter::new(Vec::new());
+    for sample in [left_sample, right_sample] {
+        subframe_writer.write_bit(false).unwrap();
+        write_test_bits_u64(&mut subframe_writer, 0, 6);
+        subframe_writer.write_bit(false).unwrap();
+        write_test_bits_u64(&mut subframe_writer, u64::from(sample), 16);
+    }
+    align_test_bit_writer(&mut subframe_writer);
+    frame.extend_from_slice(&subframe_writer.into_inner().unwrap());
+    let footer_crc = flac_crc16_for_test(&frame);
+    frame.extend_from_slice(&footer_crc.to_be_bytes());
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_test_mhas_config_payload() -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut writer, 12, 8);
+    write_test_bits_u64(&mut writer, 3, 5);
+    write_test_bits_u64(&mut writer, 1, 3);
+    writer.write_bit(false).unwrap();
+    writer.write_bit(false).unwrap();
+    write_test_bits_u64(&mut writer, 1, 2);
+    write_test_mhas_escaped_value(&mut writer, 1, 5, 8, 16);
+    align_test_bit_writer(&mut writer);
+    writer.into_inner().unwrap()
+}
+
+#[cfg(feature = "mux")]
+fn build_mhas_packet(packet_type: u64, payload: &[u8]) -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_mhas_escaped_value(&mut writer, packet_type, 3, 8, 8);
+    write_test_mhas_escaped_value(&mut writer, 0, 2, 8, 32);
+    write_test_mhas_escaped_value(
+        &mut writer,
+        u64::try_from(payload.len()).unwrap(),
+        11,
+        24,
+        24,
+    );
+    align_test_bit_writer(&mut writer);
+    let mut packet = writer.into_inner().unwrap();
+    packet.extend_from_slice(payload);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn write_test_mhas_escaped_value(
+    writer: &mut BitWriter<Vec<u8>>,
+    value: u64,
+    first_width: usize,
+    second_width: usize,
+    third_width: usize,
+) {
+    let first_max = (1_u64 << first_width) - 1;
+    if value < first_max {
+        write_test_bits_u64(writer, value, first_width);
+        return;
+    }
+    write_test_bits_u64(writer, first_max, first_width);
+    let remainder = value - first_max;
+    let second_max = (1_u64 << second_width) - 1;
+    if remainder < second_max {
+        write_test_bits_u64(writer, remainder, second_width);
+        return;
+    }
+    write_test_bits_u64(writer, second_max, second_width);
+    write_test_bits_u64(writer, remainder - second_max, third_width);
+}
+
+#[cfg(feature = "mux")]
+fn write_test_bits_u64(writer: &mut BitWriter<Vec<u8>>, value: u64, width: usize) {
+    writer.write_bits(&value.to_be_bytes(), width).unwrap();
+}
+
+#[cfg(feature = "mux")]
+fn align_test_bit_writer(writer: &mut BitWriter<Vec<u8>>) {
+    while !writer.is_aligned() {
+        writer.write_bit(false).unwrap();
+    }
+}
+
+#[cfg(feature = "mux")]
+fn build_opus_head_packet(channel_count: u8) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(19);
+    packet.extend_from_slice(b"OpusHead");
+    packet.push(1);
+    packet.push(channel_count);
+    packet.extend_from_slice(&312_u16.to_le_bytes());
+    packet.extend_from_slice(&48_000_u32.to_le_bytes());
+    packet.extend_from_slice(&0_i16.to_le_bytes());
+    packet.push(0);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_vorbis_identification_packet() -> Vec<u8> {
+    let mut packet = Vec::with_capacity(30);
+    packet.push(0x01);
+    packet.extend_from_slice(b"vorbis");
+    packet.extend_from_slice(&0_u32.to_le_bytes());
+    packet.push(2);
+    packet.extend_from_slice(&48_000_u32.to_le_bytes());
+    packet.extend_from_slice(&0_i32.to_le_bytes());
+    packet.extend_from_slice(&0_i32.to_le_bytes());
+    packet.extend_from_slice(&0_i32.to_le_bytes());
+    packet.push(0x76);
+    packet.push(1);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_vorbis_comment_packet() -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.push(0x03);
+    packet.extend_from_slice(b"vorbis");
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_vorbis_setup_packet() -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.push(0x05);
+    packet.extend_from_slice(b"vorbis");
+
+    let mut writer = TestLsbBitWriter::default();
+    writer.write(0, 8);
+    writer.write(0, 24);
+    writer.write(1, 16);
+    writer.write(1, 24);
+    writer.write(0, 1);
+    writer.write(0, 1);
+    writer.write(0, 5);
+    writer.write(0, 4);
+    writer.write(0, 6);
+    writer.write(0, 16);
+    writer.write(0, 6);
+    writer.write(0, 16);
+    writer.write(0, 8);
+    writer.write(0, 16);
+    writer.write(0, 16);
+    writer.write(0, 6);
+    writer.write(0, 8);
+    writer.write(0, 4);
+    writer.write(0, 8);
+    writer.write(0, 6);
+    writer.write(0, 16);
+    writer.write(0, 24);
+    writer.write(0, 24);
+    writer.write(0, 24);
+    writer.write(0, 6);
+    writer.write(0, 8);
+    writer.write(0, 3);
+    writer.write(0, 1);
+    writer.write(0, 6);
+    writer.write(0, 16);
+    writer.write(0, 1);
+    writer.write(0, 1);
+    writer.write(0, 2);
+    writer.write(0, 8);
+    writer.write(0, 8);
+    writer.write(0, 8);
+    writer.write(1, 6);
+    writer.write(0, 1);
+    writer.write(0, 16);
+    writer.write(0, 16);
+    writer.write(0, 8);
+    writer.write(1, 1);
+    writer.write(0, 16);
+    writer.write(0, 16);
+    writer.write(0, 8);
+
+    packet.extend_from_slice(&writer.finish());
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_vorbis_audio_packet(payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(payload.len() + 1);
+    packet.push(0x02);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_speex_header_packet() -> Vec<u8> {
+    let mut packet = vec![0_u8; 80];
+    packet[..8].copy_from_slice(b"Speex   ");
+    packet[8..28].copy_from_slice(b"mp4forge-test\0\0\0\0\0\0\0");
+    packet[28..32].copy_from_slice(&1_u32.to_le_bytes());
+    packet[32..36].copy_from_slice(&80_u32.to_le_bytes());
+    packet[36..40].copy_from_slice(&16_000_u32.to_le_bytes());
+    packet[40..44].copy_from_slice(&0_u32.to_le_bytes());
+    packet[44..48].copy_from_slice(&1_u32.to_le_bytes());
+    packet[48..52].copy_from_slice(&1_u32.to_le_bytes());
+    packet[52..56].copy_from_slice(&0_i32.to_le_bytes());
+    packet[56..60].copy_from_slice(&160_u32.to_le_bytes());
+    packet[60..64].copy_from_slice(&0_u32.to_le_bytes());
+    packet[64..68].copy_from_slice(&1_u32.to_le_bytes());
+    packet[68..72].copy_from_slice(&0_u32.to_le_bytes());
+    packet[72..76].copy_from_slice(&0_u32.to_le_bytes());
+    packet[76..80].copy_from_slice(&0_u32.to_le_bytes());
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_theora_identification_packet(sar_num: u32, sar_den: u32) -> Vec<u8> {
+    let mut packet = vec![0_u8; 42];
+    packet[0] = 0x80;
+    packet[1..7].copy_from_slice(b"theora");
+    packet[7] = 3;
+    packet[10..12].copy_from_slice(&(320_u16 / 16).to_be_bytes());
+    packet[12..14].copy_from_slice(&(240_u16 / 16).to_be_bytes());
+    packet[22..26].copy_from_slice(&30_000_u32.to_be_bytes());
+    packet[26..30].copy_from_slice(&1_001_u32.to_be_bytes());
+    packet[30] = u8::try_from((sar_num >> 16) & 0xFF).unwrap();
+    packet[31] = u8::try_from((sar_num >> 8) & 0xFF).unwrap();
+    packet[32] = u8::try_from(sar_num & 0xFF).unwrap();
+    packet[33] = u8::try_from((sar_den >> 16) & 0xFF).unwrap();
+    packet[34] = u8::try_from((sar_den >> 8) & 0xFF).unwrap();
+    packet[35] = u8::try_from(sar_den & 0xFF).unwrap();
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_theora_comment_packet() -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.push(0x81);
+    packet.extend_from_slice(b"theora");
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_theora_setup_packet() -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.push(0x82);
+    packet.extend_from_slice(b"theora");
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_theora_frame_packet(payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(payload.len() + 1);
+    packet.push(0x00);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_test_iamf_sequence_header_payload() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(6);
+    payload.extend_from_slice(b"iamf");
+    payload.push(0);
+    payload.push(0);
+    payload
+}
+
+#[cfg(feature = "mux")]
+fn build_test_iamf_codec_config_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    append_leb128_for_test(&mut payload, 0);
+    payload.extend_from_slice(b"Opus");
+    append_leb128_for_test(&mut payload, 960);
+    payload.extend_from_slice(&0_i16.to_be_bytes());
+    payload
+}
+
+#[cfg(feature = "mux")]
+fn build_test_iamf_audio_element_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    append_leb128_for_test(&mut payload, 0);
+    payload.push(0);
+    append_leb128_for_test(&mut payload, 0);
+    append_leb128_for_test(&mut payload, 1);
+    payload
+}
+
+#[cfg(feature = "mux")]
+fn build_test_iamf_obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(obu_type << 3);
+    append_leb128_for_test(&mut bytes, u64::try_from(payload.len()).unwrap());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_ogg_page(
+    serial: u32,
+    sequence_number: u32,
+    header_type: u8,
+    granule_position: u64,
+    packets: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut lacing_values = Vec::new();
+    let mut payload = Vec::new();
+    for packet in packets {
+        let mut remaining = packet.len();
+        while remaining >= 255 {
+            lacing_values.push(255_u8);
+            remaining -= 255;
+        }
+        lacing_values.push(u8::try_from(remaining).unwrap());
+        payload.extend_from_slice(packet);
+    }
+
+    let mut page = Vec::with_capacity(27 + lacing_values.len() + payload.len());
+    page.extend_from_slice(b"OggS");
+    page.push(0);
+    page.push(header_type);
+    page.extend_from_slice(&granule_position.to_le_bytes());
+    page.extend_from_slice(&serial.to_le_bytes());
+    page.extend_from_slice(&sequence_number.to_le_bytes());
+    page.extend_from_slice(&0_u32.to_le_bytes());
+    page.push(u8::try_from(lacing_values.len()).unwrap());
+    page.extend_from_slice(&lacing_values);
+    page.extend_from_slice(&payload);
+    page
+}
+
+#[cfg(feature = "mux")]
+fn append_leb128_for_test(bytes: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = u8::try_from(value & 0x7F).unwrap();
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(feature = "mux")]
+#[derive(Default)]
+struct TestLsbBitWriter {
+    bytes: Vec<u8>,
+    current: u8,
+    bit_offset: u8,
+}
+
+#[cfg(feature = "mux")]
+impl TestLsbBitWriter {
+    fn write(&mut self, mut value: u32, width: u8) {
+        for _ in 0..width {
+            if value & 1 != 0 {
+                self.current |= 1 << self.bit_offset;
+            }
+            self.bit_offset += 1;
+            if self.bit_offset == 8 {
+                self.bytes.push(self.current);
+                self.current = 0;
+                self.bit_offset = 0;
+            }
+            value >>= 1;
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.bit_offset != 0 {
+            self.bytes.push(self.current);
+        }
+        self.bytes
+    }
+}
+
+#[cfg(feature = "mux")]
+fn flac_crc8_for_test(data: &[u8]) -> u8 {
+    let mut crc = 0_u8;
+    for byte in data {
+        crc ^= *byte;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+#[cfg(feature = "mux")]
+fn flac_crc16_for_test(data: &[u8]) -> u16 {
+    let mut crc = 0_u16;
+    for byte in data {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+#[cfg(feature = "mux")]
+fn build_caf_alac_description_chunk(
+    bytes_per_packet: u32,
+    frames_per_packet: u32,
+    channels_per_frame: u32,
+    bits_per_channel: u32,
+    sample_rate: f64,
+) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    bytes[..8].copy_from_slice(&sample_rate.to_bits().to_be_bytes());
+    bytes[8..12].copy_from_slice(b"alac");
+    bytes[16..20].copy_from_slice(&bytes_per_packet.to_be_bytes());
+    bytes[20..24].copy_from_slice(&frames_per_packet.to_be_bytes());
+    bytes[24..28].copy_from_slice(&channels_per_frame.to_be_bytes());
+    bytes[28..32].copy_from_slice(&bits_per_channel.to_be_bytes());
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_caf_alac_magic_cookie(
+    frame_length: u32,
+    bit_depth: u8,
+    channel_count: u8,
+    sample_rate: u32,
+) -> Vec<u8> {
+    let mut cookie = Vec::new();
+    cookie.extend_from_slice(&12_u32.to_be_bytes());
+    cookie.extend_from_slice(b"frma");
+    cookie.extend_from_slice(b"alac");
+
+    let mut payload = Vec::with_capacity(28);
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&frame_length.to_be_bytes());
+    payload.push(0);
+    payload.push(bit_depth);
+    payload.push(40);
+    payload.push(10);
+    payload.push(14);
+    payload.push(channel_count);
+    payload.extend_from_slice(&0_u16.to_be_bytes());
+    payload.extend_from_slice(&(frame_length * u32::from(channel_count) * 2).to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&sample_rate.to_be_bytes());
+
+    cookie.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
+    cookie.extend_from_slice(b"alac");
+    cookie.extend_from_slice(&payload);
+    cookie
+}
+
+#[cfg(feature = "mux")]
+fn build_caf_packet_table(
+    number_packets: u64,
+    number_valid_frames: u64,
+    priming_frames: u32,
+    remainder_frames: u32,
+    packet_sizes: &[u32],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&number_packets.to_be_bytes());
+    bytes.extend_from_slice(&number_valid_frames.to_be_bytes());
+    bytes.extend_from_slice(&priming_frames.to_be_bytes());
+    bytes.extend_from_slice(&remainder_frames.to_be_bytes());
+    for packet_size in packet_sizes {
+        bytes.extend_from_slice(&encode_caf_packet_size_vlint(*packet_size));
+    }
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn encode_caf_packet_size_vlint(value: u32) -> Vec<u8> {
+    let mut parts = Vec::new();
+    let mut remaining = value;
+    parts.push(u8::try_from(remaining & 0x7F).unwrap());
+    remaining >>= 7;
+    while remaining != 0 {
+        parts.push(u8::try_from(remaining & 0x7F).unwrap() | 0x80);
+        remaining >>= 7;
+    }
+    parts.reverse();
+    parts
 }
 
 #[cfg(feature = "mux")]
@@ -278,6 +2925,19 @@ fn build_mp3_frame(payload: &[u8]) -> Vec<u8> {
     frame[0] = 0xFF;
     frame[1] = 0xFB;
     frame[2] = 0x94;
+    frame[3] = 0x00;
+    frame[4..4 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_mp3_frame_44100(payload: &[u8]) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 417;
+    assert!(payload.len() <= FRAME_LENGTH - 4);
+    let mut frame = vec![0_u8; FRAME_LENGTH];
+    frame[0] = 0xFF;
+    frame[1] = 0xFB;
+    frame[2] = 0x90;
     frame[3] = 0x00;
     frame[4..4 + payload.len()].copy_from_slice(payload);
     frame
@@ -361,17 +3021,57 @@ fn build_eac3_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(feature = "mux")]
-fn build_ac4_frame(payload: &[u8]) -> Vec<u8> {
-    let payload_size = u16::try_from(payload.len().max(1)).unwrap();
-    let mut frame = Vec::with_capacity(4 + usize::from(payload_size));
-    frame.extend_from_slice(&[0xAC, 0x40]);
-    frame.extend_from_slice(&payload_size.to_be_bytes());
-    if payload.is_empty() {
-        frame.push(0);
-    } else {
-        frame.extend_from_slice(payload);
+fn build_dts_frame(seed: usize) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 2_048;
+    let mut writer = BitWriter::new(Vec::new());
+    write_test_bits_u64(&mut writer, 0x7FFE_8001, 32);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 5);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 31, 7);
+    write_test_bits_u64(&mut writer, u64::try_from(FRAME_LENGTH - 1).unwrap(), 14);
+    write_test_bits_u64(&mut writer, 2, 6);
+    write_test_bits_u64(&mut writer, 13, 4);
+    write_test_bits_u64(&mut writer, 15, 5);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 3);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 1);
+    write_test_bits_u64(&mut writer, 0, 2);
+    align_test_bit_writer(&mut writer);
+    let mut frame = writer.into_inner().unwrap();
+    frame.resize(FRAME_LENGTH, 0);
+    for (offset, byte) in frame[11..].iter_mut().enumerate() {
+        *byte = u8::try_from((seed + offset) & 0xFF).unwrap();
     }
     frame
+}
+
+#[cfg(feature = "mux")]
+const TEST_AC4_FRAME_HEX: &str = concat!(
+    "ac41ffff00015cbfcee7984004a7012e2c20304d805c8458d0a0c06013b58354cb613912144b0232be85",
+    "4b4800025c71fd3eaacd4a86324c1498a4bd6021dfa8b016b42115ba6b684770fd34e31a264f66703f14",
+    "090541b22397fd7c837ef68f05211a79862d48d5c46d87857bedd9f69bbdb26682bcf49b036bccb100ab84",
+    "4568e5a54fc32e4302233b9144cb4bd0ca86c64794cf4e7eca5191e8d8c48ccef686868ae56b5f5e416097",
+    "07ad77775b5bfa5b61bff5f32ed963f6caee5ac968a743e60e578f5a4892c90101e18a7246f88c51161028",
+    "870564d088f0799f9d11701ecd86f202692868b8649e14e10f0304bc20f4b47d06b3ba58fcd3c950fecd1a",
+    "137dd410334797b62d82ed35073d1131e2f10a02ce51c269e1248e423c299956b2c53ad26a6c5ddcb1d7cd",
+    "c999265bb1954775fbc72cd8cf322a47091169f3fff19ff6aca15a5894fe68d2fa20c1f55000000000f010",
+    "4a51e02094a880a3c134b5ff00",
+);
+
+#[cfg(feature = "mux")]
+fn decode_test_hex_bytes(hex: &str) -> Vec<u8> {
+    assert!(hex.len().is_multiple_of(2));
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for index in (0..hex.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&hex[index..index + 2], 16).unwrap());
+    }
+    bytes
 }
 
 pub fn temp_output_dir(prefix: &str) -> PathBuf {
@@ -3908,6 +6608,525 @@ fn compute_fixture_ctr_counter_block(iv: [u8; 16], stream_offset: u64) -> Block<
     }
 
     counter_block
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_avih_payload(stream_count: usize, max_chunk_size: usize) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&21_333_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&u32::try_from(stream_count).unwrap().to_le_bytes());
+    payload.extend_from_slice(&u32::try_from(max_chunk_size).unwrap().to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_pcm_stream_list(index: usize, stream: &TestAviPcmStream<'_>) -> Vec<u8> {
+    let block_align = stream.channel_count * (stream.bits_per_sample / 8);
+    let byte_rate = stream.sample_rate * u32::from(block_align);
+    let total_samples = stream
+        .chunks
+        .iter()
+        .map(|chunk| u32::try_from(chunk.len()).unwrap() / u32::from(block_align))
+        .sum::<u32>();
+
+    let mut strh = Vec::new();
+    strh.extend_from_slice(b"auds");
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&u32::from(block_align).to_le_bytes());
+    strh.extend_from_slice(&byte_rate.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&total_samples.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&u32::from(block_align).to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+
+    let mut strf = Vec::new();
+    strf.extend_from_slice(&1_u16.to_le_bytes());
+    strf.extend_from_slice(&stream.channel_count.to_le_bytes());
+    strf.extend_from_slice(&stream.sample_rate.to_le_bytes());
+    strf.extend_from_slice(&byte_rate.to_le_bytes());
+    strf.extend_from_slice(&block_align.to_le_bytes());
+    strf.extend_from_slice(&stream.bits_per_sample.to_le_bytes());
+
+    let mut bytes = Vec::new();
+    let _ = index;
+    bytes.extend_from_slice(&encode_riff_chunk(*b"strh", &strh));
+    bytes.extend_from_slice(&encode_riff_chunk(*b"strf", &strf));
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_framed_audio_stream_list(
+    format_tag: u16,
+    sample_rate: u32,
+    channel_count: u16,
+    bits_per_sample: u16,
+    frames: &[&[u8]],
+) -> Vec<u8> {
+    let max_chunk_size = frames.iter().map(|frame| frame.len()).max().unwrap_or(0);
+    let block_align = u16::try_from(max_chunk_size).unwrap_or(u16::MAX).max(1);
+    let sample_duration = match format_tag {
+        0x0055 => 1_152,
+        0x2000 => 1_536,
+        _ => 1,
+    };
+    let byte_rate = u32::try_from(max_chunk_size)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(sample_rate)
+        / sample_duration.max(1);
+    let total_samples = u32::try_from(frames.len()).unwrap();
+
+    let mut strh = Vec::new();
+    strh.extend_from_slice(b"auds");
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&sample_duration.to_le_bytes());
+    strh.extend_from_slice(&sample_rate.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&total_samples.to_le_bytes());
+    strh.extend_from_slice(
+        &u32::try_from(max_chunk_size)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    strh.extend_from_slice(&u32::MAX.to_le_bytes());
+    strh.extend_from_slice(&u32::from(block_align).to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+
+    let mut strf = Vec::new();
+    strf.extend_from_slice(&format_tag.to_le_bytes());
+    strf.extend_from_slice(&channel_count.to_le_bytes());
+    strf.extend_from_slice(&sample_rate.to_le_bytes());
+    strf.extend_from_slice(&byte_rate.to_le_bytes());
+    strf.extend_from_slice(&block_align.to_le_bytes());
+    strf.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&encode_riff_chunk(*b"strh", &strh));
+    bytes.extend_from_slice(&encode_riff_chunk(*b"strf", &strf));
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_mp4v_stream_list(stream: &TestAviMp4vStream<'_>) -> Vec<u8> {
+    build_test_avi_video_stream_list(
+        stream.width,
+        stream.height,
+        stream.frame_scale,
+        stream.frame_rate,
+        stream.compression,
+        stream.decoder_specific_info,
+        stream.frames,
+    )
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_movi_payload(streams: &[TestAviPcmStream<'_>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let max_chunk_count = streams
+        .iter()
+        .map(|stream| stream.chunks.len())
+        .max()
+        .unwrap_or(0);
+    for chunk_index in 0..max_chunk_count {
+        for (stream_index, stream) in streams.iter().enumerate() {
+            if let Some(chunk) = stream.chunks.get(chunk_index) {
+                let chunk_id = format!("{stream_index:02}wb");
+                bytes.extend_from_slice(&encode_riff_chunk(
+                    chunk_id.as_bytes().try_into().unwrap(),
+                    chunk,
+                ));
+            }
+        }
+    }
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_audio_movi_payload(frames: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        bytes.extend_from_slice(&encode_riff_chunk(*b"00wb", frame));
+    }
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_mp4v_movi_payload(stream: &TestAviMp4vStream<'_>) -> Vec<u8> {
+    build_test_avi_video_movi_payload(stream.frames)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_video_stream_list(
+    width: u16,
+    height: u16,
+    frame_scale: u32,
+    frame_rate: u32,
+    compression: [u8; 4],
+    decoder_specific_info: &[u8],
+    frames: &[&[u8]],
+) -> Vec<u8> {
+    let total_frames = u32::try_from(frames.len()).unwrap();
+    let max_chunk_size = frames.iter().map(|frame| frame.len()).max().unwrap_or(0);
+
+    let mut strh = Vec::new();
+    strh.extend_from_slice(b"vids");
+    strh.extend_from_slice(&compression);
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&frame_scale.to_le_bytes());
+    strh.extend_from_slice(&frame_rate.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&total_frames.to_le_bytes());
+    strh.extend_from_slice(&u32::try_from(max_chunk_size).unwrap().to_le_bytes());
+    strh.extend_from_slice(&u32::MAX.to_le_bytes());
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&0_i16.to_le_bytes());
+    strh.extend_from_slice(&i16::try_from(width).unwrap().to_le_bytes());
+    strh.extend_from_slice(&i16::try_from(height).unwrap().to_le_bytes());
+
+    let mut strf = Vec::new();
+    strf.extend_from_slice(&40_u32.to_le_bytes());
+    strf.extend_from_slice(&i32::from(width).to_le_bytes());
+    strf.extend_from_slice(&i32::from(height).to_le_bytes());
+    strf.extend_from_slice(&1_u16.to_le_bytes());
+    strf.extend_from_slice(&24_u16.to_le_bytes());
+    strf.extend_from_slice(&compression);
+    strf.extend_from_slice(&u32::try_from(max_chunk_size).unwrap().to_le_bytes());
+    strf.extend_from_slice(&0_i32.to_le_bytes());
+    strf.extend_from_slice(&0_i32.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+    strf.extend_from_slice(decoder_specific_info);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&encode_riff_chunk(*b"strh", &strh));
+    bytes.extend_from_slice(&encode_riff_chunk(*b"strf", &strf));
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_avi_video_movi_payload(frames: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        bytes.extend_from_slice(&encode_riff_chunk(*b"00dc", frame));
+    }
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn encode_riff_chunk(chunk_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&chunk_type);
+    bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(payload);
+    if !payload.len().is_multiple_of(2) {
+        bytes.push(0);
+    }
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn encode_riff_list(list_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut list_payload = Vec::new();
+    list_payload.extend_from_slice(&list_type);
+    list_payload.extend_from_slice(payload);
+    encode_riff_chunk(*b"LIST", &list_payload)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_program_stream_pack_header() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+    bytes.extend_from_slice(&[0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x89, 0xC3, 0xF8, 0x00]);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_program_stream_mp3_pes_packet(payload: &[u8]) -> Vec<u8> {
+    let frame = build_mp3_frame(payload);
+    let pes_packet_length = u16::try_from(frame.len() + 3).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xC0]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00]);
+    bytes.extend_from_slice(&frame);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_program_stream_ac3_pes_packet(payload: &[u8]) -> Vec<u8> {
+    let frame = build_ac3_frame(payload);
+    let pes_packet_length = u16::try_from(frame.len() + 7).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xBD]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00]);
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
+    bytes.extend_from_slice(&frame);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_program_stream_vobsub_pes_packet(
+    pts: u64,
+    substream_id: u8,
+    packet: &[u8],
+) -> Vec<u8> {
+    let pts_bytes = [
+        (((pts >> 29) & 0x0E) as u8) | 0x21,
+        ((pts >> 22) & 0xFF) as u8,
+        (((pts >> 14) & 0xFE) as u8) | 0x01,
+        ((pts >> 7) & 0xFF) as u8,
+        (((pts << 1) & 0xFE) as u8) | 0x01,
+    ];
+    let pes_packet_length = u16::try_from(packet.len() + 12).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xBD]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x80, 0x05]);
+    bytes.extend_from_slice(&pts_bytes);
+    bytes.extend_from_slice(&[substream_id, 0x00, 0x00, 0x00]);
+    bytes.extend_from_slice(packet);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_program_stream_mp4v_pes_packet(payload: &[u8]) -> Vec<u8> {
+    build_test_program_stream_video_pes_packet(payload)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_program_stream_video_pes_packet(payload: &[u8]) -> Vec<u8> {
+    let pes_packet_length = u16::try_from(payload.len() + 3).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00]);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_pat_packet(continuity_counter: u8) -> Vec<u8> {
+    let mut section = Vec::new();
+    section.push(0x00);
+    section.extend_from_slice(&0xB00D_u16.to_be_bytes());
+    section.extend_from_slice(&1_u16.to_be_bytes());
+    section.extend_from_slice(&[0xC1, 0x00, 0x00]);
+    section.extend_from_slice(&1_u16.to_be_bytes());
+    section.extend_from_slice(&0xE100_u16.to_be_bytes());
+    section.extend_from_slice(&0_u32.to_be_bytes());
+    build_test_transport_stream_section_packet(0x0000, continuity_counter, &section)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_pmt_packet(continuity_counter: u8) -> Vec<u8> {
+    build_test_transport_stream_pmt_packet_for_stream_type(continuity_counter, 0x03)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_pmt_packet_for_stream_type(
+    continuity_counter: u8,
+    stream_type: u8,
+) -> Vec<u8> {
+    build_test_transport_stream_pmt_packet_for_stream_type_with_descriptors(
+        continuity_counter,
+        stream_type,
+        &[],
+    )
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_pmt_packet_for_private_data(
+    continuity_counter: u8,
+    descriptors: &[u8],
+) -> Vec<u8> {
+    build_test_transport_stream_pmt_packet_for_stream_type_with_descriptors(
+        continuity_counter,
+        0x06,
+        descriptors,
+    )
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_pmt_packet_for_stream_type_with_descriptors(
+    continuity_counter: u8,
+    stream_type: u8,
+    descriptors: &[u8],
+) -> Vec<u8> {
+    let mut section = Vec::new();
+    section.push(0x02);
+    let section_length =
+        u16::try_from(18 + descriptors.len()).expect("PMT descriptor payload should fit");
+    section.extend_from_slice(&(0xB000_u16 | section_length).to_be_bytes());
+    section.extend_from_slice(&1_u16.to_be_bytes());
+    section.extend_from_slice(&[0xC1, 0x00, 0x00]);
+    section.extend_from_slice(&0xE101_u16.to_be_bytes());
+    section.extend_from_slice(&0xF000_u16.to_be_bytes());
+    section.push(stream_type);
+    section.extend_from_slice(&0xE101_u16.to_be_bytes());
+    let es_info_length =
+        u16::try_from(descriptors.len()).expect("PMT descriptor payload should fit");
+    section.extend_from_slice(&(0xF000_u16 | es_info_length).to_be_bytes());
+    section.extend_from_slice(descriptors);
+    section.extend_from_slice(&0_u32.to_be_bytes());
+    build_test_transport_stream_section_packet(0x0100, continuity_counter, &section)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_section_packet(
+    pid: u16,
+    continuity_counter: u8,
+    section: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0xFF; TS_PACKET_SIZE];
+    packet[0] = 0x47;
+    packet[1] = 0x40 | u8::try_from((pid >> 8) & 0x1F).unwrap();
+    packet[2] = u8::try_from(pid & 0xFF).unwrap();
+    packet[3] = 0x10 | (continuity_counter & 0x0F);
+    packet[4] = 0x00;
+    let payload_end = 5 + section.len();
+    packet[5..payload_end].copy_from_slice(section);
+    packet
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_mp3_pes_packet(payload: &[u8]) -> Vec<u8> {
+    let frame = build_mp3_frame(payload);
+    let pes_packet_length = u16::try_from(frame.len() + 3).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xC0]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00]);
+    bytes.extend_from_slice(&frame);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_mp4v_pes_packet(payload: &[u8]) -> Vec<u8> {
+    build_test_transport_stream_video_pes_packet(payload)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_private_data_pes_packet(payload: &[u8]) -> Vec<u8> {
+    let pes_packet_length = u16::try_from(payload.len() + 3).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xBD]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00]);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_video_pes_packet(payload: &[u8]) -> Vec<u8> {
+    let pes_packet_length = u16::try_from(payload.len() + 3).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+    bytes.extend_from_slice(&pes_packet_length.to_be_bytes());
+    bytes.extend_from_slice(&[0x80, 0x00, 0x00]);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_dvb_subtitle_descriptor(
+    language: [u8; 3],
+    subtitle_type: u8,
+    composition_page_id: u16,
+    ancillary_page_id: u16,
+) -> Vec<u8> {
+    let mut bytes = vec![0x59, 8];
+    bytes.extend_from_slice(&language);
+    bytes.push(subtitle_type);
+    bytes.extend_from_slice(&composition_page_id.to_be_bytes());
+    bytes.extend_from_slice(&ancillary_page_id.to_be_bytes());
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_dvb_teletext_descriptor(
+    language: [u8; 3],
+    teletext_type: u8,
+    page_byte: u8,
+) -> Vec<u8> {
+    let mut bytes = vec![0x56, 5];
+    bytes.extend_from_slice(&language);
+    bytes.push(teletext_type);
+    bytes.push(page_byte);
+    bytes
+}
+
+#[cfg(feature = "mux")]
+fn packetize_test_transport_stream_pes(
+    pid: u16,
+    continuity_counter: &mut u8,
+    pes_packet: &[u8],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut offset = 0usize;
+    let mut first = true;
+    while offset < pes_packet.len() {
+        let mut packet = vec![0xFF; TS_PACKET_SIZE];
+        packet[0] = 0x47;
+        packet[1] = (if first { 0x40 } else { 0x00 }) | u8::try_from((pid >> 8) & 0x1F).unwrap();
+        packet[2] = u8::try_from(pid & 0xFF).unwrap();
+
+        let remaining = pes_packet.len() - offset;
+        if remaining >= 184 {
+            packet[3] = 0x10 | (*continuity_counter & 0x0F);
+            let payload_end = offset + 184;
+            packet[4..188].copy_from_slice(&pes_packet[offset..payload_end]);
+            offset = payload_end;
+        } else {
+            let adaptation_length = 183 - remaining;
+            packet[3] = 0x30 | (*continuity_counter & 0x0F);
+            packet[4] = u8::try_from(adaptation_length).unwrap();
+            if adaptation_length > 0 {
+                packet[5] = 0x00;
+                for byte in &mut packet[6..(5 + adaptation_length)] {
+                    *byte = 0xFF;
+                }
+            }
+            let payload_start = 5 + adaptation_length;
+            packet[payload_start..payload_start + remaining]
+                .copy_from_slice(&pes_packet[offset..offset + remaining]);
+            offset = pes_packet.len();
+        }
+        *continuity_counter = (*continuity_counter + 1) & 0x0F;
+        first = false;
+        bytes.extend_from_slice(&packet);
+    }
+    bytes
 }
 
 fn encrypted_fragment_default_kid() -> [u8; 16] {

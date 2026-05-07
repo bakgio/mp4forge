@@ -16,7 +16,7 @@ use mp4forge::boxes::metadata::{
     TempoData, TrackNumberData, TvEpisodeData, TvEpisodeIdData, TvNetworkNameData, TvSeasonData,
     TvShowNameData, WriterData,
 };
-use mp4forge::boxes::{AnyTypeBox, default_registry};
+use mp4forge::boxes::{AnyTypeBox, BoxLookupContext, default_registry};
 use mp4forge::codec::{CodecBox, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any};
 use mp4forge::stringify::stringify;
 
@@ -972,6 +972,10 @@ fn built_in_registry_reports_context_free_metadata_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"ilst")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ID32")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"keys")));
+    assert!(registry.is_registered_with_context(
+        FourCc::from_bytes([0xa9, b'e', b'n', b'c']),
+        BoxLookupContext::new().enter(FourCc::from_bytes(*b"ilst"))
+    ));
     assert!(!registry.is_registered(FourCc::from_bytes(*b"data")));
     assert!(!registry.is_registered(FourCc::from_bytes(*b"----")));
     assert!(!registry.is_registered(FourCc::from_bytes(*b"mean")));

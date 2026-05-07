@@ -6,19 +6,19 @@ use std::time::{Duration, UNIX_EPOCH};
 use mp4forge::FourCc;
 use mp4forge::boxes::iso14496_12::{
     AVCDecoderConfiguration, AVCParameterSet, AlbumLoudnessInfo, AlternativeStartupEntry,
-    AlternativeStartupEntryL, AlternativeStartupEntryOpt, AudioSampleEntry, Btrt, Cdat, Cdsc, Clap,
-    Co64, CoLL, Colr, Cslg, Ctts, CttsEntry, Dinf, Dpnd, Dref, Edts, Elng, Elst, ElstEntry, Emeb,
-    Emib, Emsg, EventMessageSampleEntry, Fiel, Font, Free, Frma, Ftyp, HEVCDecoderConfiguration,
-    HEVCNalu, HEVCNaluArray, Hdlr, Hind, Hint, Ipir, Kind, Leva, LevaLevel, LoudnessEntry,
-    LoudnessMeasurement, Ludt, Mdat, Mdhd, Mdia, Mehd, Meta, Mfhd, Mfra, Mfro, Mime, Minf, Moof,
-    Moov, Mpod, Mvex, Mvhd, Nmhd, PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS,
-    PRFT_TIME_ARBITRARY_CONSISTENT, PRFT_TIME_CAPTURED, PRFT_TIME_ENCODER_INPUT,
-    PRFT_TIME_ENCODER_OUTPUT, PRFT_TIME_MOOF_FINALIZED, PRFT_TIME_MOOF_WRITTEN, Pasp, Prft, Saio,
-    Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm, Sdtp, SdtpSampleElem, SeigEntry, SeigEntryL,
-    Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf, Skip, SmDm, Smhd, SphericalVideoV1Metadata,
-    Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stss, Stsz, Stts,
-    SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt, Sync, TFHD_BASE_DATA_OFFSET_PRESENT,
-    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TRUN_DATA_OFFSET_PRESENT,
+    AlternativeStartupEntryL, AlternativeStartupEntryOpt, AudioSampleEntry, Btrt, Cdat, Cdsc, Chnl,
+    Clap, Co64, CoLL, Colr, Cslg, Ctts, CttsEntry, Dinf, Dpnd, Dref, DvsC, Edts, Elng, Elst,
+    ElstEntry, Emeb, Emib, Emsg, EventMessageSampleEntry, Fiel, Font, Free, Frma, Ftyp,
+    GenericMediaSampleEntry, HEVCDecoderConfiguration, HEVCNalu, HEVCNaluArray, Hdlr, Hind, Hint,
+    Ipir, Kind, Leva, LevaLevel, LoudnessEntry, LoudnessMeasurement, Ludt, Mdat, Mdhd, Mdia, Mehd,
+    Meta, Mfhd, Mfra, Mfro, Mime, Minf, Moof, Moov, Mpod, Mvex, Mvhd, Nmhd,
+    PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS, PRFT_TIME_ARBITRARY_CONSISTENT, PRFT_TIME_CAPTURED,
+    PRFT_TIME_ENCODER_INPUT, PRFT_TIME_ENCODER_OUTPUT, PRFT_TIME_MOOF_FINALIZED,
+    PRFT_TIME_MOOF_WRITTEN, Pasp, Prft, Saio, Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm, Sdtp,
+    SdtpSampleElem, SeigEntry, SeigEntryL, Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf, Skip,
+    SmDm, Smhd, SphericalVideoV1Metadata, Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd, Stsc,
+    StscEntry, Stsd, Stss, Stsz, Stts, SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt, Sync,
+    TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TRUN_DATA_OFFSET_PRESENT,
     TRUN_FIRST_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT,
     TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry,
     TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra, TfraEntry, Tkhd, TrackLoudnessInfo, Traf, Trak,
@@ -1697,7 +1697,8 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         general_level_idc: 0x78,
         min_spatial_segmentation_idc: 0x0000,
         chroma_format_idc: 0x01,
-        temporal_id_nested: 0x03,
+        num_temporal_layers: 0x01,
+        temporal_id_nested: 0x01,
         length_size_minus_one: 0x03,
         num_of_nalu_arrays: 4,
         nalu_arrays: vec![
@@ -1775,6 +1776,33 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
             box_type: FourCc::from_bytes(*b"evte"),
             data_reference_index: 0x1234,
         },
+    };
+
+    let dvbs = GenericMediaSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"dvbs"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let dvbt = GenericMediaSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"dvbt"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let mp4s = GenericMediaSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"mp4s"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let dvsc = DvsC {
+        composition_page_id: 0x0123,
+        ancillary_page_id: 0x0456,
+        subtitle_type: 0x10,
     };
 
     let mut silb = Silb::default();
@@ -1999,7 +2027,7 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
             "GeneralConstraintIndicator=[0x90, 0x0, 0x0, 0x0, 0x0, 0x0] GeneralLevelIdc=0x78 ",
             "MinSpatialSegmentationIdc=0 ParallelismType=0x0 ChromaFormatIdc=0x1 ",
             "BitDepthLumaMinus8=0x0 BitDepthChromaMinus8=0x0 AvgFrameRate=0 ConstantFrameRate=0x0 ",
-            "NumTemporalLayers=0x0 TemporalIdNested=0x3 LengthSizeMinusOne=0x3 NumOfNaluArrays=0x4 ",
+            "NumTemporalLayers=0x1 TemporalIdNested=0x1 LengthSizeMinusOne=0x3 NumOfNaluArrays=0x4 ",
             "NaluArrays=[{Completeness=false Reserved=false NaluType=0x20 NumNalus=1 Nalus=[{Length=24 NALUnit=[0x40, 0x1, 0xc, 0x1, 0xff, 0xff, 0x1, 0x60, 0x0, 0x0, 0x3, 0x0, 0x90, 0x0, 0x0, 0x3, 0x0, 0x0, 0x3, 0x0, 0x78, 0x99, 0x98, 0x9]}]}, ",
             "{Completeness=false Reserved=false NaluType=0x21 NumNalus=1 Nalus=[{Length=42 NALUnit=[0x6, 0x1, 0x1, 0x1, 0x60, 0x0, 0x0, 0x3, 0x0, 0x90, 0x0, 0x0, 0x3, 0x0, 0x0, 0x3, 0x0, 0x78, 0xa0, 0x3, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x66, 0x69, 0x24, 0xca, 0xe0, 0x10, 0x0, 0x0, 0x3, 0x0, 0x10, 0x0, 0x0, 0x3, 0x1, 0xe0, 0x80]}]}, ",
             "{Completeness=false Reserved=false NaluType=0x22 NumNalus=1 Nalus=[{Length=7 NALUnit=[0x44, 0x1, 0xc1, 0x72, 0xb4, 0x62, 0x40]}]}, ",
@@ -2030,6 +2058,26 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         evte,
         &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
         "DataReferenceIndex=4660",
+    );
+    assert_any_box_roundtrip(
+        dvbs,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_any_box_roundtrip(
+        dvbt,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_any_box_roundtrip(
+        mp4s,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_box_roundtrip(
+        dvsc,
+        &[0x01, 0x23, 0x04, 0x56, 0x10],
+        "CompositionPageID=291 AncillaryPageID=1110 SubtitleType=16",
     );
     assert_box_roundtrip(
         silb,
@@ -2248,6 +2296,13 @@ fn compact_track_payload_metadata_iso14496_12_catalog_roundtrips() {
         },
         &[0xde, 0xad, 0xbe, 0xef],
         "Data=[0xde, 0xad, 0xbe, 0xef]",
+    );
+    assert_box_roundtrip(
+        Chnl {
+            data: vec![0x01, 0x02, 0x03, 0x04],
+        },
+        &[0x01, 0x02, 0x03, 0x04],
+        "Data=[0x1, 0x2, 0x3, 0x4]",
     );
 }
 
@@ -3007,6 +3062,10 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
         Some(&[][..])
     );
     assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"chnl")),
+        Some(&[][..])
+    );
+    assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"leva")),
         Some(&[0][..])
     );
@@ -3091,6 +3150,7 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"avcC")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"btrt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"cdat")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"chnl")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"clap")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"colr")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"CoLL")));
@@ -3106,8 +3166,19 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"avc1")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mime")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mp4a")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dvbs")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dvbt")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"mp4s")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dvsC")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"jpeg")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"png ")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"pasp")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"prft")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"samr")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sawb")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sqcp")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sevc")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ssmv")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"schm")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sbtt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sidx")));
@@ -3119,6 +3190,7 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"sync")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"subt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"subs")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"s263")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"nmhd")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"tref")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"tlou")));

@@ -77,7 +77,7 @@ feature flags:
   duration coordination on one mux event graph, the retained low-level seekable and progressive
   payload assembly helpers, and one-sample-at-a-time seekable or progressive readers that stay
   aligned with the same staged plan model. It also enables the sync-only `mux` CLI route for one
-  output MP4 built from repeated `--track` inputs.
+  output MP4 built from repeated path-first `--track` inputs.
 - `serde`: derives `Serialize` and `Deserialize` for the reusable public report structs under
   `mp4forge::cli::probe` and `mp4forge::cli::dump`, along with their nested public codec-detail,
   media-characteristics, `FieldValue`, and `FourCc` data. This is intended for library-side report
@@ -107,22 +107,28 @@ sync and async APIs.
 
 `mux` is available when the crate is built with `--features mux`. The CLI route stays sync-only
 and accepts repeated `--track` inputs, one required positional output path, and at most one of
-`--segment_duration` or `--fragment_duration`. The widened `--track` grammar is
-`<codec>:PATH[#key=value[,key=value...]]` for raw imports and `PATH.mp4#video`,
-`PATH.mp4#audio`, `PATH.mp4#audio:N`, `PATH.mp4#text`, `PATH.mp4#text:N`, or
-`PATH.mp4#track:ID` for MP4 track selectors. Raw codec-prefixed imports now cover the current
-widened codec set: self-describing families such as H.264, H.265, AAC, MP3, AC-3, E-AC-3, and
-AC-4 parse their native framing directly, while broader raw families such as AV1, VP8, VP9,
-ALAC, DTS-family entries, FLAC, Opus, IAMF, and MPEG-H use explicit `#key=value` layout
-parameters when their source bytes are not self-describing enough to derive one safe MP4
-sample-entry shape automatically. MP4-track merges continue to cover the broader registered
-sample-entry families because they preserve encoded sample-entry bytes from the source file, and
-mixed video/audio/text/subtitle jobs retain imported handler names and languages on the real MP4
-path. The matching sync and async library entry points use the same `MuxRequest` surface, while
-the retained lower-level mux helpers remain available separately when you need staged planning or
-payload-copy behavior without the task-level request layer. The public
-`mp4forge::mux::sample_reader` helpers can also expose stable text or subtitle track identity when
-you construct them with companion `MuxTrackConfig` values.
+`--segment_duration` or `--fragment_duration`. The current public `--track` grammar is path-first:
+`PATH` imports one raw source or every supported track from one MP4 source, while
+`PATH#video`, `PATH#audio`, `PATH#audio:N`, `PATH#text`, `PATH#text:N`, and `PATH#track:ID`
+select one specific track from a containerized source. The landed path-only auto-detection
+currently covers MP4, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported
+MPEG-PS MPEG audio streams plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS
+MPEG audio streams plus AC-3/E-AC-3 audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC
+ADTS, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, AAC LATM, Dolby
+TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video,
+H.264 Annex B, H.265 Annex B, VVC Annex B, IVF-backed AV1, IVF-backed VP8, IVF-backed VP9,
+JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg-backed FLAC,
+Ogg-backed Opus, Ogg-backed Vorbis, Ogg-backed Speex, Ogg-backed Theora, and CAF-backed ALAC.
+Broader DTS-family
+sample-entry variants remain supported through MP4 track import, and the broader demux-backed
+path-only families continue to move over behind the same public shape.
+MP4-track merges continue to cover the broader registered sample-entry families because they
+preserve encoded sample-entry bytes from the source file, and mixed video/audio/text/subtitle jobs
+retain imported handler names and languages on the real MP4 path. The matching sync and async
+library entry points use the same `MuxRequest` surface, while the retained lower-level mux helpers
+remain available separately when you need staged planning or payload-copy behavior without the
+task-level request layer. The public `mp4forge::mux::sample_reader` helpers can also expose stable
+text or subtitle track identity when you construct them with companion `MuxTrackConfig` values.
 
 `divide` currently targets fragmented inputs with up to one video track from AVC, HEVC, Dolby
 Vision on HEVC, AV1, VP8, or VP9 and one audio track from MP4A-based audio, Opus, AC-3,

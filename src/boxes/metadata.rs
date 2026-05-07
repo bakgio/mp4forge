@@ -47,6 +47,7 @@ const GENRE_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes([0xa9, b'g', b'e', b
 const GROUPING_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes([0xa9, b'g', b'r', b'p']);
 const LEGACY_GENRE_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes(*b"gnre");
 const NAME_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes([0xa9, b'n', b'a', b'm']);
+const ENCODING_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes([0xa9, b'e', b'n', b'c']);
 const TOOL_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes([0xa9, b't', b'o', b'o']);
 const SORT_ALBUM_ARTIST_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes(*b"soaa");
 const SORT_ALBUM_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes(*b"soal");
@@ -83,6 +84,7 @@ const ILST_META_BOX_TYPES: &[FourCc] = &[
     FourCc::from_bytes(*b"purl"),
     FourCc::from_bytes(*b"rtng"),
     FourCc::from_bytes(*b"sfID"),
+    ENCODING_METADATA_ITEM_TYPE,
     FourCc::from_bytes(*b"soaa"),
     FourCc::from_bytes(*b"soal"),
     FourCc::from_bytes(*b"soar"),
