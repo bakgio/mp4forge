@@ -7,7 +7,7 @@ use tokio::fs::File as TokioFile;
 use crate::FourCc;
 use crate::boxes::iso14496_14::{
     DECODER_CONFIG_DESCRIPTOR_TAG, DECODER_SPECIFIC_INFO_TAG, DecoderConfigDescriptor, Descriptor,
-    Esds,
+    ES_DESCRIPTOR_TAG, EsDescriptor, Esds, SL_CONFIG_DESCRIPTOR_TAG,
 };
 
 use super::super::MuxError;
@@ -15,8 +15,11 @@ use super::super::MuxError;
 use super::super::import::read_exact_at_async;
 use super::super::import::{
     SegmentedMuxSourceSegment, SegmentedMuxSourceSegmentData, SegmentedMuxSourceSpec, StagedSample,
-    build_generic_audio_sample_entry_box, read_exact_at_sync,
+    build_btrt_from_sample_sizes, build_generic_audio_sample_entry_box, read_exact_at_sync,
 };
+#[cfg(feature = "async")]
+use super::container_common::read_segmented_bytes_async;
+use super::container_common::read_segmented_bytes_sync;
 
 const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
 const LATM_SYNC_BYTE: u8 = 0x56;
@@ -115,6 +118,16 @@ pub(in crate::mux) fn scan_latm_file_sync(
     parse_latm_stream_sync(&mut file, file_size, path, spec)
 }
 
+pub(in crate::mux) fn scan_latm_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    path: &Path,
+    spec: &str,
+) -> Result<ParsedLatmTrack, MuxError> {
+    parse_latm_segmented_stream_sync(file, segments, total_size, path, spec)
+}
+
 #[cfg(feature = "async")]
 pub(in crate::mux) async fn scan_latm_file_async(
     path: &Path,
@@ -123,6 +136,17 @@ pub(in crate::mux) async fn scan_latm_file_async(
     let mut file = TokioFile::open(path).await?;
     let file_size = file.metadata().await?.len();
     parse_latm_stream_async(&mut file, file_size, path, spec).await
+}
+
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn scan_latm_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    path: &Path,
+    spec: &str,
+) -> Result<ParsedLatmTrack, MuxError> {
+    parse_latm_segmented_stream_async(file, segments, total_size, path, spec).await
 }
 
 fn parse_latm_stream_sync(
@@ -140,6 +164,64 @@ fn parse_latm_stream_sync(
     while offset < file_size {
         let frame = read_latm_frame_sync(file, file_size, offset, spec)?;
         let parsed = parse_latm_frame(&frame, spec, config.as_ref(), offset, file_size)?;
+        if let Some(existing) = &config {
+            if existing != &parsed.config {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: "LATM input changed sample rate, channel layout, or AudioSpecificConfig bytes mid-stream".to_string(),
+                });
+            }
+        } else {
+            config = Some(parsed.config.clone());
+        }
+
+        let data_size = u32::try_from(parsed.payload.len())
+            .map_err(|_| MuxError::LayoutOverflow("LATM payload size"))?;
+        transformed_segments.push(SegmentedMuxSourceSegment {
+            logical_offset,
+            data: SegmentedMuxSourceSegmentData::Bytes(parsed.payload),
+        });
+        samples.push(StagedSample {
+            data_offset: logical_offset,
+            data_size,
+            duration: LATM_SAMPLE_DURATION,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        logical_offset = logical_offset
+            .checked_add(u64::from(data_size))
+            .ok_or(MuxError::LayoutOverflow("LATM transformed logical size"))?;
+        offset = offset
+            .checked_add(u64::try_from(frame.len()).unwrap())
+            .ok_or(MuxError::LayoutOverflow("LATM frame offset"))?;
+    }
+
+    finalize_latm_track(
+        path,
+        spec,
+        config,
+        transformed_segments,
+        samples,
+        logical_offset,
+    )
+}
+
+fn parse_latm_segmented_stream_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    path: &Path,
+    spec: &str,
+) -> Result<ParsedLatmTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut config = None::<ParsedLatmConfig>;
+    let mut transformed_segments = Vec::new();
+    let mut samples = Vec::new();
+    let mut logical_offset = 0_u64;
+
+    while offset < total_size {
+        let frame = read_latm_frame_segmented_sync(file, segments, total_size, offset, spec)?;
+        let parsed = parse_latm_frame(&frame, spec, config.as_ref(), offset, total_size)?;
         if let Some(existing) = &config {
             if existing != &parsed.config {
                 return Err(MuxError::UnsupportedTrackImport {
@@ -240,6 +322,66 @@ async fn parse_latm_stream_async(
     )
 }
 
+#[cfg(feature = "async")]
+async fn parse_latm_segmented_stream_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    path: &Path,
+    spec: &str,
+) -> Result<ParsedLatmTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut config = None::<ParsedLatmConfig>;
+    let mut transformed_segments = Vec::new();
+    let mut samples = Vec::new();
+    let mut logical_offset = 0_u64;
+
+    while offset < total_size {
+        let frame =
+            read_latm_frame_segmented_async(file, segments, total_size, offset, spec).await?;
+        let parsed = parse_latm_frame(&frame, spec, config.as_ref(), offset, total_size)?;
+        if let Some(existing) = &config {
+            if existing != &parsed.config {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: "LATM input changed sample rate, channel layout, or AudioSpecificConfig bytes mid-stream".to_string(),
+                });
+            }
+        } else {
+            config = Some(parsed.config.clone());
+        }
+
+        let data_size = u32::try_from(parsed.payload.len())
+            .map_err(|_| MuxError::LayoutOverflow("LATM payload size"))?;
+        transformed_segments.push(SegmentedMuxSourceSegment {
+            logical_offset,
+            data: SegmentedMuxSourceSegmentData::Bytes(parsed.payload),
+        });
+        samples.push(StagedSample {
+            data_offset: logical_offset,
+            data_size,
+            duration: LATM_SAMPLE_DURATION,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        logical_offset = logical_offset
+            .checked_add(u64::from(data_size))
+            .ok_or(MuxError::LayoutOverflow("LATM transformed logical size"))?;
+        offset = offset
+            .checked_add(u64::try_from(frame.len()).unwrap())
+            .ok_or(MuxError::LayoutOverflow("LATM frame offset"))?;
+    }
+
+    finalize_latm_track(
+        path,
+        spec,
+        config,
+        transformed_segments,
+        samples,
+        logical_offset,
+    )
+}
+
 fn finalize_latm_track(
     path: &Path,
     spec: &str,
@@ -261,7 +403,7 @@ fn finalize_latm_track(
 
     Ok(ParsedLatmTrack {
         sample_rate: config.sample_rate,
-        sample_entry_box: build_latm_sample_entry_box(&config)?,
+        sample_entry_box: build_latm_sample_entry_box(&config, &samples)?,
         segmented_source: SegmentedMuxSourceSpec {
             path: path.to_path_buf(),
             segments: transformed_segments,
@@ -310,6 +452,56 @@ fn read_latm_frame_sync(
     Ok(frame)
 }
 
+fn read_latm_frame_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<Vec<u8>, MuxError> {
+    if total_size.saturating_sub(offset) < 3 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("truncated LATM sync header at logical byte offset {offset}"),
+        });
+    }
+    let mut header = [0_u8; 3];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut header,
+        spec,
+        "truncated LATM sync header",
+    )?;
+    validate_latm_sync_header(&header, spec, offset)?;
+    let mux_size = latm_mux_size(&header);
+    let frame_size = 3_u64
+        .checked_add(mux_size)
+        .ok_or(MuxError::LayoutOverflow("LATM frame size"))?;
+    if offset
+        .checked_add(frame_size)
+        .is_none_or(|end| end > total_size)
+    {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("truncated LATM frame at logical byte offset {offset}"),
+        });
+    }
+    let mut frame = vec![0_u8; usize::try_from(frame_size).unwrap()];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut frame,
+        spec,
+        "truncated LATM frame",
+    )?;
+    Ok(frame)
+}
+
 #[cfg(feature = "async")]
 async fn read_latm_frame_async(
     file: &mut TokioFile,
@@ -348,6 +540,59 @@ async fn read_latm_frame_async(
     }
     let mut frame = vec![0_u8; usize::try_from(frame_size).unwrap()];
     read_exact_at_async(file, offset, &mut frame, spec, "truncated LATM frame").await?;
+    Ok(frame)
+}
+
+#[cfg(feature = "async")]
+async fn read_latm_frame_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<Vec<u8>, MuxError> {
+    if total_size.saturating_sub(offset) < 3 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("truncated LATM sync header at logical byte offset {offset}"),
+        });
+    }
+    let mut header = [0_u8; 3];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut header,
+        spec,
+        "truncated LATM sync header",
+    )
+    .await?;
+    validate_latm_sync_header(&header, spec, offset)?;
+    let mux_size = latm_mux_size(&header);
+    let frame_size = 3_u64
+        .checked_add(mux_size)
+        .ok_or(MuxError::LayoutOverflow("LATM frame size"))?;
+    if offset
+        .checked_add(frame_size)
+        .is_none_or(|end| end > total_size)
+    {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("truncated LATM frame at logical byte offset {offset}"),
+        });
+    }
+    let mut frame = vec![0_u8; usize::try_from(frame_size).unwrap()];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut frame,
+        spec,
+        "truncated LATM frame",
+    )
+    .await?;
     Ok(frame)
 }
 
@@ -481,20 +726,8 @@ fn parse_latm_stream_mux_config(
         });
     }
     let _latm_buffer_fullness = bits.read_bits(8, spec, "LATM latmBufferFullness")?;
-    let other_data_present = bits.read_bool(spec, "LATM otherDataPresent")?;
-    if other_data_present {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "LATM direct input currently rejects otherDataPresent streams".to_string(),
-        });
-    }
-    let crc_check_present = bits.read_bool(spec, "LATM crcCheckPresent")?;
-    if crc_check_present {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "LATM direct input currently rejects crcCheckPresent streams".to_string(),
-        });
-    }
+    let _other_data_present = bits.read_bool(spec, "LATM otherDataPresent")?;
+    let _crc_check_present = bits.read_bool(spec, "LATM crcCheckPresent")?;
 
     Ok(ParsedLatmConfig {
         audio_object_type: parsed_audio_config.audio_object_type,
@@ -538,6 +771,12 @@ fn parse_audio_specific_config(
             ),
         }
     })?;
+    let _frame_length_flag = bits.read_bool(spec, "LATM frameLengthFlag")?;
+    let depends_on_core_coder = bits.read_bool(spec, "LATM dependsOnCoreCoder")?;
+    if depends_on_core_coder {
+        let _core_coder_delay = bits.read_bits(14, spec, "LATM coreCoderDelay")?;
+    }
+    let _extension_flag = bits.read_bool(spec, "LATM extensionFlag")?;
     Ok(ParsedLatmAudioSpecificConfig {
         audio_object_type: core_audio_object_type,
         sample_rate,
@@ -635,9 +874,14 @@ fn extract_packed_bit_slice(
     Ok(output)
 }
 
-fn build_latm_sample_entry_box(config: &ParsedLatmConfig) -> Result<Vec<u8>, MuxError> {
-    let esds =
-        super::super::mp4::encode_typed_box(&build_latm_esds(&config.audio_specific_config), &[])?;
+fn build_latm_sample_entry_box(
+    config: &ParsedLatmConfig,
+    samples: &[StagedSample],
+) -> Result<Vec<u8>, MuxError> {
+    let mut esds = build_latm_esds(config.sample_rate, &config.audio_specific_config, samples)?;
+    esds.normalize_descriptor_sizes_for_mux()
+        .map_err(|_| MuxError::LayoutOverflow("LATM esds normalization"))?;
+    let esds = super::super::mp4::encode_typed_box(&esds, &[])?;
     build_generic_audio_sample_entry_box(
         MP4A,
         config.sample_rate,
@@ -647,15 +891,32 @@ fn build_latm_sample_entry_box(config: &ParsedLatmConfig) -> Result<Vec<u8>, Mux
     )
 }
 
-fn build_latm_esds(audio_specific_config: &[u8]) -> Esds {
+fn build_latm_esds(
+    sample_rate: u32,
+    audio_specific_config: &[u8],
+    samples: &[StagedSample],
+) -> Result<Esds, MuxError> {
+    let decoder_bitrates = build_btrt_from_sample_sizes(
+        samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+        sample_rate,
+    )?;
     let mut esds = Esds::default();
     esds.descriptors = vec![
         Descriptor {
+            tag: ES_DESCRIPTOR_TAG,
+            es_descriptor: Some(EsDescriptor::default()),
+            ..Descriptor::default()
+        },
+        Descriptor {
             tag: DECODER_CONFIG_DESCRIPTOR_TAG,
-            size: 13,
             decoder_config_descriptor: Some(DecoderConfigDescriptor {
                 object_type_indication: MPEG4_AUDIO_OBJECT_TYPE_INDICATION,
                 stream_type: 5,
+                buffer_size_db: decoder_bitrates.buffer_size_db,
+                max_bitrate: decoder_bitrates.max_bitrate,
+                avg_bitrate: decoder_bitrates.avg_bitrate,
                 reserved: true,
                 ..DecoderConfigDescriptor::default()
             }),
@@ -667,6 +928,12 @@ fn build_latm_esds(audio_specific_config: &[u8]) -> Esds {
             data: audio_specific_config.to_vec(),
             ..Descriptor::default()
         },
+        Descriptor {
+            tag: SL_CONFIG_DESCRIPTOR_TAG,
+            size: 1,
+            data: vec![0x02],
+            ..Descriptor::default()
+        },
     ];
-    esds
+    Ok(esds)
 }

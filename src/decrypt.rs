@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use aes::Aes128;
 use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
@@ -522,6 +522,26 @@ impl From<DecryptRewriteError> for DecryptError {
     }
 }
 
+impl DecryptError {
+    /// Stable coarse category label for additive decrypt diagnostics.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Rewrite(error) => error.category(),
+            Self::MissingFragmentsInfo | Self::InvalidInput { .. } => "input",
+        }
+    }
+
+    /// Stable coarse stage label for additive decrypt diagnostics.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Rewrite(error) => error.stage(),
+            Self::MissingFragmentsInfo | Self::InvalidInput { .. } => "request",
+        }
+    }
+}
+
 /// Errors raised by the native Common Encryption sample-transform core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommonEncryptionDecryptError {
@@ -616,6 +636,25 @@ impl fmt::Display for CommonEncryptionDecryptError {
 
 impl Error for CommonEncryptionDecryptError {}
 
+impl CommonEncryptionDecryptError {
+    /// Stable coarse category label for additive decrypt diagnostics.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::UnsupportedNativeSchemeType { .. } => "unsupported",
+            Self::MissingDecryptionKey { .. } => "key",
+            Self::MissingInitializationVector { .. }
+            | Self::InvalidInitializationVectorSize { .. }
+            | Self::InvalidProtectedRegion { .. }
+            | Self::ProtectedByteCountOverflow { .. } => "crypto",
+        }
+    }
+
+    /// Stable coarse stage label for additive decrypt diagnostics.
+    pub fn stage(&self) -> &'static str {
+        "process"
+    }
+}
+
 /// Errors raised while rewriting decrypted MP4 output for the native Common Encryption path.
 #[derive(Debug)]
 pub enum DecryptRewriteError {
@@ -675,6 +714,31 @@ impl fmt::Display for DecryptRewriteError {
                 f,
                 "sample {sample_index} for track {track_id} points outside root media data: offset={absolute_offset}, size={sample_size}"
             ),
+        }
+    }
+}
+
+impl DecryptRewriteError {
+    /// Stable coarse category label for additive decrypt diagnostics.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Extract(_) => "input",
+            Self::Resolve(_) => "layout",
+            Self::Decrypt(error) => error.category(),
+            Self::InvalidLayout { .. } | Self::SampleDataRangeNotFound { .. } => "layout",
+            Self::UnsupportedTrackSchemeType { .. } => "unsupported",
+        }
+    }
+
+    /// Stable coarse stage label for additive decrypt diagnostics.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::Extract(_) => "inspect",
+            Self::Resolve(_) => "plan",
+            Self::Decrypt(error) => error.stage(),
+            Self::InvalidLayout { .. } => "rewrite",
+            Self::UnsupportedTrackSchemeType { .. } => "inspect",
+            Self::SampleDataRangeNotFound { .. } => "process",
         }
     }
 }
@@ -3995,6 +4059,54 @@ where
     Ok(output)
 }
 
+fn decrypt_io_at_path(operation: &'static str, path: &Path, source: io::Error) -> DecryptError {
+    DecryptError::Io(io::Error::new(
+        source.kind(),
+        format!("failed to {operation} `{}`: {source}", path.display()),
+    ))
+}
+
+fn decrypt_invalid_file_arguments(message: String) -> DecryptError {
+    DecryptError::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid decrypt file arguments: {message}"),
+    ))
+}
+
+fn absolute_decrypt_path(path: &Path) -> Result<PathBuf, DecryptError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
+
+fn validate_decrypt_file_paths(
+    input_path: &Path,
+    output_path: &Path,
+    fragments_info_path: Option<&Path>,
+) -> Result<(), DecryptError> {
+    let input_absolute = absolute_decrypt_path(input_path)?;
+    let output_absolute = absolute_decrypt_path(output_path)?;
+    if input_absolute == output_absolute {
+        return Err(decrypt_invalid_file_arguments(format!(
+            "decrypt output path `{}` conflicts with input `{}`",
+            output_absolute.display(),
+            input_absolute.display()
+        )));
+    }
+    if let Some(fragments_info_path) = fragments_info_path {
+        let fragments_absolute = absolute_decrypt_path(fragments_info_path)?;
+        if fragments_absolute == output_absolute {
+            return Err(decrypt_invalid_file_arguments(format!(
+                "decrypt output path `{}` conflicts with fragments-info path `{}`",
+                output_absolute.display(),
+                fragments_absolute.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn decrypt_file_with_optional_progress_and_fragments_info_path<F>(
     input_path: &Path,
     output_path: &Path,
@@ -4005,16 +4117,24 @@ pub(crate) fn decrypt_file_with_optional_progress_and_fragments_info_path<F>(
 where
     F: FnMut(DecryptProgress),
 {
+    validate_decrypt_file_paths(input_path, output_path, fragments_info_path)?;
     let mut reporter = ProgressReporter::new(progress);
     reporter.report(DecryptProgressPhase::OpenInput, 0, Some(1));
-    let mut input = fs::File::open(input_path)?;
+    let mut input = fs::File::open(input_path)
+        .map_err(|error| decrypt_io_at_path("open decrypt input", input_path, error))?;
     reporter.report(DecryptProgressPhase::OpenInput, 1, Some(1));
 
-    let mut fragments_info = fragments_info_path.map(fs::File::open).transpose()?;
+    let mut fragments_info = fragments_info_path
+        .map(|path| {
+            fs::File::open(path)
+                .map_err(|error| decrypt_io_at_path("open decrypt fragments-info", path, error))
+        })
+        .transpose()?;
 
     // Keep the externally visible progress phase order stable while the file-backed path moves
     // onto the stream-first core internally.
-    let mut output = fs::File::create(output_path)?;
+    let mut output = fs::File::create(output_path)
+        .map_err(|error| decrypt_io_at_path("create decrypt output", output_path, error))?;
     if let Err(error) = decrypt_sync_stream_with_optional_progress(
         &mut input,
         &mut output,
@@ -4047,12 +4167,17 @@ async fn decrypt_file_with_optional_progress_async<F>(
 where
     F: FnMut(DecryptProgress) + Send,
 {
+    validate_decrypt_file_paths(input_path, output_path, None)?;
     let mut reporter = ProgressReporter::new(progress);
     reporter.report(DecryptProgressPhase::OpenInput, 0, Some(1));
-    let mut input = tokio_fs::File::open(input_path).await?;
+    let mut input = tokio_fs::File::open(input_path)
+        .await
+        .map_err(|error| decrypt_io_at_path("open decrypt input", input_path, error))?;
     reporter.report(DecryptProgressPhase::OpenInput, 1, Some(1));
 
-    let mut output = tokio_fs::File::create(output_path).await?;
+    let mut output = tokio_fs::File::create(output_path)
+        .await
+        .map_err(|error| decrypt_io_at_path("create decrypt output", output_path, error))?;
     if let Err(error) = decrypt_async_stream_with_optional_progress(
         &mut input,
         &mut output,
@@ -5577,9 +5702,14 @@ fn decrypt_common_encryption_sample_edit_with_reuse(
     Ok(clear)
 }
 
-fn map_raw_offset_queue_error(error: RawOffsetQueueError) -> DecryptError {
+fn map_raw_offset_queue_error(
+    stage: &'static str,
+    start: u64,
+    size: u64,
+    error: RawOffsetQueueError,
+) -> DecryptError {
     DecryptRewriteError::InvalidLayout {
-        reason: error.to_string(),
+        reason: format!("{stage} queue access failed for offset {start} size {size}: {error}"),
     }
     .into()
 }
@@ -5589,6 +5719,7 @@ fn fill_progressive_raw_queue<R>(
     raw_queue: &mut RawOffsetQueue,
     target_end: u64,
     buffer: &mut [u8],
+    stage: &'static str,
 ) -> Result<(), DecryptError>
 where
     R: Read,
@@ -5596,7 +5727,18 @@ where
     while raw_queue.tail() < target_end {
         let remaining = target_end - raw_queue.tail();
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-        input.read_exact(&mut buffer[..chunk_len])?;
+        if let Err(error) = input.read_exact(&mut buffer[..chunk_len]) {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: format!(
+                        "{stage} ended before reaching progressive offset {target_end}; buffered tail is {}",
+                        raw_queue.tail()
+                    ),
+                }
+                .into());
+            }
+            return Err(error.into());
+        }
         raw_queue.push_bytes(&buffer[..chunk_len]);
     }
     Ok(())
@@ -5622,13 +5764,26 @@ where
         })?;
     while cursor < end {
         let chunk_end = end.min(cursor + buffer.len() as u64);
-        fill_progressive_raw_queue(input, raw_queue, chunk_end, buffer)?;
+        fill_progressive_raw_queue(
+            input,
+            raw_queue,
+            chunk_end,
+            buffer,
+            "progressive copy range",
+        )?;
         raw_queue
             .with_range_bytes(cursor, chunk_end - cursor, |bytes| output.write_all(bytes))
-            .map_err(map_raw_offset_queue_error)??;
-        raw_queue
-            .trim_to(chunk_end)
-            .map_err(map_raw_offset_queue_error)?;
+            .map_err(|error| {
+                map_raw_offset_queue_error(
+                    "progressive copy range",
+                    cursor,
+                    chunk_end - cursor,
+                    error,
+                )
+            })??;
+        raw_queue.trim_to(chunk_end).map_err(|error| {
+            map_raw_offset_queue_error("progressive copy trim", chunk_end, 0, error)
+        })?;
         cursor = chunk_end;
     }
     Ok(())
@@ -5649,11 +5804,15 @@ where
         .ok_or_else(|| DecryptRewriteError::InvalidLayout {
             reason: "progressive sample range overflowed u64".to_owned(),
         })?;
-    fill_progressive_raw_queue(input, raw_queue, end, buffer)?;
+    fill_progressive_raw_queue(input, raw_queue, end, buffer, "progressive sample range")?;
     let bytes = raw_queue
         .with_range_bytes(start, size, <[u8]>::to_vec)
-        .map_err(map_raw_offset_queue_error)?;
-    raw_queue.trim_to(end).map_err(map_raw_offset_queue_error)?;
+        .map_err(|error| {
+            map_raw_offset_queue_error("progressive sample range", start, size, error)
+        })?;
+    raw_queue
+        .trim_to(end)
+        .map_err(|error| map_raw_offset_queue_error("progressive sample trim", end, 0, error))?;
     Ok(bytes)
 }
 
@@ -5778,6 +5937,7 @@ async fn fill_progressive_raw_queue_async<R>(
     raw_queue: &mut RawOffsetQueue,
     target_end: u64,
     buffer: &mut [u8],
+    stage: &'static str,
 ) -> Result<(), DecryptError>
 where
     R: AsyncReadForward,
@@ -5785,7 +5945,18 @@ where
     while raw_queue.tail() < target_end {
         let remaining = target_end - raw_queue.tail();
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-        input.read_exact(&mut buffer[..chunk_len]).await?;
+        if let Err(error) = input.read_exact(&mut buffer[..chunk_len]).await {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(DecryptRewriteError::InvalidLayout {
+                    reason: format!(
+                        "{stage} ended before reaching progressive offset {target_end}; buffered tail is {}",
+                        raw_queue.tail()
+                    ),
+                }
+                .into());
+            }
+            return Err(error.into());
+        }
         raw_queue.push_bytes(&buffer[..chunk_len]);
     }
     Ok(())
@@ -5812,14 +5983,28 @@ where
         })?;
     while cursor < end {
         let chunk_end = end.min(cursor + buffer.len() as u64);
-        fill_progressive_raw_queue_async(input, raw_queue, chunk_end, buffer).await?;
+        fill_progressive_raw_queue_async(
+            input,
+            raw_queue,
+            chunk_end,
+            buffer,
+            "progressive copy range",
+        )
+        .await?;
         let chunk = raw_queue
             .with_range_bytes(cursor, chunk_end - cursor, <[u8]>::to_vec)
-            .map_err(map_raw_offset_queue_error)?;
+            .map_err(|error| {
+                map_raw_offset_queue_error(
+                    "progressive copy range",
+                    cursor,
+                    chunk_end - cursor,
+                    error,
+                )
+            })?;
         output.write_all(&chunk).await?;
-        raw_queue
-            .trim_to(chunk_end)
-            .map_err(map_raw_offset_queue_error)?;
+        raw_queue.trim_to(chunk_end).map_err(|error| {
+            map_raw_offset_queue_error("progressive copy trim", chunk_end, 0, error)
+        })?;
         cursor = chunk_end;
     }
     Ok(())
@@ -5841,11 +6026,16 @@ where
         .ok_or_else(|| DecryptRewriteError::InvalidLayout {
             reason: "progressive sample range overflowed u64".to_owned(),
         })?;
-    fill_progressive_raw_queue_async(input, raw_queue, end, buffer).await?;
+    fill_progressive_raw_queue_async(input, raw_queue, end, buffer, "progressive sample range")
+        .await?;
     let bytes = raw_queue
         .with_range_bytes(start, size, <[u8]>::to_vec)
-        .map_err(map_raw_offset_queue_error)?;
-    raw_queue.trim_to(end).map_err(map_raw_offset_queue_error)?;
+        .map_err(|error| {
+            map_raw_offset_queue_error("progressive sample range", start, size, error)
+        })?;
+    raw_queue
+        .trim_to(end)
+        .map_err(|error| map_raw_offset_queue_error("progressive sample trim", end, 0, error))?;
     Ok(bytes)
 }
 

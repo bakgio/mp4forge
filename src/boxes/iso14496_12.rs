@@ -12044,7 +12044,18 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sqcp"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sevc"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ssmv"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"alaw"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b".mp3"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ulaw"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes([0x6D, 0x73, 0x00, 0x02]));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes([0x6D, 0x73, 0x00, 0x11]));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"CSVD"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"OPCM"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"DSTD"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"YPCM"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"TSPE"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"G610"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"IPCM"));
     registry.register_contextual_any::<OpaqueCodecSpecificData>(
         FourCc::from_bytes(*b"alac"),
         is_audio_sample_entry_child_context,
@@ -12066,12 +12077,24 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbt"));
     registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"mp4s"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"H263"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"DIV3"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"DIV4"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"BGR3"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MJPG"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MPEG"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mjp2"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"PNG "));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apco"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apcn"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apch"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apcs"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"ap4x"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"ap4h"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"jpeg"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mp4v"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"s263"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"png "));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"uncv"));
     registry.register::<DvsC>(FourCc::from_bytes(*b"dvsC"));
     registry.register::<Pasp>(FourCc::from_bytes(*b"pasp"));
     registry.register::<Saio>(FourCc::from_bytes(*b"saio"));

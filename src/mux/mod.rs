@@ -6,8 +6,11 @@
 //!
 //! Internally, both layers build on one mux event graph that carries stream descriptions, ordered
 //! sample events, and boundary events. The task-level sample-reader helpers live under
-//! [`crate::mux::sample_reader`], while the real file-backed mux surface builds actual MP4
-//! container output on top of the same internal event flow.
+//! [`crate::mux::sample_reader`], the public direct-ingest inspection and export helpers plus the
+//! additive packet-focused report surface live under [`crate::mux::inspect`], the public
+//! elementary sample rewrite helpers and elementary export helpers live under
+//! [`crate::mux::rewrite`], and the real file-backed mux surface builds actual MP4 container
+//! output on top of the same internal event flow.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -34,7 +37,13 @@ mod coordination;
 mod demux;
 pub(crate) mod event;
 mod import;
+/// Feature-gated direct-ingest inspection and export helpers built on native mux parsing.
+#[cfg_attr(docsrs, doc(cfg(feature = "mux")))]
+pub mod inspect;
 mod mp4;
+/// Feature-gated elementary sample rewrite helpers built on landed mux codec logic.
+#[cfg_attr(docsrs, doc(cfg(feature = "mux")))]
+pub mod rewrite;
 /// Feature-gated planned sample-reader helpers built on mux plans.
 #[cfg_attr(docsrs, doc(cfg(feature = "mux")))]
 pub mod sample_reader;
@@ -58,6 +67,8 @@ pub use import::mux_to_path_async;
 pub(crate) enum MuxRawCodec {
     /// AV1 elementary input.
     Av1,
+    /// MPEG-2 elementary video input.
+    Mpeg2v,
     /// MPEG-4 Part 2 elementary input.
     Mp4v,
     /// H.263 elementary input.
@@ -96,6 +107,14 @@ pub(crate) enum MuxRawCodec {
     Jpeg,
     /// PNG still-image input.
     Png,
+    /// BMP still-image input.
+    Bmp,
+    /// Raw ProRes input.
+    Prores,
+    /// Self-describing YUV4MPEG input.
+    Y4m,
+    /// JPEG 2000 image or codestream input.
+    J2k,
     /// WAVE or PCM input.
     Pcm,
     /// DTS core input.
@@ -124,6 +143,7 @@ impl MuxRawCodec {
     pub const fn prefix(&self) -> &'static str {
         match self {
             Self::Av1 => "av1",
+            Self::Mpeg2v => "mpeg2v",
             Self::Mp4v => "mp4v",
             Self::H263 => "h263",
             Self::H264 => "h264",
@@ -143,6 +163,10 @@ impl MuxRawCodec {
             Self::Qcp => "qcp",
             Self::Jpeg => "jpeg",
             Self::Png => "png",
+            Self::Bmp => "bmp",
+            Self::Prores => "prores",
+            Self::Y4m => "y4m",
+            Self::J2k => "j2k",
             Self::Pcm => "pcm",
             Self::Dts => "dts",
             Self::Truehd => "truehd",
@@ -183,6 +207,300 @@ pub enum MuxMp4TrackSelector {
 /// - path-only imports: `PATH`
 /// - path plus selector: `PATH#video`, `PATH#audio`, `PATH#audio:N`, `PATH#text`,
 ///   `PATH#text:N`, `PATH#track:ID`
+/// - explicit bare raw-video imports: `PATH#rawvideo:size=WIDTHxHEIGHT,spfmt=PIXFMT,fps=NUM/DEN`
+///
+/// The raw-video form is intentionally explicit. Unlike self-describing YUV4MPEG streams, bare
+/// raw video needs out-of-band geometry, pixel-format, and frame-rate metadata before `mp4forge`
+/// can author a truthful `uncv` sample entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MuxRawVideoPixelFormat {
+    /// Planar 8-bit YUV 4:2:0.
+    Yuv420p8,
+    /// Planar 8-bit YVU 4:2:0.
+    Yvu420p8,
+    /// Planar 10-bit YUV 4:2:0 stored in 16-bit words.
+    Yuv420p10,
+    /// Planar 8-bit YUV 4:2:2.
+    Yuv422p8,
+    /// Planar 10-bit YUV 4:2:2 stored in 16-bit words.
+    Yuv422p10,
+    /// Planar 8-bit YUV 4:4:4.
+    Yuv444p8,
+    /// Planar 10-bit YUV 4:4:4 stored in 16-bit words.
+    Yuv444p10,
+    /// Planar 8-bit YUV 4:2:0 with alpha.
+    Yuva420p8,
+    /// Planar 8-bit YUV 4:2:0 with depth.
+    Yuvd420p8,
+    /// Planar 8-bit YUV 4:4:4 with alpha.
+    Yuva444p8,
+    /// Semi-planar 8-bit NV12.
+    Nv12p8,
+    /// Semi-planar 8-bit NV21.
+    Nv21p8,
+    /// Semi-planar 10-bit NV12 stored in 16-bit words.
+    Nv12p10,
+    /// Semi-planar 10-bit NV21 stored in 16-bit words.
+    Nv21p10,
+    /// Packed 8-bit UYVY 4:2:2.
+    Uyvy422p8,
+    /// Packed 8-bit VYUY 4:2:2.
+    Vyuy422p8,
+    /// Packed 8-bit YUYV 4:2:2.
+    Yuyv422p8,
+    /// Packed 8-bit YVYU 4:2:2.
+    Yvyu422p8,
+    /// Packed 10-bit UYVY 4:2:2 stored in 16-bit words.
+    Uyvy422p10,
+    /// Packed 10-bit VYUY 4:2:2 stored in 16-bit words.
+    Vyuy422p10,
+    /// Packed 10-bit YUYV 4:2:2 stored in 16-bit words.
+    Yuyv422p10,
+    /// Packed 10-bit YVYU 4:2:2 stored in 16-bit words.
+    Yvyu422p10,
+    /// Packed 8-bit YUV 4:4:4.
+    Yuv444Packed8,
+    /// Packed 8-bit VYU 4:4:4.
+    Vyu444Packed8,
+    /// Packed 8-bit YUV 4:4:4 with alpha.
+    Yuva444Packed8,
+    /// Packed 8-bit UYV 4:4:4 with alpha.
+    Uyva444Packed8,
+    /// Packed 10-bit UYV 4:4:4 little-endian.
+    Yuv444Packed10,
+    /// Packed 10-bit v210 4:2:2 little-endian.
+    V210,
+    /// 8-bit greyscale.
+    Grey8,
+    /// 8-bit alpha followed by 8-bit greyscale.
+    AlphaGrey8,
+    /// 8-bit greyscale followed by 8-bit alpha.
+    GreyAlpha8,
+    /// Packed RGB 3:3:2.
+    Rgb332,
+    /// Packed RGB 4:4:4 stored in 16 bits.
+    Rgb444,
+    /// Packed RGB 5:5:5 stored in 16 bits.
+    Rgb555,
+    /// Packed RGB 5:6:5 stored in 16 bits.
+    Rgb565,
+    /// Packed 24-bit RGB in byte order `R-G-B`.
+    Rgb24,
+    /// Packed 24-bit RGB in byte order `B-G-R`.
+    Bgr24,
+    /// Packed 32-bit RGB in byte order `R-G-B-X`.
+    Rgbx32,
+    /// Packed 32-bit RGB in byte order `B-G-R-X`.
+    Bgrx32,
+    /// Packed 32-bit RGB in byte order `X-R-G-B`.
+    Xrgb32,
+    /// Packed 32-bit RGB in byte order `X-B-G-R`.
+    Xbgr32,
+    /// Packed 32-bit RGBA in byte order `A-R-G-B`.
+    Argb32,
+    /// Packed 32-bit RGBA in byte order `R-G-B-A`.
+    Rgba32,
+    /// Packed 32-bit RGBA in byte order `B-G-R-A`.
+    Bgra32,
+    /// Packed 32-bit RGBA in byte order `A-B-G-R`.
+    Abgr32,
+    /// Packed 32-bit RGB with depth.
+    Rgbd32,
+    /// Packed 32-bit RGB with depth and bit-shape.
+    Rgbds32,
+}
+
+impl MuxRawVideoPixelFormat {
+    /// Returns the canonical raw-video pixel-format label.
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Yuv420p8 => "yuv420",
+            Self::Yvu420p8 => "yvu420",
+            Self::Yuv420p10 => "yuv420_10",
+            Self::Yuv422p8 => "yuv422",
+            Self::Yuv422p10 => "yuv422_10",
+            Self::Yuv444p8 => "yuv444",
+            Self::Yuv444p10 => "yuv444_10",
+            Self::Yuva420p8 => "yuva",
+            Self::Yuvd420p8 => "yuvd",
+            Self::Yuva444p8 => "yuv444a",
+            Self::Nv12p8 => "nv12",
+            Self::Nv21p8 => "nv21",
+            Self::Nv12p10 => "nv12_10",
+            Self::Nv21p10 => "nv21_10",
+            Self::Uyvy422p8 => "uyvy",
+            Self::Vyuy422p8 => "vyuy",
+            Self::Yuyv422p8 => "yuyv",
+            Self::Yvyu422p8 => "yvyu",
+            Self::Uyvy422p10 => "uyvl",
+            Self::Vyuy422p10 => "vyul",
+            Self::Yuyv422p10 => "yuyl",
+            Self::Yvyu422p10 => "yvyl",
+            Self::Yuv444Packed8 => "yuv444p",
+            Self::Vyu444Packed8 => "v308",
+            Self::Yuva444Packed8 => "yuv444ap",
+            Self::Uyva444Packed8 => "v408",
+            Self::Yuv444Packed10 => "v410",
+            Self::V210 => "v210",
+            Self::Grey8 => "grey",
+            Self::AlphaGrey8 => "algr",
+            Self::GreyAlpha8 => "gral",
+            Self::Rgb332 => "rgb8",
+            Self::Rgb444 => "rgb4",
+            Self::Rgb555 => "rgb5",
+            Self::Rgb565 => "rgb6",
+            Self::Rgb24 => "rgb",
+            Self::Bgr24 => "bgr",
+            Self::Rgbx32 => "rgbx",
+            Self::Bgrx32 => "bgrx",
+            Self::Xrgb32 => "xrgb",
+            Self::Xbgr32 => "xbgr",
+            Self::Argb32 => "argb",
+            Self::Rgba32 => "rgba",
+            Self::Bgra32 => "bgra",
+            Self::Abgr32 => "abgr",
+            Self::Rgbd32 => "rgbd",
+            Self::Rgbds32 => "rgbds",
+        }
+    }
+
+    fn parse(spec: &str, value: &str) -> Result<Self, MuxError> {
+        match value {
+            "yuv420" | "yuv" => Ok(Self::Yuv420p8),
+            "yvu420" | "yvu" => Ok(Self::Yvu420p8),
+            "yuv420_10" | "yuvl" => Ok(Self::Yuv420p10),
+            "yuv422" | "yuv2" => Ok(Self::Yuv422p8),
+            "yuv422_10" | "yp2l" => Ok(Self::Yuv422p10),
+            "yuv444" | "yuv4" => Ok(Self::Yuv444p8),
+            "yuv444_10" | "yp4l" => Ok(Self::Yuv444p10),
+            "yuva" => Ok(Self::Yuva420p8),
+            "yuvd" => Ok(Self::Yuvd420p8),
+            "yuv444a" | "yp4a" => Ok(Self::Yuva444p8),
+            "nv12" => Ok(Self::Nv12p8),
+            "nv21" => Ok(Self::Nv21p8),
+            "nv12_10" | "nv1l" => Ok(Self::Nv12p10),
+            "nv21_10" | "nv2l" => Ok(Self::Nv21p10),
+            "uyvy" => Ok(Self::Uyvy422p8),
+            "vyuy" => Ok(Self::Vyuy422p8),
+            "yuyv" => Ok(Self::Yuyv422p8),
+            "yvyu" => Ok(Self::Yvyu422p8),
+            "uyvl" => Ok(Self::Uyvy422p10),
+            "vyul" => Ok(Self::Vyuy422p10),
+            "yuyl" => Ok(Self::Yuyv422p10),
+            "yvyl" => Ok(Self::Yvyu422p10),
+            "yuv444p" | "yv4p" => Ok(Self::Yuv444Packed8),
+            "v308" => Ok(Self::Vyu444Packed8),
+            "yuv444ap" | "y4ap" => Ok(Self::Yuva444Packed8),
+            "v408" => Ok(Self::Uyva444Packed8),
+            "v410" => Ok(Self::Yuv444Packed10),
+            "v210" => Ok(Self::V210),
+            "grey" => Ok(Self::Grey8),
+            "algr" => Ok(Self::AlphaGrey8),
+            "gral" => Ok(Self::GreyAlpha8),
+            "rgb8" => Ok(Self::Rgb332),
+            "rgb4" => Ok(Self::Rgb444),
+            "rgb5" => Ok(Self::Rgb555),
+            "rgb6" => Ok(Self::Rgb565),
+            "rgb" => Ok(Self::Rgb24),
+            "bgr" => Ok(Self::Bgr24),
+            "rgbx" => Ok(Self::Rgbx32),
+            "bgrx" => Ok(Self::Bgrx32),
+            "xrgb" => Ok(Self::Xrgb32),
+            "xbgr" => Ok(Self::Xbgr32),
+            "argb" => Ok(Self::Argb32),
+            "rgba" => Ok(Self::Rgba32),
+            "bgra" => Ok(Self::Bgra32),
+            "abgr" => Ok(Self::Abgr32),
+            "rgbd" => Ok(Self::Rgbd32),
+            "rgbds" => Ok(Self::Rgbds32),
+            _ => Err(MuxError::InvalidTrackSpec {
+                spec: spec.to_string(),
+                message: format!(
+                    "unsupported rawvideo `spfmt={value}`; expected one of the rawvideo pixel formats supported by mp4forge"
+                ),
+            }),
+        }
+    }
+}
+
+/// One explicit bare raw-video import description for the mux surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MuxRawVideoParams {
+    width: u32,
+    height: u32,
+    pixel_format: MuxRawVideoPixelFormat,
+    fps_num: u32,
+    fps_den: u32,
+}
+
+impl MuxRawVideoParams {
+    /// Validates one explicit raw-video import description.
+    pub fn new(
+        width: u32,
+        height: u32,
+        pixel_format: MuxRawVideoPixelFormat,
+        fps_num: u32,
+        fps_den: u32,
+    ) -> Result<Self, MuxError> {
+        if width == 0 || height == 0 {
+            return Err(MuxError::InvalidTrackSpec {
+                spec: "rawvideo".to_string(),
+                message: "rawvideo `size` must declare non-zero width and height".to_string(),
+            });
+        }
+        if fps_num == 0 || fps_den == 0 {
+            return Err(MuxError::InvalidTrackSpec {
+                spec: "rawvideo".to_string(),
+                message: "rawvideo `fps` must declare non-zero numerator and denominator"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            pixel_format,
+            fps_num,
+            fps_den,
+        })
+    }
+
+    /// Returns the declared frame width in pixels.
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the declared frame height in pixels.
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns the declared pixel format.
+    pub const fn pixel_format(&self) -> MuxRawVideoPixelFormat {
+        self.pixel_format
+    }
+
+    /// Returns the declared frame-rate numerator.
+    pub const fn fps_num(&self) -> u32 {
+        self.fps_num
+    }
+
+    /// Returns the declared frame-rate denominator.
+    pub const fn fps_den(&self) -> u32 {
+        self.fps_den
+    }
+
+    fn format_suffix(&self) -> String {
+        format!(
+            "rawvideo:size={}x{},spfmt={},fps={}/{}",
+            self.width,
+            self.height,
+            self.pixel_format.canonical_name(),
+            self.fps_num,
+            self.fps_den
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MuxTrackSpec {
     /// Import one input path, optionally selecting one track when the source is containerized.
@@ -191,6 +509,13 @@ pub enum MuxTrackSpec {
         path: PathBuf,
         /// The optional public selector to resolve inside that source.
         selector: Option<MuxMp4TrackSelector>,
+    },
+    /// Import one bare raw-video input using explicit out-of-band geometry and frame-rate data.
+    RawVideo {
+        /// The filesystem path to import.
+        path: PathBuf,
+        /// The explicit raw-video parameters.
+        params: MuxRawVideoParams,
     },
 }
 
@@ -216,10 +541,19 @@ impl MuxTrackSpec {
         Self::selected(path, selector)
     }
 
+    /// Creates one explicit bare raw-video track specification from `path` and `params`.
+    pub fn raw_video(path: impl Into<PathBuf>, params: MuxRawVideoParams) -> Self {
+        Self::RawVideo {
+            path: path.into(),
+            params,
+        }
+    }
+
     /// Returns the filesystem path referenced by this track specification.
     pub fn input_path(&self) -> &Path {
         match self {
             Self::Path { path, .. } => path.as_path(),
+            Self::RawVideo { path, .. } => path.as_path(),
         }
     }
 }
@@ -240,6 +574,13 @@ impl FromStr for MuxTrackSpec {
                 return Err(MuxError::InvalidTrackSpec {
                     spec: value.to_string(),
                     message: "missing input path before `#`".to_string(),
+                });
+            }
+            if let Some(rawvideo_text) = selector_text.strip_prefix("rawvideo:") {
+                let params = parse_raw_video_params(value, rawvideo_text)?;
+                return Ok(Self::RawVideo {
+                    path: PathBuf::from(path),
+                    params,
                 });
             }
             let selector = parse_mp4_track_selector(value, selector_text)?;
@@ -328,6 +669,133 @@ fn parse_mp4_track_selector(spec: &str, selector: &str) -> Result<MuxMp4TrackSel
         message: format!(
             "unsupported MP4 track selector `{selector}`; expected `video`, `audio`, `audio:N`, `text`, `text:N`, or `track:ID`"
         ),
+    })
+}
+
+fn parse_raw_video_params(spec: &str, rawvideo_text: &str) -> Result<MuxRawVideoParams, MuxError> {
+    if rawvideo_text.is_empty() {
+        return Err(MuxError::InvalidTrackSpec {
+            spec: spec.to_string(),
+            message:
+                "expected rawvideo parameters after `#rawvideo:`, such as `size=1920x1080,spfmt=yuv420,fps=25/1`"
+                    .to_string(),
+        });
+    }
+
+    let mut width = None::<u32>;
+    let mut height = None::<u32>;
+    let mut pixel_format = None::<MuxRawVideoPixelFormat>;
+    let mut fps_num = None::<u32>;
+    let mut fps_den = None::<u32>;
+
+    for token in rawvideo_text.split(',') {
+        let (name, value) = token.split_once('=').ok_or_else(|| MuxError::InvalidTrackSpec {
+            spec: spec.to_string(),
+            message: format!(
+                "invalid rawvideo parameter `{token}`; expected `name=value` pairs separated by commas"
+            ),
+        })?;
+        match name {
+            "size" => {
+                let (parsed_width, parsed_height) =
+                    value
+                        .split_once('x')
+                        .ok_or_else(|| MuxError::InvalidTrackSpec {
+                            spec: spec.to_string(),
+                            message: "rawvideo `size` must use `WIDTHxHEIGHT`".to_string(),
+                        })?;
+                width =
+                    Some(
+                        parsed_width
+                            .parse::<u32>()
+                            .map_err(|_| MuxError::InvalidTrackSpec {
+                                spec: spec.to_string(),
+                                message: format!("invalid rawvideo width `{parsed_width}`"),
+                            })?,
+                    );
+                height =
+                    Some(
+                        parsed_height
+                            .parse::<u32>()
+                            .map_err(|_| MuxError::InvalidTrackSpec {
+                                spec: spec.to_string(),
+                                message: format!("invalid rawvideo height `{parsed_height}`"),
+                            })?,
+                    );
+            }
+            "spfmt" => {
+                pixel_format = Some(MuxRawVideoPixelFormat::parse(spec, value)?);
+            }
+            "fps" => {
+                let (parsed_num, parsed_den) =
+                    value
+                        .split_once('/')
+                        .ok_or_else(|| MuxError::InvalidTrackSpec {
+                            spec: spec.to_string(),
+                            message: "rawvideo `fps` must use `NUM/DEN`".to_string(),
+                        })?;
+                fps_num =
+                    Some(
+                        parsed_num
+                            .parse::<u32>()
+                            .map_err(|_| MuxError::InvalidTrackSpec {
+                                spec: spec.to_string(),
+                                message: format!(
+                                    "invalid rawvideo frame-rate numerator `{parsed_num}`"
+                                ),
+                            })?,
+                    );
+                fps_den =
+                    Some(
+                        parsed_den
+                            .parse::<u32>()
+                            .map_err(|_| MuxError::InvalidTrackSpec {
+                                spec: spec.to_string(),
+                                message: format!(
+                                    "invalid rawvideo frame-rate denominator `{parsed_den}`"
+                                ),
+                            })?,
+                    );
+            }
+            _ => {
+                return Err(MuxError::InvalidTrackSpec {
+                    spec: spec.to_string(),
+                    message: format!(
+                        "unsupported rawvideo parameter `{name}`; expected `size`, `spfmt`, or `fps`"
+                    ),
+                });
+            }
+        }
+    }
+
+    let width = width.ok_or_else(|| MuxError::InvalidTrackSpec {
+        spec: spec.to_string(),
+        message: "rawvideo track specs must declare `size=WIDTHxHEIGHT`".to_string(),
+    })?;
+    let height = height.ok_or_else(|| MuxError::InvalidTrackSpec {
+        spec: spec.to_string(),
+        message: "rawvideo track specs must declare `size=WIDTHxHEIGHT`".to_string(),
+    })?;
+    let pixel_format = pixel_format.ok_or_else(|| MuxError::InvalidTrackSpec {
+        spec: spec.to_string(),
+        message: "rawvideo track specs must declare `spfmt=PIXFMT`".to_string(),
+    })?;
+    let fps_num = fps_num.ok_or_else(|| MuxError::InvalidTrackSpec {
+        spec: spec.to_string(),
+        message: "rawvideo track specs must declare `fps=NUM/DEN`".to_string(),
+    })?;
+    let fps_den = fps_den.ok_or_else(|| MuxError::InvalidTrackSpec {
+        spec: spec.to_string(),
+        message: "rawvideo track specs must declare `fps=NUM/DEN`".to_string(),
+    })?;
+    MuxRawVideoParams::new(width, height, pixel_format, fps_num, fps_den).map_err(|error| {
+        match error {
+            MuxError::InvalidTrackSpec { message, .. } => MuxError::InvalidTrackSpec {
+                spec: spec.to_string(),
+                message,
+            },
+            other => other,
+        }
     })
 }
 
@@ -476,7 +944,7 @@ impl MuxRequest {
 /// Interleave policy used when ordering staged media items into one output payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum MuxInterleavePolicy {
-    /// Orders staged items by normalized decode time while keeping ties stable by track and
+    /// Orders staged items by normalized decode time while keeping ties stable by source and
     /// source-offset order.
     #[default]
     DecodeTime,
@@ -696,6 +1164,11 @@ pub struct MuxFileConfig {
     minor_version: u32,
     compatible_brands: Vec<FourCc>,
     auto_flat_profile: bool,
+    allow_audio_only_iods: bool,
+    keep_flat_free_box: bool,
+    keep_flat_authority_brands: bool,
+    preserve_auto_flat_movie_timescale: bool,
+    flat_source_encoding_metadata: Option<String>,
 }
 
 impl MuxFileConfig {
@@ -709,6 +1182,11 @@ impl MuxFileConfig {
             minor_version: 0,
             compatible_brands: vec![FourCc::from_bytes(*b"isom"), FourCc::from_bytes(*b"mp42")],
             auto_flat_profile: false,
+            allow_audio_only_iods: false,
+            keep_flat_free_box: false,
+            keep_flat_authority_brands: false,
+            preserve_auto_flat_movie_timescale: false,
+            flat_source_encoding_metadata: None,
         }
     }
 
@@ -757,12 +1235,71 @@ impl MuxFileConfig {
         self
     }
 
+    pub(crate) fn with_compatible_brands(mut self, compatible_brands: Vec<FourCc>) -> Self {
+        self.compatible_brands = compatible_brands;
+        self
+    }
+
     pub(crate) const fn auto_flat_profile(&self) -> bool {
         self.auto_flat_profile
     }
 
     pub(crate) const fn with_auto_flat_profile(mut self, auto_flat_profile: bool) -> Self {
         self.auto_flat_profile = auto_flat_profile;
+        self
+    }
+
+    pub(crate) const fn allow_audio_only_iods(&self) -> bool {
+        self.allow_audio_only_iods
+    }
+
+    pub(crate) const fn with_allow_audio_only_iods(mut self, allow_audio_only_iods: bool) -> Self {
+        self.allow_audio_only_iods = allow_audio_only_iods;
+        self
+    }
+
+    pub(crate) const fn keep_flat_free_box(&self) -> bool {
+        self.keep_flat_free_box
+    }
+
+    pub(crate) const fn with_keep_flat_free_box(mut self, keep_flat_free_box: bool) -> Self {
+        self.keep_flat_free_box = keep_flat_free_box;
+        self
+    }
+
+    pub(crate) const fn keep_flat_authority_brands(&self) -> bool {
+        self.keep_flat_authority_brands
+    }
+
+    pub(crate) const fn with_keep_flat_authority_brands(
+        mut self,
+        keep_flat_authority_brands: bool,
+    ) -> Self {
+        self.keep_flat_authority_brands = keep_flat_authority_brands;
+        self
+    }
+
+    pub(crate) const fn preserve_auto_flat_movie_timescale(&self) -> bool {
+        self.preserve_auto_flat_movie_timescale
+    }
+
+    pub(crate) const fn with_preserve_auto_flat_movie_timescale(
+        mut self,
+        preserve_auto_flat_movie_timescale: bool,
+    ) -> Self {
+        self.preserve_auto_flat_movie_timescale = preserve_auto_flat_movie_timescale;
+        self
+    }
+
+    pub(crate) fn flat_source_encoding_metadata(&self) -> Option<&str> {
+        self.flat_source_encoding_metadata.as_deref()
+    }
+
+    pub(crate) fn with_flat_source_encoding_metadata(
+        mut self,
+        flat_source_encoding_metadata: Option<String>,
+    ) -> Self {
+        self.flat_source_encoding_metadata = flat_source_encoding_metadata;
         self
     }
 }
@@ -797,6 +1334,19 @@ impl MuxTrackKind {
     }
 }
 
+const DEFAULT_TKHD_FLAGS: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+const DEFAULT_AUDIO_ALTERNATE_GROUP: i16 = 1;
+const DEFAULT_SUBTITLE_ALTERNATE_GROUP: i16 = 0;
+const DEFAULT_TKHD_MATRIX: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+
+const fn default_alternate_group_for_kind(kind: MuxTrackKind) -> i16 {
+    match kind {
+        MuxTrackKind::Audio => DEFAULT_AUDIO_ALTERNATE_GROUP,
+        MuxTrackKind::Subtitle => DEFAULT_SUBTITLE_ALTERNATE_GROUP,
+        MuxTrackKind::Video | MuxTrackKind::Text => 0,
+    }
+}
+
 /// Per-track configuration for the real MP4 mux surface.
 ///
 /// The current real muxer expects one fully encoded sample-entry box per track. That keeps the
@@ -811,11 +1361,15 @@ pub struct MuxTrackConfig {
     handler_name: String,
     track_width: u16,
     track_height: u16,
+    tkhd_flags: u32,
+    alternate_group: i16,
     volume: i16,
+    matrix: [i32; 9],
     edit_media_time: Option<u64>,
     sample_roll_distance: Option<i16>,
     sample_entry_box: Vec<u8>,
     sync_sample_table_mode: SyncSampleTableMode,
+    stts_run_encoding_mode: SttsRunEncodingMode,
     stsc_run_encoding_mode: StscRunEncodingMode,
     flat_timing_override: Option<FlatTimingOverride>,
 }
@@ -833,9 +1387,16 @@ pub(crate) enum StscRunEncodingMode {
     PreserveTerminalBoundary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SttsRunEncodingMode {
+    CollapseIdentical,
+    PreservePerSample,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlatTimingOverride {
     pub(crate) sample_durations: Vec<u32>,
+    pub(crate) composition_offsets: Vec<i32>,
     pub(crate) media_duration: u64,
     pub(crate) presentation_duration: u64,
 }
@@ -851,11 +1412,15 @@ impl MuxTrackConfig {
             handler_name: "SoundHandler".to_string(),
             track_width: 0,
             track_height: 0,
+            tkhd_flags: DEFAULT_TKHD_FLAGS,
+            alternate_group: default_alternate_group_for_kind(MuxTrackKind::Audio),
             volume: 0x0100,
+            matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
         }
@@ -877,11 +1442,15 @@ impl MuxTrackConfig {
             handler_name: "VideoHandler".to_string(),
             track_width: width,
             track_height: height,
+            tkhd_flags: DEFAULT_TKHD_FLAGS,
+            alternate_group: default_alternate_group_for_kind(MuxTrackKind::Video),
             volume: 0,
+            matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
         }
@@ -903,11 +1472,15 @@ impl MuxTrackConfig {
             handler_name: "TextHandler".to_string(),
             track_width: width,
             track_height: height,
+            tkhd_flags: DEFAULT_TKHD_FLAGS,
+            alternate_group: default_alternate_group_for_kind(MuxTrackKind::Text),
             volume: 0,
+            matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
         }
@@ -929,11 +1502,15 @@ impl MuxTrackConfig {
             handler_name: "SubtitleHandler".to_string(),
             track_width: width,
             track_height: height,
+            tkhd_flags: DEFAULT_TKHD_FLAGS,
+            alternate_group: default_alternate_group_for_kind(MuxTrackKind::Subtitle),
             volume: 0,
+            matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
+            stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
         }
@@ -974,9 +1551,21 @@ impl MuxTrackConfig {
         self.track_height
     }
 
+    pub(crate) const fn tkhd_flags(&self) -> u32 {
+        self.tkhd_flags
+    }
+
+    pub(crate) const fn alternate_group(&self) -> i16 {
+        self.alternate_group
+    }
+
     /// Returns the fixed-point 8.8 track volume written into `tkhd`.
     pub const fn volume(&self) -> i16 {
         self.volume
+    }
+
+    pub(crate) const fn matrix(&self) -> [i32; 9] {
+        self.matrix
     }
 
     /// Returns the optional media-time trim that should be written into one edit list.
@@ -1005,9 +1594,24 @@ impl MuxTrackConfig {
         self
     }
 
+    pub(crate) const fn with_tkhd_flags(mut self, tkhd_flags: u32) -> Self {
+        self.tkhd_flags = tkhd_flags;
+        self
+    }
+
+    pub(crate) const fn with_alternate_group(mut self, alternate_group: i16) -> Self {
+        self.alternate_group = alternate_group;
+        self
+    }
+
     /// Returns a copy of this configuration with a different fixed-point 8.8 track volume.
     pub const fn with_volume(mut self, volume: i16) -> Self {
         self.volume = volume;
+        self
+    }
+
+    pub(crate) const fn with_matrix(mut self, matrix: [i32; 9]) -> Self {
+        self.matrix = matrix;
         self
     }
 
@@ -1027,6 +1631,18 @@ impl MuxTrackConfig {
         sync_sample_table_mode: SyncSampleTableMode,
     ) -> Self {
         self.sync_sample_table_mode = sync_sample_table_mode;
+        self
+    }
+
+    pub(crate) const fn stts_run_encoding_mode(&self) -> SttsRunEncodingMode {
+        self.stts_run_encoding_mode
+    }
+
+    pub(crate) const fn with_stts_run_encoding_mode(
+        mut self,
+        stts_run_encoding_mode: SttsRunEncodingMode,
+    ) -> Self {
+        self.stts_run_encoding_mode = stts_run_encoding_mode;
         self
     }
 
@@ -1289,6 +1905,78 @@ impl fmt::Display for MuxError {
     }
 }
 
+impl MuxError {
+    /// Stable coarse category label for additive mux diagnostics.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::InvalidTrackSpec { .. }
+            | Self::MultipleVideoTracks { .. }
+            | Self::MissingTrackSpecs
+            | Self::MissingTrackSelection { .. }
+            | Self::InvalidDurationMode { .. }
+            | Self::InvalidOutputLayout { .. }
+            | Self::InvalidDestinationMode { .. }
+            | Self::OutputPathConflict { .. }
+            | Self::InvalidMovieTimescale
+            | Self::InvalidTrackTimescale { .. }
+            | Self::InvalidTrackLanguage { .. } => "input",
+            Self::UnsupportedTrackImport { .. } => "unsupported",
+            Self::IncompatibleTrackTiming { .. } | Self::NonMonotonicTrackDecodeTime { .. } => {
+                "timing"
+            }
+            Self::InvalidChunkPlan { .. }
+            | Self::PayloadSizeOverflow
+            | Self::MissingSourceIndex { .. }
+            | Self::NonMonotonicSourceOffset { .. }
+            | Self::IncompleteAdvance { .. }
+            | Self::IncompleteCopy { .. }
+            | Self::DuplicateTrackId { .. }
+            | Self::MissingTrackId { .. }
+            | Self::TrackHasNoSamples { .. }
+            | Self::InvalidSampleEntryBox { .. }
+            | Self::LayoutOverflow(_) => "layout",
+            Self::Codec(_) | Self::Writer(_) | Self::Header(_) => "writer",
+            Self::Extract(_) | Self::Probe(_) => "input",
+            Self::Io(_) => "io",
+        }
+    }
+
+    /// Stable coarse stage label for additive mux diagnostics.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::InvalidTrackSpec { .. }
+            | Self::MultipleVideoTracks { .. }
+            | Self::MissingTrackSpecs
+            | Self::InvalidDurationMode { .. }
+            | Self::InvalidOutputLayout { .. }
+            | Self::InvalidDestinationMode { .. }
+            | Self::OutputPathConflict { .. } => "request",
+            Self::MissingTrackSelection { .. }
+            | Self::UnsupportedTrackImport { .. }
+            | Self::Extract(_)
+            | Self::Probe(_) => "import",
+            Self::IncompatibleTrackTiming { .. }
+            | Self::InvalidChunkPlan { .. }
+            | Self::PayloadSizeOverflow
+            | Self::MissingSourceIndex { .. }
+            | Self::InvalidMovieTimescale
+            | Self::InvalidTrackTimescale { .. }
+            | Self::InvalidTrackLanguage { .. }
+            | Self::DuplicateTrackId { .. }
+            | Self::MissingTrackId { .. }
+            | Self::TrackHasNoSamples { .. }
+            | Self::NonMonotonicTrackDecodeTime { .. }
+            | Self::InvalidSampleEntryBox { .. }
+            | Self::LayoutOverflow(_) => "plan",
+            Self::NonMonotonicSourceOffset { .. }
+            | Self::IncompleteAdvance { .. }
+            | Self::IncompleteCopy { .. }
+            | Self::Io(_) => "payload",
+            Self::Codec(_) | Self::Writer(_) | Self::Header(_) => "write",
+        }
+    }
+}
+
 impl Error for MuxError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -1359,13 +2047,14 @@ pub(crate) fn plan_staged_media_items_with_coordination(
 
     match interleave_policy {
         MuxInterleavePolicy::DecodeTime => {
-            // Keep equal decode-time items stable by track, source, and byte offset before the
-            // queue layer applies the decode-time ordering key.
+            // Keep equal decode-time items stable by source and byte offset before the queue
+            // layer applies the decode-time ordering key. This preserves path-first merge order
+            // even when a carried track keeps a large external track identifier such as a TS PID.
             queue_items.sort_by_key(|item| {
                 (
-                    item.staged.track_id,
                     item.staged.source_index,
                     item.staged.data_offset,
+                    item.staged.track_id,
                 )
             });
         }
@@ -1755,9 +2444,9 @@ struct PlannedChunk {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PlannedChunkOrderKey {
     decode_time: u64,
-    track_id: u32,
     source_index: usize,
     data_offset: u64,
+    track_id: u32,
 }
 
 fn build_planned_items_from_tracks(
@@ -1786,9 +2475,9 @@ fn build_planned_items_from_tracks(
             chunks.push(PlannedChunk {
                 order_key: PlannedChunkOrderKey {
                     decode_time: first_sample.decode_time(),
-                    track_id,
                     source_index: first_sample.source_index(),
                     data_offset: first_sample.data_offset(),
+                    track_id,
                 },
                 track_id,
                 start_index,

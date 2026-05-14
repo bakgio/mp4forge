@@ -532,11 +532,18 @@ pub(in crate::mux) fn parse_mp3_frame_header(
         });
     }
     let layer = (header[1] >> 1) & 0x03;
-    if layer != 0x01 {
+    if layer == 0x00 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
-            message: "the current raw MP3 mux importer only supports MPEG Layer III frames"
-                .to_string(),
+            message: format!("reserved MPEG audio layer at byte offset {offset}"),
+        });
+    }
+    if layer == 0x03 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message:
+                "the current raw MPEG audio mux importer supports Layer II and Layer III frames only"
+                    .to_string(),
         });
     }
     let bitrate_index = (header[2] >> 4) & 0x0F;
@@ -553,20 +560,29 @@ pub(in crate::mux) fn parse_mp3_frame_header(
             message: format!("unsupported MP3 sample-rate index {sample_rate_index}"),
         }
     })?;
-    let bitrate_bps = mp3_bitrate_bps(version_id, bitrate_index).ok_or_else(|| {
-        MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("unsupported MP3 bitrate index {bitrate_index}"),
-        }
-    })?;
+    let bitrate_bps =
+        mpeg_audio_bitrate_bps(version_id, layer, bitrate_index).ok_or_else(|| {
+            MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "unsupported MPEG audio bitrate index {bitrate_index} for layer {}",
+                    mpeg_audio_layer_name(layer)
+                ),
+            }
+        })?;
     let padding = u32::from((header[2] >> 1) & 0x01);
     let channel_count = if (header[3] >> 6) == 0x03 { 1 } else { 2 };
-    let sample_duration = if version_id == 0x03 { 1152 } else { 576 };
-    let frame_length = if version_id == 0x03 {
-        ((144_u32 * bitrate_bps) / sample_rate).saturating_add(padding)
-    } else {
-        ((72_u32 * bitrate_bps) / sample_rate).saturating_add(padding)
-    };
+    let sample_duration = mpeg_audio_sample_duration(version_id, layer);
+    let frame_length =
+        mpeg_audio_frame_length(version_id, layer, bitrate_bps, sample_rate, padding).ok_or_else(
+            || MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "unsupported MPEG audio frame-length calculation for layer {}",
+                    mpeg_audio_layer_name(layer)
+                ),
+            },
+        )?;
     if frame_length < 4 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -712,43 +728,106 @@ const fn mp3_sample_rate(version_id: u8, sample_rate_index: u8) -> Option<u32> {
     }
 }
 
-const fn mp3_bitrate_bps(version_id: u8, bitrate_index: u8) -> Option<u32> {
-    let kbps = match version_id {
-        0x03 => match bitrate_index {
+const fn mpeg_audio_bitrate_bps(version_id: u8, layer: u8, bitrate_index: u8) -> Option<u32> {
+    let kbps = match layer {
+        0x02 => match bitrate_index {
             1 => 32,
-            2 => 40,
-            3 => 48,
-            4 => 56,
-            5 => 64,
-            6 => 80,
-            7 => 96,
-            8 => 112,
-            9 => 128,
-            10 => 160,
-            11 => 192,
-            12 => 224,
-            13 => 256,
-            14 => 320,
+            2 => 48,
+            3 => 56,
+            4 => 64,
+            5 => 80,
+            6 => 96,
+            7 => 112,
+            8 => 128,
+            9 => 160,
+            10 => 192,
+            11 => 224,
+            12 => 256,
+            13 => 320,
+            14 => 384,
             _ => return None,
         },
-        0x02 | 0x00 => match bitrate_index {
-            1 => 8,
-            2 => 16,
-            3 => 24,
-            4 => 32,
-            5 => 40,
-            6 => 48,
-            7 => 56,
-            8 => 64,
-            9 => 80,
-            10 => 96,
-            11 => 112,
-            12 => 128,
-            13 => 144,
-            14 => 160,
+        0x01 => match version_id {
+            0x03 => match bitrate_index {
+                1 => 32,
+                2 => 40,
+                3 => 48,
+                4 => 56,
+                5 => 64,
+                6 => 80,
+                7 => 96,
+                8 => 112,
+                9 => 128,
+                10 => 160,
+                11 => 192,
+                12 => 224,
+                13 => 256,
+                14 => 320,
+                _ => return None,
+            },
+            0x02 | 0x00 => match bitrate_index {
+                1 => 8,
+                2 => 16,
+                3 => 24,
+                4 => 32,
+                5 => 40,
+                6 => 48,
+                7 => 56,
+                8 => 64,
+                9 => 80,
+                10 => 96,
+                11 => 112,
+                12 => 128,
+                13 => 144,
+                14 => 160,
+                _ => return None,
+            },
             _ => return None,
         },
         _ => return None,
     };
     Some(kbps * 1_000)
+}
+
+const fn mpeg_audio_sample_duration(version_id: u8, layer: u8) -> u32 {
+    match layer {
+        0x02 => 1152,
+        0x01 => {
+            if version_id == 0x03 {
+                1152
+            } else {
+                576
+            }
+        }
+        _ => 0,
+    }
+}
+
+const fn mpeg_audio_frame_length(
+    version_id: u8,
+    layer: u8,
+    bitrate_bps: u32,
+    sample_rate: u32,
+    padding: u32,
+) -> Option<u32> {
+    match layer {
+        0x02 => Some(((144_u32 * bitrate_bps) / sample_rate).saturating_add(padding)),
+        0x01 => {
+            if version_id == 0x03 {
+                Some(((144_u32 * bitrate_bps) / sample_rate).saturating_add(padding))
+            } else {
+                Some(((72_u32 * bitrate_bps) / sample_rate).saturating_add(padding))
+            }
+        }
+        _ => None,
+    }
+}
+
+const fn mpeg_audio_layer_name(layer: u8) -> &'static str {
+    match layer {
+        0x03 => "I",
+        0x02 => "II",
+        0x01 => "III",
+        _ => "reserved",
+    }
 }

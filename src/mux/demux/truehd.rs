@@ -11,7 +11,10 @@ use crate::boxes::iso14496_12::{AudioSampleEntry, Btrt, SampleEntry};
 use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
-use super::super::import::{StagedSample, read_exact_at_sync};
+use super::super::import::{SegmentedMuxSourceSegment, StagedSample, read_exact_at_sync};
+#[cfg(feature = "async")]
+use super::container_common::read_segmented_bytes_async;
+use super::container_common::read_segmented_bytes_sync;
 
 const SAMPLE_ENTRY_MLPA: FourCc = FourCc::from_bytes(*b"mlpa");
 const TRUEHD_SYNC: u32 = 0xF872_6FBA;
@@ -61,17 +64,18 @@ const AC3_FRAME_SIZE_WORDS: [[u16; 3]; 38] = [
 
 pub(in crate::mux) struct ParsedTrueHdTrack {
     pub(in crate::mux) sample_rate: u32,
+    pub(in crate::mux) descriptor: TrueHdDescriptor,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrueHdDescriptor {
+pub(in crate::mux) struct TrueHdDescriptor {
     sample_rate: u32,
     channel_count: u16,
     format_info: u32,
     peak_data_rate: u16,
-    sample_duration: u32,
+    pub(in crate::mux) sample_duration: u32,
 }
 
 enum ParsedTrueHdUnit {
@@ -93,6 +97,15 @@ pub(in crate::mux) fn scan_truehd_file_sync(
     parse_truehd_stream_sync(&mut file, file_size, spec)
 }
 
+pub(in crate::mux) fn scan_truehd_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedTrueHdTrack, MuxError> {
+    parse_truehd_segmented_stream_sync(file, segments, total_size, spec)
+}
+
 #[cfg(feature = "async")]
 pub(in crate::mux) async fn scan_truehd_file_async(
     path: &Path,
@@ -101,6 +114,16 @@ pub(in crate::mux) async fn scan_truehd_file_async(
     let mut file = TokioFile::open(path).await?;
     let file_size = file.metadata().await?.len();
     parse_truehd_stream_async(&mut file, file_size, spec).await
+}
+
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn scan_truehd_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedTrueHdTrack, MuxError> {
+    parse_truehd_segmented_stream_async(file, segments, total_size, spec).await
 }
 
 fn parse_truehd_stream_sync(
@@ -156,6 +179,67 @@ fn parse_truehd_stream_sync(
                 offset = offset
                     .checked_add(u64::from(frame_size))
                     .ok_or(MuxError::LayoutOverflow("TrueHD frame offset"))?;
+            }
+        }
+    }
+
+    finalize_truehd_track(spec, descriptor, samples)
+}
+
+fn parse_truehd_segmented_stream_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedTrueHdTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    let mut descriptor = None::<TrueHdDescriptor>;
+
+    while offset < total_size {
+        match parse_truehd_unit_segmented_sync(file, segments, total_size, offset, spec)? {
+            ParsedTrueHdUnit::AuxiliaryAc3 { frame_size } => {
+                offset =
+                    offset
+                        .checked_add(u64::from(frame_size))
+                        .ok_or(MuxError::LayoutOverflow(
+                            "TrueHD auxiliary AC-3 logical frame offset",
+                        ))?;
+            }
+            ParsedTrueHdUnit::TrueHdFrame {
+                descriptor: parsed_descriptor,
+                frame_size,
+            } => {
+                if offset
+                    .checked_add(u64::from(frame_size))
+                    .is_none_or(|end| end > total_size)
+                {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: spec.to_string(),
+                        message: format!("truncated TrueHD frame at logical byte offset {offset}"),
+                    });
+                }
+                if let Some(current) = descriptor {
+                    if current != parsed_descriptor {
+                        return Err(MuxError::UnsupportedTrackImport {
+                            spec: spec.to_string(),
+                            message: "TrueHD frames changed decoder configuration mid-stream"
+                                .to_string(),
+                        });
+                    }
+                } else {
+                    descriptor = Some(parsed_descriptor);
+                }
+                samples.push(StagedSample {
+                    data_offset: offset,
+                    data_size: frame_size,
+                    duration: parsed_descriptor.sample_duration,
+                    composition_time_offset: 0,
+                    is_sync_sample: true,
+                });
+                offset = offset
+                    .checked_add(u64::from(frame_size))
+                    .ok_or(MuxError::LayoutOverflow("TrueHD logical frame offset"))?;
             }
         }
     }
@@ -224,6 +308,68 @@ async fn parse_truehd_stream_async(
     finalize_truehd_track(spec, descriptor, samples)
 }
 
+#[cfg(feature = "async")]
+async fn parse_truehd_segmented_stream_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedTrueHdTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    let mut descriptor = None::<TrueHdDescriptor>;
+
+    while offset < total_size {
+        match parse_truehd_unit_segmented_async(file, segments, total_size, offset, spec).await? {
+            ParsedTrueHdUnit::AuxiliaryAc3 { frame_size } => {
+                offset =
+                    offset
+                        .checked_add(u64::from(frame_size))
+                        .ok_or(MuxError::LayoutOverflow(
+                            "TrueHD auxiliary AC-3 logical frame offset",
+                        ))?;
+            }
+            ParsedTrueHdUnit::TrueHdFrame {
+                descriptor: parsed_descriptor,
+                frame_size,
+            } => {
+                if offset
+                    .checked_add(u64::from(frame_size))
+                    .is_none_or(|end| end > total_size)
+                {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: spec.to_string(),
+                        message: format!("truncated TrueHD frame at logical byte offset {offset}"),
+                    });
+                }
+                if let Some(current) = descriptor {
+                    if current != parsed_descriptor {
+                        return Err(MuxError::UnsupportedTrackImport {
+                            spec: spec.to_string(),
+                            message: "TrueHD frames changed decoder configuration mid-stream"
+                                .to_string(),
+                        });
+                    }
+                } else {
+                    descriptor = Some(parsed_descriptor);
+                }
+                samples.push(StagedSample {
+                    data_offset: offset,
+                    data_size: frame_size,
+                    duration: parsed_descriptor.sample_duration,
+                    composition_time_offset: 0,
+                    is_sync_sample: true,
+                });
+                offset = offset
+                    .checked_add(u64::from(frame_size))
+                    .ok_or(MuxError::LayoutOverflow("TrueHD logical frame offset"))?;
+            }
+        }
+    }
+
+    finalize_truehd_track(spec, descriptor, samples)
+}
+
 fn finalize_truehd_track(
     spec: &str,
     descriptor: Option<TrueHdDescriptor>,
@@ -236,6 +382,7 @@ fn finalize_truehd_track(
 
     Ok(ParsedTrueHdTrack {
         sample_rate: descriptor.sample_rate,
+        descriptor,
         sample_entry_box: build_truehd_sample_entry_box(descriptor)?,
         samples,
     })
@@ -267,6 +414,35 @@ fn parse_truehd_unit_sync(
     parse_truehd_unit_header(&header, remaining, offset, spec)
 }
 
+fn parse_truehd_unit_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<ParsedTrueHdUnit, MuxError> {
+    let remaining = total_size.saturating_sub(offset);
+    if remaining < u64::try_from(AC3_MIN_HEADER_BYTES).unwrap() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated TrueHD frame header".to_string(),
+        });
+    }
+    let header_len =
+        usize::try_from(remaining.min(u64::try_from(TRUEHD_MIN_HEADER_BYTES).unwrap())).unwrap();
+    let mut header = vec![0_u8; header_len];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut header,
+        spec,
+        "truncated TrueHD frame header",
+    )?;
+    parse_truehd_unit_header(&header, remaining, offset, spec)
+}
+
 #[cfg(feature = "async")]
 async fn parse_truehd_unit_async(
     file: &mut TokioFile,
@@ -286,6 +462,37 @@ async fn parse_truehd_unit_async(
     let mut header = vec![0_u8; header_len];
     read_exact_at_async(
         file,
+        offset,
+        &mut header,
+        spec,
+        "truncated TrueHD frame header",
+    )
+    .await?;
+    parse_truehd_unit_header(&header, remaining, offset, spec)
+}
+
+#[cfg(feature = "async")]
+async fn parse_truehd_unit_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<ParsedTrueHdUnit, MuxError> {
+    let remaining = total_size.saturating_sub(offset);
+    if remaining < u64::try_from(AC3_MIN_HEADER_BYTES).unwrap() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated TrueHD frame header".to_string(),
+        });
+    }
+    let header_len =
+        usize::try_from(remaining.min(u64::try_from(TRUEHD_MIN_HEADER_BYTES).unwrap())).unwrap();
+    let mut header = vec![0_u8; header_len];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        total_size,
         offset,
         &mut header,
         spec,
@@ -484,7 +691,10 @@ fn truehd_channel_count(format_info: u32) -> Option<u16> {
     (channel_count != 0).then_some(channel_count)
 }
 
-fn build_truehd_sample_entry_box(descriptor: TrueHdDescriptor) -> Result<Vec<u8>, MuxError> {
+pub(in crate::mux) fn build_truehd_sample_entry_box_with_btrt(
+    descriptor: TrueHdDescriptor,
+    btrt: Btrt,
+) -> Result<Vec<u8>, MuxError> {
     let dmlp = super::super::mp4::encode_typed_box(
         &Dmlp {
             format_info: descriptor.format_info,
@@ -492,19 +702,7 @@ fn build_truehd_sample_entry_box(descriptor: TrueHdDescriptor) -> Result<Vec<u8>
         },
         &[],
     )?;
-    let nominal_bitrate = descriptor
-        .sample_rate
-        .checked_mul(u32::from(descriptor.channel_count))
-        .and_then(|value| value.checked_mul(4))
-        .ok_or(MuxError::LayoutOverflow("TrueHD nominal bitrate"))?;
-    let btrt = super::super::mp4::encode_typed_box(
-        &Btrt {
-            buffer_size_db: descriptor.sample_duration,
-            max_bitrate: nominal_bitrate,
-            avg_bitrate: nominal_bitrate,
-        },
-        &[],
-    )?;
+    let btrt = super::super::mp4::encode_typed_box(&btrt, &[])?;
     super::super::mp4::encode_typed_box(
         &AudioSampleEntry {
             sample_entry: SampleEntry {
@@ -518,6 +716,29 @@ fn build_truehd_sample_entry_box(descriptor: TrueHdDescriptor) -> Result<Vec<u8>
         },
         &[dmlp, btrt].concat(),
     )
+}
+
+pub(in crate::mux) fn build_truehd_sample_entry_box_with_btrt_buffer_size(
+    descriptor: TrueHdDescriptor,
+    buffer_size_db: u32,
+) -> Result<Vec<u8>, MuxError> {
+    let nominal_bitrate = descriptor
+        .sample_rate
+        .checked_mul(u32::from(descriptor.channel_count))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or(MuxError::LayoutOverflow("TrueHD nominal bitrate"))?;
+    build_truehd_sample_entry_box_with_btrt(
+        descriptor,
+        Btrt {
+            buffer_size_db,
+            max_bitrate: nominal_bitrate,
+            avg_bitrate: nominal_bitrate,
+        },
+    )
+}
+
+fn build_truehd_sample_entry_box(descriptor: TrueHdDescriptor) -> Result<Vec<u8>, MuxError> {
+    build_truehd_sample_entry_box_with_btrt_buffer_size(descriptor, descriptor.sample_duration)
 }
 
 fn parse_auxiliary_ac3_frame_size(header: &[u8], offset: u64, spec: &str) -> Result<u32, MuxError> {

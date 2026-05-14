@@ -30,6 +30,7 @@ pub(in crate::mux) struct ParsedOggOpusTrack {
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) edit_media_time: Option<u64>,
     pub(in crate::mux) sample_roll_distance: Option<i16>,
+    pub(in crate::mux) flat_source_encoding_metadata: Option<String>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
@@ -49,6 +50,7 @@ pub(in crate::mux) fn scan_ogg_opus_file_sync(
     let mut packet_builder = OggPacketBuilder::default();
     let mut config = None;
     let mut saw_tags_packet = false;
+    let mut flat_source_encoding_metadata = None;
     let mut logical_size = 0_u64;
     let mut transformed_segments = Vec::new();
     let mut samples = Vec::new();
@@ -85,6 +87,7 @@ pub(in crate::mux) fn scan_ogg_opus_file_sync(
             spec,
             &mut config,
             &mut saw_tags_packet,
+            &mut flat_source_encoding_metadata,
             &mut logical_size,
             &mut transformed_segments,
             &mut samples,
@@ -127,6 +130,7 @@ pub(in crate::mux) fn scan_ogg_opus_file_sync(
         sample_entry_box: build_opus_sample_entry_box(&config, btrt)?,
         edit_media_time: (config.pre_skip != 0).then_some(u64::from(config.pre_skip)),
         sample_roll_distance: Some(3_840),
+        flat_source_encoding_metadata,
         samples,
     })
 }
@@ -142,6 +146,7 @@ pub(in crate::mux) async fn scan_ogg_opus_file_async(
     let mut packet_builder = OggPacketBuilder::default();
     let mut config = None;
     let mut saw_tags_packet = false;
+    let mut flat_source_encoding_metadata = None;
     let mut logical_size = 0_u64;
     let mut transformed_segments = Vec::new();
     let mut samples = Vec::new();
@@ -178,6 +183,7 @@ pub(in crate::mux) async fn scan_ogg_opus_file_async(
             spec,
             &mut config,
             &mut saw_tags_packet,
+            &mut flat_source_encoding_metadata,
             &mut logical_size,
             &mut transformed_segments,
             &mut samples,
@@ -221,6 +227,7 @@ pub(in crate::mux) async fn scan_ogg_opus_file_async(
         sample_entry_box: build_opus_sample_entry_box(&config, btrt)?,
         edit_media_time: (config.pre_skip != 0).then_some(u64::from(config.pre_skip)),
         sample_roll_distance: Some(3_840),
+        flat_source_encoding_metadata,
         samples,
     })
 }
@@ -231,6 +238,7 @@ fn process_opus_completed_page_sync(
     spec: &str,
     config: &mut Option<DOps>,
     saw_tags_packet: &mut bool,
+    flat_source_encoding_metadata: &mut Option<String>,
     logical_size: &mut u64,
     transformed_segments: &mut Vec<SegmentedMuxSourceSegment>,
     samples: &mut Vec<StagedSample>,
@@ -252,6 +260,9 @@ fn process_opus_completed_page_sync(
         }
         if !*saw_tags_packet && packet_bytes.starts_with(b"OpusTags") {
             *saw_tags_packet = true;
+            if flat_source_encoding_metadata.is_none() {
+                *flat_source_encoding_metadata = parse_opus_tags_encoding_metadata(&packet_bytes);
+            }
             continue;
         }
         *saw_tags_packet = true;
@@ -276,6 +287,7 @@ async fn process_opus_completed_page_async(
     spec: &str,
     config: &mut Option<DOps>,
     saw_tags_packet: &mut bool,
+    flat_source_encoding_metadata: &mut Option<String>,
     logical_size: &mut u64,
     transformed_segments: &mut Vec<SegmentedMuxSourceSegment>,
     samples: &mut Vec<StagedSample>,
@@ -298,6 +310,9 @@ async fn process_opus_completed_page_async(
         }
         if !*saw_tags_packet && packet_bytes.starts_with(b"OpusTags") {
             *saw_tags_packet = true;
+            if flat_source_encoding_metadata.is_none() {
+                *flat_source_encoding_metadata = parse_opus_tags_encoding_metadata(&packet_bytes);
+            }
             continue;
         }
         *saw_tags_packet = true;
@@ -383,6 +398,48 @@ fn build_opus_sample_entry_box(config: &DOps, btrt: Btrt) -> Result<Vec<u8>, Mux
     )
 }
 
+fn parse_opus_tags_encoding_metadata(packet_bytes: &[u8]) -> Option<String> {
+    if !packet_bytes.starts_with(b"OpusTags") || packet_bytes.len() < 12 {
+        return None;
+    }
+
+    let vendor_len =
+        usize::try_from(u32::from_le_bytes(packet_bytes[8..12].try_into().ok()?)).ok()?;
+    let vendor_start = 12usize;
+    let vendor_end = vendor_start.checked_add(vendor_len)?;
+    let vendor = packet_bytes.get(vendor_start..vendor_end)?;
+    let vendor = String::from_utf8_lossy(vendor).into_owned();
+
+    let Some(comment_count_bytes) = packet_bytes.get(vendor_end..vendor_end.checked_add(4)?) else {
+        return Some(vendor);
+    };
+    let comment_count =
+        usize::try_from(u32::from_le_bytes(comment_count_bytes.try_into().ok()?)).ok()?;
+    let mut cursor = vendor_end.checked_add(4)?;
+    for _ in 0..comment_count {
+        let Some(comment_len_bytes) = packet_bytes.get(cursor..cursor.checked_add(4)?) else {
+            return Some(vendor);
+        };
+        let comment_len =
+            usize::try_from(u32::from_le_bytes(comment_len_bytes.try_into().ok()?)).ok()?;
+        cursor = cursor.checked_add(4)?;
+        let comment_end = cursor.checked_add(comment_len)?;
+        let Some(comment_bytes) = packet_bytes.get(cursor..comment_end) else {
+            return Some(vendor);
+        };
+        let comment = String::from_utf8_lossy(comment_bytes);
+        if let Some((key, value)) = comment.split_once('=')
+            && key.eq_ignore_ascii_case("encoder")
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+        cursor = comment_end;
+    }
+
+    Some(vendor)
+}
+
 fn parse_opus_head_packet(packet: &[u8], spec: &str) -> Result<DOps, MuxError> {
     if packet.len() < 19 || !packet.starts_with(b"OpusHead") {
         return Err(MuxError::UnsupportedTrackImport {
@@ -459,4 +516,47 @@ fn opus_packet_duration_from_bytes(packet: &[u8], spec: &str) -> Result<u32, Mux
         _ => unreachable!(),
     };
     Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_opus_tags_encoding_metadata;
+
+    #[test]
+    fn parse_opus_tags_encoding_metadata_prefers_encoder_comment() {
+        let comment = b"encoder=Lavc61.2.100 libopus";
+        let mut packet = Vec::from(&b"OpusTags"[..]);
+        packet.extend_from_slice(&12_u32.to_le_bytes());
+        packet.extend_from_slice(b"Lavf61.0.100");
+        packet.extend_from_slice(&1_u32.to_le_bytes());
+        packet.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        packet.extend_from_slice(comment);
+
+        assert_eq!(
+            parse_opus_tags_encoding_metadata(&packet).as_deref(),
+            Some("Lavc61.2.100 libopus")
+        );
+    }
+
+    #[test]
+    fn parse_opus_tags_encoding_metadata_falls_back_to_vendor() {
+        let mut packet = Vec::from(&b"OpusTags"[..]);
+        packet.extend_from_slice(&5_u32.to_le_bytes());
+        packet.extend_from_slice(b"Lavf1");
+        packet.extend_from_slice(&0_u32.to_le_bytes());
+
+        assert_eq!(
+            parse_opus_tags_encoding_metadata(&packet).as_deref(),
+            Some("Lavf1")
+        );
+    }
+
+    #[test]
+    fn parse_opus_tags_encoding_metadata_rejects_truncated_packet() {
+        let mut packet = Vec::from(&b"OpusTags"[..]);
+        packet.extend_from_slice(&10_u32.to_le_bytes());
+        packet.extend_from_slice(b"short");
+
+        assert_eq!(parse_opus_tags_encoding_metadata(&packet), None);
+    }
 }

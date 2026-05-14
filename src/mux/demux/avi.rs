@@ -11,10 +11,13 @@ use super::super::MuxTrackKind;
 use super::super::import::read_exact_at_async;
 use super::super::import::{
     CandidateSample, CompositeTrackCandidate, SegmentedMuxSourceSegment, SegmentedMuxSourceSpec,
-    StagedSample, TrackCandidate, build_btrt_from_sample_sizes, direct_ingest_handler_name,
-    direct_ingest_mux_policy, read_exact_at_sync, with_force_empty_sync_sample_table,
+    StagedSample, TrackCandidate, build_btrt_from_sample_sizes,
+    build_generic_audio_sample_entry_box, direct_ingest_handler_name, direct_ingest_mux_policy,
+    read_exact_at_sync, with_force_empty_sync_sample_table,
 };
-use super::aac::build_aac_lc_sample_entry_box;
+#[cfg(feature = "async")]
+use super::aac::scan_adts_segmented_async;
+use super::aac::{build_aac_lc_sample_entry_box, scan_adts_segmented_sync};
 #[cfg(feature = "async")]
 use super::ac3::scan_ac3_segmented_async;
 use super::ac3::scan_ac3_segmented_sync;
@@ -22,17 +25,20 @@ use super::h263::{build_avi_h263_sample_entry_box, parse_h263_picture_bytes};
 #[cfg(feature = "async")]
 use super::h264::stage_annex_b_h264_segmented_async;
 use super::h264::{
-    build_h264_sample_entry_from_avc_config_with_options, stage_annex_b_h264_segmented_sync,
+    build_h264_sample_entry_from_avc_config_with_options, retune_carried_h264_sample_entry_box,
+    stage_annex_b_h264_segmented_sync,
 };
 use super::jpeg::{build_avi_jpeg_sample_entry_box, parse_jpeg_bytes};
 #[cfg(feature = "async")]
 use super::mp3::scan_mp3_segmented_async;
 use super::mp3::scan_mp3_segmented_sync;
-use super::mp4v::build_mp4v_sample_entry_box;
+#[cfg(feature = "async")]
+use super::mp4v::scan_mp4v_segmented_async;
+use super::mp4v::{build_direct_mp4v_sample_entry_box, scan_mp4v_segmented_sync};
 use super::pcm::build_pcm_sample_entry_box;
 use super::png::{build_avi_png_sample_entry_box, parse_png_bytes};
 use crate::FourCc;
-use crate::boxes::iso14496_12::AVCDecoderConfiguration;
+use crate::boxes::iso14496_12::{AVCDecoderConfiguration, SampleEntry, VisualSampleEntry};
 use crate::codec::unmarshal;
 
 const RIFF: &[u8; 4] = b"RIFF";
@@ -47,13 +53,60 @@ const RECL: FourCc = FourCc::from_bytes(*b"rec ");
 const AUDS: FourCc = FourCc::from_bytes(*b"auds");
 const VIDS: FourCc = FourCc::from_bytes(*b"vids");
 const WAVE_FORMAT_PCM: u16 = 0x0001;
+const WAVE_FORMAT_ADPCM: u16 = 0x0002;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
+const IBM_FORMAT_CVSD: u16 = 0x0005;
+const WAVE_FORMAT_ALAW: u16 = 0x0006;
+const WAVE_FORMAT_MULAW: u16 = 0x0007;
+const WAVE_FORMAT_OKI_ADPCM: u16 = 0x0010;
+const WAVE_FORMAT_DVI_ADPCM: u16 = 0x0011;
+const WAVE_FORMAT_DIGISTD: u16 = 0x0015;
+const WAVE_FORMAT_YAMAHA_ADPCM: u16 = 0x0020;
+const WAVE_FORMAT_DSP_TRUESPEECH: u16 = 0x0022;
+const WAVE_FORMAT_GSM610: u16 = 0x0031;
 const WAVE_FORMAT_MP3: u16 = 0x0055;
+const WAVE_FORMAT_AAC_ADTS: u16 = 0x706D;
+const IBM_FORMAT_MULAW: u16 = 0x0101;
+const IBM_FORMAT_ALAW: u16 = 0x0102;
+const IBM_FORMAT_ADPCM: u16 = 0x0103;
 const WAVE_FORMAT_AAC: u16 = 0x00FF;
 const WAVE_FORMAT_AC3: u16 = 0x2000;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const SAMPLE_ENTRY_IPCM: FourCc = FourCc::from_bytes(*b"ipcm");
 const SAMPLE_ENTRY_FPCM: FourCc = FourCc::from_bytes(*b"fpcm");
+const SAMPLE_ENTRY_ALAW: FourCc = FourCc::from_bytes(*b"alaw");
+const SAMPLE_ENTRY_ULAW: FourCc = FourCc::from_bytes(*b"ulaw");
+const SAMPLE_ENTRY_MS_ADPCM: FourCc = FourCc::from_bytes([0x6D, 0x73, 0x00, 0x02]);
+const SAMPLE_ENTRY_IMA_ADPCM: FourCc = FourCc::from_bytes([0x6D, 0x73, 0x00, 0x11]);
+const SAMPLE_ENTRY_IBM_CVSD: FourCc = FourCc::from_bytes(*b"CSVD");
+const SAMPLE_ENTRY_OKI_ADPCM: FourCc = FourCc::from_bytes(*b"OPCM");
+const SAMPLE_ENTRY_DIGISTD: FourCc = FourCc::from_bytes(*b"DSTD");
+const SAMPLE_ENTRY_YAMAHA_ADPCM: FourCc = FourCc::from_bytes(*b"YPCM");
+const SAMPLE_ENTRY_DSP_TRUESPEECH: FourCc = FourCc::from_bytes(*b"TSPE");
+const SAMPLE_ENTRY_GSM610: FourCc = FourCc::from_bytes(*b"G610");
+const SAMPLE_ENTRY_IBM_ADPCM: FourCc = FourCc::from_bytes(*b"IPCM");
+const SAMPLE_ENTRY_DIV3: FourCc = FourCc::from_bytes(*b"DIV3");
+const SAMPLE_ENTRY_DIV4: FourCc = FourCc::from_bytes(*b"DIV4");
+const SAMPLE_ENTRY_UNCV: FourCc = FourCc::from_bytes(*b"uncv");
 const AVC1: FourCc = FourCc::from_bytes(*b"AVC1");
+const CMPD: FourCc = FourCc::from_bytes(*b"cmpd");
+const UNCC: FourCc = FourCc::from_bytes(*b"uncC");
+const AVI_RAW_VIDEO_COMPRESSOR_NAME: &[u8] = b"RawVideo";
+const AVI_MS_MPEG4_V3_COMPRESSOR_NAME: &[u8] = b"MS-MPEG4 V3";
+const AVI_GENERIC_UNSUPPORTED_COMPRESSOR_NAME: &[u8] = b"Codec Not Supported";
+const SUPPORTED_AVI_AUDIO_TAGS: &str = "PCM, extensible PCM, IEEE float PCM, extensible IEEE float PCM, A-law, extensible A-law, IBM A-law, mu-law, extensible mu-law, IBM mu-law, Microsoft ADPCM, IMA ADPCM, IBM CVSD, OKI ADPCM, DIGISTD, Yamaha ADPCM, DSP TrueSpeech, GSM 610, IBM ADPCM, AAC ADTS, AAC, MP3, and AC-3";
+const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: [u8; 16] = [
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+const KSDATAFORMAT_SUBTYPE_ALAW: [u8; 16] = [
+    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+const KSDATAFORMAT_SUBTYPE_MULAW: [u8; 16] = [
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
 
 pub(in crate::mux) struct ScannedAviSource {
     pub(in crate::mux) tracks: Vec<TrackCandidate>,
@@ -105,7 +158,6 @@ struct AviVideoFormat {
     width: u16,
     height: u16,
     codec: AviVideoCodec,
-    compressor_name: [u8; 4],
     decoder_specific_info: Vec<u8>,
 }
 
@@ -117,12 +169,21 @@ enum AviVideoCodec {
     H263,
     Jpeg,
     Png,
+    MsMpeg4V3(FourCc),
+    RawBgr,
+    GenericPassthrough(FourCc),
 }
 
 #[derive(Clone, Copy)]
 struct AviChunkSpan {
     data_offset: u64,
     data_size: u32,
+}
+
+#[derive(Clone, Copy)]
+enum AviAdpcmKind {
+    Microsoft,
+    ImaDvi,
 }
 
 fn parse_avi_source_sync(
@@ -314,6 +375,114 @@ fn finalize_avi_tracks_sync(
                         chunks,
                         true,
                     )?),
+                    WAVE_FORMAT_ALAW | IBM_FORMAT_ALAW => {
+                        tracks.push(finalize_avi_companded_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_ALAW,
+                            "alaw",
+                        )?)
+                    }
+                    WAVE_FORMAT_MULAW | IBM_FORMAT_MULAW => {
+                        tracks.push(finalize_avi_companded_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_ULAW,
+                            "ulaw",
+                        )?)
+                    }
+                    WAVE_FORMAT_ADPCM => tracks.push(finalize_avi_adpcm_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        AviAdpcmKind::Microsoft,
+                    )?),
+                    WAVE_FORMAT_DVI_ADPCM => tracks.push(finalize_avi_adpcm_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        AviAdpcmKind::ImaDvi,
+                    )?),
+                    IBM_FORMAT_CVSD => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_IBM_CVSD,
+                        "ibm-cvsd",
+                    )?),
+                    WAVE_FORMAT_OKI_ADPCM => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_OKI_ADPCM,
+                        "oki-adpcm",
+                    )?),
+                    WAVE_FORMAT_DIGISTD => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_DIGISTD,
+                        "digistd",
+                    )?),
+                    WAVE_FORMAT_YAMAHA_ADPCM => {
+                        tracks.push(finalize_avi_generic_coded_audio_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_YAMAHA_ADPCM,
+                            "yamaha-adpcm",
+                        )?)
+                    }
+                    WAVE_FORMAT_DSP_TRUESPEECH => {
+                        tracks.push(finalize_avi_generic_coded_audio_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_DSP_TRUESPEECH,
+                            "truespeech",
+                        )?)
+                    }
+                    WAVE_FORMAT_GSM610 => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_GSM610,
+                        "gsm610",
+                    )?),
+                    IBM_FORMAT_ADPCM => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_IBM_ADPCM,
+                        "ibm-adpcm",
+                    )?),
+                    WAVE_FORMAT_AAC_ADTS => composite_tracks.push(finalize_avi_adts_track_sync(
+                        file, path, spec, descriptor, chunks,
+                    )?),
                     WAVE_FORMAT_AAC => tracks.push(finalize_avi_raw_aac_track(
                         spec,
                         source_index,
@@ -330,9 +499,9 @@ fn finalize_avi_tracks_sync(
                     _ => {
                         return Err(invalid_avi(
                             spec,
-                            &format!(
-                                "AVI audio stream {} uses unsupported WAVE format tag 0x{:04X}",
-                                descriptor.stream_index, audio_format.format_tag
+                            &unsupported_avi_audio_format_tag_message(
+                                descriptor.stream_index,
+                                audio_format,
                             ),
                         ));
                     }
@@ -351,6 +520,7 @@ fn finalize_avi_tracks_sync(
                 match video_format.codec {
                     AviVideoCodec::Mp4v => tracks.push(finalize_avi_mp4v_track_sync(
                         file,
+                        path,
                         spec,
                         source_index,
                         descriptor,
@@ -399,6 +569,32 @@ fn finalize_avi_tracks_sync(
                         video_format,
                         chunks,
                     )?),
+                    AviVideoCodec::MsMpeg4V3(sample_entry_type) => {
+                        tracks.push(finalize_avi_generic_visual_track(
+                            source_index,
+                            descriptor,
+                            video_format,
+                            chunks,
+                            sample_entry_type,
+                            AVI_MS_MPEG4_V3_COMPRESSOR_NAME.to_vec(),
+                        )?)
+                    }
+                    AviVideoCodec::RawBgr => tracks.push(finalize_avi_uncv_bgr_track(
+                        source_index,
+                        descriptor,
+                        video_format,
+                        chunks,
+                    )?),
+                    AviVideoCodec::GenericPassthrough(sample_entry_type) => {
+                        tracks.push(finalize_avi_generic_visual_track(
+                            source_index,
+                            descriptor,
+                            video_format,
+                            chunks,
+                            sample_entry_type,
+                            AVI_GENERIC_UNSUPPORTED_COMPRESSOR_NAME.to_vec(),
+                        )?)
+                    }
                 }
             }
             other => {
@@ -467,6 +663,114 @@ async fn finalize_avi_tracks_async(
                         chunks,
                         true,
                     )?),
+                    WAVE_FORMAT_ALAW | IBM_FORMAT_ALAW => {
+                        tracks.push(finalize_avi_companded_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_ALAW,
+                            "alaw",
+                        )?)
+                    }
+                    WAVE_FORMAT_MULAW | IBM_FORMAT_MULAW => {
+                        tracks.push(finalize_avi_companded_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_ULAW,
+                            "ulaw",
+                        )?)
+                    }
+                    WAVE_FORMAT_ADPCM => tracks.push(finalize_avi_adpcm_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        AviAdpcmKind::Microsoft,
+                    )?),
+                    WAVE_FORMAT_DVI_ADPCM => tracks.push(finalize_avi_adpcm_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        AviAdpcmKind::ImaDvi,
+                    )?),
+                    IBM_FORMAT_CVSD => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_IBM_CVSD,
+                        "ibm-cvsd",
+                    )?),
+                    WAVE_FORMAT_OKI_ADPCM => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_OKI_ADPCM,
+                        "oki-adpcm",
+                    )?),
+                    WAVE_FORMAT_DIGISTD => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_DIGISTD,
+                        "digistd",
+                    )?),
+                    WAVE_FORMAT_YAMAHA_ADPCM => {
+                        tracks.push(finalize_avi_generic_coded_audio_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_YAMAHA_ADPCM,
+                            "yamaha-adpcm",
+                        )?)
+                    }
+                    WAVE_FORMAT_DSP_TRUESPEECH => {
+                        tracks.push(finalize_avi_generic_coded_audio_track(
+                            spec,
+                            source_index,
+                            descriptor.stream_index,
+                            audio_format,
+                            chunks,
+                            SAMPLE_ENTRY_DSP_TRUESPEECH,
+                            "truespeech",
+                        )?)
+                    }
+                    WAVE_FORMAT_GSM610 => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_GSM610,
+                        "gsm610",
+                    )?),
+                    IBM_FORMAT_ADPCM => tracks.push(finalize_avi_generic_coded_audio_track(
+                        spec,
+                        source_index,
+                        descriptor.stream_index,
+                        audio_format,
+                        chunks,
+                        SAMPLE_ENTRY_IBM_ADPCM,
+                        "ibm-adpcm",
+                    )?),
+                    WAVE_FORMAT_AAC_ADTS => composite_tracks.push(
+                        finalize_avi_adts_track_async(file, path, spec, descriptor, chunks).await?,
+                    ),
                     WAVE_FORMAT_AAC => tracks.push(finalize_avi_raw_aac_track(
                         spec,
                         source_index,
@@ -483,9 +787,9 @@ async fn finalize_avi_tracks_async(
                     _ => {
                         return Err(invalid_avi(
                             spec,
-                            &format!(
-                                "AVI audio stream {} uses unsupported WAVE format tag 0x{:04X}",
-                                descriptor.stream_index, audio_format.format_tag
+                            &unsupported_avi_audio_format_tag_message(
+                                descriptor.stream_index,
+                                audio_format,
                             ),
                         ));
                     }
@@ -505,6 +809,7 @@ async fn finalize_avi_tracks_async(
                     AviVideoCodec::Mp4v => tracks.push(
                         finalize_avi_mp4v_track_async(
                             file,
+                            path,
                             spec,
                             source_index,
                             descriptor,
@@ -568,6 +873,32 @@ async fn finalize_avi_tracks_async(
                         )
                         .await?,
                     ),
+                    AviVideoCodec::MsMpeg4V3(sample_entry_type) => {
+                        tracks.push(finalize_avi_generic_visual_track(
+                            source_index,
+                            descriptor,
+                            video_format,
+                            chunks,
+                            sample_entry_type,
+                            AVI_MS_MPEG4_V3_COMPRESSOR_NAME.to_vec(),
+                        )?)
+                    }
+                    AviVideoCodec::RawBgr => tracks.push(finalize_avi_uncv_bgr_track(
+                        source_index,
+                        descriptor,
+                        video_format,
+                        chunks,
+                    )?),
+                    AviVideoCodec::GenericPassthrough(sample_entry_type) => {
+                        tracks.push(finalize_avi_generic_visual_track(
+                            source_index,
+                            descriptor,
+                            video_format,
+                            chunks,
+                            sample_entry_type,
+                            AVI_GENERIC_UNSUPPORTED_COMPRESSOR_NAME.to_vec(),
+                        )?)
+                    }
                 }
             }
             other => {
@@ -664,6 +995,291 @@ fn finalize_avi_pcm_track(
         source_edit_media_time: None,
         samples,
     })
+}
+
+fn finalize_avi_companded_track(
+    spec: &str,
+    source_index: usize,
+    stream_index: u32,
+    audio_format: AviAudioFormat,
+    chunks: Vec<AviChunkSpan>,
+    sample_entry_type: FourCc,
+    codec_label: &str,
+) -> Result<TrackCandidate, MuxError> {
+    if audio_format.block_align == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!("AVI audio stream {stream_index} declared a zero block align"),
+        ));
+    }
+    let sample_entry_box = build_generic_audio_sample_entry_box(
+        sample_entry_type,
+        audio_format.sample_rate,
+        audio_format.channel_count,
+        audio_format.bits_per_sample,
+        &[],
+    )?;
+    let mut samples = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if !chunk
+            .data_size
+            .is_multiple_of(u32::from(audio_format.block_align))
+        {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} chunk size {} is not a whole number of audio sample frames",
+                    chunk.data_size
+                ),
+            ));
+        }
+        let duration = chunk.data_size / u32::from(audio_format.block_align);
+        if duration == 0 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} chunk did not contain a complete audio frame"
+                ),
+            ));
+        }
+        samples.push(CandidateSample {
+            source_index,
+            data_offset: chunk.data_offset,
+            data_size: chunk.data_size,
+            duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+    }
+    Ok(TrackCandidate {
+        track_id: stream_index + 1,
+        kind: MuxTrackKind::Audio,
+        timescale: audio_format.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(codec_label),
+        mux_policy: direct_ingest_mux_policy(codec_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box,
+        source_edit_media_time: None,
+        samples,
+    })
+}
+
+fn finalize_avi_generic_coded_audio_track(
+    spec: &str,
+    source_index: usize,
+    stream_index: u32,
+    audio_format: AviAudioFormat,
+    chunks: Vec<AviChunkSpan>,
+    sample_entry_type: FourCc,
+    codec_label: &str,
+) -> Result<TrackCandidate, MuxError> {
+    let channels = u32::from(audio_format.channel_count);
+    if channels == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!("AVI audio stream {stream_index} declared zero channels"),
+        ));
+    }
+    let bits_per_sample = u32::from(audio_format.bits_per_sample);
+    if bits_per_sample == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!("AVI audio stream {stream_index} declared zero bits per sample"),
+        ));
+    }
+    let coded_sample_width = bits_per_sample
+        .checked_mul(channels)
+        .ok_or_else(|| invalid_avi(spec, "AVI coded-audio sample width overflow"))?;
+    let sample_entry_box = build_generic_audio_sample_entry_box(
+        sample_entry_type,
+        audio_format.sample_rate,
+        audio_format.channel_count,
+        audio_format.bits_per_sample,
+        &[],
+    )?;
+    let mut samples = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let coded_payload_bits = chunk
+            .data_size
+            .checked_mul(8)
+            .ok_or(MuxError::LayoutOverflow("AVI coded-audio payload bits"))?;
+        // Mirror the local reference AVI demux timing model for framed coded audio:
+        // duration comes from payload size, coded sample width, and channel count.
+        let duration = coded_payload_bits / coded_sample_width;
+        if duration == 0 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} chunk did not contain one complete coded audio sample frame"
+                ),
+            ));
+        }
+        samples.push(CandidateSample {
+            source_index,
+            data_offset: chunk.data_offset,
+            data_size: chunk.data_size,
+            duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+    }
+    Ok(TrackCandidate {
+        track_id: stream_index + 1,
+        kind: MuxTrackKind::Audio,
+        timescale: audio_format.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(codec_label),
+        mux_policy: direct_ingest_mux_policy(codec_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box,
+        source_edit_media_time: None,
+        samples,
+    })
+}
+
+fn finalize_avi_adpcm_track(
+    spec: &str,
+    source_index: usize,
+    stream_index: u32,
+    audio_format: AviAudioFormat,
+    chunks: Vec<AviChunkSpan>,
+    adpcm_kind: AviAdpcmKind,
+) -> Result<TrackCandidate, MuxError> {
+    if audio_format.block_align == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!("AVI audio stream {stream_index} declared a zero block align"),
+        ));
+    }
+    let (sample_entry_type, codec_label, samples_per_block) =
+        avi_adpcm_parameters(spec, stream_index, audio_format, adpcm_kind)?;
+    let sample_entry_box = build_generic_audio_sample_entry_box(
+        sample_entry_type,
+        audio_format.sample_rate,
+        audio_format.channel_count,
+        audio_format.bits_per_sample,
+        &[],
+    )?;
+    let mut samples = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if !chunk
+            .data_size
+            .is_multiple_of(u32::from(audio_format.block_align))
+        {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} chunk size {} is not a whole number of ADPCM blocks",
+                    chunk.data_size
+                ),
+            ));
+        }
+        let block_count = chunk.data_size / u32::from(audio_format.block_align);
+        if block_count == 0 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} chunk did not contain one complete ADPCM block"
+                ),
+            ));
+        }
+        let duration = block_count.checked_mul(samples_per_block).ok_or_else(|| {
+            invalid_avi(
+                spec,
+                &format!("AVI audio stream {stream_index} ADPCM duration overflowed"),
+            )
+        })?;
+        samples.push(CandidateSample {
+            source_index,
+            data_offset: chunk.data_offset,
+            data_size: chunk.data_size,
+            duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+    }
+    Ok(TrackCandidate {
+        track_id: stream_index + 1,
+        kind: MuxTrackKind::Audio,
+        timescale: audio_format.sample_rate,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name(codec_label),
+        mux_policy: direct_ingest_mux_policy(codec_label, MuxTrackKind::Audio),
+        width: 0,
+        height: 0,
+        sample_entry_box,
+        source_edit_media_time: None,
+        samples,
+    })
+}
+
+fn avi_adpcm_parameters(
+    spec: &str,
+    stream_index: u32,
+    audio_format: AviAudioFormat,
+    adpcm_kind: AviAdpcmKind,
+) -> Result<(FourCc, &'static str, u32), MuxError> {
+    let channels = u32::from(audio_format.channel_count);
+    if channels == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!("AVI audio stream {stream_index} declared zero channels"),
+        ));
+    }
+    let bits_per_sample = u32::from(audio_format.bits_per_sample);
+    if bits_per_sample == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!("AVI audio stream {stream_index} declared zero bits per sample"),
+        ));
+    }
+    let block_align = u32::from(audio_format.block_align);
+    let (sample_entry_type, codec_label, header_bytes_per_channel, leading_samples) =
+        match adpcm_kind {
+            AviAdpcmKind::Microsoft => (SAMPLE_ENTRY_MS_ADPCM, "adpcm", 7_u32, 2_u32),
+            AviAdpcmKind::ImaDvi => (SAMPLE_ENTRY_IMA_ADPCM, "ima-adpcm", 4_u32, 1_u32),
+        };
+    let header_bytes = header_bytes_per_channel
+        .checked_mul(channels)
+        .ok_or_else(|| invalid_avi(spec, "AVI ADPCM header-size overflow"))?;
+    if block_align <= header_bytes {
+        return Err(invalid_avi(
+            spec,
+            &format!(
+                "AVI audio stream {stream_index} declared block_align {} too small for its ADPCM header",
+                audio_format.block_align
+            ),
+        ));
+    }
+    let coded_payload_bits = block_align
+        .checked_sub(header_bytes)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or_else(|| invalid_avi(spec, "AVI ADPCM coded-payload size overflow"))?;
+    let coded_sample_width = bits_per_sample
+        .checked_mul(channels)
+        .ok_or_else(|| invalid_avi(spec, "AVI ADPCM coded-sample width overflow"))?;
+    if coded_sample_width == 0 || coded_payload_bits % coded_sample_width != 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!(
+                "AVI audio stream {stream_index} declared one unsupported ADPCM block geometry (block_align={}, channels={}, bits_per_sample={})",
+                audio_format.block_align, audio_format.channel_count, audio_format.bits_per_sample
+            ),
+        ));
+    }
+    let samples_per_block = coded_payload_bits / coded_sample_width + leading_samples;
+    if samples_per_block == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!(
+                "AVI audio stream {stream_index} did not expose one complete ADPCM sample block"
+            ),
+        ));
+    }
+    Ok((sample_entry_type, codec_label, samples_per_block))
 }
 
 fn finalize_avi_mp3_track_sync(
@@ -780,6 +1396,64 @@ async fn finalize_avi_ac3_track_async(
     })
 }
 
+fn finalize_avi_adts_track_sync(
+    file: &mut File,
+    path: &Path,
+    spec: &str,
+    descriptor: AviTrackDescriptor,
+    chunks: Vec<AviChunkSpan>,
+) -> Result<CompositeTrackCandidate, MuxError> {
+    let source_spec = build_avi_segmented_source_spec(path, &chunks)?;
+    let parsed =
+        scan_adts_segmented_sync(file, &source_spec.segments, source_spec.total_size, spec)?;
+    Ok(CompositeTrackCandidate {
+        track: TrackCandidate {
+            track_id: descriptor.stream_index + 1,
+            kind: MuxTrackKind::Audio,
+            timescale: parsed.sample_rate,
+            language: *b"und",
+            handler_name: direct_ingest_handler_name("aac"),
+            mux_policy: direct_ingest_mux_policy("aac", MuxTrackKind::Audio),
+            width: 0,
+            height: 0,
+            sample_entry_box: parsed.sample_entry_box,
+            source_edit_media_time: None,
+            samples: candidate_samples_from_staged(parsed.samples),
+        },
+        source_spec,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn finalize_avi_adts_track_async(
+    file: &mut TokioFile,
+    path: &Path,
+    spec: &str,
+    descriptor: AviTrackDescriptor,
+    chunks: Vec<AviChunkSpan>,
+) -> Result<CompositeTrackCandidate, MuxError> {
+    let source_spec = build_avi_segmented_source_spec(path, &chunks)?;
+    let parsed =
+        scan_adts_segmented_async(file, &source_spec.segments, source_spec.total_size, spec)
+            .await?;
+    Ok(CompositeTrackCandidate {
+        track: TrackCandidate {
+            track_id: descriptor.stream_index + 1,
+            kind: MuxTrackKind::Audio,
+            timescale: parsed.sample_rate,
+            language: *b"und",
+            handler_name: direct_ingest_handler_name("aac"),
+            mux_policy: direct_ingest_mux_policy("aac", MuxTrackKind::Audio),
+            width: 0,
+            height: 0,
+            sample_entry_box: parsed.sample_entry_box,
+            source_edit_media_time: None,
+            samples: candidate_samples_from_staged(parsed.samples),
+        },
+        source_spec,
+    })
+}
+
 fn finalize_avi_raw_aac_track(
     spec: &str,
     source_index: usize,
@@ -823,6 +1497,7 @@ fn finalize_avi_raw_aac_track(
 
 fn finalize_avi_mp4v_track_sync(
     file: &mut File,
+    path: &Path,
     spec: &str,
     source_index: usize,
     descriptor: AviTrackDescriptor,
@@ -830,46 +1505,129 @@ fn finalize_avi_mp4v_track_sync(
     chunks: Vec<AviChunkSpan>,
 ) -> Result<TrackCandidate, MuxError> {
     let timing = avi_video_timing(descriptor.timing_scale, descriptor.timing_rate);
-    let mut samples = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        if chunk.data_size == 0 {
-            return Err(invalid_avi(
-                spec,
-                &format!(
-                    "AVI video stream {} carried one zero-length chunk",
-                    descriptor.stream_index
-                ),
-            ));
+    let input_spec = build_avi_segmented_source_spec(path, &chunks)?;
+    let (decoder_specific_info, parsed_samples) = match scan_mp4v_segmented_sync(
+        file,
+        &input_spec.segments,
+        input_spec.total_size,
+        spec,
+    ) {
+        Ok(parsed) => {
+            if parsed.samples.len() != chunks.len() {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} did not map one chunk to one access unit on the native direct-ingest path",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            if parsed.width != video_format.width || parsed.height != video_format.height {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} carried container dimensions that disagreed with the decoder configuration",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            (parsed.decoder_specific_info, Some(parsed.samples))
         }
-        let mut frame = vec![
-            0_u8;
-            usize::try_from(chunk.data_size)
-                .map_err(|_| MuxError::LayoutOverflow("AVI video chunk size"))?
-        ];
-        read_exact_at_sync(
-            file,
-            chunk.data_offset,
-            &mut frame,
-            spec,
-            "AVI video chunk is truncated",
-        )?;
-        let is_sync_sample = avi_mp4v_chunk_is_sync_sample(spec, descriptor.stream_index, &frame)?;
-        samples.push(CandidateSample {
-            source_index,
-            data_offset: chunk.data_offset,
-            data_size: chunk.data_size,
-            duration: timing.sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample,
-        });
-    }
-    let sample_entry_box = build_avi_mp4v_sample_entry_box(
-        &video_format,
-        timing.timescale,
-        chunks
-            .iter()
-            .map(|chunk| (chunk.data_size, timing.sample_duration)),
-    )?;
+        Err(MuxError::UnsupportedTrackImport { message, .. })
+            if message == "MPEG-4 Part 2 decoder config did not precede the first VOP sample"
+                && !video_format.decoder_specific_info.is_empty() =>
+        {
+            (video_format.decoder_specific_info.clone(), None)
+        }
+        Err(error) => return Err(error),
+    };
+    let (samples, sample_sizes) = if let Some(parsed_samples) = parsed_samples {
+        let mut logical_chunk_offset = 0_u64;
+        let mut samples = Vec::with_capacity(parsed_samples.len());
+        let mut sample_sizes = Vec::with_capacity(parsed_samples.len());
+        for (chunk, sample) in chunks.iter().zip(parsed_samples.into_iter()) {
+            let sample_start = sample
+                .data_offset
+                .checked_sub(logical_chunk_offset)
+                .ok_or_else(|| {
+                    invalid_avi(
+                        spec,
+                        &format!(
+                            "AVI MPEG-4 Part 2 stream {} produced one sample before its chunk start",
+                            descriptor.stream_index
+                        ),
+                    )
+                })?;
+            let sample_end = sample_start
+                .checked_add(u64::from(sample.data_size))
+                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample end"))?;
+            if sample_end > u64::from(chunk.data_size) {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} produced one sample that overran its chunk payload",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            let data_offset = chunk
+                .data_offset
+                .checked_add(sample_start)
+                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample offset"))?;
+            sample_sizes.push((sample.data_size, sample.duration));
+            samples.push(CandidateSample {
+                source_index,
+                data_offset,
+                data_size: sample.data_size,
+                duration: sample.duration,
+                composition_time_offset: sample.composition_time_offset,
+                is_sync_sample: sample.is_sync_sample,
+            });
+            logical_chunk_offset = logical_chunk_offset
+                .checked_add(u64::from(chunk.data_size))
+                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 logical offset"))?;
+        }
+        (samples, sample_sizes)
+    } else {
+        let mut samples = Vec::with_capacity(chunks.len());
+        let mut sample_sizes = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            if chunk.data_size == 0 {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI video stream {} carried one zero-length chunk",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            let mut frame = vec![
+                0_u8;
+                usize::try_from(chunk.data_size).map_err(|_| {
+                    MuxError::LayoutOverflow("AVI video chunk size")
+                })?
+            ];
+            read_exact_at_sync(
+                file,
+                chunk.data_offset,
+                &mut frame,
+                spec,
+                "AVI video chunk is truncated",
+            )?;
+            let is_sync_sample =
+                avi_mp4v_chunk_is_sync_sample(spec, descriptor.stream_index, &frame)?;
+            sample_sizes.push((chunk.data_size, timing.sample_duration));
+            samples.push(CandidateSample {
+                source_index,
+                data_offset: chunk.data_offset,
+                data_size: chunk.data_size,
+                duration: timing.sample_duration,
+                composition_time_offset: 0,
+                is_sync_sample,
+            });
+        }
+        (samples, sample_sizes)
+    };
     Ok(TrackCandidate {
         track_id: descriptor.stream_index + 1,
         kind: MuxTrackKind::Video,
@@ -879,7 +1637,13 @@ fn finalize_avi_mp4v_track_sync(
         mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
         width: video_format.width,
         height: video_format.height,
-        sample_entry_box,
+        sample_entry_box: build_direct_mp4v_sample_entry_box(
+            video_format.width,
+            video_format.height,
+            &decoder_specific_info,
+            timing.timescale,
+            sample_sizes,
+        )?,
         source_edit_media_time: None,
         samples,
     })
@@ -888,6 +1652,7 @@ fn finalize_avi_mp4v_track_sync(
 #[cfg(feature = "async")]
 async fn finalize_avi_mp4v_track_async(
     file: &mut TokioFile,
+    path: &Path,
     spec: &str,
     source_index: usize,
     descriptor: AviTrackDescriptor,
@@ -895,47 +1660,132 @@ async fn finalize_avi_mp4v_track_async(
     chunks: Vec<AviChunkSpan>,
 ) -> Result<TrackCandidate, MuxError> {
     let timing = avi_video_timing(descriptor.timing_scale, descriptor.timing_rate);
-    let mut samples = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        if chunk.data_size == 0 {
-            return Err(invalid_avi(
-                spec,
-                &format!(
-                    "AVI video stream {} carried one zero-length chunk",
-                    descriptor.stream_index
-                ),
-            ));
+    let input_spec = build_avi_segmented_source_spec(path, &chunks)?;
+    let (decoder_specific_info, parsed_samples) = match scan_mp4v_segmented_async(
+        file,
+        &input_spec.segments,
+        input_spec.total_size,
+        spec,
+    )
+    .await
+    {
+        Ok(parsed) => {
+            if parsed.samples.len() != chunks.len() {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} did not map one chunk to one access unit on the native direct-ingest path",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            if parsed.width != video_format.width || parsed.height != video_format.height {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} carried container dimensions that disagreed with the decoder configuration",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            (parsed.decoder_specific_info, Some(parsed.samples))
         }
-        let mut frame = vec![
-            0_u8;
-            usize::try_from(chunk.data_size)
-                .map_err(|_| MuxError::LayoutOverflow("AVI video chunk size"))?
-        ];
-        read_exact_at_async(
-            file,
-            chunk.data_offset,
-            &mut frame,
-            spec,
-            "AVI video chunk is truncated",
-        )
-        .await?;
-        let is_sync_sample = avi_mp4v_chunk_is_sync_sample(spec, descriptor.stream_index, &frame)?;
-        samples.push(CandidateSample {
-            source_index,
-            data_offset: chunk.data_offset,
-            data_size: chunk.data_size,
-            duration: timing.sample_duration,
-            composition_time_offset: 0,
-            is_sync_sample,
-        });
-    }
-    let sample_entry_box = build_avi_mp4v_sample_entry_box(
-        &video_format,
-        timing.timescale,
-        chunks
-            .iter()
-            .map(|chunk| (chunk.data_size, timing.sample_duration)),
-    )?;
+        Err(MuxError::UnsupportedTrackImport { message, .. })
+            if message == "MPEG-4 Part 2 decoder config did not precede the first VOP sample"
+                && !video_format.decoder_specific_info.is_empty() =>
+        {
+            (video_format.decoder_specific_info.clone(), None)
+        }
+        Err(error) => return Err(error),
+    };
+    let (samples, sample_sizes) = if let Some(parsed_samples) = parsed_samples {
+        let mut logical_chunk_offset = 0_u64;
+        let mut samples = Vec::with_capacity(parsed_samples.len());
+        let mut sample_sizes = Vec::with_capacity(parsed_samples.len());
+        for (chunk, sample) in chunks.iter().zip(parsed_samples.into_iter()) {
+            let sample_start = sample
+                .data_offset
+                .checked_sub(logical_chunk_offset)
+                .ok_or_else(|| {
+                    invalid_avi(
+                        spec,
+                        &format!(
+                            "AVI MPEG-4 Part 2 stream {} produced one sample before its chunk start",
+                            descriptor.stream_index
+                        ),
+                    )
+                })?;
+            let sample_end = sample_start
+                .checked_add(u64::from(sample.data_size))
+                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample end"))?;
+            if sample_end > u64::from(chunk.data_size) {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} produced one sample that overran its chunk payload",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            let data_offset = chunk
+                .data_offset
+                .checked_add(sample_start)
+                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample offset"))?;
+            sample_sizes.push((sample.data_size, sample.duration));
+            samples.push(CandidateSample {
+                source_index,
+                data_offset,
+                data_size: sample.data_size,
+                duration: sample.duration,
+                composition_time_offset: sample.composition_time_offset,
+                is_sync_sample: sample.is_sync_sample,
+            });
+            logical_chunk_offset = logical_chunk_offset
+                .checked_add(u64::from(chunk.data_size))
+                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 logical offset"))?;
+        }
+        (samples, sample_sizes)
+    } else {
+        let mut samples = Vec::with_capacity(chunks.len());
+        let mut sample_sizes = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            if chunk.data_size == 0 {
+                return Err(invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI video stream {} carried one zero-length chunk",
+                        descriptor.stream_index
+                    ),
+                ));
+            }
+            let mut frame = vec![
+                0_u8;
+                usize::try_from(chunk.data_size).map_err(|_| {
+                    MuxError::LayoutOverflow("AVI video chunk size")
+                })?
+            ];
+            read_exact_at_async(
+                file,
+                chunk.data_offset,
+                &mut frame,
+                spec,
+                "AVI video chunk is truncated",
+            )
+            .await?;
+            let is_sync_sample =
+                avi_mp4v_chunk_is_sync_sample(spec, descriptor.stream_index, &frame)?;
+            sample_sizes.push((chunk.data_size, timing.sample_duration));
+            samples.push(CandidateSample {
+                source_index,
+                data_offset: chunk.data_offset,
+                data_size: chunk.data_size,
+                duration: timing.sample_duration,
+                composition_time_offset: 0,
+                is_sync_sample,
+            });
+        }
+        (samples, sample_sizes)
+    };
     Ok(TrackCandidate {
         track_id: descriptor.stream_index + 1,
         kind: MuxTrackKind::Video,
@@ -945,7 +1795,13 @@ async fn finalize_avi_mp4v_track_async(
         mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
         width: video_format.width,
         height: video_format.height,
-        sample_entry_box,
+        sample_entry_box: build_direct_mp4v_sample_entry_box(
+            video_format.width,
+            video_format.height,
+            &decoder_specific_info,
+            timing.timescale,
+            sample_sizes,
+        )?,
         source_edit_media_time: None,
         samples,
     })
@@ -989,6 +1845,14 @@ fn finalize_avi_h264_track_sync(
     for sample in &mut staged.samples {
         sample.duration = timing.sample_duration;
     }
+    let sample_entry_box = retune_carried_h264_sample_entry_box(
+        &staged.sample_entry_box,
+        timing.timescale,
+        staged
+            .samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+    )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
             track_id: descriptor.stream_index + 1,
@@ -999,7 +1863,7 @@ fn finalize_avi_h264_track_sync(
             mux_policy: direct_ingest_mux_policy("h264", MuxTrackKind::Video),
             width: staged.track_width,
             height: staged.track_height,
-            sample_entry_box: staged.sample_entry_box,
+            sample_entry_box,
             source_edit_media_time: None,
             samples: candidate_samples_from_staged(staged.samples),
         },
@@ -1047,6 +1911,14 @@ async fn finalize_avi_h264_track_async(
     for sample in &mut staged.samples {
         sample.duration = timing.sample_duration;
     }
+    let sample_entry_box = retune_carried_h264_sample_entry_box(
+        &staged.sample_entry_box,
+        timing.timescale,
+        staged
+            .samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+    )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
             track_id: descriptor.stream_index + 1,
@@ -1057,7 +1929,7 @@ async fn finalize_avi_h264_track_async(
             mux_policy: direct_ingest_mux_policy("h264", MuxTrackKind::Video),
             width: staged.track_width,
             height: staged.track_height,
-            sample_entry_box: staged.sample_entry_box,
+            sample_entry_box,
             source_edit_media_time: None,
             samples: candidate_samples_from_staged(staged.samples),
         },
@@ -1514,6 +2386,95 @@ fn finalize_avi_still_image_track_sync(
     })
 }
 
+fn finalize_avi_generic_visual_track(
+    source_index: usize,
+    descriptor: AviTrackDescriptor,
+    video_format: AviVideoFormat,
+    chunks: Vec<AviChunkSpan>,
+    sample_entry_type: FourCc,
+    compressor_name: Vec<u8>,
+) -> Result<TrackCandidate, MuxError> {
+    let timing = avi_video_timing(descriptor.timing_scale, descriptor.timing_rate);
+    let samples = chunks
+        .into_iter()
+        .map(|chunk| CandidateSample {
+            source_index,
+            data_offset: chunk.data_offset,
+            data_size: chunk.data_size,
+            duration: timing.sample_duration,
+            composition_time_offset: 0,
+            is_sync_sample: false,
+        })
+        .collect::<Vec<_>>();
+    let sample_entry_box = build_avi_generic_visual_sample_entry_box(
+        sample_entry_type,
+        video_format.width,
+        video_format.height,
+        &compressor_name,
+    )?;
+    let sample_entry_box = append_btrt_to_visual_sample_entry(
+        sample_entry_box,
+        timing.timescale,
+        samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+    )?;
+    Ok(TrackCandidate {
+        track_id: descriptor.stream_index + 1,
+        kind: MuxTrackKind::Video,
+        timescale: timing.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mp4v"),
+        mux_policy: with_force_empty_sync_sample_table(direct_ingest_mux_policy(
+            "mp4v",
+            MuxTrackKind::Video,
+        )),
+        width: video_format.width,
+        height: video_format.height,
+        sample_entry_box,
+        source_edit_media_time: None,
+        samples,
+    })
+}
+
+fn finalize_avi_uncv_bgr_track(
+    source_index: usize,
+    descriptor: AviTrackDescriptor,
+    video_format: AviVideoFormat,
+    chunks: Vec<AviChunkSpan>,
+) -> Result<TrackCandidate, MuxError> {
+    let timing = avi_video_timing(descriptor.timing_scale, descriptor.timing_rate);
+    let samples = chunks
+        .into_iter()
+        .map(|chunk| CandidateSample {
+            source_index,
+            data_offset: chunk.data_offset,
+            data_size: chunk.data_size,
+            duration: timing.sample_duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        })
+        .collect::<Vec<_>>();
+    let sample_entry_box = build_avi_uncv_bgr_sample_entry_box(
+        video_format.width,
+        video_format.height,
+        AVI_RAW_VIDEO_COMPRESSOR_NAME,
+    )?;
+    Ok(TrackCandidate {
+        track_id: descriptor.stream_index + 1,
+        kind: MuxTrackKind::Video,
+        timescale: timing.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mp4v"),
+        mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
+        width: video_format.width,
+        height: video_format.height,
+        sample_entry_box,
+        source_edit_media_time: None,
+        samples,
+    })
+}
+
 #[cfg(feature = "async")]
 async fn finalize_avi_still_image_track_async(
     file: &mut TokioFile,
@@ -1820,7 +2781,7 @@ fn parse_avi_audio_format(
             &format!("AVI audio stream {stream_index} carried a truncated WAVEFORMAT payload"),
         ));
     }
-    let format_tag = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+    let mut format_tag = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
     let channel_count = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
     let sample_rate = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     let block_align = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
@@ -1831,6 +2792,43 @@ fn parse_avi_audio_format(
             &format!("AVI audio stream {stream_index} declared zero channels or zero sample rate"),
         ));
     }
+    if format_tag == WAVE_FORMAT_EXTENSIBLE {
+        if bytes.len() < 40 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} carried a truncated WAVE extensible payload"
+                ),
+            ));
+        }
+        let cb_size = u16::from_le_bytes(bytes[16..18].try_into().unwrap());
+        if cb_size < 22 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} carried one unsupported WAVE extensible extra size {cb_size}"
+                ),
+            ));
+        }
+        let subtype_guid = &bytes[24..40];
+        format_tag = if subtype_guid == KSDATAFORMAT_SUBTYPE_PCM {
+            WAVE_FORMAT_PCM
+        } else if subtype_guid == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+            WAVE_FORMAT_IEEE_FLOAT
+        } else if subtype_guid == KSDATAFORMAT_SUBTYPE_ALAW {
+            WAVE_FORMAT_ALAW
+        } else if subtype_guid == KSDATAFORMAT_SUBTYPE_MULAW {
+            WAVE_FORMAT_MULAW
+        } else {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI audio stream {stream_index} carried one unsupported WAVE extensible subtype GUID {}",
+                    format_extensible_guid(subtype_guid)
+                ),
+            ));
+        };
+    }
     Ok(AviAudioFormat {
         format_tag,
         channel_count,
@@ -1838,6 +2836,14 @@ fn parse_avi_audio_format(
         block_align,
         bits_per_sample,
     })
+}
+
+fn format_extensible_guid(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn parse_avi_video_format(
@@ -1885,46 +2891,32 @@ fn parse_avi_video_format(
             ),
         ));
     }
-    let compression =
-        normalize_avi_video_tag(FourCc::from_bytes(bytes[16..20].try_into().unwrap()));
+    let original_compression = FourCc::from_bytes(bytes[16..20].try_into().unwrap());
+    let compression = normalize_avi_video_tag(original_compression);
     let handler = normalize_avi_video_tag(stream_handler);
-    let (codec, compressor_name) = if avi_tag_maps_to_mp4v(compression) {
-        (AviVideoCodec::Mp4v, compression.into_bytes())
-    } else if avi_tag_maps_to_mp4v(handler) {
-        (AviVideoCodec::Mp4v, handler.into_bytes())
-    } else if avi_tag_maps_to_h264_annex_b(compression) {
-        (AviVideoCodec::H264AnnexB, compression.into_bytes())
-    } else if avi_tag_maps_to_h264_annex_b(handler) {
-        (AviVideoCodec::H264AnnexB, handler.into_bytes())
-    } else if compression == AVC1 {
-        (AviVideoCodec::H264Avc1, compression.into_bytes())
-    } else if handler == AVC1 {
-        (AviVideoCodec::H264Avc1, handler.into_bytes())
-    } else if avi_tag_maps_to_h263(compression) {
-        (AviVideoCodec::H263, compression.into_bytes())
-    } else if avi_tag_maps_to_h263(handler) {
-        (AviVideoCodec::H263, handler.into_bytes())
-    } else if avi_tag_maps_to_jpeg(compression) {
-        (AviVideoCodec::Jpeg, compression.into_bytes())
-    } else if avi_tag_maps_to_jpeg(handler) {
-        (AviVideoCodec::Jpeg, handler.into_bytes())
-    } else if avi_tag_maps_to_png(compression) {
-        (AviVideoCodec::Png, compression.into_bytes())
-    } else if avi_tag_maps_to_png(handler) {
-        (AviVideoCodec::Png, handler.into_bytes())
+    let codec = if avi_tag_maps_to_mp4v(compression) || avi_tag_maps_to_mp4v(handler) {
+        AviVideoCodec::Mp4v
+    } else if avi_tag_maps_to_h264_annex_b(compression) || avi_tag_maps_to_h264_annex_b(handler) {
+        AviVideoCodec::H264AnnexB
+    } else if compression == AVC1 || handler == AVC1 {
+        AviVideoCodec::H264Avc1
+    } else if avi_tag_maps_to_h263(compression) || avi_tag_maps_to_h263(handler) {
+        AviVideoCodec::H263
+    } else if avi_tag_maps_to_jpeg(compression) || avi_tag_maps_to_jpeg(handler) {
+        AviVideoCodec::Jpeg
+    } else if avi_tag_maps_to_png(compression) || avi_tag_maps_to_png(handler) {
+        AviVideoCodec::Png
+    } else if compression == SAMPLE_ENTRY_DIV3 || compression == SAMPLE_ENTRY_DIV4 {
+        AviVideoCodec::MsMpeg4V3(SAMPLE_ENTRY_DIV3)
+    } else if original_compression.into_bytes() == [0, 0, 0, 0] {
+        AviVideoCodec::RawBgr
     } else {
-        return Err(invalid_avi(
-            spec,
-            &format!(
-                "AVI video stream {stream_index} uses unsupported compressor tag `{compression}`"
-            ),
-        ));
+        AviVideoCodec::GenericPassthrough(original_compression)
     };
     Ok(AviVideoFormat {
         width,
         height,
         codec,
-        compressor_name,
         decoder_specific_info: bytes[header_size..].to_vec(),
     })
 }
@@ -2040,17 +3032,116 @@ where
         &[],
     )?;
     if sample_entry_box.len() < 8 {
-        return Err(MuxError::LayoutOverflow("AVI avc1 sample-entry header"));
+        return Err(MuxError::LayoutOverflow("AVI visual sample-entry header"));
     }
     let existing_size = u32::from_be_bytes(sample_entry_box[..4].try_into().unwrap());
     let appended_size = u32::try_from(btrt_box.len())
-        .map_err(|_| MuxError::LayoutOverflow("AVI avc1 btrt child size"))?;
+        .map_err(|_| MuxError::LayoutOverflow("AVI visual btrt child size"))?;
     let updated_size = existing_size
         .checked_add(appended_size)
-        .ok_or(MuxError::LayoutOverflow("AVI avc1 sample-entry size"))?;
+        .ok_or(MuxError::LayoutOverflow("AVI visual sample-entry size"))?;
     sample_entry_box[..4].copy_from_slice(&updated_size.to_be_bytes());
     sample_entry_box.extend_from_slice(&btrt_box);
     Ok(sample_entry_box)
+}
+
+fn build_avi_generic_visual_sample_entry_box(
+    sample_entry_type: FourCc,
+    width: u16,
+    height: u16,
+    compressor_name: &[u8],
+) -> Result<Vec<u8>, MuxError> {
+    build_avi_generic_visual_sample_entry_box_with_children(
+        sample_entry_type,
+        width,
+        height,
+        compressor_name,
+        &[],
+    )
+}
+
+fn build_avi_generic_visual_sample_entry_box_with_children(
+    sample_entry_type: FourCc,
+    width: u16,
+    height: u16,
+    compressor_name: &[u8],
+    child_boxes: &[Vec<u8>],
+) -> Result<Vec<u8>, MuxError> {
+    let mut compressorname = [0_u8; 32];
+    let visible_len = compressor_name.len().min(31);
+    compressorname[0] =
+        u8::try_from(visible_len).map_err(|_| MuxError::LayoutOverflow("compressor name"))?;
+    compressorname[1..1 + visible_len].copy_from_slice(&compressor_name[..visible_len]);
+    super::super::mp4::encode_typed_box(
+        &VisualSampleEntry {
+            sample_entry: SampleEntry {
+                box_type: sample_entry_type,
+                data_reference_index: 1,
+            },
+            pre_defined2: [0, 0, 0],
+            width,
+            height,
+            // The retained reference authoring writes literal 72 here, not 16.16 fixed-point.
+            horizresolution: 72,
+            vertresolution: 72,
+            frame_count: 1,
+            compressorname,
+            depth: 0x0018,
+            pre_defined3: -1,
+            ..VisualSampleEntry::default()
+        },
+        &child_boxes.concat(),
+    )
+}
+
+fn build_avi_uncv_bgr_sample_entry_box(
+    width: u16,
+    height: u16,
+    compressor_name: &[u8],
+) -> Result<Vec<u8>, MuxError> {
+    let child_boxes = vec![
+        build_avi_uncv_bgr_cmpd_box()?,
+        build_avi_uncv_bgr_uncc_box()?,
+    ];
+    build_avi_generic_visual_sample_entry_box_with_children(
+        SAMPLE_ENTRY_UNCV,
+        width,
+        height,
+        compressor_name,
+        &child_boxes,
+    )
+}
+
+fn build_avi_uncv_bgr_cmpd_box() -> Result<Vec<u8>, MuxError> {
+    let mut payload = Vec::with_capacity(10);
+    payload.extend_from_slice(&3_u32.to_be_bytes());
+    payload.extend_from_slice(&6_u16.to_be_bytes());
+    payload.extend_from_slice(&5_u16.to_be_bytes());
+    payload.extend_from_slice(&4_u16.to_be_bytes());
+    super::super::mp4::encode_raw_box(CMPD, &payload)
+}
+
+fn build_avi_uncv_bgr_uncc_box() -> Result<Vec<u8>, MuxError> {
+    let mut payload = Vec::with_capacity(51);
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&3_u32.to_be_bytes());
+    for component_index in 0_u16..3 {
+        payload.extend_from_slice(&component_index.to_be_bytes());
+        payload.push(7);
+        payload.push(0);
+        payload.push(0);
+    }
+    payload.push(0);
+    payload.push(1);
+    payload.push(0);
+    payload.push(0x08);
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    super::super::mp4::encode_raw_box(UNCC, &payload)
 }
 
 fn avi_avc1_mux_policy() -> super::super::import::ImportedTrackMuxPolicy {
@@ -2424,24 +3515,6 @@ fn parse_stream_chunk_index(chunk_type: FourCc) -> Option<usize> {
     Some(usize::from(bytes[0] - b'0') * 10 + usize::from(bytes[1] - b'0'))
 }
 
-fn build_avi_mp4v_sample_entry_box<I>(
-    video_format: &AviVideoFormat,
-    timescale: u32,
-    samples: I,
-) -> Result<Vec<u8>, MuxError>
-where
-    I: IntoIterator<Item = (u32, u32)>,
-{
-    build_mp4v_sample_entry_box(
-        video_format.width,
-        video_format.height,
-        &video_format.compressor_name,
-        &video_format.decoder_specific_info,
-        timescale,
-        samples,
-    )
-}
-
 fn build_avi_segmented_source_spec(
     path: &Path,
     chunks: &[AviChunkSpan],
@@ -2512,6 +3585,20 @@ fn invalid_avi(spec: &str, message: &str) -> MuxError {
         spec: spec.to_string(),
         message: message.to_string(),
     }
+}
+
+fn unsupported_avi_audio_format_tag_message(
+    stream_index: u32,
+    audio_format: AviAudioFormat,
+) -> String {
+    format!(
+        "AVI audio stream {stream_index} uses unsupported WAVE format tag 0x{:04X} (channels={}, sample_rate={}, bits_per_sample={}, block_align={}); native direct-ingest currently accepts {SUPPORTED_AVI_AUDIO_TAGS}",
+        audio_format.format_tag,
+        audio_format.channel_count,
+        audio_format.sample_rate,
+        audio_format.bits_per_sample,
+        audio_format.block_align,
+    )
 }
 
 #[cfg(test)]

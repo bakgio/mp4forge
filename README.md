@@ -75,9 +75,9 @@ feature flags:
   optional `segment_duration` or `fragment_duration`, real `ftyp`/`moov`/`mdat` writing for sync
   callers, additive async real-container writing when combined with `async`, internal chunk and
   duration coordination on one mux event graph, the retained low-level seekable and progressive
-  payload assembly helpers, and one-sample-at-a-time seekable or progressive readers that stay
-  aligned with the same staged plan model. It also enables the sync-only `mux` CLI route for one
-  output MP4 built from repeated path-first `--track` inputs.
+  payload assembly helpers, and one-sample-at-a-time seekable or progressive readers. It also 
+  enables the sync-only `mux` CLI route for one output MP4 built from repeated 
+  path-first `--track` inputs.
 - `serde`: derives `Serialize` and `Deserialize` for the reusable public report structs under
   `mp4forge::cli::probe` and `mp4forge::cli::dump`, along with their nested public codec-detail,
   media-characteristics, `FieldValue`, and `FourCc` data. This is intended for library-side report
@@ -112,11 +112,11 @@ and accepts repeated `--track` inputs, one required positional output path, and 
 `PATH#video`, `PATH#audio`, `PATH#audio:N`, `PATH#text`, `PATH#text:N`, and `PATH#track:ID`
 select one specific track from a containerized source. The landed path-only auto-detection
 currently covers MP4, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported
-MPEG-PS MPEG audio streams plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS
-MPEG audio streams plus AC-3/E-AC-3 audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC
+MPEG-PS MPEG audio streams plus LPCM audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS
+MPEG audio streams plus AAC LATM/MHAS plus AC-3/E-AC-3/AC-4/DTS/TrueHD audio plus MPEG-2/AV1/AVS3/MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC
 ADTS, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, AAC LATM, Dolby
-TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video,
-H.264 Annex B, H.265 Annex B, VVC Annex B, IVF-backed AV1, IVF-backed VP8, IVF-backed VP9,
+TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video,
+H.264 Annex B, H.265 Annex B, VVC Annex B, raw AV1 OBU, raw AV1 Annex B, IVF-backed AV1, IVF-backed VP8, IVF-backed VP9,
 JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg-backed FLAC,
 Ogg-backed Opus, Ogg-backed Vorbis, Ogg-backed Speex, Ogg-backed Theora, and CAF-backed ALAC.
 Broader DTS-family

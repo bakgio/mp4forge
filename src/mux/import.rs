@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "async")]
 use std::pin::Pin;
@@ -30,42 +30,49 @@ use crate::codec::{CodecBox, ImmutableBox};
 use crate::extract::{
     ExtractedBox, extract_box, extract_box_as, extract_box_bytes, extract_box_with_payload,
 };
-#[cfg(feature = "async")]
-use crate::extract::{
-    extract_box_as_async, extract_box_async, extract_box_bytes_async,
-    extract_box_with_payload_async,
-};
 use crate::header::BoxInfo as HeaderInfo;
 use crate::walk::BoxPath;
 
 use super::demux::{
-    DetectedContainerPathKind, DetectedPathTrackKind, detect_caf_track_kind_sync,
-    detect_id3_wrapped_audio_from_prefix, detect_ogg_track_kind_sync,
-    detect_path_track_kind_from_prefix, id3v2_size_from_prefix, scan_ac3_file_sync,
-    scan_ac4_file_sync, scan_adts_file_sync, scan_amr_file_sync, scan_amr_wb_file_sync,
-    scan_av1_file_sync, scan_avi_source_sync, scan_caf_alac_file_sync, scan_dts_file_sync,
-    scan_eac3_file_sync, scan_flac_file_sync, scan_h263_file_sync, scan_iamf_file_sync,
+    DetectedContainerPathKind, DetectedNhmlSidecarKind, DetectedPathTrackKind, ParsedAv1Track,
+    ParsedAv1TrackSource, ParsedDashSource, ParsedNhmlSource, ParsedNhmlSourceSpec,
+    PcmContainerKind, detect_caf_track_kind_sync, detect_container_path_kind_from_path_and_prefix,
+    detect_id3_wrapped_audio_from_prefix, detect_nhml_sidecar_kind, detect_ogg_track_kind_sync,
+    detect_path_track_kind_from_prefix, id3v2_size_from_prefix, parse_dash_source_sync,
+    parse_nhml_source_sync, scan_ac3_file_sync, scan_ac4_file_sync, scan_adts_file_sync,
+    scan_amr_file_sync, scan_amr_wb_file_sync, scan_av1_file_sync, scan_avi_source_sync,
+    scan_bmp_file_sync, scan_caf_alac_file_sync, scan_dts_file_sync, scan_eac3_file_sync,
+    scan_flac_file_sync, scan_h263_file_sync, scan_iamf_file_sync, scan_j2k_file_sync,
     scan_jpeg_file_sync, scan_latm_file_sync, scan_mhas_file_sync, scan_mp3_file_sync,
-    scan_mp4v_file_sync, scan_ogg_flac_file_sync, scan_ogg_opus_file_sync,
+    scan_mp4v_file_sync, scan_mpeg2v_file_sync, scan_ogg_flac_file_sync, scan_ogg_opus_file_sync,
     scan_ogg_speex_file_sync, scan_ogg_theora_file_sync, scan_ogg_vorbis_file_sync,
-    scan_pcm_file_sync, scan_png_file_sync, scan_program_stream_sync, scan_qcp_file_sync,
-    scan_transport_stream_sync, scan_truehd_file_sync, scan_vobsub_source_sync, scan_vp8_file_sync,
-    scan_vp9_file_sync, scan_vp10_file_sync, stage_annex_b_h264_sync, stage_annex_b_h265_sync,
-    stage_annex_b_vvc_sync,
+    scan_pcm_file_sync, scan_png_file_sync, scan_program_stream_sync, scan_prores_file_sync,
+    scan_qcp_file_sync, scan_raw_video_file_sync, scan_transport_stream_sync,
+    scan_truehd_file_sync, scan_vobsub_source_sync, scan_vp8_file_sync, scan_vp9_file_sync,
+    scan_vp10_file_sync, scan_y4m_file_sync, stage_annex_b_h264_sync, stage_annex_b_h265_sync,
+    stage_annex_b_vvc_sync, wrapped_dts_family_has_native_core_sync_sync,
 };
 #[cfg(feature = "async")]
 use super::demux::{
-    detect_caf_track_kind_async, detect_ogg_track_kind_async, scan_ac3_file_async,
-    scan_ac4_file_async, scan_adts_file_async, scan_amr_file_async, scan_amr_wb_file_async,
-    scan_av1_file_async, scan_avi_source_async, scan_caf_alac_file_async, scan_dts_file_async,
-    scan_eac3_file_async, scan_flac_file_async, scan_h263_file_async, scan_iamf_file_async,
+    detect_caf_track_kind_async, detect_ogg_track_kind_async, parse_dash_source_async,
+    parse_nhml_source_async, scan_ac3_file_async, scan_ac4_file_async, scan_adts_file_async,
+    scan_amr_file_async, scan_amr_wb_file_async, scan_av1_file_async, scan_avi_source_async,
+    scan_bmp_file_async, scan_caf_alac_file_async, scan_dts_file_async, scan_eac3_file_async,
+    scan_flac_file_async, scan_h263_file_async, scan_iamf_file_async, scan_j2k_file_async,
     scan_jpeg_file_async, scan_latm_file_async, scan_mhas_file_async, scan_mp3_file_async,
-    scan_mp4v_file_async, scan_ogg_flac_file_async, scan_ogg_opus_file_async,
-    scan_ogg_speex_file_async, scan_ogg_theora_file_async, scan_ogg_vorbis_file_async,
-    scan_pcm_file_async, scan_png_file_async, scan_program_stream_async, scan_qcp_file_async,
-    scan_transport_stream_async, scan_truehd_file_async, scan_vobsub_source_async,
-    scan_vp8_file_async, scan_vp9_file_async, scan_vp10_file_async, stage_annex_b_h264_async,
-    stage_annex_b_h265_async, stage_annex_b_vvc_async,
+    scan_mp4v_file_async, scan_mpeg2v_file_async, scan_ogg_flac_file_async,
+    scan_ogg_opus_file_async, scan_ogg_speex_file_async, scan_ogg_theora_file_async,
+    scan_ogg_vorbis_file_async, scan_pcm_file_async, scan_png_file_async,
+    scan_program_stream_async, scan_prores_file_async, scan_qcp_file_async,
+    scan_raw_video_file_async, scan_transport_stream_async, scan_truehd_file_async,
+    scan_vobsub_source_async, scan_vp8_file_async, scan_vp9_file_async, scan_vp10_file_async,
+    scan_y4m_file_async, stage_annex_b_h264_async, stage_annex_b_h265_async,
+    stage_annex_b_vvc_async, wrapped_dts_family_has_native_core_sync_async,
+};
+use super::inspect::{
+    DirectIngestDetectedKind, DirectIngestPacketEntry, DirectIngestPacketReport,
+    DirectIngestReport, DirectIngestSampleReport, DirectIngestSourceSegmentReport,
+    DirectIngestStagedSourceReport, DirectIngestTrackReport,
 };
 use super::mp4::write_fragmented_mp4_mux;
 #[cfg(feature = "async")]
@@ -74,10 +81,11 @@ use super::mp4::write_fragmented_mp4_mux_async;
 use super::write_mp4_mux_async;
 use super::{
     FlatTimingOverride, MuxDestinationMode, MuxDurationBoundaryKind, MuxError, MuxFileConfig,
-    MuxInterleavePolicy, MuxMp4TrackSelector, MuxOutputLayout, MuxRawCodec, MuxRequest,
-    MuxStagedMediaItem, MuxTrackConfig, MuxTrackKind, MuxTrackSpec, StscRunEncodingMode,
-    SyncSampleTableMode, TrackCoordinationDirective, build_capped_duration_chunk_sample_counts,
-    build_duration_chunk_sample_counts, build_duration_chunk_sample_counts_with_start_time,
+    MuxInterleavePolicy, MuxMp4TrackSelector, MuxOutputLayout, MuxRawCodec, MuxRawVideoParams,
+    MuxRequest, MuxStagedMediaItem, MuxTrackConfig, MuxTrackKind, MuxTrackSpec,
+    StscRunEncodingMode, SttsRunEncodingMode, SyncSampleTableMode, TrackCoordinationDirective,
+    build_capped_duration_chunk_sample_counts, build_duration_chunk_sample_counts,
+    build_duration_chunk_sample_counts_with_start_time,
     build_sync_aligned_segment_chunk_sample_counts, plan_staged_media_items_with_coordination,
     rebalance_small_multi_audio_chunk_sample_counts, write_mp4_mux,
 };
@@ -115,6 +123,14 @@ const ENCV: FourCc = FourCc::from_bytes(*b"encv");
 const ENCA: FourCc = FourCc::from_bytes(*b"enca");
 const NON_KEY_SAMPLE_FLAGS: u32 = 0x0001_0000;
 const AUTO_FLAT_INTERLEAVE_MILLISECONDS: u64 = 500;
+
+fn mux_io_at_path(operation: &'static str, path: &Path, source: io::Error) -> MuxError {
+    MuxError::Io(io::Error::new(
+        source.kind(),
+        format!("failed to {operation} `{}`: {source}", path.display()),
+    ))
+}
+
 /// Opens the requested track specs, validates the narrowed mux request shape, and writes one newly
 /// created output MP4 file to `output_path`.
 ///
@@ -154,7 +170,8 @@ fn mux_to_path_inner(request: &MuxRequest, output_path: &Path) -> Result<(), Mux
         .iter()
         .map(SyncMuxSource::open)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut writer = File::create(output_path)?;
+    let mut writer = File::create(output_path)
+        .map_err(|error| mux_io_at_path("create mux output", output_path, error))?;
     match prepared.output_layout {
         MuxOutputLayout::Flat => write_mp4_mux(
             &mut sources,
@@ -234,7 +251,9 @@ async fn mux_to_path_async_inner(request: &MuxRequest, output_path: &Path) -> Re
     for spec in &prepared.source_specs {
         sources.push(AsyncMuxSource::open(spec).await?);
     }
-    let output = TokioFile::create(output_path).await?;
+    let output = TokioFile::create(output_path)
+        .await
+        .map_err(|error| mux_io_at_path("create mux output", output_path, error))?;
     let mut writer = BufWriter::new(output);
     match prepared.output_layout {
         MuxOutputLayout::Flat => {
@@ -325,7 +344,15 @@ pub(in crate::mux) struct SegmentedMuxSourceSegment {
 pub(in crate::mux) enum SegmentedMuxSourceSegmentData {
     Prefix([u8; 4]),
     Bytes(Vec<u8>),
-    FileRange { source_offset: u64, size: u32 },
+    FileRange {
+        source_offset: u64,
+        size: u32,
+    },
+    ExternalFileRange {
+        path: PathBuf,
+        source_offset: u64,
+        size: u32,
+    },
 }
 
 impl SegmentedMuxSourceSegment {
@@ -334,6 +361,7 @@ impl SegmentedMuxSourceSegment {
             SegmentedMuxSourceSegmentData::Prefix(_) => 4,
             SegmentedMuxSourceSegmentData::Bytes(bytes) => u64::try_from(bytes.len()).unwrap(),
             SegmentedMuxSourceSegmentData::FileRange { size, .. } => u64::from(*size),
+            SegmentedMuxSourceSegmentData::ExternalFileRange { size, .. } => u64::from(*size),
         }
     }
 
@@ -389,22 +417,31 @@ enum SyncMuxSourceInner {
 }
 
 struct SegmentedSyncMuxSource {
+    primary_path: PathBuf,
     file: File,
+    extra_files: BTreeMap<PathBuf, File>,
     segments: Vec<SegmentedMuxSourceSegment>,
     total_size: u64,
     position: u64,
+    file_path: Option<PathBuf>,
     file_position: Option<u64>,
 }
 
 impl SyncMuxSource {
     fn open(spec: &SourceSpec) -> Result<Self, MuxError> {
         let inner = match spec {
-            SourceSpec::File(path) => SyncMuxSourceInner::File(File::open(path)?),
+            SourceSpec::File(path) => SyncMuxSourceInner::File(
+                File::open(path).map_err(|error| mux_io_at_path("open mux input", path, error))?,
+            ),
             SourceSpec::Segmented(spec) => SyncMuxSourceInner::Segmented(SegmentedSyncMuxSource {
-                file: File::open(&spec.path)?,
+                primary_path: spec.path.clone(),
+                file: File::open(&spec.path)
+                    .map_err(|error| mux_io_at_path("open mux input", &spec.path, error))?,
+                extra_files: BTreeMap::new(),
                 segments: spec.segments.clone(),
                 total_size: spec.total_size,
                 position: 0,
+                file_path: None,
                 file_position: None,
             }),
         };
@@ -413,6 +450,53 @@ impl SyncMuxSource {
 }
 
 impl SegmentedSyncMuxSource {
+    fn file_for_path_mut(&mut self, path: &Path) -> io::Result<&mut File> {
+        if path == self.primary_path {
+            return Ok(&mut self.file);
+        }
+        if !self.extra_files.contains_key(path) {
+            let opened = File::open(path)?;
+            self.extra_files.insert(path.to_path_buf(), opened);
+        }
+        Ok(self.extra_files.get_mut(path).unwrap())
+    }
+
+    fn read_file_range_into(
+        &mut self,
+        path: &Path,
+        source_offset: u64,
+        size: u32,
+        segment_offset: usize,
+        buf: &mut [u8],
+        written: &mut usize,
+    ) -> io::Result<()> {
+        let available =
+            usize::try_from(u64::from(size) - u64::try_from(segment_offset).unwrap())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment size overflow"))?;
+        let to_read = available.min(buf.len() - *written);
+        let file_offset = source_offset + u64::try_from(segment_offset).unwrap();
+        let should_seek =
+            self.file_path.as_deref() != Some(path) || self.file_position != Some(file_offset);
+        let read = {
+            let file = self.file_for_path_mut(path)?;
+            if should_seek {
+                file.seek(SeekFrom::Start(file_offset))?;
+            }
+            file.read(&mut buf[*written..*written + to_read])?
+        };
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated segmented mux source input",
+            ));
+        }
+        *written += read;
+        self.position += u64::try_from(read).unwrap();
+        self.file_path = Some(path.to_path_buf());
+        self.file_position = Some(file_offset + u64::try_from(read).unwrap());
+        Ok(())
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.position >= self.total_size {
             return Ok(0);
@@ -425,12 +509,13 @@ impl SegmentedSyncMuxSource {
             else {
                 break;
             };
-            let segment = &self.segments[segment_index];
+            let segment_logical_offset = self.segments[segment_index].logical_offset;
+            let segment_data = self.segments[segment_index].data.clone();
             let segment_offset =
-                usize::try_from(self.position - segment.logical_offset).map_err(|_| {
+                usize::try_from(self.position - segment_logical_offset).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "logical offset overflow")
                 })?;
-            match &segment.data {
+            match segment_data {
                 SegmentedMuxSourceSegmentData::Prefix(prefix) => {
                     let available = prefix.len().saturating_sub(segment_offset);
                     let to_copy = available.min(buf.len() - written);
@@ -450,29 +535,26 @@ impl SegmentedSyncMuxSource {
                 SegmentedMuxSourceSegmentData::FileRange {
                     source_offset,
                     size,
-                } => {
-                    let available =
-                        usize::try_from(u64::from(*size) - u64::try_from(segment_offset).unwrap())
-                            .map_err(|_| {
-                                io::Error::new(io::ErrorKind::InvalidData, "segment size overflow")
-                            })?;
-                    let to_read = available.min(buf.len() - written);
-                    let file_offset = source_offset + u64::try_from(segment_offset).unwrap();
-                    if self.file_position != Some(file_offset) {
-                        self.file.seek(SeekFrom::Start(file_offset))?;
-                        self.file_position = Some(file_offset);
-                    }
-                    let read = self.file.read(&mut buf[written..written + to_read])?;
-                    if read == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "truncated segmented mux source input",
-                        ));
-                    }
-                    written += read;
-                    self.position += u64::try_from(read).unwrap();
-                    self.file_position = Some(file_offset + u64::try_from(read).unwrap());
-                }
+                } => self.read_file_range_into(
+                    &self.primary_path.clone(),
+                    source_offset,
+                    size,
+                    segment_offset,
+                    buf,
+                    &mut written,
+                )?,
+                SegmentedMuxSourceSegmentData::ExternalFileRange {
+                    path,
+                    source_offset,
+                    size,
+                } => self.read_file_range_into(
+                    &path,
+                    source_offset,
+                    size,
+                    segment_offset,
+                    buf,
+                    &mut written,
+                )?,
             }
         }
         Ok(written)
@@ -515,36 +597,84 @@ enum AsyncMuxSourceInner {
 
 #[cfg(feature = "async")]
 struct SegmentedAsyncMuxSource {
+    primary_path: PathBuf,
     file: TokioFile,
+    extra_files: BTreeMap<PathBuf, TokioFile>,
     segments: Vec<SegmentedMuxSourceSegment>,
     total_size: u64,
     position: u64,
+    file_path: Option<PathBuf>,
     file_position: Option<u64>,
-    pending_file_seek: Option<u64>,
+    pending_file_seek: Option<(PathBuf, u64)>,
 }
 
 #[cfg(feature = "async")]
 impl AsyncMuxSource {
     async fn open(spec: &SourceSpec) -> Result<Self, MuxError> {
         let inner = match spec {
-            SourceSpec::File(path) => AsyncMuxSourceInner::File(TokioFile::open(path).await?),
+            SourceSpec::File(path) => AsyncMuxSourceInner::File(
+                TokioFile::open(path)
+                    .await
+                    .map_err(|error| mux_io_at_path("open mux input", path, error))?,
+            ),
             SourceSpec::Segmented(spec) => {
                 AsyncMuxSourceInner::Segmented(SegmentedAsyncMuxSource {
-                    file: TokioFile::open(&spec.path).await?,
+                    primary_path: spec.path.clone(),
+                    file: TokioFile::open(&spec.path)
+                        .await
+                        .map_err(|error| mux_io_at_path("open mux input", &spec.path, error))?,
+                    extra_files: BTreeMap::new(),
                     segments: spec.segments.clone(),
                     total_size: spec.total_size,
                     position: 0,
+                    file_path: None,
                     file_position: None,
                     pending_file_seek: None,
                 })
             }
         };
-        Ok(Self { inner })
+        let mut source = Self { inner };
+        if let AsyncMuxSourceInner::Segmented(segmented) = &mut source.inner {
+            segmented.open_external_files().await?;
+        }
+        Ok(source)
     }
 }
 
 #[cfg(feature = "async")]
 impl SegmentedAsyncMuxSource {
+    fn file_for_path_mut(&mut self, path: &Path) -> io::Result<&mut TokioFile> {
+        if path == self.primary_path {
+            return Ok(&mut self.file);
+        }
+        if !self.extra_files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "segmented async mux source file `{}` was not opened before polling",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(self.extra_files.get_mut(path).unwrap())
+    }
+
+    async fn open_external_files(&mut self) -> io::Result<()> {
+        let mut pending = Vec::new();
+        for segment in &self.segments {
+            if let SegmentedMuxSourceSegmentData::ExternalFileRange { path, .. } = &segment.data
+                && !self.extra_files.contains_key(path)
+            {
+                pending.push(path.clone());
+            }
+        }
+        for path in pending {
+            let file = TokioFile::open(&path).await?;
+            self.extra_files.insert(path, file);
+        }
+        Ok(())
+    }
+
     fn start_seek(&mut self, target: SeekFrom) -> io::Result<()> {
         self.position = seek_mux_source_position(self.position, self.total_size, target)?;
         Ok(())
@@ -590,51 +720,105 @@ impl SegmentedAsyncMuxSource {
                 source_offset,
                 size,
             } => {
-                let available =
-                    usize::try_from(u64::from(*size) - u64::try_from(segment_offset).unwrap())
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "segment size overflow")
-                        })?;
-                let to_read = available.min(buf.remaining()).min(8192);
-                let file_offset = source_offset + u64::try_from(segment_offset).unwrap();
-                if self.file_position != Some(file_offset) {
-                    if self.pending_file_seek.is_none() {
-                        Pin::new(&mut self.file).start_seek(SeekFrom::Start(file_offset))?;
-                        self.pending_file_seek = Some(file_offset);
-                    }
-                    match Pin::new(&mut self.file).poll_complete(cx) {
-                        Poll::Ready(Ok(position)) => {
-                            self.pending_file_seek = None;
-                            self.file_position = Some(position);
-                        }
-                        Poll::Ready(Err(error)) => {
-                            self.pending_file_seek = None;
-                            return Poll::Ready(Err(error));
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-
-                let mut scratch = [0_u8; 8192];
-                let mut temp = ReadBuf::new(&mut scratch[..to_read]);
-                match Pin::new(&mut self.file).poll_read(cx, &mut temp) {
-                    Poll::Ready(Ok(())) => {
-                        let read = temp.filled().len();
-                        if read == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "truncated segmented mux source input",
-                            )));
-                        }
-                        buf.put_slice(temp.filled());
-                        self.position += u64::try_from(read).unwrap();
-                        self.file_position = Some(file_offset + u64::try_from(read).unwrap());
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                    Poll::Pending => Poll::Pending,
-                }
+                let path = self.primary_path.clone();
+                self.poll_read_file_range(cx, buf, &path, *source_offset, *size, segment_offset)
             }
+            SegmentedMuxSourceSegmentData::ExternalFileRange {
+                path,
+                source_offset,
+                size,
+            } => {
+                let path = path.clone();
+                self.poll_read_file_range(cx, buf, &path, *source_offset, *size, segment_offset)
+            }
+        }
+    }
+
+    fn poll_read_file_range(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+        path: &Path,
+        source_offset: u64,
+        size: u32,
+        segment_offset: usize,
+    ) -> Poll<io::Result<()>> {
+        let available =
+            match usize::try_from(u64::from(size) - u64::try_from(segment_offset).unwrap()) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "segment size overflow",
+                    )));
+                }
+            };
+        let to_read = available.min(buf.remaining()).min(8192);
+        let file_offset = source_offset + u64::try_from(segment_offset).unwrap();
+        let should_seek =
+            self.file_path.as_deref() != Some(path) || self.file_position != Some(file_offset);
+        if should_seek {
+            if self.pending_file_seek.is_none() {
+                let start_seek = {
+                    let file = match self.file_for_path_mut(path) {
+                        Ok(file) => file,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
+                    Pin::new(file).start_seek(SeekFrom::Start(file_offset))
+                };
+                if let Err(error) = start_seek {
+                    return Poll::Ready(Err(error));
+                }
+                self.pending_file_seek = Some((path.to_path_buf(), file_offset));
+            }
+            let seek_target = self.pending_file_seek.clone().unwrap();
+            let poll = {
+                let file = match self.file_for_path_mut(&seek_target.0) {
+                    Ok(file) => file,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                Pin::new(file).poll_complete(cx)
+            };
+            match poll {
+                Poll::Ready(Ok(position)) => {
+                    self.pending_file_seek = None;
+                    self.file_path = Some(path.to_path_buf());
+                    self.file_position = Some(position);
+                }
+                Poll::Ready(Err(error)) => {
+                    self.pending_file_seek = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let mut scratch = [0_u8; 8192];
+        let mut temp = ReadBuf::new(&mut scratch[..to_read]);
+        let poll = {
+            let file = match self.file_for_path_mut(path) {
+                Ok(file) => file,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            Pin::new(file).poll_read(cx, &mut temp)
+        };
+        match poll {
+            Poll::Ready(Ok(())) => {
+                let read = temp.filled().len();
+                if read == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated segmented mux source input",
+                    )));
+                }
+                buf.put_slice(temp.filled());
+                self.position += u64::try_from(read).unwrap();
+                self.file_path = Some(path.to_path_buf());
+                self.file_position = Some(file_offset + u64::try_from(read).unwrap());
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -684,6 +868,34 @@ struct ImportedTrack {
     samples: Vec<ImportedSample>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportedTrackHeaderPolicy {
+    tkhd_flags: u32,
+    alternate_group: i16,
+    volume: i16,
+    matrix: [i32; 9],
+}
+
+const DEFAULT_IMPORTED_TKHD_FLAGS: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+const DEFAULT_IMPORTED_TKHD_MATRIX: [i32; 9] =
+    [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+
+const fn default_imported_track_header_policy(kind: MuxTrackKind) -> ImportedTrackHeaderPolicy {
+    ImportedTrackHeaderPolicy {
+        tkhd_flags: DEFAULT_IMPORTED_TKHD_FLAGS,
+        alternate_group: match kind {
+            MuxTrackKind::Audio => 1,
+            MuxTrackKind::Subtitle => 0,
+            MuxTrackKind::Video | MuxTrackKind::Text => 0,
+        },
+        volume: match kind {
+            MuxTrackKind::Audio => 0x0100,
+            MuxTrackKind::Video | MuxTrackKind::Text | MuxTrackKind::Subtitle => 0,
+        },
+        matrix: DEFAULT_IMPORTED_TKHD_MATRIX,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ImportedSample {
     source_index: usize,
@@ -698,21 +910,92 @@ struct ImportedSample {
 pub(in crate::mux) enum FlatTimingOverrideKind {
     None,
     IamfSequencePresentation,
+    ZeroDurationSamples,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlatChunkingMode {
+    Auto,
+    OneSamplePerChunk,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::mux) struct ImportedTrackMuxPolicy {
     sync_sample_table_mode: SyncSampleTableMode,
+    stts_run_encoding_mode: SttsRunEncodingMode,
     stsc_run_encoding_mode: StscRunEncodingMode,
     flat_timing_override_kind: FlatTimingOverrideKind,
+    flat_chunking_mode: FlatChunkingMode,
+    preferred_track_id: Option<u32>,
+    sample_roll_distance: Option<i16>,
+    header_policy: Option<ImportedTrackHeaderPolicy>,
+    strip_single_sample_dts_btrt: bool,
 }
 
 impl ImportedTrackMuxPolicy {
     const DEFAULT: Self = Self {
         sync_sample_table_mode: SyncSampleTableMode::Auto,
+        stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
         stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
         flat_timing_override_kind: FlatTimingOverrideKind::None,
+        flat_chunking_mode: FlatChunkingMode::Auto,
+        preferred_track_id: None,
+        sample_roll_distance: None,
+        header_policy: None,
+        strip_single_sample_dts_btrt: false,
     };
+
+    const fn with_preferred_track_id(mut self, preferred_track_id: u32) -> Self {
+        self.preferred_track_id = if preferred_track_id == 0 {
+            None
+        } else {
+            Some(preferred_track_id)
+        };
+        self
+    }
+
+    const fn preferred_track_id(self) -> Option<u32> {
+        self.preferred_track_id
+    }
+
+    pub(crate) const fn sample_roll_distance(self) -> Option<i16> {
+        self.sample_roll_distance
+    }
+
+    pub(crate) const fn with_sample_roll_distance(mut self, sample_roll_distance: i16) -> Self {
+        self.sample_roll_distance = Some(sample_roll_distance);
+        self
+    }
+
+    const fn header_policy(self) -> Option<ImportedTrackHeaderPolicy> {
+        self.header_policy
+    }
+
+    const fn with_header_policy(mut self, header_policy: ImportedTrackHeaderPolicy) -> Self {
+        self.header_policy = Some(header_policy);
+        self
+    }
+
+    pub(crate) const fn stts_run_encoding_mode(self) -> SttsRunEncodingMode {
+        self.stts_run_encoding_mode
+    }
+
+    pub(crate) const fn with_stts_run_encoding_mode(
+        mut self,
+        stts_run_encoding_mode: SttsRunEncodingMode,
+    ) -> Self {
+        self.stts_run_encoding_mode = stts_run_encoding_mode;
+        self
+    }
+
+    pub(crate) const fn strip_single_sample_dts_btrt(self) -> bool {
+        self.strip_single_sample_dts_btrt
+    }
+
+    pub(crate) const fn with_strip_single_sample_dts_btrt(mut self, enabled: bool) -> Self {
+        self.strip_single_sample_dts_btrt = enabled;
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -784,85 +1067,160 @@ fn prepare_request_sync(
     validate_request_shape(request, output_path)?;
 
     let mut path_kinds = Vec::with_capacity(request.tracks().len());
-    let mut all_mp4_inputs = true;
+    let mut all_profile_authority_inputs = true;
     for track in request.tracks() {
         let kind = match track {
             MuxTrackSpec::Path { path, .. } => detect_path_track_kind_sync(path)?,
+            MuxTrackSpec::RawVideo { .. } => DetectedPathTrackKind::Unknown,
         };
-        if !matches!(kind, DetectedPathTrackKind::Mp4) {
-            all_mp4_inputs = false;
+        if !matches!(
+            kind,
+            DetectedPathTrackKind::Mp4
+                | DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash)
+        ) {
+            all_profile_authority_inputs = false;
         }
         path_kinds.push(kind);
     }
     let mut sources = SourceCatalog::default();
     let mut mp4_cache = BTreeMap::<PathBuf, PathSourceMetadata>::new();
     let mut avi_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut dash_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut nhml_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut program_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut saf_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut transport_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut vobsub_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut imported_tracks = Vec::new();
     let mut authority_file_config = None::<MuxFileConfig>;
 
     for (track, path_kind) in request.tracks().iter().zip(path_kinds.into_iter()) {
-        let MuxTrackSpec::Path { path, selector } = track;
         let spec = display_track_spec(track);
-        let selector = *selector;
-        match path_kind {
-            DetectedPathTrackKind::Mp4 => {
-                let metadata = load_mp4_source_sync(path.as_path(), &mut mp4_cache, &mut sources)?;
-                if all_mp4_inputs && authority_file_config.is_none() {
-                    authority_file_config = metadata.file_config.clone();
-                }
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
-                let metadata = load_avi_source_sync(path.as_path(), &mut avi_cache, &mut sources)?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
-                let metadata = load_program_stream_source_sync(
+        match track {
+            MuxTrackSpec::RawVideo { path, params } => {
+                imported_tracks.push(import_raw_video_sync(
                     path.as_path(),
-                    &mut program_stream_cache,
-                    &mut sources,
-                )?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
-                let metadata = load_transport_stream_source_sync(
-                    path.as_path(),
-                    &mut transport_stream_cache,
-                    &mut sources,
-                )?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
-                let metadata =
-                    load_vobsub_source_sync(path.as_path(), &mut vobsub_cache, &mut sources)?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Raw(_)
-            | DetectedPathTrackKind::Mp4ImportOnly(_)
-            | DetectedPathTrackKind::Unknown => {
-                if let Some(selector) = selector {
-                    return Err(MuxError::UnsupportedTrackImport {
-                        spec,
-                        message: format!(
-                            "selector `{}` only applies to containerized sources",
-                            format_mp4_selector(selector)
-                        ),
-                    });
-                }
-                imported_tracks.push(import_detected_path_raw_sync(
-                    path.as_path(),
-                    &spec,
+                    *params,
+                    spec,
                     &mut sources,
                 )?);
+                continue;
             }
+            MuxTrackSpec::Path { path, selector } => match path_kind {
+                DetectedPathTrackKind::Mp4 => {
+                    let metadata =
+                        load_mp4_source_sync(path.as_path(), &mut mp4_cache, &mut sources)?;
+                    if all_profile_authority_inputs && authority_file_config.is_none() {
+                        authority_file_config = metadata.file_config.clone();
+                    }
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, false)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+                    let metadata =
+                        load_avi_source_sync(path.as_path(), &mut avi_cache, &mut sources)?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash) => {
+                    let metadata =
+                        load_dash_source_sync(path.as_path(), &mut dash_cache, &mut sources)?;
+                    if all_profile_authority_inputs && authority_file_config.is_none() {
+                        authority_file_config = metadata.file_config.clone();
+                    }
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi) => {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec,
+                        message: unsupported_ghi_container_message().to_string(),
+                    });
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec,
+                        message: unsupported_gsf_container_message().to_string(),
+                    });
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml) => {
+                    let metadata = load_nhml_source_sync(
+                        path.as_path(),
+                        DetectedNhmlSidecarKind::Nhml,
+                        &mut nhml_cache,
+                        &mut sources,
+                    )?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt) => {
+                    let metadata = load_nhml_source_sync(
+                        path.as_path(),
+                        DetectedNhmlSidecarKind::Nhnt,
+                        &mut nhml_cache,
+                        &mut sources,
+                    )?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+                    let metadata = load_program_stream_source_sync(
+                        path.as_path(),
+                        &mut program_stream_cache,
+                        &mut sources,
+                    )?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf) => {
+                    let metadata =
+                        load_saf_source_sync(path.as_path(), &mut saf_cache, &mut sources)?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+                    let metadata = load_transport_stream_source_sync(
+                        path.as_path(),
+                        &mut transport_stream_cache,
+                        &mut sources,
+                    )?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+                    let metadata =
+                        load_vobsub_source_sync(path.as_path(), &mut vobsub_cache, &mut sources)?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Raw(_)
+                | DetectedPathTrackKind::Mp4ImportOnly(_)
+                | DetectedPathTrackKind::Unknown => {
+                    if let Some(selector) = selector {
+                        return Err(MuxError::UnsupportedTrackImport {
+                            spec,
+                            message: format!(
+                                "selector `{}` only applies to containerized sources",
+                                format_mp4_selector(*selector)
+                            ),
+                        });
+                    }
+                    imported_tracks.push(import_detected_path_raw_sync(
+                        path.as_path(),
+                        &spec,
+                        &mut sources,
+                    )?);
+                }
+            },
         }
     }
 
@@ -883,88 +1241,161 @@ async fn prepare_request_async(
     validate_request_shape(request, output_path)?;
 
     let mut path_kinds = Vec::with_capacity(request.tracks().len());
-    let mut all_mp4_inputs = true;
+    let mut all_profile_authority_inputs = true;
     for track in request.tracks() {
         let kind = match track {
             MuxTrackSpec::Path { path, .. } => detect_path_track_kind_async(path).await?,
+            MuxTrackSpec::RawVideo { .. } => DetectedPathTrackKind::Unknown,
         };
-        if !matches!(kind, DetectedPathTrackKind::Mp4) {
-            all_mp4_inputs = false;
+        if !matches!(
+            kind,
+            DetectedPathTrackKind::Mp4
+                | DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash)
+        ) {
+            all_profile_authority_inputs = false;
         }
         path_kinds.push(kind);
     }
     let mut sources = SourceCatalog::default();
     let mut mp4_cache = BTreeMap::<PathBuf, PathSourceMetadata>::new();
     let mut avi_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut dash_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut nhml_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut program_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
+    let mut saf_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut transport_stream_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut vobsub_cache = BTreeMap::<PathBuf, ContainerSourceMetadata>::new();
     let mut imported_tracks = Vec::new();
     let mut authority_file_config = None::<MuxFileConfig>;
 
     for (track, path_kind) in request.tracks().iter().zip(path_kinds.into_iter()) {
-        let MuxTrackSpec::Path { path, selector } = track;
         let spec = display_track_spec(track);
-        let selector = *selector;
-        match path_kind {
-            DetectedPathTrackKind::Mp4 => {
-                let metadata =
-                    load_mp4_source_async(path.as_path(), &mut mp4_cache, &mut sources).await?;
-                if all_mp4_inputs && authority_file_config.is_none() {
-                    authority_file_config = metadata.file_config.clone();
+        match track {
+            MuxTrackSpec::RawVideo { path, params } => {
+                imported_tracks.push(
+                    import_raw_video_async(path.as_path(), *params, spec, &mut sources).await?,
+                );
+                continue;
+            }
+            MuxTrackSpec::Path { path, selector } => match path_kind {
+                DetectedPathTrackKind::Mp4 => {
+                    let metadata =
+                        load_mp4_source_async(path.as_path(), &mut mp4_cache, &mut sources).await?;
+                    if all_profile_authority_inputs && authority_file_config.is_none() {
+                        authority_file_config = metadata.file_config.clone();
+                    }
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, false)?;
+                    imported_tracks.append(&mut selected);
                 }
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
-                let metadata =
-                    load_avi_source_async(path.as_path(), &mut avi_cache, &mut sources).await?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
-                let metadata = load_program_stream_source_async(
-                    path.as_path(),
-                    &mut program_stream_cache,
-                    &mut sources,
-                )
-                .await?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
-                let metadata = load_transport_stream_source_async(
-                    path.as_path(),
-                    &mut transport_stream_cache,
-                    &mut sources,
-                )
-                .await?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
-                let metadata =
-                    load_vobsub_source_async(path.as_path(), &mut vobsub_cache, &mut sources)
-                        .await?;
-                let mut selected = select_container_tracks(&metadata.tracks, selector, spec)?;
-                imported_tracks.append(&mut selected);
-            }
-            DetectedPathTrackKind::Raw(_)
-            | DetectedPathTrackKind::Mp4ImportOnly(_)
-            | DetectedPathTrackKind::Unknown => {
-                if let Some(selector) = selector {
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+                    let metadata =
+                        load_avi_source_async(path.as_path(), &mut avi_cache, &mut sources).await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash) => {
+                    let metadata =
+                        load_dash_source_async(path.as_path(), &mut dash_cache, &mut sources)
+                            .await?;
+                    if all_profile_authority_inputs && authority_file_config.is_none() {
+                        authority_file_config = metadata.file_config.clone();
+                    }
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi) => {
                     return Err(MuxError::UnsupportedTrackImport {
                         spec,
-                        message: format!(
-                            "selector `{}` only applies to containerized sources",
-                            format_mp4_selector(selector)
-                        ),
+                        message: unsupported_ghi_container_message().to_string(),
                     });
                 }
-                imported_tracks.push(
-                    import_detected_path_raw_async(path.as_path(), &spec, &mut sources).await?,
-                );
-            }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec,
+                        message: unsupported_gsf_container_message().to_string(),
+                    });
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml) => {
+                    let metadata = load_nhml_source_async(
+                        path.as_path(),
+                        DetectedNhmlSidecarKind::Nhml,
+                        &mut nhml_cache,
+                        &mut sources,
+                    )
+                    .await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt) => {
+                    let metadata = load_nhml_source_async(
+                        path.as_path(),
+                        DetectedNhmlSidecarKind::Nhnt,
+                        &mut nhml_cache,
+                        &mut sources,
+                    )
+                    .await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+                    let metadata = load_program_stream_source_async(
+                        path.as_path(),
+                        &mut program_stream_cache,
+                        &mut sources,
+                    )
+                    .await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf) => {
+                    let metadata =
+                        load_saf_source_async(path.as_path(), &mut saf_cache, &mut sources).await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+                    let metadata = load_transport_stream_source_async(
+                        path.as_path(),
+                        &mut transport_stream_cache,
+                        &mut sources,
+                    )
+                    .await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+                    let metadata =
+                        load_vobsub_source_async(path.as_path(), &mut vobsub_cache, &mut sources)
+                            .await?;
+                    let mut selected =
+                        select_container_tracks(&metadata.tracks, *selector, spec, true)?;
+                    imported_tracks.append(&mut selected);
+                }
+                DetectedPathTrackKind::Raw(_)
+                | DetectedPathTrackKind::Mp4ImportOnly(_)
+                | DetectedPathTrackKind::Unknown => {
+                    if let Some(selector) = selector {
+                        return Err(MuxError::UnsupportedTrackImport {
+                            spec,
+                            message: format!(
+                                "selector `{}` only applies to containerized sources",
+                                format_mp4_selector(*selector)
+                            ),
+                        });
+                    }
+                    imported_tracks.push(
+                        import_detected_path_raw_async(path.as_path(), &spec, &mut sources).await?,
+                    );
+                }
+            },
         }
     }
 
@@ -997,7 +1428,12 @@ fn finish_prepared_request(
         authority_file_config.as_ref(),
         request.output_layout(),
     )?;
-    let file_config = choose_file_config(movie_timescale, authority_file_config.as_ref());
+    let file_config = choose_file_config(
+        movie_timescale,
+        &imported_tracks,
+        &sources,
+        authority_file_config.as_ref(),
+    );
     let duration_boundary_kind = request
         .duration_mode()
         .map(|duration_mode| match duration_mode {
@@ -1050,9 +1486,11 @@ fn finish_prepared_request(
     let mut staged_items = Vec::new();
     let mut track_configs = Vec::new();
     let mut coordination_directives = Vec::new();
-    for (index, imported_track) in imported_tracks.iter().enumerate() {
-        let track_id = u32::try_from(index + 1)
-            .map_err(|_| MuxError::LayoutOverflow("track identifier assignment"))?;
+    let assigned_track_ids = assign_imported_track_ids(&imported_tracks)?;
+    for (imported_track, track_id) in imported_tracks.iter().zip(assigned_track_ids) {
+        let normalized_sample_entry_box = normalize_imported_sample_entry_box(imported_track)?;
+        let allow_inexact_movie_scaling = imported_track.mux_policy.header_policy().is_some()
+            && imported_track.timescale != movie_timescale;
         let mut decode_time = 0_u64;
         if let (Some(target_ticks), Some(duration_boundary_kind)) =
             (duration_target, duration_boundary_kind)
@@ -1066,6 +1504,7 @@ fn finish_prepared_request(
                         i64::from(sample.duration),
                         imported_track.timescale,
                         movie_timescale,
+                        allow_inexact_movie_scaling,
                     )
                     .map(|duration| duration as u32)
                 })
@@ -1082,6 +1521,7 @@ fn finish_prepared_request(
                                 })?,
                                 imported_track.timescale,
                                 movie_timescale,
+                                allow_inexact_movie_scaling,
                             )
                             .map(|normalized| -normalized)
                         })
@@ -1097,6 +1537,7 @@ fn finish_prepared_request(
                                 i64::from(sample.composition_time_offset),
                                 imported_track.timescale,
                                 movie_timescale,
+                                allow_inexact_movie_scaling,
                             )?;
                             Ok((
                                 duration_ticks,
@@ -1122,6 +1563,7 @@ fn finish_prepared_request(
                                 })?,
                                 imported_track.timescale,
                                 movie_timescale,
+                                allow_inexact_movie_scaling,
                             )
                             .map(|normalized| -normalized)
                         })
@@ -1147,32 +1589,44 @@ fn finish_prepared_request(
             }
         } else if let Some(target_ticks) = auto_flat_interleave_target {
             if imported_track.kind.is_audio() {
-                let normalized_sample_durations = imported_track
-                    .samples
-                    .iter()
-                    .map(|sample| {
-                        scale_track_time_to_movie(
+                if !imported_track.samples.is_empty() {
+                    if imported_track.mux_policy.flat_chunking_mode
+                        == FlatChunkingMode::OneSamplePerChunk
+                    {
+                        coordination_directives.push(TrackCoordinationDirective::new(
                             track_id,
-                            i64::from(sample.duration),
-                            imported_track.timescale,
-                            movie_timescale,
-                        )
-                        .map(|duration| duration as u32)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if !normalized_sample_durations.is_empty() {
-                    let mut chunk_sample_counts = build_capped_duration_chunk_sample_counts(
-                        track_id,
-                        normalized_sample_durations,
-                        target_ticks,
-                    )?;
-                    if audio_track_count > 1 {
-                        rebalance_small_multi_audio_chunk_sample_counts(&mut chunk_sample_counts);
+                            vec![1; imported_track.samples.len()],
+                        ));
+                    } else {
+                        let normalized_sample_durations = imported_track
+                            .samples
+                            .iter()
+                            .map(|sample| {
+                                scale_track_time_to_movie(
+                                    track_id,
+                                    i64::from(sample.duration),
+                                    imported_track.timescale,
+                                    movie_timescale,
+                                    allow_inexact_movie_scaling,
+                                )
+                                .map(|duration| duration as u32)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut chunk_sample_counts = build_capped_duration_chunk_sample_counts(
+                            track_id,
+                            normalized_sample_durations,
+                            target_ticks,
+                        )?;
+                        if audio_track_count > 1 {
+                            rebalance_small_multi_audio_chunk_sample_counts(
+                                &mut chunk_sample_counts,
+                            );
+                        }
+                        coordination_directives.push(TrackCoordinationDirective::new(
+                            track_id,
+                            chunk_sample_counts,
+                        ));
                     }
-                    coordination_directives.push(TrackCoordinationDirective::new(
-                        track_id,
-                        chunk_sample_counts,
-                    ));
                 }
             } else if imported_track.kind == MuxTrackKind::Subtitle
                 && imported_track.sample_entry_box.get(4..8) == Some(b"mp4s".as_slice())
@@ -1199,12 +1653,14 @@ fn finish_prepared_request(
                 i64::from(sample.duration),
                 imported_track.timescale,
                 movie_timescale,
+                allow_inexact_movie_scaling,
             )? as u32;
             let composition_time_offset = scale_track_time_to_movie(
                 track_id,
                 i64::from(sample.composition_time_offset),
                 imported_track.timescale,
                 movie_timescale,
+                allow_inexact_movie_scaling,
             )? as i32;
             staged_items.push(
                 MuxStagedMediaItem::new(
@@ -1227,33 +1683,62 @@ fn finish_prepared_request(
             MuxTrackKind::Audio => MuxTrackConfig::new_audio(
                 track_id,
                 imported_track.timescale,
-                imported_track.sample_entry_box.clone(),
+                normalized_sample_entry_box.clone(),
             ),
             MuxTrackKind::Video => MuxTrackConfig::new_video(
                 track_id,
                 imported_track.timescale,
                 imported_track.width,
                 imported_track.height,
-                imported_track.sample_entry_box.clone(),
+                normalized_sample_entry_box.clone(),
             ),
             MuxTrackKind::Text => MuxTrackConfig::new_text(
                 track_id,
                 imported_track.timescale,
                 imported_track.width,
                 imported_track.height,
-                imported_track.sample_entry_box.clone(),
+                normalized_sample_entry_box.clone(),
             ),
             MuxTrackKind::Subtitle => MuxTrackConfig::new_subtitle(
                 track_id,
                 imported_track.timescale,
                 imported_track.width,
                 imported_track.height,
-                imported_track.sample_entry_box.clone(),
+                normalized_sample_entry_box.clone(),
             ),
         }
         .with_language(imported_track.language)
         .with_handler_name(imported_track.handler_name.clone())
+        .with_tkhd_flags(
+            imported_track
+                .mux_policy
+                .header_policy()
+                .unwrap_or_else(|| default_imported_track_header_policy(imported_track.kind))
+                .tkhd_flags,
+        )
+        .with_alternate_group(
+            imported_track
+                .mux_policy
+                .header_policy()
+                .unwrap_or_else(|| default_imported_track_header_policy(imported_track.kind))
+                .alternate_group,
+        )
+        .with_volume(
+            imported_track
+                .mux_policy
+                .header_policy()
+                .unwrap_or_else(|| default_imported_track_header_policy(imported_track.kind))
+                .volume,
+        )
+        .with_matrix(
+            imported_track
+                .mux_policy
+                .header_policy()
+                .unwrap_or_else(|| default_imported_track_header_policy(imported_track.kind))
+                .matrix,
+        )
         .with_sync_sample_table_mode(sync_sample_table_mode_for_imported_track(imported_track))
+        .with_stts_run_encoding_mode(stts_run_encoding_mode_for_imported_track(imported_track))
         .with_stsc_run_encoding_mode(stsc_run_encoding_mode_for_imported_track(imported_track));
         let config = if let Some(edit_media_time) = imported_track.source_edit_media_time {
             config.with_edit_media_time(edit_media_time)
@@ -1266,7 +1751,7 @@ fn finish_prepared_request(
             config
         };
         let config = if let Some(flat_timing_override) =
-            flat_timing_override_for_imported_track(imported_track)
+            flat_timing_override_for_imported_track(imported_track, movie_timescale)
         {
             config.with_flat_timing_override(flat_timing_override)
         } else {
@@ -1301,6 +1786,7 @@ fn auto_flat_interleave_target_ticks(movie_timescale: u32) -> u64 {
 struct SourceCatalog {
     specs: Vec<SourceSpec>,
     files: BTreeMap<PathBuf, usize>,
+    flat_source_encoding_metadata: BTreeMap<usize, String>,
 }
 
 impl SourceCatalog {
@@ -1321,6 +1807,17 @@ impl SourceCatalog {
         self.specs.push(SourceSpec::Segmented(spec));
         Ok(index)
     }
+
+    fn set_flat_source_encoding_metadata(&mut self, source_index: usize, metadata: String) {
+        self.flat_source_encoding_metadata
+            .insert(source_index, metadata);
+    }
+
+    fn flat_source_encoding_metadata(&self, source_index: usize) -> Option<&str> {
+        self.flat_source_encoding_metadata
+            .get(&source_index)
+            .map(String::as_str)
+    }
 }
 
 struct PathSourceMetadata {
@@ -1329,7 +1826,356 @@ struct PathSourceMetadata {
 }
 
 struct ContainerSourceMetadata {
+    file_config: Option<MuxFileConfig>,
     tracks: Vec<TrackCandidate>,
+}
+
+fn remap_candidate_source_indices(
+    track: &mut TrackCandidate,
+    source_index_map: &BTreeMap<usize, usize>,
+) -> Result<(), MuxError> {
+    for sample in &mut track.samples {
+        sample.source_index =
+            *source_index_map
+                .get(&sample.source_index)
+                .ok_or(MuxError::MissingSourceIndex {
+                    source_index: sample.source_index,
+                    source_count: source_index_map.len(),
+                })?;
+    }
+    Ok(())
+}
+
+fn materialize_parsed_nhml_source(
+    parsed: ParsedNhmlSource,
+    sources: &mut SourceCatalog,
+) -> Result<ContainerSourceMetadata, MuxError> {
+    let mut source_index_map = BTreeMap::<usize, usize>::new();
+    for (xml_source_index, spec) in parsed.source_specs {
+        let source_index = match spec {
+            ParsedNhmlSourceSpec::File(path) => sources.add_file(&path)?,
+            ParsedNhmlSourceSpec::Segmented(spec) => sources.add_segmented(spec)?,
+        };
+        source_index_map.insert(xml_source_index, source_index);
+    }
+    let mut tracks = parsed.tracks;
+    for track in &mut tracks {
+        remap_candidate_source_indices(track, &source_index_map)?;
+    }
+    Ok(ContainerSourceMetadata {
+        file_config: None,
+        tracks,
+    })
+}
+
+fn materialize_parsed_dash_source(
+    manifest_path: &Path,
+    parsed: ParsedDashSource,
+    sources: &mut SourceCatalog,
+) -> Result<ContainerSourceMetadata, MuxError> {
+    let period_count = parsed.periods.len();
+    let mut merged_tracks = Vec::new();
+    let mut authority_file_config = None::<MuxFileConfig>;
+    let mut saw_authority_file_config = false;
+    let mut authority_file_config_compatible = true;
+    for period in parsed.periods {
+        let mut period_tracks = Vec::new();
+        for spec in period.sources {
+            let source_index = sources.add_segmented(spec.clone())?;
+            let mut reader = SyncMuxSource::open(&SourceSpec::Segmented(spec))?;
+            let parsed = parse_mp4_source_sync(manifest_path, source_index, &mut reader)?;
+            merge_dash_file_config(
+                &mut authority_file_config,
+                &mut saw_authority_file_config,
+                &mut authority_file_config_compatible,
+                parsed.file_config.as_ref(),
+            );
+            period_tracks.extend(parsed.tracks);
+        }
+        merge_dash_period_tracks(
+            manifest_path,
+            &mut merged_tracks,
+            period_tracks,
+            period.start_millis,
+        )?;
+    }
+    for track in &mut merged_tracks {
+        track.mux_policy = track.mux_policy.with_strip_single_sample_dts_btrt(true);
+        if period_count > 1 && track_candidate_uses_dts_family(track) {
+            track.mux_policy = track
+                .mux_policy
+                .with_stts_run_encoding_mode(SttsRunEncodingMode::PreservePerSample);
+        }
+        normalize_local_dash_track_header_policy(track);
+    }
+    Ok(ContainerSourceMetadata {
+        file_config: authority_file_config.map(normalize_local_dash_authority_file_config),
+        tracks: merged_tracks,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn materialize_parsed_dash_source_async(
+    manifest_path: &Path,
+    parsed: ParsedDashSource,
+    sources: &mut SourceCatalog,
+) -> Result<ContainerSourceMetadata, MuxError> {
+    let period_count = parsed.periods.len();
+    let mut merged_tracks = Vec::new();
+    let mut authority_file_config = None::<MuxFileConfig>;
+    let mut saw_authority_file_config = false;
+    let mut authority_file_config_compatible = true;
+    for period in parsed.periods {
+        let mut period_tracks = Vec::new();
+        for spec in period.sources {
+            let source_index = sources.add_segmented(spec.clone())?;
+            let mut reader = AsyncMuxSource::open(&SourceSpec::Segmented(spec)).await?;
+            let parsed = parse_mp4_source_async(manifest_path, source_index, &mut reader).await?;
+            merge_dash_file_config(
+                &mut authority_file_config,
+                &mut saw_authority_file_config,
+                &mut authority_file_config_compatible,
+                parsed.file_config.as_ref(),
+            );
+            period_tracks.extend(parsed.tracks);
+        }
+        merge_dash_period_tracks(
+            manifest_path,
+            &mut merged_tracks,
+            period_tracks,
+            period.start_millis,
+        )?;
+    }
+    for track in &mut merged_tracks {
+        track.mux_policy = track.mux_policy.with_strip_single_sample_dts_btrt(true);
+        if period_count > 1 && track_candidate_uses_dts_family(track) {
+            track.mux_policy = track
+                .mux_policy
+                .with_stts_run_encoding_mode(SttsRunEncodingMode::PreservePerSample);
+        }
+        normalize_local_dash_track_header_policy(track);
+    }
+    Ok(ContainerSourceMetadata {
+        file_config: authority_file_config.map(normalize_local_dash_authority_file_config),
+        tracks: merged_tracks,
+    })
+}
+
+fn normalize_local_dash_authority_file_config(file_config: MuxFileConfig) -> MuxFileConfig {
+    file_config
+        .with_minor_version(1)
+        .with_keep_flat_free_box(true)
+        .with_auto_flat_profile(true)
+        .with_keep_flat_authority_brands(true)
+        .with_preserve_auto_flat_movie_timescale(true)
+}
+
+fn normalize_local_dash_track_header_policy(track: &mut TrackCandidate) {
+    if track.kind != MuxTrackKind::Audio {
+        return;
+    }
+    let Some(mut header_policy) = track.mux_policy.header_policy() else {
+        return;
+    };
+    if header_policy.alternate_group == 0 {
+        header_policy.alternate_group = 1;
+        track.mux_policy = track.mux_policy.with_header_policy(header_policy);
+    }
+}
+
+fn merge_dash_file_config(
+    authority_file_config: &mut Option<MuxFileConfig>,
+    saw_authority_file_config: &mut bool,
+    authority_file_config_compatible: &mut bool,
+    candidate: Option<&MuxFileConfig>,
+) {
+    if !*authority_file_config_compatible {
+        return;
+    }
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if !*saw_authority_file_config {
+        *authority_file_config = Some(candidate.clone());
+        *saw_authority_file_config = true;
+        return;
+    }
+    if authority_file_config.as_ref() != Some(candidate) {
+        *authority_file_config = None;
+        *authority_file_config_compatible = false;
+    }
+}
+
+fn merge_dash_period_tracks(
+    manifest_path: &Path,
+    merged_tracks: &mut Vec<TrackCandidate>,
+    period_tracks: Vec<TrackCandidate>,
+    period_start_millis: u64,
+) -> Result<(), MuxError> {
+    if period_tracks.is_empty() {
+        return Ok(());
+    }
+    if merged_tracks.is_empty() {
+        *merged_tracks = period_tracks;
+        return Ok(());
+    }
+    if merged_tracks.len() != period_tracks.len() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: manifest_path.display().to_string(),
+            message: format!(
+                "multi-period local MPD import requires the same compatible track count in each period; the first period resolved to {} track{} but a later period resolved to {}",
+                merged_tracks.len(),
+                if merged_tracks.len() == 1 { "" } else { "s" },
+                period_tracks.len()
+            ),
+        });
+    }
+    for (track_index, (merged_track, period_track)) in merged_tracks
+        .iter_mut()
+        .zip(period_tracks.into_iter())
+        .enumerate()
+    {
+        ensure_dash_period_track_compatible(
+            manifest_path,
+            track_index,
+            merged_track,
+            &period_track,
+        )?;
+        if track_candidate_uses_dts_family(merged_track) {
+            merge_dash_period_track_samples_with_start(
+                manifest_path,
+                merged_track,
+                &period_track,
+                period_start_millis,
+            )?;
+        } else {
+            merged_track.samples.extend(period_track.samples);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_dash_period_track_compatible(
+    manifest_path: &Path,
+    track_index: usize,
+    merged_track: &TrackCandidate,
+    period_track: &TrackCandidate,
+) -> Result<(), MuxError> {
+    let track_number = track_index + 1;
+    let incompatible = merged_track.kind != period_track.kind
+        || merged_track.timescale != period_track.timescale
+        || merged_track.language != period_track.language
+        || merged_track.handler_name != period_track.handler_name
+        || merged_track.mux_policy != period_track.mux_policy
+        || merged_track.width != period_track.width
+        || merged_track.height != period_track.height
+        || merged_track.sample_entry_box != period_track.sample_entry_box
+        || merged_track.source_edit_media_time != period_track.source_edit_media_time;
+    if incompatible {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: manifest_path.display().to_string(),
+            message: format!(
+                "multi-period local MPD import requires one stable authored track shape per track position; track {} changed across periods and cannot be merged truthfully on the current path-only ingest surface",
+                track_number
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct DashRequestedSampleSpan {
+    start: u64,
+    end: u64,
+    sample: CandidateSample,
+}
+
+fn merge_dash_period_track_samples_with_start(
+    manifest_path: &Path,
+    merged_track: &mut TrackCandidate,
+    period_track: &TrackCandidate,
+    period_start_millis: u64,
+) -> Result<(), MuxError> {
+    let period_start_ticks =
+        scale_dash_period_start_millis(period_start_millis, merged_track.timescale)?;
+    let mut spans = dash_requested_sample_spans(&merged_track.samples, 0)?;
+    spans.extend(dash_requested_sample_spans(
+        &period_track.samples,
+        period_start_ticks,
+    )?);
+    spans.sort_by_key(|span| span.start);
+
+    let Some(merged_end) = spans.iter().map(|span| span.end).max() else {
+        merged_track.samples.clear();
+        return Ok(());
+    };
+
+    let mut adjusted_starts = Vec::with_capacity(spans.len());
+    for span in &spans {
+        let adjusted = adjusted_starts
+            .last()
+            .copied()
+            .map_or(span.start, |previous: u64| {
+                span.start.max(previous.saturating_add(1))
+            });
+        adjusted_starts.push(adjusted);
+    }
+
+    let Some(last_start) = adjusted_starts.last().copied() else {
+        merged_track.samples.clear();
+        return Ok(());
+    };
+    if last_start >= merged_end {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: manifest_path.display().to_string(),
+            message: "multi-period local MPD DTS-family import resolved more overlapping samples than can fit in the merged period timeline on the current path-only ingest surface".to_string(),
+        });
+    }
+
+    let mut merged_samples = Vec::with_capacity(spans.len());
+    for (index, span) in spans.into_iter().enumerate() {
+        let next_start = adjusted_starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(merged_end);
+        let duration = u32::try_from(next_start - adjusted_starts[index])
+            .map_err(|_| MuxError::LayoutOverflow("dash merged sample duration"))?;
+        let mut sample = span.sample;
+        sample.duration = duration;
+        merged_samples.push(sample);
+    }
+    merged_track.samples = merged_samples;
+    Ok(())
+}
+
+fn dash_requested_sample_spans(
+    samples: &[CandidateSample],
+    timeline_start: u64,
+) -> Result<Vec<DashRequestedSampleSpan>, MuxError> {
+    let mut spans = Vec::with_capacity(samples.len());
+    let mut decode_time = timeline_start;
+    for sample in samples {
+        let end = decode_time
+            .checked_add(u64::from(sample.duration))
+            .ok_or(MuxError::LayoutOverflow("dash requested sample span"))?;
+        spans.push(DashRequestedSampleSpan {
+            start: decode_time,
+            end,
+            sample: *sample,
+        });
+        decode_time = end;
+    }
+    Ok(spans)
+}
+
+fn scale_dash_period_start_millis(
+    period_start_millis: u64,
+    timescale: u32,
+) -> Result<u64, MuxError> {
+    period_start_millis
+        .checked_mul(u64::from(timescale))
+        .ok_or(MuxError::LayoutOverflow("dash period start scaling"))
+        .map(|scaled| scaled / 1000)
 }
 
 fn materialize_composite_tracks(
@@ -1343,7 +2189,10 @@ fn materialize_composite_tracks(
         assign_candidate_source_index(&mut track, source_index);
         tracks.push(track);
     }
-    Ok(ContainerSourceMetadata { tracks })
+    Ok(ContainerSourceMetadata {
+        file_config: None,
+        tracks,
+    })
 }
 
 fn load_mp4_source_sync<'a>(
@@ -1395,7 +2244,46 @@ fn load_avi_source_sync<'a>(
         if !scanned.composite_tracks.is_empty() {
             tracks.extend(materialize_composite_tracks(sources, scanned.composite_tracks)?.tracks);
         }
-        cache.insert(absolute.clone(), ContainerSourceMetadata { tracks });
+        cache.insert(
+            absolute.clone(),
+            ContainerSourceMetadata {
+                file_config: None,
+                tracks,
+            },
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+fn load_nhml_source_sync<'a>(
+    path: &Path,
+    kind: DetectedNhmlSidecarKind,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let parsed = parse_nhml_source_sync(&absolute, kind)?;
+        cache.insert(
+            absolute.clone(),
+            materialize_parsed_nhml_source(parsed, sources)?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+fn load_dash_source_sync<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let parsed = parse_dash_source_sync(&absolute)?;
+        cache.insert(
+            absolute.clone(),
+            materialize_parsed_dash_source(&absolute, parsed, sources)?,
+        );
     }
     Ok(cache.get(&absolute).unwrap())
 }
@@ -1413,6 +2301,30 @@ fn load_program_stream_source_sync<'a>(
                 sources,
                 scan_program_stream_sync(&absolute, &absolute.display().to_string())?,
             )?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+fn load_saf_source_sync<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let source_index = sources.add_file(&absolute)?;
+        let tracks = super::demux::scan_saf_source_sync(
+            &absolute,
+            &absolute.display().to_string(),
+            source_index,
+        )?;
+        cache.insert(
+            absolute.clone(),
+            ContainerSourceMetadata {
+                file_config: None,
+                tracks,
+            },
         );
     }
     Ok(cache.get(&absolute).unwrap())
@@ -1469,7 +2381,46 @@ async fn load_avi_source_async<'a>(
         if !scanned.composite_tracks.is_empty() {
             tracks.extend(materialize_composite_tracks(sources, scanned.composite_tracks)?.tracks);
         }
-        cache.insert(absolute.clone(), ContainerSourceMetadata { tracks });
+        cache.insert(
+            absolute.clone(),
+            ContainerSourceMetadata {
+                file_config: None,
+                tracks,
+            },
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
+async fn load_nhml_source_async<'a>(
+    path: &Path,
+    kind: DetectedNhmlSidecarKind,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let parsed = parse_nhml_source_async(&absolute, kind).await?;
+        cache.insert(
+            absolute.clone(),
+            materialize_parsed_nhml_source(parsed, sources)?,
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
+async fn load_dash_source_async<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let parsed = parse_dash_source_async(&absolute).await?;
+        let metadata = materialize_parsed_dash_source_async(&absolute, parsed, sources).await?;
+        cache.insert(absolute.clone(), metadata);
     }
     Ok(cache.get(&absolute).unwrap())
 }
@@ -1513,6 +2464,32 @@ async fn load_program_stream_source_async<'a>(
 }
 
 #[cfg(feature = "async")]
+async fn load_saf_source_async<'a>(
+    path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
+    sources: &mut SourceCatalog,
+) -> Result<&'a ContainerSourceMetadata, MuxError> {
+    let absolute = absolute_path(path)?;
+    if !cache.contains_key(&absolute) {
+        let source_index = sources.add_file(&absolute)?;
+        let tracks = super::demux::scan_saf_source_async(
+            &absolute,
+            &absolute.display().to_string(),
+            source_index,
+        )
+        .await?;
+        cache.insert(
+            absolute.clone(),
+            ContainerSourceMetadata {
+                file_config: None,
+                tracks,
+            },
+        );
+    }
+    Ok(cache.get(&absolute).unwrap())
+}
+
+#[cfg(feature = "async")]
 async fn load_transport_stream_source_async<'a>(
     path: &Path,
     cache: &'a mut BTreeMap<PathBuf, ContainerSourceMetadata>,
@@ -1540,10 +2517,13 @@ where
     R: Read + Seek,
 {
     let file_config = probe_file_config_sync(reader)?;
+    let fragmented_hint = !extract_box(reader, None, BoxPath::from([MOOF]))?.is_empty();
     let track_infos = extract_box(reader, None, BoxPath::from([MOOV, TRAK]))?;
     let mut tracks = Vec::new();
     for trak_info in track_infos {
-        if let Some(track) = parse_track_candidate_sync(path, source_index, reader, &trak_info)? {
+        if let Some(track) =
+            parse_track_candidate_sync(path, source_index, fragmented_hint, reader, &trak_info)?
+        {
             tracks.push(track);
         }
     }
@@ -1563,21 +2543,16 @@ async fn parse_mp4_source_async<R>(
 where
     R: AsyncReadSeek,
 {
-    let file_config = probe_file_config_async(reader).await?;
-    let track_infos = extract_box_async(reader, None, BoxPath::from([MOOV, TRAK])).await?;
-    let mut tracks = Vec::new();
-    for trak_info in track_infos {
-        if let Some(track) =
-            parse_track_candidate_async(path, source_index, reader, &trak_info).await?
-        {
-            tracks.push(track);
-        }
-    }
-    populate_empty_fragmented_track_samples_async(path, source_index, reader, &mut tracks).await?;
-    Ok(PathSourceMetadata {
-        file_config: Some(file_config),
-        tracks,
-    })
+    let file_size = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(0)).await?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(file_size)
+            .map_err(|_| MuxError::LayoutOverflow("async MP4 source size"))?
+    ];
+    reader.read_exact(&mut bytes).await?;
+    let mut cursor = Cursor::new(bytes);
+    parse_mp4_source_sync(path, source_index, &mut cursor)
 }
 
 fn populate_empty_fragmented_track_samples_sync<R>(
@@ -1619,48 +2594,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "async")]
-async fn populate_empty_fragmented_track_samples_async<R>(
-    path: &Path,
-    source_index: usize,
-    reader: &mut R,
-    tracks: &mut [TrackCandidate],
-) -> Result<(), MuxError>
-where
-    R: AsyncReadSeek,
-{
-    if tracks.iter().all(|track| !track.samples.is_empty()) {
-        return Ok(());
-    }
-
-    let moof_infos = extract_box_async(reader, None, BoxPath::from([MOOF])).await?;
-    if moof_infos.is_empty() {
-        return Ok(());
-    }
-    let trex_by_track_id =
-        extract_box_as_async::<_, Trex>(reader, None, BoxPath::from([MOOV, MVEX, TREX]))
-            .await?
-            .into_iter()
-            .map(|trex| (trex.track_id, trex))
-            .collect::<BTreeMap<_, _>>();
-
-    for track in tracks.iter_mut().filter(|track| track.samples.is_empty()) {
-        let samples = collect_fragment_candidate_samples_async(
-            path,
-            source_index,
-            reader,
-            track.track_id,
-            &moof_infos,
-            trex_by_track_id.get(&track.track_id),
-        )
-        .await?;
-        if !samples.is_empty() {
-            track.samples = samples;
-        }
-    }
-    Ok(())
-}
-
 fn collect_fragment_candidate_samples_sync<R>(
     path: &Path,
     source_index: usize,
@@ -1687,56 +2620,6 @@ where
             }
             let truns = extract_box_as::<_, Trun>(reader, Some(&traf_info), BoxPath::from([TRUN]))?;
             let trun_infos = extract_box(reader, Some(&traf_info), BoxPath::from([TRUN]))?;
-            let context = FragmentRunContext {
-                path,
-                source_index,
-                track_id,
-                moof_offset: moof_info.offset(),
-                trex,
-            };
-            collect_fragment_candidate_samples_from_runs(
-                &context,
-                &tfhd,
-                &truns,
-                &trun_infos,
-                &mut samples,
-            )?;
-        }
-    }
-    Ok(samples)
-}
-
-#[cfg(feature = "async")]
-async fn collect_fragment_candidate_samples_async<R>(
-    path: &Path,
-    source_index: usize,
-    reader: &mut R,
-    track_id: u32,
-    moof_infos: &[HeaderInfo],
-    trex: Option<&Trex>,
-) -> Result<Vec<CandidateSample>, MuxError>
-where
-    R: AsyncReadSeek,
-{
-    let mut samples = Vec::new();
-    for moof_info in moof_infos {
-        let traf_infos = extract_box_async(reader, Some(moof_info), BoxPath::from([TRAF])).await?;
-        for traf_info in traf_infos {
-            let tfhd = extract_required_single_as_async::<_, Tfhd>(
-                reader,
-                &traf_info,
-                BoxPath::from([TFHD]),
-                "tfhd",
-            )
-            .await?;
-            if tfhd.track_id != track_id {
-                continue;
-            }
-            let truns =
-                extract_box_as_async::<_, Trun>(reader, Some(&traf_info), BoxPath::from([TRUN]))
-                    .await?;
-            let trun_infos =
-                extract_box_async(reader, Some(&traf_info), BoxPath::from([TRUN])).await?;
             let context = FragmentRunContext {
                 path,
                 source_index,
@@ -2002,6 +2885,7 @@ fn select_mp4_track(
     tracks: &[TrackCandidate],
     selector: MuxMp4TrackSelector,
     spec: String,
+    preserve_track_id: bool,
 ) -> Result<ImportedTrack, MuxError> {
     let selected = match selector {
         MuxMp4TrackSelector::Video => tracks.iter().find(|track| track.kind.is_video()),
@@ -2029,7 +2913,7 @@ fn select_mp4_track(
         height: selected.height,
         sample_entry_box: selected.sample_entry_box.clone(),
         source_edit_media_time: selected.source_edit_media_time,
-        sample_roll_distance: None,
+        sample_roll_distance: selected.mux_policy.sample_roll_distance(),
         samples: selected
             .samples
             .iter()
@@ -2043,16 +2927,22 @@ fn select_mp4_track(
             })
             .collect(),
     }
-    .with_source_index_from_candidate(selected))
+    .with_source_index_from_candidate(selected, preserve_track_id))
 }
 
 fn select_container_tracks(
     tracks: &[TrackCandidate],
     selector: Option<MuxMp4TrackSelector>,
     spec: String,
+    preserve_track_id: bool,
 ) -> Result<Vec<ImportedTrack>, MuxError> {
     match selector {
-        Some(selector) => Ok(vec![select_mp4_track(tracks, selector, spec)?]),
+        Some(selector) => Ok(vec![select_mp4_track(
+            tracks,
+            selector,
+            spec,
+            preserve_track_id,
+        )?]),
         None => {
             let selected = tracks
                 .iter()
@@ -2065,29 +2955,32 @@ fn select_container_tracks(
                             | MuxTrackKind::Subtitle
                     )
                 })
-                .map(|track| ImportedTrack {
-                    kind: track.kind,
-                    timescale: track.timescale,
-                    language: track.language,
-                    handler_name: track.handler_name.clone(),
-                    mux_policy: track.mux_policy,
-                    width: track.width,
-                    height: track.height,
-                    sample_entry_box: track.sample_entry_box.clone(),
-                    source_edit_media_time: track.source_edit_media_time,
-                    sample_roll_distance: None,
-                    samples: track
-                        .samples
-                        .iter()
-                        .map(|sample| ImportedSample {
-                            source_index: sample.source_index,
-                            data_offset: sample.data_offset,
-                            data_size: sample.data_size,
-                            duration: sample.duration,
-                            composition_time_offset: sample.composition_time_offset,
-                            is_sync_sample: sample.is_sync_sample,
-                        })
-                        .collect(),
+                .map(|track| {
+                    ImportedTrack {
+                        kind: track.kind,
+                        timescale: track.timescale,
+                        language: track.language,
+                        handler_name: track.handler_name.clone(),
+                        mux_policy: track.mux_policy,
+                        width: track.width,
+                        height: track.height,
+                        sample_entry_box: track.sample_entry_box.clone(),
+                        source_edit_media_time: track.source_edit_media_time,
+                        sample_roll_distance: track.mux_policy.sample_roll_distance(),
+                        samples: track
+                            .samples
+                            .iter()
+                            .map(|sample| ImportedSample {
+                                source_index: sample.source_index,
+                                data_offset: sample.data_offset,
+                                data_size: sample.data_size,
+                                duration: sample.duration,
+                                composition_time_offset: sample.composition_time_offset,
+                                is_sync_sample: sample.is_sync_sample,
+                            })
+                            .collect(),
+                    }
+                    .with_source_index_from_candidate(track, preserve_track_id)
                 })
                 .collect::<Vec<_>>();
             if selected.is_empty() {
@@ -2099,11 +2992,22 @@ fn select_container_tracks(
 }
 
 trait ImportedTrackExt {
-    fn with_source_index_from_candidate(self, candidate: &TrackCandidate) -> Self;
+    fn with_source_index_from_candidate(
+        self,
+        candidate: &TrackCandidate,
+        preserve_track_id: bool,
+    ) -> Self;
 }
 
 impl ImportedTrackExt for ImportedTrack {
-    fn with_source_index_from_candidate(mut self, candidate: &TrackCandidate) -> Self {
+    fn with_source_index_from_candidate(
+        mut self,
+        candidate: &TrackCandidate,
+        preserve_track_id: bool,
+    ) -> Self {
+        if preserve_track_id {
+            self.mux_policy = self.mux_policy.with_preferred_track_id(candidate.track_id);
+        }
         for (sample, source) in self.samples.iter_mut().zip(candidate.samples.iter()) {
             sample.source_index = source.source_index;
         }
@@ -2114,6 +3018,7 @@ impl ImportedTrackExt for ImportedTrack {
 fn parse_track_candidate_sync<R>(
     path: &Path,
     source_index: usize,
+    fragmented_hint: bool,
     reader: &mut R,
     trak_info: &HeaderInfo,
 ) -> Result<Option<TrackCandidate>, MuxError>
@@ -2132,12 +3037,8 @@ where
         BoxPath::from([MDIA, MDHD]),
         "mdhd",
     )?;
-    let hdlr = extract_required_single_as_sync::<_, Hdlr>(
-        reader,
-        trak_info,
-        BoxPath::from([MDIA, HDLR]),
-        "hdlr",
-    )?;
+    let hdlr =
+        extract_optional_single_as_sync::<_, Hdlr>(reader, trak_info, BoxPath::from([MDIA, HDLR]))?;
     let stsd_info = extract_required_single_info_sync(
         reader,
         trak_info,
@@ -2181,6 +3082,20 @@ where
             ),
         });
     };
+    let elst =
+        extract_optional_single_as_sync::<_, Elst>(reader, trak_info, BoxPath::from([EDTS, ELST]))?;
+    if fragmented_hint {
+        return build_track_candidate_from_components(
+            path,
+            tkhd,
+            mdhd,
+            hdlr,
+            sample_entry,
+            sample_entry_box.clone(),
+            elst,
+            Vec::new(),
+        );
+    }
     parse_track_candidate_from_components(
         path,
         source_index,
@@ -2200,7 +3115,7 @@ where
             trak_info,
             BoxPath::from([MDIA, MINF, STBL, CTTS]),
         )?,
-        extract_optional_single_as_sync::<_, Elst>(reader, trak_info, BoxPath::from([EDTS, ELST]))?,
+        elst,
         extract_required_single_as_sync::<_, Stsc>(
             reader,
             trak_info,
@@ -2231,148 +3146,13 @@ where
     )
 }
 
-#[cfg(feature = "async")]
-async fn parse_track_candidate_async<R>(
-    path: &Path,
-    source_index: usize,
-    reader: &mut R,
-    trak_info: &HeaderInfo,
-) -> Result<Option<TrackCandidate>, MuxError>
-where
-    R: AsyncReadSeek,
-{
-    let tkhd = extract_required_single_as_async::<_, Tkhd>(
-        reader,
-        trak_info,
-        BoxPath::from([TKHD]),
-        "tkhd",
-    )
-    .await?;
-    let mdhd = extract_required_single_as_async::<_, Mdhd>(
-        reader,
-        trak_info,
-        BoxPath::from([MDIA, MDHD]),
-        "mdhd",
-    )
-    .await?;
-    let hdlr = extract_required_single_as_async::<_, Hdlr>(
-        reader,
-        trak_info,
-        BoxPath::from([MDIA, HDLR]),
-        "hdlr",
-    )
-    .await?;
-    let stsd_info = extract_required_single_info_async(
-        reader,
-        trak_info,
-        BoxPath::from([MDIA, MINF, STBL, STSD]),
-        "stsd",
-    )
-    .await?;
-    let stsd = extract_required_single_as_async::<_, crate::boxes::iso14496_12::Stsd>(
-        reader,
-        trak_info,
-        BoxPath::from([MDIA, MINF, STBL, STSD]),
-        "stsd",
-    )
-    .await?;
-    if stsd.entry_count != 1 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: path.display().to_string(),
-            message: format!(
-                "track {} uses {} sample descriptions; the current mux import expects exactly one",
-                tkhd.track_id, stsd.entry_count
-            ),
-        });
-    }
-    let sample_entries =
-        extract_box_with_payload_async(reader, Some(&stsd_info), BoxPath::from([FourCc::ANY]))
-            .await?;
-    let [sample_entry] = sample_entries.as_slice() else {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: path.display().to_string(),
-            message: format!(
-                "track {} does not expose exactly one sample-entry payload",
-                tkhd.track_id
-            ),
-        });
-    };
-    let sample_entry_bytes =
-        extract_box_bytes_async(reader, Some(&stsd_info), BoxPath::from([FourCc::ANY])).await?;
-    let [sample_entry_box] = sample_entry_bytes.as_slice() else {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: path.display().to_string(),
-            message: format!(
-                "track {} does not expose exactly one encoded sample-entry box",
-                tkhd.track_id
-            ),
-        });
-    };
-    parse_track_candidate_from_components(
-        path,
-        source_index,
-        tkhd,
-        mdhd,
-        hdlr,
-        sample_entry,
-        sample_entry_box.clone(),
-        extract_required_single_as_async::<_, Stts>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, STTS]),
-            "stts",
-        )
-        .await?,
-        extract_optional_single_as_async::<_, Ctts>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, CTTS]),
-        )
-        .await?,
-        extract_optional_single_as_async::<_, Elst>(reader, trak_info, BoxPath::from([EDTS, ELST]))
-            .await?,
-        extract_required_single_as_async::<_, Stsc>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, STSC]),
-            "stsc",
-        )
-        .await?,
-        extract_required_single_as_async::<_, Stsz>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, STSZ]),
-            "stsz",
-        )
-        .await?,
-        extract_optional_single_as_async::<_, Stco>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, STCO]),
-        )
-        .await?,
-        extract_optional_single_as_async::<_, Co64>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, CO64]),
-        )
-        .await?,
-        extract_optional_single_as_async::<_, Stss>(
-            reader,
-            trak_info,
-            BoxPath::from([MDIA, MINF, STBL, STSS]),
-        )
-        .await?,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn parse_track_candidate_from_components(
     path: &Path,
     source_index: usize,
     tkhd: Tkhd,
     mdhd: Mdhd,
-    hdlr: Hdlr,
+    hdlr: Option<Hdlr>,
     sample_entry: &ExtractedBox,
     sample_entry_box: Vec<u8>,
     stts: Stts,
@@ -2384,14 +3164,72 @@ fn parse_track_candidate_from_components(
     co64: Option<Co64>,
     stss: Option<Stss>,
 ) -> Result<Option<TrackCandidate>, MuxError> {
-    let kind = match hdlr.handler_type {
-        VIDE => MuxTrackKind::Video,
-        SOUN => MuxTrackKind::Audio,
-        TEXT => MuxTrackKind::Text,
-        SUBT | SUBP => MuxTrackKind::Subtitle,
-        _ => return Ok(None),
-    };
     let sample_entry_type = sample_entry.info.box_type();
+    let sample_sizes = expand_sample_sizes(&stsz, path, tkhd.track_id)?;
+    let sample_durations = expand_sample_durations(&stts, sample_sizes.len(), path, tkhd.track_id)?;
+    let composition_offsets =
+        expand_composition_offsets(ctts.as_ref(), sample_sizes.len(), path, tkhd.track_id)?;
+    let chunk_offsets = select_chunk_offsets(stco.as_ref(), co64.as_ref(), path, tkhd.track_id)?;
+    let sample_offsets =
+        expand_sample_offsets(&stsc, &sample_sizes, &chunk_offsets, path, tkhd.track_id)?;
+    let sync_samples = expand_sync_samples(
+        stss.as_ref(),
+        sample_entry_type,
+        sample_sizes.len(),
+        path,
+        tkhd.track_id,
+    )?;
+
+    let mut samples = Vec::with_capacity(sample_sizes.len());
+    for index in 0..sample_sizes.len() {
+        samples.push(CandidateSample {
+            source_index,
+            data_offset: sample_offsets[index],
+            data_size: sample_sizes[index],
+            duration: sample_durations[index],
+            composition_time_offset: composition_offsets[index],
+            is_sync_sample: sync_samples[index],
+        });
+    }
+
+    build_track_candidate_from_components(
+        path,
+        tkhd,
+        mdhd,
+        hdlr,
+        sample_entry,
+        sample_entry_box,
+        elst,
+        samples,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_track_candidate_from_components(
+    path: &Path,
+    tkhd: Tkhd,
+    mdhd: Mdhd,
+    hdlr: Option<Hdlr>,
+    sample_entry: &ExtractedBox,
+    sample_entry_box: Vec<u8>,
+    elst: Option<Elst>,
+    samples: Vec<CandidateSample>,
+) -> Result<Option<TrackCandidate>, MuxError> {
+    let sample_entry_type = sample_entry.info.box_type();
+    let kind = if let Some(hdlr) = hdlr.as_ref() {
+        match hdlr.handler_type {
+            VIDE => MuxTrackKind::Video,
+            SOUN => MuxTrackKind::Audio,
+            TEXT => MuxTrackKind::Text,
+            SUBT | SUBP => MuxTrackKind::Subtitle,
+            _ => return Ok(None),
+        }
+    } else {
+        let Some(kind) = infer_track_kind_from_sample_entry_type(sample_entry_type) else {
+            return Ok(None);
+        };
+        kind
+    };
     if matches!(sample_entry_type, ENCV | ENCA) {
         return Err(MuxError::UnsupportedTrackImport {
             spec: path.display().to_string(),
@@ -2409,46 +3247,22 @@ fn parse_track_candidate_from_components(
             fixed_16_16_to_u16(tkhd.height),
         ),
     };
-
-    let sample_sizes = expand_sample_sizes(&stsz, path, tkhd.track_id)?;
-    let sample_durations = expand_sample_durations(&stts, sample_sizes.len(), path, tkhd.track_id)?;
-    let composition_offsets =
-        expand_composition_offsets(ctts.as_ref(), sample_sizes.len(), path, tkhd.track_id)?;
-    let chunk_offsets = select_chunk_offsets(stco.as_ref(), co64.as_ref(), path, tkhd.track_id)?;
-    let sample_offsets =
-        expand_sample_offsets(&stsc, &sample_sizes, &chunk_offsets, path, tkhd.track_id)?;
-    let sync_samples = expand_sync_samples(
-        stss.as_ref(),
-        sample_entry_type,
-        sample_sizes.len(),
-        path,
-        tkhd.track_id,
-    )?;
-
     let language = decode_mdhd_language(mdhd.language);
-    let mut samples = Vec::with_capacity(sample_sizes.len());
-    for index in 0..sample_sizes.len() {
-        samples.push(CandidateSample {
-            source_index,
-            data_offset: sample_offsets[index],
-            data_size: sample_sizes[index],
-            duration: sample_durations[index],
-            composition_time_offset: composition_offsets[index],
-            is_sync_sample: sync_samples[index],
-        });
-    }
 
     Ok(Some(TrackCandidate {
         track_id: tkhd.track_id,
         kind,
         timescale: mdhd.timescale,
         language,
-        handler_name: if hdlr.name.is_empty() {
-            default_handler_name_for_kind(kind).to_string()
-        } else {
-            hdlr.name
-        },
-        mux_policy: ImportedTrackMuxPolicy::DEFAULT,
+        handler_name: hdlr
+            .and_then(|value| (!value.name.is_empty()).then_some(value.name))
+            .unwrap_or_else(|| default_handler_name_for_kind(kind).to_string()),
+        mux_policy: ImportedTrackMuxPolicy::DEFAULT.with_header_policy(ImportedTrackHeaderPolicy {
+            tkhd_flags: tkhd.flags(),
+            alternate_group: tkhd.alternate_group,
+            volume: tkhd.volume,
+            matrix: tkhd.matrix,
+        }),
         width,
         height,
         sample_entry_box,
@@ -2467,6 +3281,74 @@ fn fixed_16_16_to_u16(value: u32) -> u16 {
     u16::try_from(value >> 16).unwrap_or(u16::MAX)
 }
 
+fn infer_track_kind_from_sample_entry_type(sample_entry_type: FourCc) -> Option<MuxTrackKind> {
+    if [
+        ENCA,
+        FourCc::from_bytes(*b"mp4a"),
+        FourCc::from_bytes(*b".mp3"),
+        FourCc::from_bytes(*b"alaw"),
+        FourCc::from_bytes(*b"ulaw"),
+        FourCc::from_bytes(*b"Opus"),
+        FourCc::from_bytes(*b"spex"),
+        FourCc::from_bytes(*b"samr"),
+        FourCc::from_bytes(*b"sawb"),
+        FourCc::from_bytes(*b"sqcp"),
+        FourCc::from_bytes(*b"sevc"),
+        FourCc::from_bytes(*b"ssmv"),
+        FourCc::from_bytes(*b"ac-3"),
+        FourCc::from_bytes(*b"ec-3"),
+        FourCc::from_bytes(*b"ac-4"),
+        FourCc::from_bytes(*b"alac"),
+        FourCc::from_bytes(*b"mlpa"),
+        FourCc::from_bytes(*b"dtsc"),
+        FourCc::from_bytes(*b"dtse"),
+        FourCc::from_bytes(*b"dtsh"),
+        FourCc::from_bytes(*b"dtsl"),
+        FourCc::from_bytes(*b"dtsm"),
+        FourCc::from_bytes(*b"dtsx"),
+        FourCc::from_bytes(*b"dtsy"),
+        FourCc::from_bytes(*b"fLaC"),
+        FourCc::from_bytes(*b"iamf"),
+        FourCc::from_bytes(*b"mha1"),
+        FourCc::from_bytes(*b"mha2"),
+        FourCc::from_bytes(*b"mhm1"),
+        FourCc::from_bytes(*b"mhm2"),
+        FourCc::from_bytes(*b"ipcm"),
+        FourCc::from_bytes(*b"fpcm"),
+    ]
+    .contains(&sample_entry_type)
+    {
+        Some(MuxTrackKind::Audio)
+    } else if [
+        ENCV,
+        FourCc::from_bytes(*b"avc1"),
+        FourCc::from_bytes(*b"hev1"),
+        FourCc::from_bytes(*b"hvc1"),
+        FourCc::from_bytes(*b"dvhe"),
+        FourCc::from_bytes(*b"dvh1"),
+        FourCc::from_bytes(*b"vvc1"),
+        FourCc::from_bytes(*b"vvi1"),
+        FourCc::from_bytes(*b"avs3"),
+        FourCc::from_bytes(*b"av01"),
+        FourCc::from_bytes(*b"jpeg"),
+        FourCc::from_bytes(*b"mjpg"),
+        FourCc::from_bytes(*b"mpeg"),
+        FourCc::from_bytes(*b"mp4v"),
+        FourCc::from_bytes(*b"s263"),
+        FourCc::from_bytes(*b"h263"),
+        FourCc::from_bytes(*b"png "),
+        FourCc::from_bytes(*b"vp08"),
+        FourCc::from_bytes(*b"vp09"),
+        FourCc::from_bytes(*b"vp10"),
+    ]
+    .contains(&sample_entry_type)
+    {
+        Some(MuxTrackKind::Video)
+    } else {
+        None
+    }
+}
+
 const fn default_handler_name_for_kind(kind: MuxTrackKind) -> &'static str {
     match kind {
         MuxTrackKind::Audio => "SoundHandler",
@@ -2478,8 +3360,9 @@ const fn default_handler_name_for_kind(kind: MuxTrackKind) -> &'static str {
 
 pub(in crate::mux) fn direct_ingest_handler_name(codec_label: &str) -> String {
     let kind = match codec_label {
-        "h263" | "h264" | "h265" | "vvc" | "av1" | "vp8" | "vp9" | "mp4v" | "ogg-theora"
-        | "jpeg" | "png" => MuxTrackKind::Video,
+        "h263" | "h264" | "h265" | "vvc" | "av1" | "vp8" | "vp9" | "vp10" | "mp4v" | "mpeg2v"
+        | "avs3" | "ogg-theora" | "jpeg" | "png" | "bmp" | "prores" | "y4m" | "rawvideo"
+        | "j2k" => MuxTrackKind::Video,
         "vobsub" => MuxTrackKind::Subtitle,
         _ => MuxTrackKind::Audio,
     };
@@ -2509,6 +3392,215 @@ pub(in crate::mux) fn direct_ingest_mux_policy(
     policy
 }
 
+pub(in crate::mux) fn direct_ingest_mux_policy_with_preferred_track_id(
+    codec_label: &str,
+    kind: MuxTrackKind,
+    preferred_track_id: u32,
+) -> ImportedTrackMuxPolicy {
+    direct_ingest_mux_policy(codec_label, kind).with_preferred_track_id(preferred_track_id)
+}
+
+fn assign_imported_track_ids(imported_tracks: &[ImportedTrack]) -> Result<Vec<u32>, MuxError> {
+    let mut preferred_counts = BTreeMap::<u32, usize>::new();
+    for track in imported_tracks {
+        if let Some(track_id) = track.mux_policy.preferred_track_id() {
+            *preferred_counts.entry(track_id).or_default() += 1;
+        }
+    }
+
+    let mut assigned = Vec::with_capacity(imported_tracks.len());
+    let mut used = BTreeMap::<u32, ()>::new();
+    for track in imported_tracks {
+        let preserved = track
+            .mux_policy
+            .preferred_track_id()
+            .filter(|track_id| preferred_counts.get(track_id) == Some(&1));
+        if let Some(track_id) = preserved {
+            used.insert(track_id, ());
+            assigned.push(track_id);
+        } else {
+            assigned.push(0);
+        }
+    }
+
+    for (index, track_id) in assigned.iter_mut().enumerate() {
+        if *track_id != 0 {
+            continue;
+        }
+        let mut next_track_id = u32::try_from(index + 1)
+            .map_err(|_| MuxError::LayoutOverflow("track identifier assignment"))?;
+        while used.contains_key(&next_track_id) {
+            next_track_id = next_track_id
+                .checked_add(1)
+                .ok_or(MuxError::LayoutOverflow("track identifier assignment"))?;
+        }
+        *track_id = next_track_id;
+        used.insert(next_track_id, ());
+    }
+
+    Ok(assigned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ImportedSample, ImportedTrack, ImportedTrackMuxPolicy, MuxTrackKind, SourceCatalog,
+        SourceSpec, assign_imported_track_ids, choose_file_config,
+    };
+    use crate::FourCc;
+    use crate::mux::MuxFileConfig;
+    use std::path::PathBuf;
+
+    fn imported_track(
+        kind: MuxTrackKind,
+        preferred_track_id: Option<u32>,
+        source_index: usize,
+    ) -> ImportedTrack {
+        let mux_policy = preferred_track_id
+            .map(|track_id| ImportedTrackMuxPolicy::DEFAULT.with_preferred_track_id(track_id))
+            .unwrap_or(ImportedTrackMuxPolicy::DEFAULT);
+        ImportedTrack {
+            kind,
+            timescale: 1,
+            language: *b"und",
+            handler_name: String::new(),
+            mux_policy,
+            width: 0,
+            height: 0,
+            sample_entry_box: Vec::new(),
+            source_edit_media_time: None,
+            sample_roll_distance: None,
+            samples: vec![ImportedSample {
+                source_index,
+                data_offset: 0,
+                data_size: 1,
+                duration: 1,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn assign_imported_track_ids_uses_source_order_slots_for_unpreferred_tracks() {
+        let imported_tracks = vec![
+            imported_track(MuxTrackKind::Video, Some(256), 0),
+            imported_track(MuxTrackKind::Audio, None, 1),
+            imported_track(MuxTrackKind::Audio, Some(448), 2),
+        ];
+
+        let assigned = assign_imported_track_ids(&imported_tracks).unwrap();
+
+        assert_eq!(assigned, vec![256, 2, 448]);
+    }
+
+    #[test]
+    fn choose_file_config_promotes_imported_dts_family_mp4_tracks_to_auto_flat_profile() {
+        let mut imported_track = imported_track(MuxTrackKind::Audio, Some(1), 0);
+        imported_track.sample_entry_box = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&16_u32.to_be_bytes());
+            bytes.extend_from_slice(b"dtsc");
+            bytes.extend_from_slice(&[0_u8; 8]);
+            bytes
+        };
+        let authority = MuxFileConfig::new(1000)
+            .with_major_brand(FourCc::from_bytes(*b"isom"))
+            .with_minor_version(512)
+            .with_compatible_brand(FourCc::from_bytes(*b"iso8"))
+            .with_compatible_brand(FourCc::from_bytes(*b"dtsc"));
+
+        let file_config = choose_file_config(
+            1000,
+            &[imported_track],
+            &SourceCatalog::default(),
+            Some(&authority),
+        );
+
+        assert!(file_config.auto_flat_profile());
+        assert!(file_config.allow_audio_only_iods());
+        assert!(file_config.keep_flat_free_box());
+        assert!(file_config.preserve_auto_flat_movie_timescale());
+        assert!(!file_config.keep_flat_authority_brands());
+    }
+
+    #[test]
+    fn choose_file_config_uses_default_flat_movie_timescale_for_raw_dts_profiles() {
+        let mut imported_track = imported_track(MuxTrackKind::Audio, Some(1), 0);
+        imported_track.sample_entry_box = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&16_u32.to_be_bytes());
+            bytes.extend_from_slice(b"dtsc");
+            bytes.extend_from_slice(&[0_u8; 8]);
+            bytes
+        };
+
+        let file_config =
+            choose_file_config(90_000, &[imported_track], &SourceCatalog::default(), None);
+
+        assert!(file_config.auto_flat_profile());
+        assert!(!file_config.allow_audio_only_iods());
+        assert!(file_config.keep_flat_free_box());
+        assert!(!file_config.preserve_auto_flat_movie_timescale());
+    }
+
+    #[test]
+    fn choose_file_config_preserves_authority_timing_for_local_dash_profiles() {
+        let imported_tracks = vec![imported_track(MuxTrackKind::Audio, Some(1), 0)];
+        let authority = MuxFileConfig::new(1000)
+            .with_auto_flat_profile(true)
+            .with_keep_flat_authority_brands(true)
+            .with_preserve_auto_flat_movie_timescale(true);
+
+        let file_config = choose_file_config(
+            1000,
+            &imported_tracks,
+            &SourceCatalog::default(),
+            Some(&authority),
+        );
+
+        assert!(file_config.auto_flat_profile());
+        assert!(file_config.keep_flat_authority_brands());
+        assert!(file_config.preserve_auto_flat_movie_timescale());
+        assert!(!file_config.allow_audio_only_iods());
+    }
+
+    #[test]
+    fn choose_file_config_preserves_auto_flat_movie_timescale_for_prores_imports() {
+        let mut imported_track = imported_track(MuxTrackKind::Video, Some(1), 0);
+        imported_track.sample_entry_box = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&16_u32.to_be_bytes());
+            bytes.extend_from_slice(b"apch");
+            bytes.extend_from_slice(&[0_u8; 8]);
+            bytes
+        };
+
+        let file_config =
+            choose_file_config(2_500, &[imported_track], &SourceCatalog::default(), None);
+
+        assert!(file_config.auto_flat_profile());
+        assert!(file_config.preserve_auto_flat_movie_timescale());
+    }
+
+    #[test]
+    fn choose_file_config_carries_source_encoding_metadata() {
+        let imported_track = imported_track(MuxTrackKind::Audio, Some(1), 0);
+        let mut sources = SourceCatalog::default();
+        sources
+            .specs
+            .push(SourceSpec::File(PathBuf::from("source-with-metadata.ogg")));
+        sources.set_flat_source_encoding_metadata(0, "SourceEncoder 1.0".to_string());
+
+        let file_config = choose_file_config(48_000, &[imported_track], &sources, None);
+
+        assert_eq!(
+            file_config.flat_source_encoding_metadata(),
+            Some("SourceEncoder 1.0")
+        );
+    }
+}
+
 pub(in crate::mux) fn with_force_empty_sync_sample_table(
     mut policy: ImportedTrackMuxPolicy,
 ) -> ImportedTrackMuxPolicy {
@@ -2518,26 +3610,85 @@ pub(in crate::mux) fn with_force_empty_sync_sample_table(
 
 fn flat_timing_override_for_imported_track(
     imported_track: &ImportedTrack,
+    movie_timescale: u32,
 ) -> Option<FlatTimingOverride> {
-    if imported_track.mux_policy.flat_timing_override_kind
-        != FlatTimingOverrideKind::IamfSequencePresentation
-        || imported_track.samples.is_empty()
-    {
+    if imported_track.samples.is_empty() {
         return None;
     }
 
-    let mut sample_durations = Vec::with_capacity(imported_track.samples.len());
-    if imported_track.samples.len() > 1 {
-        sample_durations.resize(imported_track.samples.len() - 1, 1);
+    if imported_track.mux_policy.header_policy().is_some()
+        && imported_track.timescale != movie_timescale
+        && !track_times_fit_movie_timescale(imported_track, movie_timescale)
+    {
+        return preserved_imported_timing_override(imported_track);
     }
-    sample_durations.push(u32::MAX);
 
-    let media_duration = u64::from(u32::MAX)
-        .checked_add(u64::try_from(imported_track.samples.len().saturating_sub(1)).ok()?)?;
+    match imported_track.mux_policy.flat_timing_override_kind {
+        FlatTimingOverrideKind::None => None,
+        FlatTimingOverrideKind::IamfSequencePresentation => {
+            let mut sample_durations = Vec::with_capacity(imported_track.samples.len());
+            if imported_track.samples.len() > 1 {
+                sample_durations.resize(imported_track.samples.len() - 1, 1);
+            }
+            sample_durations.push(u32::MAX);
+
+            let media_duration = u64::from(u32::MAX)
+                .checked_add(u64::try_from(imported_track.samples.len().saturating_sub(1)).ok()?)?;
+            Some(FlatTimingOverride {
+                sample_durations,
+                composition_offsets: vec![0; imported_track.samples.len()],
+                media_duration,
+                presentation_duration: media_duration,
+            })
+        }
+        FlatTimingOverrideKind::ZeroDurationSamples => Some(FlatTimingOverride {
+            sample_durations: vec![0; imported_track.samples.len()],
+            composition_offsets: vec![0; imported_track.samples.len()],
+            media_duration: 0,
+            presentation_duration: 0,
+        }),
+    }
+}
+
+fn preserved_imported_timing_override(
+    imported_track: &ImportedTrack,
+) -> Option<FlatTimingOverride> {
+    let sample_durations = imported_track
+        .samples
+        .iter()
+        .map(|sample| sample.duration)
+        .collect::<Vec<_>>();
+    let composition_offsets = imported_track
+        .samples
+        .iter()
+        .map(|sample| sample.composition_time_offset)
+        .collect::<Vec<_>>();
+    let mut decode_time = 0_u64;
+    let mut media_duration = 0_u64;
+    let mut max_presentation_end = 0_u64;
+    for sample in &imported_track.samples {
+        let duration = u64::from(sample.duration);
+        let decode_end = decode_time.checked_add(duration)?;
+        media_duration = media_duration.max(decode_end);
+        let presentation_end = i128::from(decode_time)
+            .saturating_add(i128::from(sample.composition_time_offset))
+            .saturating_add(i128::from(sample.duration));
+        if presentation_end > 0 {
+            max_presentation_end = max_presentation_end.max(u64::try_from(presentation_end).ok()?);
+        }
+        decode_time = decode_end;
+    }
+    media_duration = media_duration.max(max_presentation_end);
+    let presentation_duration = imported_track
+        .source_edit_media_time
+        .map_or(media_duration, |edit_media_time| {
+            media_duration.saturating_sub(edit_media_time)
+        });
     Some(FlatTimingOverride {
         sample_durations,
+        composition_offsets,
         media_duration,
-        presentation_duration: media_duration,
+        presentation_duration,
     })
 }
 
@@ -2551,6 +3702,12 @@ fn stsc_run_encoding_mode_for_imported_track(
     imported_track: &ImportedTrack,
 ) -> StscRunEncodingMode {
     imported_track.mux_policy.stsc_run_encoding_mode
+}
+
+fn stts_run_encoding_mode_for_imported_track(
+    imported_track: &ImportedTrack,
+) -> SttsRunEncodingMode {
+    imported_track.mux_policy.stts_run_encoding_mode()
 }
 
 fn import_raw_aac_sync(
@@ -2670,6 +3827,29 @@ fn import_raw_h263_sync(
     })
 }
 
+fn import_raw_mpeg2v_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_mpeg2v_file_sync(path, &spec)?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mpeg2v"),
+        mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
 fn import_raw_mp4v_sync(
     path: &Path,
     spec: String,
@@ -2731,6 +3911,30 @@ async fn import_raw_h263_async(
         language: *b"und",
         handler_name: direct_ingest_handler_name("h263"),
         mux_policy: direct_ingest_mux_policy("h263", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_mpeg2v_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_mpeg2v_file_async(path, &spec).await?;
+
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("mpeg2v"),
+        mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video),
         width: parsed.width,
         height: parsed.height,
         sample_entry_box: parsed.sample_entry_box,
@@ -3173,13 +4377,137 @@ fn import_raw_png_sync(
     })
 }
 
-fn import_raw_dts_sync(
+fn import_raw_bmp_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_bmp_file_sync(path, &spec)?;
+    let data_size = u32::try_from(parsed.segmented_source.total_size).map_err(|_| {
+        MuxError::LayoutOverflow("BMP transformed payload exceeds MP4 sample limits")
+    })?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("bmp"),
+        mux_policy: direct_ingest_mux_policy("bmp", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: vec![ImportedSample {
+            source_index,
+            data_offset: 0,
+            data_size,
+            duration: 1_000,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        }],
+    })
+}
+
+fn import_raw_prores_sync(
     path: &Path,
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
+    let parsed = scan_prores_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.media_timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("prores"),
+        mux_policy: direct_ingest_mux_policy("prores", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_y4m_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_y4m_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("y4m"),
+        mux_policy: direct_ingest_mux_policy("y4m", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_video_sync(
+    path: &Path,
+    params: MuxRawVideoParams,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_raw_video_file_sync(path, &spec, &params)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("rawvideo"),
+        mux_policy: direct_ingest_mux_policy("rawvideo", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_j2k_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_j2k_file_sync(path, &spec)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("j2k"),
+        mux_policy: direct_ingest_mux_policy("j2k", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_dts_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
     let parsed = scan_dts_file_sync(path, &spec)?;
+    let source_index = match parsed.transformed_source.clone() {
+        Some(source) => sources.add_segmented(source)?,
+        None => sources.add_file(path)?,
+    };
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.media_timescale,
@@ -3236,7 +4564,7 @@ fn import_wave_pcm_sync(
         timescale: sample_rate,
         language: *b"und",
         handler_name: direct_ingest_handler_name("pcm"),
-        mux_policy: direct_ingest_mux_policy("pcm", MuxTrackKind::Audio),
+        mux_policy: direct_pcm_mux_policy(parsed.container_kind),
         width: 0,
         height: 0,
         sample_entry_box: parsed.sample_entry_box,
@@ -3403,6 +4731,132 @@ async fn import_raw_png_async(
 }
 
 #[cfg(feature = "async")]
+async fn import_raw_bmp_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_bmp_file_async(path, &spec).await?;
+    let data_size = u32::try_from(parsed.segmented_source.total_size).map_err(|_| {
+        MuxError::LayoutOverflow("BMP transformed payload exceeds MP4 sample limits")
+    })?;
+    let source_index = sources.add_segmented(parsed.segmented_source)?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("bmp"),
+        mux_policy: direct_ingest_mux_policy("bmp", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: vec![ImportedSample {
+            source_index,
+            data_offset: 0,
+            data_size,
+            duration: 1_000,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        }],
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_prores_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_prores_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.media_timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("prores"),
+        mux_policy: direct_ingest_mux_policy("prores", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_y4m_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_y4m_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("y4m"),
+        mux_policy: direct_ingest_mux_policy("y4m", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_video_async(
+    path: &Path,
+    params: MuxRawVideoParams,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_raw_video_file_async(path, &spec, &params).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: parsed.timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("rawvideo"),
+        mux_policy: direct_ingest_mux_policy("rawvideo", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_j2k_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let source_index = sources.add_file(path)?;
+    let parsed = scan_j2k_file_async(path, &spec).await?;
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale: 1_000,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("j2k"),
+        mux_policy: direct_ingest_mux_policy("j2k", MuxTrackKind::Video),
+        width: parsed.width,
+        height: parsed.height,
+        sample_entry_box: parsed.sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
 async fn import_raw_truehd_async(
     path: &Path,
     spec: String,
@@ -3445,7 +4899,7 @@ async fn import_wave_pcm_async(
         timescale: sample_rate,
         language: *b"und",
         handler_name: direct_ingest_handler_name("pcm"),
-        mux_policy: direct_ingest_mux_policy("pcm", MuxTrackKind::Audio),
+        mux_policy: direct_pcm_mux_policy(parsed.container_kind),
         width: 0,
         height: 0,
         sample_entry_box: parsed.sample_entry_box,
@@ -3481,14 +4935,29 @@ fn imported_pcm_samples(
     Ok(samples)
 }
 
+fn direct_pcm_mux_policy(container_kind: PcmContainerKind) -> ImportedTrackMuxPolicy {
+    let mut policy = direct_ingest_mux_policy("pcm", MuxTrackKind::Audio);
+    if matches!(
+        container_kind,
+        PcmContainerKind::Aiff | PcmContainerKind::Aifc
+    ) {
+        policy.flat_timing_override_kind = FlatTimingOverrideKind::ZeroDurationSamples;
+        policy.flat_chunking_mode = FlatChunkingMode::OneSamplePerChunk;
+    }
+    policy
+}
+
 #[cfg(feature = "async")]
 async fn import_raw_dts_async(
     path: &Path,
     spec: String,
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
-    let source_index = sources.add_file(path)?;
     let parsed = scan_dts_file_async(path, &spec).await?;
+    let source_index = match parsed.transformed_source.clone() {
+        Some(source) => sources.add_segmented(source)?,
+        None => sources.add_file(path)?,
+    };
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: parsed.media_timescale,
@@ -3697,6 +5166,9 @@ fn import_ogg_opus_sync(
 ) -> Result<ImportedTrack, MuxError> {
     let parsed = scan_ogg_opus_file_sync(path, &spec)?;
     let source_index = sources.add_segmented(parsed.segmented_source)?;
+    if let Some(metadata) = parsed.flat_source_encoding_metadata {
+        sources.set_flat_source_encoding_metadata(source_index, metadata);
+    }
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: 48_000,
@@ -3786,6 +5258,9 @@ async fn import_ogg_opus_async(
 ) -> Result<ImportedTrack, MuxError> {
     let parsed = scan_ogg_opus_file_async(path, &spec).await?;
     let source_index = sources.add_segmented(parsed.segmented_source)?;
+    if let Some(metadata) = parsed.flat_source_encoding_metadata {
+        sources.set_flat_source_encoding_metadata(source_index, metadata);
+    }
     Ok(ImportedTrack {
         kind: MuxTrackKind::Audio,
         timescale: 48_000,
@@ -3938,6 +5413,13 @@ fn choose_movie_timescale(
     if preferred != 0
         && imported_tracks
             .iter()
+            .all(|track| track.mux_policy.header_policy().is_some())
+    {
+        return Ok(preferred);
+    }
+    if preferred != 0
+        && imported_tracks
+            .iter()
             .all(|track| track_times_fit_movie_timescale(track, preferred))
     {
         return Ok(preferred);
@@ -3947,20 +5429,147 @@ fn choose_movie_timescale(
 
 fn choose_file_config(
     movie_timescale: u32,
+    imported_tracks: &[ImportedTrack],
+    sources: &SourceCatalog,
     authority_file_config: Option<&MuxFileConfig>,
 ) -> MuxFileConfig {
-    let Some(authority_file_config) = authority_file_config else {
-        return MuxFileConfig::new(movie_timescale).with_auto_flat_profile(true);
+    let mut file_config = if let Some(authority_file_config) = authority_file_config {
+        MuxFileConfig::new(movie_timescale)
+            .with_major_brand(authority_file_config.major_brand())
+            .with_minor_version(authority_file_config.minor_version())
+            .with_compatible_brands(authority_file_config.compatible_brands().to_vec())
+            .with_auto_flat_profile(authority_file_config.auto_flat_profile())
+            .with_keep_flat_free_box(authority_file_config.keep_flat_free_box())
+            .with_keep_flat_authority_brands(authority_file_config.keep_flat_authority_brands())
+            .with_preserve_auto_flat_movie_timescale(
+                authority_file_config.preserve_auto_flat_movie_timescale(),
+            )
+            .with_flat_source_encoding_metadata(
+                authority_file_config
+                    .flat_source_encoding_metadata()
+                    .map(str::to_string),
+            )
+    } else {
+        MuxFileConfig::new(movie_timescale).with_auto_flat_profile(true)
     };
 
-    let mut config = MuxFileConfig::new(movie_timescale)
-        .with_major_brand(authority_file_config.major_brand())
-        .with_minor_version(authority_file_config.minor_version())
-        .with_auto_flat_profile(false);
-    for brand in authority_file_config.compatible_brands() {
-        config.add_compatible_brand(*brand);
+    if imported_tracks.iter().all(imported_track_uses_dts_family) {
+        file_config = file_config
+            .with_auto_flat_profile(true)
+            .with_keep_flat_free_box(true);
+        if authority_file_config
+            .is_some_and(|file_config| !file_config.keep_flat_authority_brands())
+        {
+            file_config = file_config
+                .with_allow_audio_only_iods(true)
+                .with_preserve_auto_flat_movie_timescale(true);
+        }
     }
-    config
+
+    if imported_tracks
+        .iter()
+        .any(imported_track_should_preserve_auto_flat_movie_timescale)
+    {
+        file_config = file_config.with_preserve_auto_flat_movie_timescale(true);
+    }
+
+    file_config = file_config.with_flat_source_encoding_metadata(
+        choose_flat_source_encoding_metadata(imported_tracks, sources),
+    );
+
+    file_config
+}
+
+fn choose_flat_source_encoding_metadata(
+    imported_tracks: &[ImportedTrack],
+    sources: &SourceCatalog,
+) -> Option<String> {
+    for track in imported_tracks {
+        let Some(source_index) = track.samples.first().map(|sample| sample.source_index) else {
+            continue;
+        };
+        if let Some(metadata) = sources.flat_source_encoding_metadata(source_index) {
+            return Some(metadata.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_imported_sample_entry_box(
+    imported_track: &ImportedTrack,
+) -> Result<Vec<u8>, MuxError> {
+    if !imported_track_uses_dts_family(imported_track) {
+        return Ok(imported_track.sample_entry_box.clone());
+    }
+
+    if imported_track_should_strip_single_sample_dts_btrt(imported_track) {
+        return super::mp4::strip_audio_sample_entry_immediate_children(
+            &imported_track.sample_entry_box,
+            &[FourCc::from_bytes(*b"btrt")],
+        );
+    }
+
+    let btrt = build_btrt_from_sample_sizes(
+        imported_track
+            .samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+        imported_track.timescale,
+    )?;
+    super::mp4::append_audio_sample_entry_btrt(&imported_track.sample_entry_box, &btrt)
+}
+
+fn imported_track_should_strip_single_sample_dts_btrt(imported_track: &ImportedTrack) -> bool {
+    imported_track.mux_policy.strip_single_sample_dts_btrt() && imported_track.samples.len() == 1
+}
+
+fn imported_track_uses_dts_family(imported_track: &ImportedTrack) -> bool {
+    matches!(
+        sample_entry_box_type(&imported_track.sample_entry_box),
+        Some(value)
+            if value == FourCc::from_bytes(*b"dtsc")
+                || value == FourCc::from_bytes(*b"dtse")
+                || value == FourCc::from_bytes(*b"dtsh")
+                || value == FourCc::from_bytes(*b"dtsl")
+                || value == FourCc::from_bytes(*b"dtsm")
+                || value == FourCc::from_bytes(*b"dtsx")
+                || value == FourCc::from_bytes(*b"dtsy")
+    )
+}
+
+fn imported_track_should_preserve_auto_flat_movie_timescale(
+    imported_track: &ImportedTrack,
+) -> bool {
+    matches!(
+        sample_entry_box_type(&imported_track.sample_entry_box),
+        Some(value)
+            if value == FourCc::from_bytes(*b"apco")
+                || value == FourCc::from_bytes(*b"apcn")
+                || value == FourCc::from_bytes(*b"apch")
+                || value == FourCc::from_bytes(*b"apcs")
+                || value == FourCc::from_bytes(*b"ap4x")
+                || value == FourCc::from_bytes(*b"ap4h")
+    )
+}
+
+fn track_candidate_uses_dts_family(track: &TrackCandidate) -> bool {
+    matches!(
+        sample_entry_box_type(&track.sample_entry_box),
+        Some(value)
+            if value == FourCc::from_bytes(*b"dtsc")
+                || value == FourCc::from_bytes(*b"dtse")
+                || value == FourCc::from_bytes(*b"dtsh")
+                || value == FourCc::from_bytes(*b"dtsl")
+                || value == FourCc::from_bytes(*b"dtsm")
+                || value == FourCc::from_bytes(*b"dtsx")
+                || value == FourCc::from_bytes(*b"dtsy")
+    )
+}
+
+fn sample_entry_box_type(sample_entry_box: &[u8]) -> Option<FourCc> {
+    Some(FourCc::from_bytes(
+        sample_entry_box.get(4..8)?.try_into().ok()?,
+    ))
 }
 
 fn validate_request_shape(request: &MuxRequest, output_path: &Path) -> Result<(), MuxError> {
@@ -4148,6 +5757,9 @@ fn display_track_spec(track: &MuxTrackSpec) -> String {
             Some(selector) => format!("{}#{}", path.display(), format_mp4_selector(*selector)),
             None => path.display().to_string(),
         },
+        MuxTrackSpec::RawVideo { path, params } => {
+            format!("{}#{}", path.display(), params.format_suffix())
+        }
     }
 }
 
@@ -4163,7 +5775,8 @@ fn format_mp4_selector(selector: MuxMp4TrackSelector) -> String {
 }
 
 fn detect_path_track_kind_sync(path: &Path) -> Result<DetectedPathTrackKind, MuxError> {
-    let mut file = File::open(path)?;
+    let mut file =
+        File::open(path).map_err(|error| mux_io_at_path("open mux input", path, error))?;
     let mut prefix = [0_u8; 512];
     let read = file.read(&mut prefix)?;
     let prefix = &prefix[..read];
@@ -4175,13 +5788,36 @@ fn detect_path_track_kind_sync(path: &Path) -> Result<DetectedPathTrackKind, Mux
         file.seek(SeekFrom::Start(0))?;
         return detect_caf_track_kind_sync(&mut file);
     }
+    if let Some(kind) = detect_container_path_kind_from_path_and_prefix(path, prefix) {
+        return Ok(DetectedPathTrackKind::Container(kind));
+    }
+    if let Some(kind) = detect_nhml_sidecar_kind(path, prefix) {
+        return Ok(DetectedPathTrackKind::Container(kind));
+    }
     if let Some(kind) = detect_id3_wrapped_audio_sync(&mut file, prefix)? {
         return Ok(kind);
     }
     if let Some(kind) = detect_vobsub_track_kind_sync(path, prefix)? {
         return Ok(kind);
     }
-    Ok(detect_path_track_kind_from_prefix(prefix))
+    let detected = detect_path_track_kind_from_prefix(prefix);
+    if matches!(detected, DetectedPathTrackKind::Mp4ImportOnly(_))
+        && prefix.starts_with(b"DTSHDHDR")
+    {
+        file.seek(SeekFrom::Start(0))?;
+        let file_size = file.metadata()?.len();
+        if wrapped_dts_family_has_native_core_sync_sync(
+            &mut file,
+            file_size,
+            &path.display().to_string(),
+        )? {
+            return Ok(DetectedPathTrackKind::Raw(MuxRawCodec::Dts));
+        }
+    }
+    if detected != DetectedPathTrackKind::Unknown {
+        return Ok(detected);
+    }
+    Ok(detect_av1_extension_fallback(path).unwrap_or(DetectedPathTrackKind::Unknown))
 }
 
 fn is_mp4_like_path(path: &Path) -> bool {
@@ -4193,7 +5829,9 @@ fn is_mp4_like_path(path: &Path) -> bool {
 
 #[cfg(feature = "async")]
 async fn detect_path_track_kind_async(path: &Path) -> Result<DetectedPathTrackKind, MuxError> {
-    let mut file = TokioFile::open(path).await?;
+    let mut file = TokioFile::open(path)
+        .await
+        .map_err(|error| mux_io_at_path("open mux input", path, error))?;
     let mut prefix = [0_u8; 512];
     let read = file.read(&mut prefix).await?;
     let prefix = &prefix[..read];
@@ -4205,13 +5843,49 @@ async fn detect_path_track_kind_async(path: &Path) -> Result<DetectedPathTrackKi
         file.seek(SeekFrom::Start(0)).await?;
         return detect_caf_track_kind_async(&mut file).await;
     }
+    if let Some(kind) = detect_container_path_kind_from_path_and_prefix(path, prefix) {
+        return Ok(DetectedPathTrackKind::Container(kind));
+    }
+    if let Some(kind) = detect_nhml_sidecar_kind(path, prefix) {
+        return Ok(DetectedPathTrackKind::Container(kind));
+    }
     if let Some(kind) = detect_id3_wrapped_audio_async(&mut file, prefix).await? {
         return Ok(kind);
     }
     if let Some(kind) = detect_vobsub_track_kind_async(path, prefix).await? {
         return Ok(kind);
     }
-    Ok(detect_path_track_kind_from_prefix(prefix))
+    let detected = detect_path_track_kind_from_prefix(prefix);
+    if matches!(detected, DetectedPathTrackKind::Mp4ImportOnly(_))
+        && prefix.starts_with(b"DTSHDHDR")
+    {
+        file.seek(SeekFrom::Start(0)).await?;
+        let file_size = file.metadata().await?.len();
+        if wrapped_dts_family_has_native_core_sync_async(
+            &mut file,
+            file_size,
+            &path.display().to_string(),
+        )
+        .await?
+        {
+            return Ok(DetectedPathTrackKind::Raw(MuxRawCodec::Dts));
+        }
+    }
+    if detected != DetectedPathTrackKind::Unknown {
+        return Ok(detected);
+    }
+    Ok(detect_av1_extension_fallback(path).unwrap_or(DetectedPathTrackKind::Unknown))
+}
+
+fn detect_av1_extension_fallback(path: &Path) -> Option<DetectedPathTrackKind> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("obu")
+        || extension.eq_ignore_ascii_case("av1")
+        || extension.eq_ignore_ascii_case("av1b")
+    {
+        return Some(DetectedPathTrackKind::Raw(MuxRawCodec::Av1));
+    }
+    None
 }
 
 fn detect_vobsub_track_kind_sync(
@@ -4304,7 +5978,8 @@ async fn detect_id3_wrapped_audio_async(
 }
 
 fn path_starts_with_sync(path: &Path, signature: &[u8]) -> Result<bool, MuxError> {
-    let mut file = File::open(path)?;
+    let mut file =
+        File::open(path).map_err(|error| mux_io_at_path("open mux input", path, error))?;
     let mut prefix = vec![0_u8; signature.len()];
     let read = file.read(&mut prefix)?;
     Ok(read == signature.len() && prefix == signature)
@@ -4312,10 +5987,1792 @@ fn path_starts_with_sync(path: &Path, signature: &[u8]) -> Result<bool, MuxError
 
 #[cfg(feature = "async")]
 async fn path_starts_with_async(path: &Path, signature: &[u8]) -> Result<bool, MuxError> {
-    let mut file = TokioFile::open(path).await?;
+    let mut file = TokioFile::open(path)
+        .await
+        .map_err(|error| mux_io_at_path("open mux input", path, error))?;
     let mut prefix = vec![0_u8; signature.len()];
     let read = file.read(&mut prefix).await?;
     Ok(read == signature.len() && prefix == signature)
+}
+
+fn direct_ingest_container_label(kind: DetectedContainerPathKind) -> &'static str {
+    match kind {
+        DetectedContainerPathKind::Avi => "avi",
+        DetectedContainerPathKind::Dash => "dash",
+        DetectedContainerPathKind::Ghi => "ghi",
+        DetectedContainerPathKind::Gsf => "gsf",
+        DetectedContainerPathKind::Nhml => "nhml",
+        DetectedContainerPathKind::Nhnt => "nhnt",
+        DetectedContainerPathKind::ProgramStream => "program_stream",
+        DetectedContainerPathKind::Saf => "saf",
+        DetectedContainerPathKind::TransportStream => "transport_stream",
+        DetectedContainerPathKind::VobSub => "vobsub",
+    }
+}
+
+fn detected_kind_supports_flat_mux(kind: DetectedPathTrackKind) -> bool {
+    matches!(
+        kind,
+        DetectedPathTrackKind::Mp4
+            | DetectedPathTrackKind::Raw(_)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream)
+            | DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub)
+    )
+}
+
+fn unsupported_gsf_container_message() -> &'static str {
+    "GSF is a serialized multi-PID transport surface rather than a local authored-media input on the current path-only mux lane; import the authored files or authored MP4 tracks directly instead"
+}
+
+fn unsupported_ghi_container_message() -> &'static str {
+    "GHI is a segment-index or manifest transport surface rather than a local authored-media input on the current path-only mux lane; import the authored media files or local MPD inputs directly instead"
+}
+
+fn direct_ingest_report_kind(kind: DetectedPathTrackKind) -> DirectIngestDetectedKind {
+    match kind {
+        DetectedPathTrackKind::Mp4 => DirectIngestDetectedKind::Mp4,
+        DetectedPathTrackKind::Container(container) => DirectIngestDetectedKind::Container {
+            container: direct_ingest_container_label(container).to_string(),
+        },
+        DetectedPathTrackKind::Raw(codec) => DirectIngestDetectedKind::Raw {
+            codec: codec.prefix().to_string(),
+        },
+        DetectedPathTrackKind::Mp4ImportOnly(family) => DirectIngestDetectedKind::ImportOnly {
+            family: family.to_string(),
+        },
+        DetectedPathTrackKind::Unknown => DirectIngestDetectedKind::Unknown,
+    }
+}
+
+fn direct_ingest_report_note(kind: DetectedPathTrackKind) -> Option<String> {
+    match kind {
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi) => {
+            Some(unsupported_ghi_container_message().to_string())
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {
+            Some(unsupported_gsf_container_message().to_string())
+        }
+        DetectedPathTrackKind::Mp4ImportOnly(kind) => Some(format!(
+            "path-only mux import for `{kind}` is not supported; import this family from an MP4 source with `#audio` or `#track:ID` instead"
+        )),
+        DetectedPathTrackKind::Unknown => Some("path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AAC LATM, MHAS, AC-3, E-AC-3, AC-4, DTS, TrueHD, MPEG-2 video, AV1, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, BMP still images, JPEG 2000 image or codestream input, self-describing YUV4MPEG raw video, raw ProRes, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string()),
+        _ => None,
+    }
+}
+
+fn direct_ingest_sample_entry_type(sample_entry_box: &[u8]) -> String {
+    if sample_entry_box.len() >= 8 {
+        String::from_utf8_lossy(&sample_entry_box[4..8]).into_owned()
+    } else {
+        "????".to_string()
+    }
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        rendered.push(HEX[usize::from(byte >> 4)] as char);
+        rendered.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    rendered
+}
+
+fn source_segment_to_direct_ingest_report(
+    segment: &SegmentedMuxSourceSegment,
+) -> DirectIngestSourceSegmentReport {
+    let (kind, source_offset, source_path, data_hex) = match &segment.data {
+        SegmentedMuxSourceSegmentData::Prefix(prefix) => (
+            "prefix".to_string(),
+            None,
+            None,
+            Some(lowercase_hex(prefix)),
+        ),
+        SegmentedMuxSourceSegmentData::Bytes(bytes) => {
+            ("bytes".to_string(), None, None, Some(lowercase_hex(bytes)))
+        }
+        SegmentedMuxSourceSegmentData::FileRange { source_offset, .. } => {
+            ("file_range".to_string(), Some(*source_offset), None, None)
+        }
+        SegmentedMuxSourceSegmentData::ExternalFileRange {
+            path,
+            source_offset,
+            ..
+        } => (
+            "file_range".to_string(),
+            Some(*source_offset),
+            Some(path.clone()),
+            None,
+        ),
+    };
+    DirectIngestSourceSegmentReport {
+        kind,
+        logical_offset: segment.logical_offset,
+        logical_size: segment.logical_size(),
+        source_offset,
+        source_path,
+        data_hex,
+    }
+}
+
+fn u32_bounds<I>(values: I) -> (Option<u32>, Option<u32>)
+where
+    I: IntoIterator<Item = u32>,
+{
+    let mut minimum = None::<u32>;
+    let mut maximum = None::<u32>;
+    for value in values {
+        minimum = Some(minimum.map_or(value, |current| current.min(value)));
+        maximum = Some(maximum.map_or(value, |current| current.max(value)));
+    }
+    (minimum, maximum)
+}
+
+fn u64_bounds<I>(values: I) -> (Option<u64>, Option<u64>)
+where
+    I: IntoIterator<Item = u64>,
+{
+    let mut minimum = None::<u64>;
+    let mut maximum = None::<u64>;
+    for value in values {
+        minimum = Some(minimum.map_or(value, |current| current.min(value)));
+        maximum = Some(maximum.map_or(value, |current| current.max(value)));
+    }
+    (minimum, maximum)
+}
+
+fn i32_bounds<I>(values: I) -> (Option<i32>, Option<i32>)
+where
+    I: IntoIterator<Item = i32>,
+{
+    let mut minimum = None::<i32>;
+    let mut maximum = None::<i32>;
+    for value in values {
+        minimum = Some(match minimum {
+            Some(current) => current.min(value),
+            None => value,
+        });
+        maximum = Some(match maximum {
+            Some(current) => current.max(value),
+            None => value,
+        });
+    }
+    (minimum, maximum)
+}
+
+fn i64_bounds<I>(values: I) -> (Option<i64>, Option<i64>)
+where
+    I: IntoIterator<Item = i64>,
+{
+    let mut minimum = None::<i64>;
+    let mut maximum = None::<i64>;
+    for value in values {
+        minimum = Some(minimum.map_or(value, |current| current.min(value)));
+        maximum = Some(maximum.map_or(value, |current| current.max(value)));
+    }
+    (minimum, maximum)
+}
+
+fn report_presentation_time(decode_time: u64, composition_time_offset: i32) -> i64 {
+    i64::try_from(decode_time)
+        .unwrap_or(i64::MAX)
+        .saturating_add(i64::from(composition_time_offset))
+}
+
+fn report_presentation_end_time(
+    decode_time: u64,
+    composition_time_offset: i32,
+    duration: u32,
+) -> i64 {
+    report_presentation_time(decode_time, composition_time_offset)
+        .saturating_add(i64::from(duration))
+}
+
+fn average_bitrate_bits_per_second(
+    total_payload_size: u64,
+    total_duration: u64,
+    timescale: u32,
+) -> Option<u64> {
+    if total_duration == 0 || timescale == 0 {
+        return None;
+    }
+    let bits = u128::from(total_payload_size).checked_mul(8)?;
+    let scaled = bits.checked_mul(u128::from(timescale))?;
+    u64::try_from(scaled / u128::from(total_duration)).ok()
+}
+
+fn average_size(total_payload_size: u64, count: usize) -> Option<u64> {
+    let count = u64::try_from(count).ok()?;
+    if count == 0 {
+        None
+    } else {
+        Some(total_payload_size / count)
+    }
+}
+
+fn average_non_sync_sample_size(samples: &[DirectIngestSampleReport]) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut count = 0_u64;
+    for sample in samples {
+        if sample.is_sync_sample {
+            continue;
+        }
+        total = total.saturating_add(u64::from(sample.data_size));
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(total / count)
+    }
+}
+
+fn sync_sample_distance_summary(
+    samples: &[DirectIngestSampleReport],
+) -> (Option<u32>, Option<u32>, Option<u64>) {
+    let mut previous_sync_index = None::<usize>;
+    let mut minimum = None::<u32>;
+    let mut maximum = None::<u32>;
+    let mut total = 0_u64;
+    let mut count = 0_u64;
+    for (index, sample) in samples.iter().enumerate() {
+        if !sample.is_sync_sample {
+            continue;
+        }
+        if let Some(previous_index) = previous_sync_index {
+            let distance = u32::try_from(index.saturating_sub(previous_index)).unwrap_or(u32::MAX);
+            minimum = Some(minimum.map_or(distance, |current| current.min(distance)));
+            maximum = Some(maximum.map_or(distance, |current| current.max(distance)));
+            total = total.saturating_add(u64::from(distance));
+            count = count.saturating_add(1);
+        }
+        previous_sync_index = Some(index);
+    }
+    let average = if count == 0 {
+        None
+    } else {
+        Some(total / count)
+    };
+    (minimum, maximum, average)
+}
+
+fn sync_sample_size_summary(
+    samples: &[DirectIngestSampleReport],
+) -> (Option<u32>, Option<u32>, Option<u64>) {
+    let sync_sizes = samples
+        .iter()
+        .filter(|sample| sample.is_sync_sample)
+        .map(|sample| sample.data_size);
+    let (minimum, maximum) = u32_bounds(sync_sizes.clone());
+    let mut total = 0_u64;
+    let mut count = 0_u64;
+    for size in sync_sizes {
+        total = total.saturating_add(u64::from(size));
+        count = count.saturating_add(1);
+    }
+    let average = if count == 0 {
+        None
+    } else {
+        Some(total / count)
+    };
+    (minimum, maximum, average)
+}
+
+fn sync_sample_decode_delta_summary(
+    samples: &[DirectIngestSampleReport],
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut previous_sync_decode_time = None::<u64>;
+    let mut minimum = None::<u64>;
+    let mut maximum = None::<u64>;
+    let mut total = 0_u64;
+    let mut count = 0_u64;
+    for sample in samples {
+        if !sample.is_sync_sample {
+            continue;
+        }
+        if let Some(previous_decode_time) = previous_sync_decode_time {
+            let delta = sample.decode_time.saturating_sub(previous_decode_time);
+            minimum = Some(minimum.map_or(delta, |current| current.min(delta)));
+            maximum = Some(maximum.map_or(delta, |current| current.max(delta)));
+            total = total.saturating_add(delta);
+            count = count.saturating_add(1);
+        }
+        previous_sync_decode_time = Some(sample.decode_time);
+    }
+    let average = if count == 0 {
+        None
+    } else {
+        Some(total / count)
+    };
+    (minimum, maximum, average)
+}
+
+type SyncSampleAnchorSummary = (
+    Option<usize>,
+    Option<usize>,
+    Option<u64>,
+    Option<u64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn sync_sample_anchor_summary(samples: &[DirectIngestSampleReport]) -> SyncSampleAnchorSummary {
+    let mut first_index = None::<usize>;
+    let mut last_index = None::<usize>;
+    let mut first_decode_time = None::<u64>;
+    let mut last_decode_time = None::<u64>;
+    let mut first_presentation_time = None::<i64>;
+    let mut last_presentation_time = None::<i64>;
+    for (index, sample) in samples.iter().enumerate() {
+        if !sample.is_sync_sample {
+            continue;
+        }
+        if first_index.is_none() {
+            first_index = Some(index);
+            first_decode_time = Some(sample.decode_time);
+            first_presentation_time = Some(sample.presentation_time);
+        }
+        last_index = Some(index);
+        last_decode_time = Some(sample.decode_time);
+        last_presentation_time = Some(sample.presentation_time);
+    }
+    (
+        first_index,
+        last_index,
+        first_decode_time,
+        last_decode_time,
+        first_presentation_time,
+        last_presentation_time,
+    )
+}
+
+type SyncPacketAnchorSummary = (
+    Option<u32>,
+    Option<usize>,
+    Option<u32>,
+    Option<usize>,
+    Option<u64>,
+    Option<u64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn sync_packet_anchor_summary(packets: &[DirectIngestPacketEntry]) -> SyncPacketAnchorSummary {
+    let mut first_track_id = None::<u32>;
+    let mut first_packet_index = None::<usize>;
+    let mut last_track_id = None::<u32>;
+    let mut last_packet_index = None::<usize>;
+    let mut first_decode_time = None::<u64>;
+    let mut last_decode_time = None::<u64>;
+    let mut first_presentation_time = None::<i64>;
+    let mut last_presentation_time = None::<i64>;
+    for packet in packets {
+        if !packet.is_sync_sample {
+            continue;
+        }
+        if first_track_id.is_none() {
+            first_track_id = Some(packet.track_id);
+            first_packet_index = Some(packet.packet_index);
+            first_decode_time = Some(packet.decode_time);
+            first_presentation_time = Some(packet.presentation_time);
+        }
+        last_track_id = Some(packet.track_id);
+        last_packet_index = Some(packet.packet_index);
+        last_decode_time = Some(packet.decode_time);
+        last_presentation_time = Some(packet.presentation_time);
+    }
+    (
+        first_track_id,
+        first_packet_index,
+        last_track_id,
+        last_packet_index,
+        first_decode_time,
+        last_decode_time,
+        first_presentation_time,
+        last_presentation_time,
+    )
+}
+
+fn track_candidate_to_direct_ingest_report(track: &TrackCandidate) -> DirectIngestTrackReport {
+    let mut decode_time = 0_u64;
+    let mut previous_decode_time = None::<u64>;
+    let mut previous_presentation_time = None::<i64>;
+    let mut previous_presentation_end_time = None::<i64>;
+    let mut previous_duration = None::<u32>;
+    let mut previous_composition_time_offset = None::<i32>;
+    let mut minimum_previous_decode_delta = None::<u64>;
+    let mut maximum_previous_decode_delta = None::<u64>;
+    let mut minimum_previous_presentation_delta = None::<i64>;
+    let mut maximum_previous_presentation_delta = None::<i64>;
+    let mut presentation_gap_count = 0usize;
+    let mut presentation_overlap_count = 0usize;
+    let mut presentation_regression_count = 0usize;
+    let mut duration_change_count = 0usize;
+    let mut composition_time_offset_change_count = 0usize;
+    let samples = track
+        .samples
+        .iter()
+        .map(|sample| {
+            let previous_decode_delta =
+                previous_decode_time.map(|value| decode_time.saturating_sub(value));
+            if let Some(delta) = previous_decode_delta {
+                minimum_previous_decode_delta =
+                    Some(minimum_previous_decode_delta.map_or(delta, |current| current.min(delta)));
+                maximum_previous_decode_delta =
+                    Some(maximum_previous_decode_delta.map_or(delta, |current| current.max(delta)));
+            }
+            let presentation_time =
+                report_presentation_time(decode_time, sample.composition_time_offset);
+            let presentation_end_time = report_presentation_end_time(
+                decode_time,
+                sample.composition_time_offset,
+                sample.duration,
+            );
+            let previous_presentation_delta =
+                previous_presentation_time.map(|value| presentation_time.saturating_sub(value));
+            if let Some(delta) = previous_presentation_delta {
+                minimum_previous_presentation_delta = Some(
+                    minimum_previous_presentation_delta.map_or(delta, |current| current.min(delta)),
+                );
+                maximum_previous_presentation_delta = Some(
+                    maximum_previous_presentation_delta.map_or(delta, |current| current.max(delta)),
+                );
+            }
+            if let Some(previous_time) = previous_presentation_time
+                && presentation_time < previous_time
+            {
+                presentation_regression_count += 1;
+            }
+            if let Some(previous_end_time) = previous_presentation_end_time {
+                if presentation_time > previous_end_time {
+                    presentation_gap_count += 1;
+                } else if presentation_time < previous_end_time {
+                    presentation_overlap_count += 1;
+                }
+            }
+            if let Some(duration) = previous_duration
+                && sample.duration != duration
+            {
+                duration_change_count += 1;
+            }
+            if let Some(composition_time_offset) = previous_composition_time_offset
+                && sample.composition_time_offset != composition_time_offset
+            {
+                composition_time_offset_change_count += 1;
+            }
+            let report = DirectIngestSampleReport {
+                source_index: sample.source_index,
+                data_offset: sample.data_offset,
+                data_size: sample.data_size,
+                decode_time,
+                previous_decode_delta,
+                composition_time_offset: sample.composition_time_offset,
+                presentation_time,
+                presentation_end_time,
+                previous_presentation_delta,
+                duration: sample.duration,
+                is_sync_sample: sample.is_sync_sample,
+            };
+            previous_decode_time = Some(decode_time);
+            decode_time += u64::from(sample.duration);
+            previous_presentation_time = Some(presentation_time);
+            previous_presentation_end_time = Some(presentation_end_time);
+            previous_duration = Some(sample.duration);
+            previous_composition_time_offset = Some(sample.composition_time_offset);
+            report
+        })
+        .collect::<Vec<_>>();
+    let total_duration = track
+        .samples
+        .iter()
+        .map(|sample| u64::from(sample.duration))
+        .sum::<u64>();
+    let sync_sample_count = track
+        .samples
+        .iter()
+        .filter(|sample| sample.is_sync_sample)
+        .count();
+    let starts_with_sync_sample = track
+        .samples
+        .first()
+        .map(|sample| sample.is_sync_sample)
+        .unwrap_or(false);
+    let total_payload_size = track
+        .samples
+        .iter()
+        .map(|sample| u64::from(sample.data_size))
+        .sum::<u64>();
+    let average_sample_size = average_size(total_payload_size, track.samples.len());
+    let (minimum_sample_size, maximum_sample_size) =
+        u32_bounds(track.samples.iter().map(|sample| sample.data_size));
+    let (minimum_sample_duration, maximum_sample_duration) =
+        u32_bounds(track.samples.iter().map(|sample| sample.duration));
+    let (minimum_composition_time_offset, maximum_composition_time_offset) = i32_bounds(
+        track
+            .samples
+            .iter()
+            .map(|sample| sample.composition_time_offset),
+    );
+    let (minimum_presentation_time, maximum_presentation_end_time) = i64_bounds(
+        samples
+            .iter()
+            .flat_map(|sample| [sample.presentation_time, sample.presentation_end_time]),
+    );
+    let average_bitrate_bits_per_second =
+        average_bitrate_bits_per_second(total_payload_size, total_duration, track.timescale);
+    let (minimum_sync_sample_size, maximum_sync_sample_size, average_sync_sample_size) =
+        sync_sample_size_summary(&samples);
+    let average_non_sync_sample_size = average_non_sync_sample_size(&samples);
+    let (minimum_sync_sample_distance, maximum_sync_sample_distance, average_sync_sample_distance) =
+        sync_sample_distance_summary(&samples);
+    let (
+        minimum_sync_sample_decode_delta,
+        maximum_sync_sample_decode_delta,
+        average_sync_sample_decode_delta,
+    ) = sync_sample_decode_delta_summary(&samples);
+    let (
+        first_sync_sample_index,
+        last_sync_sample_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+    ) = sync_sample_anchor_summary(&samples);
+    DirectIngestTrackReport {
+        track_id: track.track_id,
+        kind: match track.kind {
+            MuxTrackKind::Audio => "audio",
+            MuxTrackKind::Video => "video",
+            MuxTrackKind::Text => "text",
+            MuxTrackKind::Subtitle => "subtitle",
+        }
+        .to_string(),
+        timescale: track.timescale,
+        language: String::from_utf8_lossy(&track.language).into_owned(),
+        handler_name: track.handler_name.clone(),
+        sample_entry_type: direct_ingest_sample_entry_type(&track.sample_entry_box),
+        sample_entry_box_hex: lowercase_hex(&track.sample_entry_box),
+        width: if track.kind.is_video() || track.kind.is_textual() {
+            Some(track.width)
+        } else {
+            None
+        },
+        height: if track.kind.is_video() || track.kind.is_textual() {
+            Some(track.height)
+        } else {
+            None
+        },
+        source_edit_media_time: track.source_edit_media_time,
+        sample_roll_distance: track.mux_policy.sample_roll_distance(),
+        sample_count: track.samples.len(),
+        sync_sample_count,
+        starts_with_sync_sample,
+        total_duration,
+        total_payload_size,
+        average_sample_size,
+        minimum_sample_size,
+        maximum_sample_size,
+        minimum_sample_duration,
+        maximum_sample_duration,
+        average_bitrate_bits_per_second,
+        minimum_sync_sample_size,
+        maximum_sync_sample_size,
+        average_sync_sample_size,
+        average_non_sync_sample_size,
+        minimum_composition_time_offset,
+        maximum_composition_time_offset,
+        minimum_presentation_time,
+        maximum_presentation_end_time,
+        minimum_previous_decode_delta,
+        maximum_previous_decode_delta,
+        minimum_previous_presentation_delta,
+        maximum_previous_presentation_delta,
+        presentation_gap_count,
+        presentation_overlap_count,
+        presentation_regression_count,
+        duration_change_count,
+        composition_time_offset_change_count,
+        minimum_sync_sample_distance,
+        maximum_sync_sample_distance,
+        average_sync_sample_distance,
+        minimum_sync_sample_decode_delta,
+        maximum_sync_sample_decode_delta,
+        average_sync_sample_decode_delta,
+        first_sync_sample_index,
+        last_sync_sample_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+        first_decode_time: 0,
+        end_decode_time: total_duration,
+        samples,
+    }
+}
+
+fn imported_track_to_direct_ingest_report(track: &ImportedTrack) -> DirectIngestTrackReport {
+    let mut decode_time = 0_u64;
+    let mut previous_decode_time = None::<u64>;
+    let mut previous_presentation_time = None::<i64>;
+    let mut previous_presentation_end_time = None::<i64>;
+    let mut previous_duration = None::<u32>;
+    let mut previous_composition_time_offset = None::<i32>;
+    let mut minimum_previous_decode_delta = None::<u64>;
+    let mut maximum_previous_decode_delta = None::<u64>;
+    let mut minimum_previous_presentation_delta = None::<i64>;
+    let mut maximum_previous_presentation_delta = None::<i64>;
+    let mut presentation_gap_count = 0usize;
+    let mut presentation_overlap_count = 0usize;
+    let mut presentation_regression_count = 0usize;
+    let mut duration_change_count = 0usize;
+    let mut composition_time_offset_change_count = 0usize;
+    let samples = track
+        .samples
+        .iter()
+        .map(|sample| {
+            let previous_decode_delta =
+                previous_decode_time.map(|value| decode_time.saturating_sub(value));
+            if let Some(delta) = previous_decode_delta {
+                minimum_previous_decode_delta =
+                    Some(minimum_previous_decode_delta.map_or(delta, |current| current.min(delta)));
+                maximum_previous_decode_delta =
+                    Some(maximum_previous_decode_delta.map_or(delta, |current| current.max(delta)));
+            }
+            let presentation_time =
+                report_presentation_time(decode_time, sample.composition_time_offset);
+            let presentation_end_time = report_presentation_end_time(
+                decode_time,
+                sample.composition_time_offset,
+                sample.duration,
+            );
+            let previous_presentation_delta =
+                previous_presentation_time.map(|value| presentation_time.saturating_sub(value));
+            if let Some(delta) = previous_presentation_delta {
+                minimum_previous_presentation_delta = Some(
+                    minimum_previous_presentation_delta.map_or(delta, |current| current.min(delta)),
+                );
+                maximum_previous_presentation_delta = Some(
+                    maximum_previous_presentation_delta.map_or(delta, |current| current.max(delta)),
+                );
+            }
+            if let Some(previous_time) = previous_presentation_time
+                && presentation_time < previous_time
+            {
+                presentation_regression_count += 1;
+            }
+            if let Some(previous_end_time) = previous_presentation_end_time {
+                if presentation_time > previous_end_time {
+                    presentation_gap_count += 1;
+                } else if presentation_time < previous_end_time {
+                    presentation_overlap_count += 1;
+                }
+            }
+            if let Some(duration) = previous_duration
+                && sample.duration != duration
+            {
+                duration_change_count += 1;
+            }
+            if let Some(composition_time_offset) = previous_composition_time_offset
+                && sample.composition_time_offset != composition_time_offset
+            {
+                composition_time_offset_change_count += 1;
+            }
+            let report = DirectIngestSampleReport {
+                source_index: sample.source_index,
+                data_offset: sample.data_offset,
+                data_size: sample.data_size,
+                decode_time,
+                previous_decode_delta,
+                composition_time_offset: sample.composition_time_offset,
+                presentation_time,
+                presentation_end_time,
+                previous_presentation_delta,
+                duration: sample.duration,
+                is_sync_sample: sample.is_sync_sample,
+            };
+            previous_decode_time = Some(decode_time);
+            decode_time += u64::from(sample.duration);
+            previous_presentation_time = Some(presentation_time);
+            previous_presentation_end_time = Some(presentation_end_time);
+            previous_duration = Some(sample.duration);
+            previous_composition_time_offset = Some(sample.composition_time_offset);
+            report
+        })
+        .collect::<Vec<_>>();
+    let total_duration = track
+        .samples
+        .iter()
+        .map(|sample| u64::from(sample.duration))
+        .sum::<u64>();
+    let sync_sample_count = track
+        .samples
+        .iter()
+        .filter(|sample| sample.is_sync_sample)
+        .count();
+    let starts_with_sync_sample = track
+        .samples
+        .first()
+        .map(|sample| sample.is_sync_sample)
+        .unwrap_or(false);
+    let total_payload_size = track
+        .samples
+        .iter()
+        .map(|sample| u64::from(sample.data_size))
+        .sum::<u64>();
+    let average_sample_size = average_size(total_payload_size, track.samples.len());
+    let (minimum_sample_size, maximum_sample_size) =
+        u32_bounds(track.samples.iter().map(|sample| sample.data_size));
+    let (minimum_sample_duration, maximum_sample_duration) =
+        u32_bounds(track.samples.iter().map(|sample| sample.duration));
+    let (minimum_composition_time_offset, maximum_composition_time_offset) = i32_bounds(
+        track
+            .samples
+            .iter()
+            .map(|sample| sample.composition_time_offset),
+    );
+    let (minimum_presentation_time, maximum_presentation_end_time) = i64_bounds(
+        samples
+            .iter()
+            .flat_map(|sample| [sample.presentation_time, sample.presentation_end_time]),
+    );
+    let average_bitrate_bits_per_second =
+        average_bitrate_bits_per_second(total_payload_size, total_duration, track.timescale);
+    let (minimum_sync_sample_size, maximum_sync_sample_size, average_sync_sample_size) =
+        sync_sample_size_summary(&samples);
+    let average_non_sync_sample_size = average_non_sync_sample_size(&samples);
+    let (minimum_sync_sample_distance, maximum_sync_sample_distance, average_sync_sample_distance) =
+        sync_sample_distance_summary(&samples);
+    let (
+        minimum_sync_sample_decode_delta,
+        maximum_sync_sample_decode_delta,
+        average_sync_sample_decode_delta,
+    ) = sync_sample_decode_delta_summary(&samples);
+    let (
+        first_sync_sample_index,
+        last_sync_sample_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+    ) = sync_sample_anchor_summary(&samples);
+    DirectIngestTrackReport {
+        track_id: 1,
+        kind: match track.kind {
+            MuxTrackKind::Audio => "audio",
+            MuxTrackKind::Video => "video",
+            MuxTrackKind::Text => "text",
+            MuxTrackKind::Subtitle => "subtitle",
+        }
+        .to_string(),
+        timescale: track.timescale,
+        language: String::from_utf8_lossy(&track.language).into_owned(),
+        handler_name: track.handler_name.clone(),
+        sample_entry_type: direct_ingest_sample_entry_type(&track.sample_entry_box),
+        sample_entry_box_hex: lowercase_hex(&track.sample_entry_box),
+        width: if track.kind.is_video() || track.kind.is_textual() {
+            Some(track.width)
+        } else {
+            None
+        },
+        height: if track.kind.is_video() || track.kind.is_textual() {
+            Some(track.height)
+        } else {
+            None
+        },
+        source_edit_media_time: track.source_edit_media_time,
+        sample_roll_distance: track.sample_roll_distance,
+        sample_count: track.samples.len(),
+        sync_sample_count,
+        starts_with_sync_sample,
+        total_duration,
+        total_payload_size,
+        average_sample_size,
+        minimum_sample_size,
+        maximum_sample_size,
+        minimum_sample_duration,
+        maximum_sample_duration,
+        average_bitrate_bits_per_second,
+        minimum_sync_sample_size,
+        maximum_sync_sample_size,
+        average_sync_sample_size,
+        average_non_sync_sample_size,
+        minimum_composition_time_offset,
+        maximum_composition_time_offset,
+        minimum_presentation_time,
+        maximum_presentation_end_time,
+        minimum_previous_decode_delta,
+        maximum_previous_decode_delta,
+        minimum_previous_presentation_delta,
+        maximum_previous_presentation_delta,
+        presentation_gap_count,
+        presentation_overlap_count,
+        presentation_regression_count,
+        duration_change_count,
+        composition_time_offset_change_count,
+        minimum_sync_sample_distance,
+        maximum_sync_sample_distance,
+        average_sync_sample_distance,
+        minimum_sync_sample_decode_delta,
+        maximum_sync_sample_decode_delta,
+        average_sync_sample_decode_delta,
+        first_sync_sample_index,
+        last_sync_sample_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+        first_decode_time: 0,
+        end_decode_time: total_duration,
+        samples,
+    }
+}
+
+fn source_catalog_to_direct_ingest_reports(
+    sources: &SourceCatalog,
+) -> Vec<DirectIngestStagedSourceReport> {
+    sources
+        .specs
+        .iter()
+        .enumerate()
+        .map(|(source_index, spec)| match spec {
+            SourceSpec::File(path) => DirectIngestStagedSourceReport {
+                source_index,
+                path: path.clone(),
+                segmented: false,
+                total_size: std::fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                segment_count: None,
+                segments: None,
+            },
+            SourceSpec::Segmented(spec) => DirectIngestStagedSourceReport {
+                source_index,
+                path: spec.path.clone(),
+                segmented: true,
+                total_size: spec.total_size,
+                segment_count: Some(spec.segments.len()),
+                segments: Some(
+                    spec.segments
+                        .iter()
+                        .map(source_segment_to_direct_ingest_report)
+                        .collect(),
+                ),
+            },
+        })
+        .collect()
+}
+
+struct DirectIngestInspectionState {
+    report: DirectIngestReport,
+    sources: SourceCatalog,
+}
+
+pub(in crate::mux) fn inspect_direct_ingest_path_sync(
+    path: &Path,
+) -> Result<DirectIngestReport, MuxError> {
+    Ok(inspect_direct_ingest_state_sync(path)?.report)
+}
+
+pub(in crate::mux) fn inspect_direct_ingest_packets_sync(
+    path: &Path,
+) -> Result<DirectIngestPacketReport, MuxError> {
+    direct_ingest_packet_report_sync(inspect_direct_ingest_state_sync(path)?)
+}
+
+fn inspect_direct_ingest_state_sync(path: &Path) -> Result<DirectIngestInspectionState, MuxError> {
+    let absolute = absolute_path(path)?;
+    let detected_kind = detect_path_track_kind_sync(&absolute)?;
+    let mut report = DirectIngestReport {
+        input_path: absolute.clone(),
+        detected_kind: direct_ingest_report_kind(detected_kind),
+        supports_flat_mux: detected_kind_supports_flat_mux(detected_kind),
+        note: direct_ingest_report_note(detected_kind),
+        track_count: 0,
+        total_sample_count: 0,
+        total_sync_sample_count: 0,
+        total_payload_size: 0,
+        staged_sources: Vec::new(),
+        tracks: Vec::new(),
+    };
+    let mut sources = SourceCatalog::default();
+    match detected_kind {
+        DetectedPathTrackKind::Mp4 => {
+            let mut cache = BTreeMap::new();
+            let source = load_mp4_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+            let mut cache = BTreeMap::new();
+            let source = load_avi_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash) => {
+            let mut cache = BTreeMap::new();
+            let source = load_dash_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi)
+        | DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {}
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml) => {
+            let mut cache = BTreeMap::new();
+            let source = load_nhml_source_sync(
+                &absolute,
+                DetectedNhmlSidecarKind::Nhml,
+                &mut cache,
+                &mut sources,
+            )?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt) => {
+            let mut cache = BTreeMap::new();
+            let source = load_nhml_source_sync(
+                &absolute,
+                DetectedNhmlSidecarKind::Nhnt,
+                &mut cache,
+                &mut sources,
+            )?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+            let mut cache = BTreeMap::new();
+            let source = load_program_stream_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf) => {
+            let mut cache = BTreeMap::new();
+            let source = load_saf_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+            let mut cache = BTreeMap::new();
+            let source = load_transport_stream_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+            let mut cache = BTreeMap::new();
+            let source = load_vobsub_source_sync(&absolute, &mut cache, &mut sources)?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Raw(codec) => {
+            let imported = import_detected_raw_codec_sync(
+                &absolute,
+                codec,
+                &absolute.display().to_string(),
+                &mut sources,
+            )?;
+            report
+                .tracks
+                .push(imported_track_to_direct_ingest_report(&imported));
+        }
+        DetectedPathTrackKind::Mp4ImportOnly(_) | DetectedPathTrackKind::Unknown => {}
+    }
+    report.track_count = report.tracks.len();
+    report.total_sample_count = report.tracks.iter().map(|track| track.sample_count).sum();
+    report.total_sync_sample_count = report
+        .tracks
+        .iter()
+        .map(|track| track.sync_sample_count)
+        .sum();
+    report.total_payload_size = report
+        .tracks
+        .iter()
+        .map(|track| track.total_payload_size)
+        .sum();
+    report.staged_sources = source_catalog_to_direct_ingest_reports(&sources);
+    Ok(DirectIngestInspectionState { report, sources })
+}
+
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn inspect_direct_ingest_path_async(
+    path: &Path,
+) -> Result<DirectIngestReport, MuxError> {
+    Ok(inspect_direct_ingest_state_async(path).await?.report)
+}
+
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn inspect_direct_ingest_packets_async(
+    path: &Path,
+) -> Result<DirectIngestPacketReport, MuxError> {
+    direct_ingest_packet_report_async(inspect_direct_ingest_state_async(path).await?).await
+}
+
+#[cfg(feature = "async")]
+async fn inspect_direct_ingest_state_async(
+    path: &Path,
+) -> Result<DirectIngestInspectionState, MuxError> {
+    let absolute = absolute_path(path)?;
+    let detected_kind = detect_path_track_kind_async(&absolute).await?;
+    let mut report = DirectIngestReport {
+        input_path: absolute.clone(),
+        detected_kind: direct_ingest_report_kind(detected_kind),
+        supports_flat_mux: detected_kind_supports_flat_mux(detected_kind),
+        note: direct_ingest_report_note(detected_kind),
+        track_count: 0,
+        total_sample_count: 0,
+        total_sync_sample_count: 0,
+        total_payload_size: 0,
+        staged_sources: Vec::new(),
+        tracks: Vec::new(),
+    };
+    let mut sources = SourceCatalog::default();
+    match detected_kind {
+        DetectedPathTrackKind::Mp4 => {
+            let mut cache = BTreeMap::new();
+            let source = load_mp4_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Avi) => {
+            let mut cache = BTreeMap::new();
+            let source = load_avi_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash) => {
+            let mut cache = BTreeMap::new();
+            let source = load_dash_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi)
+        | DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {}
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml) => {
+            let mut cache = BTreeMap::new();
+            let source = load_nhml_source_async(
+                &absolute,
+                DetectedNhmlSidecarKind::Nhml,
+                &mut cache,
+                &mut sources,
+            )
+            .await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt) => {
+            let mut cache = BTreeMap::new();
+            let source = load_nhml_source_async(
+                &absolute,
+                DetectedNhmlSidecarKind::Nhnt,
+                &mut cache,
+                &mut sources,
+            )
+            .await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
+            let mut cache = BTreeMap::new();
+            let source =
+                load_program_stream_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf) => {
+            let mut cache = BTreeMap::new();
+            let source = load_saf_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
+            let mut cache = BTreeMap::new();
+            let source =
+                load_transport_stream_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::VobSub) => {
+            let mut cache = BTreeMap::new();
+            let source = load_vobsub_source_async(&absolute, &mut cache, &mut sources).await?;
+            report.tracks = source
+                .tracks
+                .iter()
+                .map(track_candidate_to_direct_ingest_report)
+                .collect();
+        }
+        DetectedPathTrackKind::Raw(codec) => {
+            let imported = import_detected_raw_codec_async(
+                &absolute,
+                codec,
+                &absolute.display().to_string(),
+                &mut sources,
+            )
+            .await?;
+            report
+                .tracks
+                .push(imported_track_to_direct_ingest_report(&imported));
+        }
+        DetectedPathTrackKind::Mp4ImportOnly(_) | DetectedPathTrackKind::Unknown => {}
+    }
+    report.track_count = report.tracks.len();
+    report.total_sample_count = report.tracks.iter().map(|track| track.sample_count).sum();
+    report.total_sync_sample_count = report
+        .tracks
+        .iter()
+        .map(|track| track.sync_sample_count)
+        .sum();
+    report.total_payload_size = report
+        .tracks
+        .iter()
+        .map(|track| track.total_payload_size)
+        .sum();
+    report.staged_sources = source_catalog_to_direct_ingest_reports(&sources);
+    Ok(DirectIngestInspectionState { report, sources })
+}
+
+fn direct_ingest_packet_report_sync(
+    state: DirectIngestInspectionState,
+) -> Result<DirectIngestPacketReport, MuxError> {
+    let DirectIngestInspectionState { report, sources } = state;
+    let mut source_readers = sources
+        .specs
+        .iter()
+        .map(SyncMuxSource::open)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut packets = Vec::new();
+    let mut minimum_sync_packet_distance = None::<u32>;
+    let mut maximum_sync_packet_distance = None::<u32>;
+    for track in &report.tracks {
+        let mut previous_decode_time = None::<u64>;
+        let mut previous_presentation_time = None::<i64>;
+        let (
+            track_minimum_sync_packet_distance,
+            track_maximum_sync_packet_distance,
+            _track_average_sync_packet_distance,
+        ) = sync_sample_distance_summary(&track.samples);
+        if let Some(distance) = track_minimum_sync_packet_distance {
+            minimum_sync_packet_distance = Some(
+                minimum_sync_packet_distance.map_or(distance, |current| current.min(distance)),
+            );
+        }
+        if let Some(distance) = track_maximum_sync_packet_distance {
+            maximum_sync_packet_distance = Some(
+                maximum_sync_packet_distance.map_or(distance, |current| current.max(distance)),
+            );
+        }
+        for (packet_index, sample) in track.samples.iter().enumerate() {
+            let payload_crc32 = crc32_from_sync_source(
+                &mut source_readers[sample.source_index],
+                sample.data_offset,
+                sample.data_size,
+            )?;
+            let previous_presentation_delta = previous_presentation_time
+                .map(|value| sample.presentation_time.saturating_sub(value));
+            packets.push(DirectIngestPacketEntry {
+                track_id: track.track_id,
+                packet_index,
+                track_kind: track.kind.clone(),
+                timescale: track.timescale,
+                sample_entry_type: track.sample_entry_type.clone(),
+                source_index: sample.source_index,
+                data_offset: sample.data_offset,
+                data_size: sample.data_size,
+                decode_time: sample.decode_time,
+                composition_time_offset: sample.composition_time_offset,
+                presentation_time: sample.presentation_time,
+                presentation_end_time: sample.presentation_end_time,
+                previous_presentation_delta,
+                duration: sample.duration,
+                previous_decode_delta: previous_decode_time
+                    .map(|value| sample.decode_time.saturating_sub(value)),
+                payload_crc32,
+                is_sync_sample: sample.is_sync_sample,
+            });
+            previous_decode_time = Some(sample.decode_time);
+            previous_presentation_time = Some(sample.presentation_time);
+        }
+    }
+    let sync_packet_count = packets
+        .iter()
+        .filter(|packet| packet.is_sync_sample)
+        .count();
+    let starts_with_sync_packet = packets
+        .first()
+        .map(|packet| packet.is_sync_sample)
+        .unwrap_or(false);
+    let total_payload_size = packets
+        .iter()
+        .map(|packet| u64::from(packet.data_size))
+        .sum::<u64>();
+    let (minimum_packet_size, maximum_packet_size) =
+        u32_bounds(packets.iter().map(|packet| packet.data_size));
+    let average_non_sync_packet_size = {
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for packet in &packets {
+            if packet.is_sync_sample {
+                continue;
+            }
+            total = total.saturating_add(u64::from(packet.data_size));
+            count = count.saturating_add(1);
+        }
+        if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        }
+    };
+    let (minimum_sync_packet_size, maximum_sync_packet_size, average_sync_packet_size) = {
+        let sync_sizes = packets
+            .iter()
+            .filter(|packet| packet.is_sync_sample)
+            .map(|packet| packet.data_size);
+        let (minimum, maximum) = u32_bounds(sync_sizes.clone());
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for size in sync_sizes {
+            total = total.saturating_add(u64::from(size));
+            count = count.saturating_add(1);
+        }
+        let average = if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        };
+        (minimum, maximum, average)
+    };
+    let (minimum_packet_duration, maximum_packet_duration) =
+        u32_bounds(packets.iter().map(|packet| packet.duration));
+    let (minimum_previous_decode_delta, maximum_previous_decode_delta) = u64_bounds(
+        packets
+            .iter()
+            .filter_map(|packet| packet.previous_decode_delta),
+    );
+    let (minimum_composition_time_offset, maximum_composition_time_offset) =
+        i32_bounds(packets.iter().map(|packet| packet.composition_time_offset));
+    let (minimum_presentation_time, maximum_presentation_end_time) = i64_bounds(
+        packets
+            .iter()
+            .flat_map(|packet| [packet.presentation_time, packet.presentation_end_time]),
+    );
+    let (minimum_previous_presentation_delta, maximum_previous_presentation_delta) = i64_bounds(
+        packets
+            .iter()
+            .filter_map(|packet| packet.previous_presentation_delta),
+    );
+    let mut presentation_gap_count = 0usize;
+    let mut presentation_overlap_count = 0usize;
+    let mut presentation_regression_count = 0usize;
+    let mut duration_change_count = 0usize;
+    let mut composition_time_offset_change_count = 0usize;
+    for track in &report.tracks {
+        for window in track.samples.windows(2) {
+            let previous = &window[0];
+            let current = &window[1];
+            if current.presentation_time < previous.presentation_time {
+                presentation_regression_count += 1;
+            }
+            if current.presentation_time > previous.presentation_end_time {
+                presentation_gap_count += 1;
+            } else if current.presentation_time < previous.presentation_end_time {
+                presentation_overlap_count += 1;
+            }
+            if current.duration != previous.duration {
+                duration_change_count += 1;
+            }
+            if current.composition_time_offset != previous.composition_time_offset {
+                composition_time_offset_change_count += 1;
+            }
+        }
+    }
+    let (
+        minimum_sync_packet_decode_delta,
+        maximum_sync_packet_decode_delta,
+        average_sync_packet_decode_delta,
+    ) = {
+        let mut previous_sync_decode_time = None::<u64>;
+        let mut minimum = None::<u64>;
+        let mut maximum = None::<u64>;
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for packet in &packets {
+            if !packet.is_sync_sample {
+                continue;
+            }
+            if let Some(previous_decode_time) = previous_sync_decode_time {
+                let delta = packet.decode_time.saturating_sub(previous_decode_time);
+                minimum = Some(minimum.map_or(delta, |current| current.min(delta)));
+                maximum = Some(maximum.map_or(delta, |current| current.max(delta)));
+                total = total.saturating_add(delta);
+                count = count.saturating_add(1);
+            }
+            previous_sync_decode_time = Some(packet.decode_time);
+        }
+        let average = if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        };
+        (minimum, maximum, average)
+    };
+    let average_sync_packet_distance = {
+        let mut previous_sync_index = None::<usize>;
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for (index, packet) in packets.iter().enumerate() {
+            if !packet.is_sync_sample {
+                continue;
+            }
+            if let Some(previous_index) = previous_sync_index {
+                let distance =
+                    u64::try_from(index.saturating_sub(previous_index)).unwrap_or(u64::MAX);
+                total = total.saturating_add(distance);
+                count = count.saturating_add(1);
+            }
+            previous_sync_index = Some(index);
+        }
+        if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        }
+    };
+    let (
+        first_sync_packet_track_id,
+        first_sync_packet_index,
+        last_sync_packet_track_id,
+        last_sync_packet_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+    ) = sync_packet_anchor_summary(&packets);
+    Ok(DirectIngestPacketReport {
+        input_path: report.input_path,
+        detected_kind: report.detected_kind,
+        supports_flat_mux: report.supports_flat_mux,
+        note: report.note,
+        track_count: report.track_count,
+        packet_count: packets.len(),
+        sync_packet_count,
+        starts_with_sync_packet,
+        total_payload_size,
+        minimum_packet_size,
+        maximum_packet_size,
+        minimum_sync_packet_size,
+        maximum_sync_packet_size,
+        average_sync_packet_size,
+        average_non_sync_packet_size,
+        minimum_packet_duration,
+        maximum_packet_duration,
+        minimum_previous_decode_delta,
+        maximum_previous_decode_delta,
+        minimum_composition_time_offset,
+        maximum_composition_time_offset,
+        minimum_presentation_time,
+        maximum_presentation_end_time,
+        minimum_previous_presentation_delta,
+        maximum_previous_presentation_delta,
+        presentation_gap_count,
+        presentation_overlap_count,
+        presentation_regression_count,
+        duration_change_count,
+        composition_time_offset_change_count,
+        minimum_sync_packet_distance,
+        maximum_sync_packet_distance,
+        average_sync_packet_distance,
+        minimum_sync_packet_decode_delta,
+        maximum_sync_packet_decode_delta,
+        average_sync_packet_decode_delta,
+        first_sync_packet_track_id,
+        first_sync_packet_index,
+        last_sync_packet_track_id,
+        last_sync_packet_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+        tracks: report.tracks,
+        staged_sources: report.staged_sources,
+        packets,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn direct_ingest_packet_report_async(
+    state: DirectIngestInspectionState,
+) -> Result<DirectIngestPacketReport, MuxError> {
+    let DirectIngestInspectionState { report, sources } = state;
+    let mut source_readers = Vec::with_capacity(sources.specs.len());
+    for spec in &sources.specs {
+        source_readers.push(AsyncMuxSource::open(spec).await?);
+    }
+    let mut packets = Vec::new();
+    let mut minimum_sync_packet_distance = None::<u32>;
+    let mut maximum_sync_packet_distance = None::<u32>;
+    for track in &report.tracks {
+        let mut previous_decode_time = None::<u64>;
+        let mut previous_presentation_time = None::<i64>;
+        let (
+            track_minimum_sync_packet_distance,
+            track_maximum_sync_packet_distance,
+            _track_average_sync_packet_distance,
+        ) = sync_sample_distance_summary(&track.samples);
+        if let Some(distance) = track_minimum_sync_packet_distance {
+            minimum_sync_packet_distance = Some(
+                minimum_sync_packet_distance.map_or(distance, |current| current.min(distance)),
+            );
+        }
+        if let Some(distance) = track_maximum_sync_packet_distance {
+            maximum_sync_packet_distance = Some(
+                maximum_sync_packet_distance.map_or(distance, |current| current.max(distance)),
+            );
+        }
+        for (packet_index, sample) in track.samples.iter().enumerate() {
+            let payload_crc32 = crc32_from_async_source(
+                &mut source_readers[sample.source_index],
+                sample.data_offset,
+                sample.data_size,
+            )
+            .await?;
+            let previous_presentation_delta = previous_presentation_time
+                .map(|value| sample.presentation_time.saturating_sub(value));
+            packets.push(DirectIngestPacketEntry {
+                track_id: track.track_id,
+                packet_index,
+                track_kind: track.kind.clone(),
+                timescale: track.timescale,
+                sample_entry_type: track.sample_entry_type.clone(),
+                source_index: sample.source_index,
+                data_offset: sample.data_offset,
+                data_size: sample.data_size,
+                decode_time: sample.decode_time,
+                composition_time_offset: sample.composition_time_offset,
+                presentation_time: sample.presentation_time,
+                presentation_end_time: sample.presentation_end_time,
+                previous_presentation_delta,
+                duration: sample.duration,
+                previous_decode_delta: previous_decode_time
+                    .map(|value| sample.decode_time.saturating_sub(value)),
+                payload_crc32,
+                is_sync_sample: sample.is_sync_sample,
+            });
+            previous_decode_time = Some(sample.decode_time);
+            previous_presentation_time = Some(sample.presentation_time);
+        }
+    }
+    let sync_packet_count = packets
+        .iter()
+        .filter(|packet| packet.is_sync_sample)
+        .count();
+    let starts_with_sync_packet = packets
+        .first()
+        .map(|packet| packet.is_sync_sample)
+        .unwrap_or(false);
+    let total_payload_size = packets
+        .iter()
+        .map(|packet| u64::from(packet.data_size))
+        .sum::<u64>();
+    let (minimum_packet_size, maximum_packet_size) =
+        u32_bounds(packets.iter().map(|packet| packet.data_size));
+    let average_non_sync_packet_size = {
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for packet in &packets {
+            if packet.is_sync_sample {
+                continue;
+            }
+            total = total.saturating_add(u64::from(packet.data_size));
+            count = count.saturating_add(1);
+        }
+        if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        }
+    };
+    let (minimum_sync_packet_size, maximum_sync_packet_size, average_sync_packet_size) = {
+        let sync_sizes = packets
+            .iter()
+            .filter(|packet| packet.is_sync_sample)
+            .map(|packet| packet.data_size);
+        let (minimum, maximum) = u32_bounds(sync_sizes.clone());
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for size in sync_sizes {
+            total = total.saturating_add(u64::from(size));
+            count = count.saturating_add(1);
+        }
+        let average = if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        };
+        (minimum, maximum, average)
+    };
+    let (minimum_packet_duration, maximum_packet_duration) =
+        u32_bounds(packets.iter().map(|packet| packet.duration));
+    let (minimum_previous_decode_delta, maximum_previous_decode_delta) = u64_bounds(
+        packets
+            .iter()
+            .filter_map(|packet| packet.previous_decode_delta),
+    );
+    let (minimum_composition_time_offset, maximum_composition_time_offset) =
+        i32_bounds(packets.iter().map(|packet| packet.composition_time_offset));
+    let (minimum_presentation_time, maximum_presentation_end_time) = i64_bounds(
+        packets
+            .iter()
+            .flat_map(|packet| [packet.presentation_time, packet.presentation_end_time]),
+    );
+    let (minimum_previous_presentation_delta, maximum_previous_presentation_delta) = i64_bounds(
+        packets
+            .iter()
+            .filter_map(|packet| packet.previous_presentation_delta),
+    );
+    let mut presentation_gap_count = 0usize;
+    let mut presentation_overlap_count = 0usize;
+    let mut presentation_regression_count = 0usize;
+    let mut duration_change_count = 0usize;
+    let mut composition_time_offset_change_count = 0usize;
+    for track in &report.tracks {
+        for window in track.samples.windows(2) {
+            let previous = &window[0];
+            let current = &window[1];
+            if current.presentation_time < previous.presentation_time {
+                presentation_regression_count += 1;
+            }
+            if current.presentation_time > previous.presentation_end_time {
+                presentation_gap_count += 1;
+            } else if current.presentation_time < previous.presentation_end_time {
+                presentation_overlap_count += 1;
+            }
+            if current.duration != previous.duration {
+                duration_change_count += 1;
+            }
+            if current.composition_time_offset != previous.composition_time_offset {
+                composition_time_offset_change_count += 1;
+            }
+        }
+    }
+    let (
+        minimum_sync_packet_decode_delta,
+        maximum_sync_packet_decode_delta,
+        average_sync_packet_decode_delta,
+    ) = {
+        let mut previous_sync_decode_time = None::<u64>;
+        let mut minimum = None::<u64>;
+        let mut maximum = None::<u64>;
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for packet in &packets {
+            if !packet.is_sync_sample {
+                continue;
+            }
+            if let Some(previous_decode_time) = previous_sync_decode_time {
+                let delta = packet.decode_time.saturating_sub(previous_decode_time);
+                minimum = Some(minimum.map_or(delta, |current| current.min(delta)));
+                maximum = Some(maximum.map_or(delta, |current| current.max(delta)));
+                total = total.saturating_add(delta);
+                count = count.saturating_add(1);
+            }
+            previous_sync_decode_time = Some(packet.decode_time);
+        }
+        let average = if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        };
+        (minimum, maximum, average)
+    };
+    let average_sync_packet_distance = {
+        let mut previous_sync_index = None::<usize>;
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for (index, packet) in packets.iter().enumerate() {
+            if !packet.is_sync_sample {
+                continue;
+            }
+            if let Some(previous_index) = previous_sync_index {
+                let distance =
+                    u64::try_from(index.saturating_sub(previous_index)).unwrap_or(u64::MAX);
+                total = total.saturating_add(distance);
+                count = count.saturating_add(1);
+            }
+            previous_sync_index = Some(index);
+        }
+        if count == 0 {
+            None
+        } else {
+            Some(total / count)
+        }
+    };
+    let (
+        first_sync_packet_track_id,
+        first_sync_packet_index,
+        last_sync_packet_track_id,
+        last_sync_packet_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+    ) = sync_packet_anchor_summary(&packets);
+    Ok(DirectIngestPacketReport {
+        input_path: report.input_path,
+        detected_kind: report.detected_kind,
+        supports_flat_mux: report.supports_flat_mux,
+        note: report.note,
+        track_count: report.track_count,
+        packet_count: packets.len(),
+        sync_packet_count,
+        starts_with_sync_packet,
+        total_payload_size,
+        minimum_packet_size,
+        maximum_packet_size,
+        minimum_sync_packet_size,
+        maximum_sync_packet_size,
+        average_sync_packet_size,
+        average_non_sync_packet_size,
+        minimum_packet_duration,
+        maximum_packet_duration,
+        minimum_previous_decode_delta,
+        maximum_previous_decode_delta,
+        minimum_composition_time_offset,
+        maximum_composition_time_offset,
+        minimum_presentation_time,
+        maximum_presentation_end_time,
+        minimum_previous_presentation_delta,
+        maximum_previous_presentation_delta,
+        presentation_gap_count,
+        presentation_overlap_count,
+        presentation_regression_count,
+        duration_change_count,
+        composition_time_offset_change_count,
+        minimum_sync_packet_distance,
+        maximum_sync_packet_distance,
+        average_sync_packet_distance,
+        minimum_sync_packet_decode_delta,
+        maximum_sync_packet_decode_delta,
+        average_sync_packet_decode_delta,
+        first_sync_packet_track_id,
+        first_sync_packet_index,
+        last_sync_packet_track_id,
+        last_sync_packet_index,
+        first_sync_decode_time,
+        last_sync_decode_time,
+        first_sync_presentation_time,
+        last_sync_presentation_time,
+        tracks: report.tracks,
+        staged_sources: report.staged_sources,
+        packets,
+    })
+}
+
+fn crc32_from_sync_source(
+    source: &mut SyncMuxSource,
+    offset: u64,
+    size: u32,
+) -> Result<u32, MuxError> {
+    source.seek(SeekFrom::Start(offset))?;
+    let mut remaining =
+        usize::try_from(size).map_err(|_| MuxError::LayoutOverflow("packet size"))?;
+    let mut buffer = [0_u8; 8192];
+    let mut crc = 0xFFFF_FFFF_u32;
+    while remaining != 0 {
+        let to_read = remaining.min(buffer.len());
+        source.read_exact(&mut buffer[..to_read])?;
+        crc = update_crc32(crc, &buffer[..to_read]);
+        remaining -= to_read;
+    }
+    Ok(!crc)
+}
+
+#[cfg(feature = "async")]
+async fn crc32_from_async_source(
+    source: &mut AsyncMuxSource,
+    offset: u64,
+    size: u32,
+) -> Result<u32, MuxError> {
+    source.seek(SeekFrom::Start(offset)).await?;
+    let mut remaining =
+        usize::try_from(size).map_err(|_| MuxError::LayoutOverflow("packet size"))?;
+    let mut buffer = [0_u8; 8192];
+    let mut crc = 0xFFFF_FFFF_u32;
+    while remaining != 0 {
+        let to_read = remaining.min(buffer.len());
+        source.read_exact(&mut buffer[..to_read]).await?;
+        crc = update_crc32(crc, &buffer[..to_read]);
+        remaining -= to_read;
+    }
+    Ok(!crc)
+}
+
+fn update_crc32(mut crc: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
 }
 
 fn import_detected_path_raw_sync(
@@ -4331,12 +7788,51 @@ fn import_detected_path_raw_sync(
                 message: "detected an AVI container on the raw-import path unexpectedly".to_string(),
             })
         }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a DASH manifest on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a GHI source on the raw-import path unexpectedly".to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a GSF source on the raw-import path unexpectedly".to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected an NHML sidecar on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected an NHNT sidecar on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
         DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
             Err(MuxError::UnsupportedTrackImport {
                 spec: spec.to_string(),
                 message:
                     "detected an MPEG program stream on the raw-import path unexpectedly"
                         .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a SAF source on the raw-import path unexpectedly".to_string(),
             })
         }
         DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
@@ -4366,7 +7862,7 @@ fn import_detected_path_raw_sync(
         }),
         DetectedPathTrackKind::Unknown => Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
-            message: "path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AC-3, E-AC-3, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string(),
+            message: "path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AAC LATM, MHAS, AC-3, E-AC-3, AC-4, DTS, TrueHD, MPEG-2 video, AV1, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, BMP still images, JPEG 2000 image or codestream input, self-describing YUV4MPEG raw video, raw ProRes, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string(),
         }),
     }
 }
@@ -4387,12 +7883,51 @@ async fn import_detected_path_raw_async(
                 message: "detected an AVI container on the raw-import path unexpectedly".to_string(),
             })
         }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Dash) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a DASH manifest on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Ghi) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a GHI source on the raw-import path unexpectedly".to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Gsf) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a GSF source on the raw-import path unexpectedly".to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhml) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected an NHML sidecar on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Nhnt) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected an NHNT sidecar on the raw-import path unexpectedly"
+                    .to_string(),
+            })
+        }
         DetectedPathTrackKind::Container(DetectedContainerPathKind::ProgramStream) => {
             Err(MuxError::UnsupportedTrackImport {
                 spec: spec.to_string(),
                 message:
                     "detected an MPEG program stream on the raw-import path unexpectedly"
                         .to_string(),
+            })
+        }
+        DetectedPathTrackKind::Container(DetectedContainerPathKind::Saf) => {
+            Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "detected a SAF source on the raw-import path unexpectedly".to_string(),
             })
         }
         DetectedPathTrackKind::Container(DetectedContainerPathKind::TransportStream) => {
@@ -4422,7 +7957,7 @@ async fn import_detected_path_raw_async(
         }),
         DetectedPathTrackKind::Unknown => Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
-            message: "path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AC-3, E-AC-3, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, DTS core audio, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string(),
+            message: "path-only mux input is not currently recognized as MP4, VobSub, supported AVI audio or MPEG-4 Part 2 video, supported MPEG-PS MPEG audio, AC-3, or MPEG-4 Part 2/H.264/H.265/VVC video, supported MPEG-TS MPEG audio, AAC LATM, MHAS, AC-3, E-AC-3, AC-4, DTS, TrueHD, MPEG-2 video, AV1, MPEG-4 Part 2, H.264, H.265, VVC, DVB subtitle, or DVB teletext video or subtitle carriage, JPEG still images, PNG still images, BMP still images, JPEG 2000 image or codestream input, self-describing YUV4MPEG raw video, raw ProRes, WAVE/AIFF/AIFC PCM, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, DTS core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, FLAC, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, IVF-backed AV1/VP8/VP9/VP10, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, or CAF ALAC".to_string(),
         }),
     }
 }
@@ -4453,12 +7988,14 @@ fn import_raw_track_sync(
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     match codec {
+        MuxRawCodec::Mpeg2v => import_raw_mpeg2v_sync(path, spec, sources),
         MuxRawCodec::Mp4v => import_raw_mp4v_sync(path, spec, sources),
         MuxRawCodec::H263 => import_raw_h263_sync(path, spec, sources),
         MuxRawCodec::H264 => import_raw_h264_sync(path, spec, sources),
         MuxRawCodec::H265 => import_raw_h265_sync(path, spec, sources),
         MuxRawCodec::Vvc => import_raw_vvc_sync(path, spec, sources),
-        MuxRawCodec::Av1 | MuxRawCodec::Vp8 | MuxRawCodec::Vp9 | MuxRawCodec::Vp10 => {
+        MuxRawCodec::Av1 => import_raw_av1_sync(path, spec, sources),
+        MuxRawCodec::Vp8 | MuxRawCodec::Vp9 | MuxRawCodec::Vp10 => {
             import_ivf_video_sync(path, codec, spec, sources)
         }
         MuxRawCodec::Aac => import_raw_aac_sync(path, spec, sources),
@@ -4472,6 +8009,10 @@ fn import_raw_track_sync(
         MuxRawCodec::Qcp => import_raw_qcp_sync(path, spec, sources),
         MuxRawCodec::Jpeg => import_raw_jpeg_sync(path, spec, sources),
         MuxRawCodec::Png => import_raw_png_sync(path, spec, sources),
+        MuxRawCodec::Bmp => import_raw_bmp_sync(path, spec, sources),
+        MuxRawCodec::Prores => import_raw_prores_sync(path, spec, sources),
+        MuxRawCodec::Y4m => import_raw_y4m_sync(path, spec, sources),
+        MuxRawCodec::J2k => import_raw_j2k_sync(path, spec, sources),
         MuxRawCodec::Pcm => import_wave_pcm_sync(path, spec, sources),
         MuxRawCodec::Dts => import_raw_dts_sync(path, spec, sources),
         MuxRawCodec::Truehd => import_raw_truehd_sync(path, spec, sources),
@@ -4494,12 +8035,14 @@ async fn import_raw_track_async(
     sources: &mut SourceCatalog,
 ) -> Result<ImportedTrack, MuxError> {
     match codec {
+        MuxRawCodec::Mpeg2v => import_raw_mpeg2v_async(path, spec, sources).await,
         MuxRawCodec::Mp4v => import_raw_mp4v_async(path, spec, sources).await,
         MuxRawCodec::H263 => import_raw_h263_async(path, spec, sources).await,
         MuxRawCodec::H264 => import_raw_h264_async(path, spec, sources).await,
         MuxRawCodec::H265 => import_raw_h265_async(path, spec, sources).await,
         MuxRawCodec::Vvc => import_raw_vvc_async(path, spec, sources).await,
-        MuxRawCodec::Av1 | MuxRawCodec::Vp8 | MuxRawCodec::Vp9 | MuxRawCodec::Vp10 => {
+        MuxRawCodec::Av1 => import_raw_av1_async(path, spec, sources).await,
+        MuxRawCodec::Vp8 | MuxRawCodec::Vp9 | MuxRawCodec::Vp10 => {
             import_ivf_video_async(path, codec, spec, sources).await
         }
         MuxRawCodec::Aac => import_raw_aac_async(path, spec, sources).await,
@@ -4513,6 +8056,10 @@ async fn import_raw_track_async(
         MuxRawCodec::Qcp => import_raw_qcp_async(path, spec, sources).await,
         MuxRawCodec::Jpeg => import_raw_jpeg_async(path, spec, sources).await,
         MuxRawCodec::Png => import_raw_png_async(path, spec, sources).await,
+        MuxRawCodec::Bmp => import_raw_bmp_async(path, spec, sources).await,
+        MuxRawCodec::Prores => import_raw_prores_async(path, spec, sources).await,
+        MuxRawCodec::Y4m => import_raw_y4m_async(path, spec, sources).await,
+        MuxRawCodec::J2k => import_raw_j2k_async(path, spec, sources).await,
         MuxRawCodec::Pcm => import_wave_pcm_async(path, spec, sources).await,
         MuxRawCodec::Dts => import_raw_dts_async(path, spec, sources).await,
         MuxRawCodec::Truehd => import_raw_truehd_async(path, spec, sources).await,
@@ -4687,7 +8234,6 @@ fn import_ivf_video_sync(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = match codec {
-        MuxRawCodec::Av1 => scan_av1_file_sync(path, &spec)?,
         MuxRawCodec::Vp8 => scan_vp8_file_sync(path, &spec)?,
         MuxRawCodec::Vp9 => scan_vp9_file_sync(path, &spec)?,
         MuxRawCodec::Vp10 => scan_vp10_file_sync(path, &spec)?,
@@ -4698,7 +8244,6 @@ fn import_ivf_video_sync(
         timescale: parsed.timescale,
         language: *b"und",
         handler_name: direct_ingest_handler_name(match codec {
-            MuxRawCodec::Av1 => "av1",
             MuxRawCodec::Vp8 => "vp8",
             MuxRawCodec::Vp9 => "vp9",
             MuxRawCodec::Vp10 => "vp10",
@@ -4706,7 +8251,6 @@ fn import_ivf_video_sync(
         }),
         mux_policy: direct_ingest_mux_policy(
             match codec {
-                MuxRawCodec::Av1 => "av1",
                 MuxRawCodec::Vp8 => "vp8",
                 MuxRawCodec::Vp9 => "vp9",
                 MuxRawCodec::Vp10 => "vp10",
@@ -4732,7 +8276,6 @@ async fn import_ivf_video_async(
 ) -> Result<ImportedTrack, MuxError> {
     let source_index = sources.add_file(path)?;
     let parsed = match codec {
-        MuxRawCodec::Av1 => scan_av1_file_async(path, &spec).await?,
         MuxRawCodec::Vp8 => scan_vp8_file_async(path, &spec).await?,
         MuxRawCodec::Vp9 => scan_vp9_file_async(path, &spec).await?,
         MuxRawCodec::Vp10 => scan_vp10_file_async(path, &spec).await?,
@@ -4743,7 +8286,6 @@ async fn import_ivf_video_async(
         timescale: parsed.timescale,
         language: *b"und",
         handler_name: direct_ingest_handler_name(match codec {
-            MuxRawCodec::Av1 => "av1",
             MuxRawCodec::Vp8 => "vp8",
             MuxRawCodec::Vp9 => "vp9",
             MuxRawCodec::Vp10 => "vp10",
@@ -4751,7 +8293,6 @@ async fn import_ivf_video_async(
         }),
         mux_policy: direct_ingest_mux_policy(
             match codec {
-                MuxRawCodec::Av1 => "av1",
                 MuxRawCodec::Vp8 => "vp8",
                 MuxRawCodec::Vp9 => "vp9",
                 MuxRawCodec::Vp10 => "vp10",
@@ -4765,6 +8306,73 @@ async fn import_ivf_video_async(
         source_edit_media_time: None,
         sample_roll_distance: None,
         samples: imported_samples_from_staged(parsed.samples, source_index),
+    })
+}
+
+fn import_raw_av1_sync(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_av1_file_sync(path, &spec)?;
+    let ParsedAv1Track {
+        width,
+        height,
+        timescale,
+        sample_entry_box,
+        samples,
+        source,
+    } = parsed;
+    let source_index = match source {
+        ParsedAv1TrackSource::File => sources.add_file(path)?,
+        ParsedAv1TrackSource::Segmented(source) => sources.add_segmented(source)?,
+    };
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("av1"),
+        mux_policy: direct_ingest_mux_policy("av1", MuxTrackKind::Video),
+        width,
+        height,
+        sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(samples, source_index),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn import_raw_av1_async(
+    path: &Path,
+    spec: String,
+    sources: &mut SourceCatalog,
+) -> Result<ImportedTrack, MuxError> {
+    let parsed = scan_av1_file_async(path, &spec).await?;
+    let ParsedAv1Track {
+        width,
+        height,
+        timescale,
+        sample_entry_box,
+        samples,
+        source,
+    } = parsed;
+    let source_index = match source {
+        ParsedAv1TrackSource::File => sources.add_file(path)?,
+        ParsedAv1TrackSource::Segmented(source) => sources.add_segmented(source)?,
+    };
+    Ok(ImportedTrack {
+        kind: MuxTrackKind::Video,
+        timescale,
+        language: *b"und",
+        handler_name: direct_ingest_handler_name("av1"),
+        mux_policy: direct_ingest_mux_policy("av1", MuxTrackKind::Video),
+        width,
+        height,
+        sample_entry_box,
+        source_edit_media_time: None,
+        sample_roll_distance: None,
+        samples: imported_samples_from_staged(samples, source_index),
     })
 }
 
@@ -4876,68 +8484,6 @@ where
     R: Read + Seek,
 {
     let infos = extract_box(reader, Some(parent), path)?;
-    let [info] = infos.as_slice() else {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: name.to_string(),
-            message: format!("expected exactly one {name} box but found {}", infos.len()),
-        });
-    };
-    Ok(*info)
-}
-
-#[cfg(feature = "async")]
-async fn extract_required_single_as_async<R, T>(
-    reader: &mut R,
-    parent: &HeaderInfo,
-    path: BoxPath,
-    name: &'static str,
-) -> Result<T, MuxError>
-where
-    R: AsyncReadSeek,
-    T: CodecBox + Clone + 'static,
-{
-    let boxes = extract_box_as_async::<_, T>(reader, Some(parent), path).await?;
-    let [value] = boxes.as_slice() else {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: name.to_string(),
-            message: format!("expected exactly one {name} box but found {}", boxes.len()),
-        });
-    };
-    Ok(value.clone())
-}
-
-#[cfg(feature = "async")]
-async fn extract_optional_single_as_async<R, T>(
-    reader: &mut R,
-    parent: &HeaderInfo,
-    path: BoxPath,
-) -> Result<Option<T>, MuxError>
-where
-    R: AsyncReadSeek,
-    T: CodecBox + Clone + 'static,
-{
-    let boxes = extract_box_as_async::<_, T>(reader, Some(parent), path).await?;
-    match boxes.len() {
-        0 => Ok(None),
-        1 => Ok(Some(boxes[0].clone())),
-        _ => Err(MuxError::UnsupportedTrackImport {
-            spec: "track".to_string(),
-            message: "expected at most one optional box".to_string(),
-        }),
-    }
-}
-
-#[cfg(feature = "async")]
-async fn extract_required_single_info_async<R>(
-    reader: &mut R,
-    parent: &HeaderInfo,
-    path: BoxPath,
-    name: &'static str,
-) -> Result<HeaderInfo, MuxError>
-where
-    R: AsyncReadSeek,
-{
-    let infos = extract_box_async(reader, Some(parent), path).await?;
     let [info] = infos.as_slice() else {
         return Err(MuxError::UnsupportedTrackImport {
             spec: name.to_string(),
@@ -5197,6 +8743,7 @@ fn scale_track_time_to_movie(
     value: i64,
     track_timescale: u32,
     movie_timescale: u32,
+    allow_inexact: bool,
 ) -> Result<i64, MuxError> {
     if track_timescale == 0 || movie_timescale == 0 {
         return Err(MuxError::InvalidTrackTimescale { track_id });
@@ -5206,7 +8753,7 @@ fn scale_track_time_to_movie(
     let scaled = magnitude
         .checked_mul(u64::from(movie_timescale))
         .ok_or(MuxError::LayoutOverflow("track time normalization"))?;
-    if scaled % u64::from(track_timescale) != 0 {
+    if scaled % u64::from(track_timescale) != 0 && !allow_inexact {
         return Err(MuxError::IncompatibleTrackTiming {
             track_id,
             track_timescale,
@@ -5261,29 +8808,10 @@ where
 {
     use crate::probe::probe_with_options;
     let summary = probe_with_options(reader, crate::probe::ProbeOptions::lightweight())?;
-    let mut config = MuxFileConfig::new(summary.timescale.max(1))
+    let config = MuxFileConfig::new(summary.timescale.max(1))
         .with_major_brand(summary.major_brand)
-        .with_minor_version(summary.minor_version);
-    for brand in summary.compatible_brands {
-        config.add_compatible_brand(brand);
-    }
-    Ok(config)
-}
-
-#[cfg(feature = "async")]
-async fn probe_file_config_async<R>(reader: &mut R) -> Result<MuxFileConfig, MuxError>
-where
-    R: AsyncReadSeek,
-{
-    use crate::probe::probe_with_options_async;
-    let summary =
-        probe_with_options_async(reader, crate::probe::ProbeOptions::lightweight()).await?;
-    let mut config = MuxFileConfig::new(summary.timescale.max(1))
-        .with_major_brand(summary.major_brand)
-        .with_minor_version(summary.minor_version);
-    for brand in summary.compatible_brands {
-        config.add_compatible_brand(brand);
-    }
+        .with_minor_version(summary.minor_version)
+        .with_compatible_brands(summary.compatible_brands);
     Ok(config)
 }
 

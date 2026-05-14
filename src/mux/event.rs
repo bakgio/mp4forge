@@ -214,8 +214,8 @@ mod tests {
                 item_count: 1,
                 first_decode_time: 0,
                 end_decode_time: 5,
-                first_output_offset: 0,
-                end_output_offset: 4,
+                first_output_offset: 5,
+                end_output_offset: 9,
             })
         ));
         assert!(matches!(
@@ -226,35 +226,35 @@ mod tests {
                 item_count: 2,
                 first_decode_time: 0,
                 end_decode_time: 14,
-                first_output_offset: 4,
+                first_output_offset: 0,
                 end_output_offset: 11,
             })
         ));
         assert!(matches!(
             &events[2],
             MuxEvent::Sample(MuxSampleEvent {
-                stream_index: 0,
+                stream_index: 1,
                 sample_index_in_stream: 0,
                 planned_item,
             }) if planned_item.output_offset() == 0
         ));
         assert!(matches!(
             &events[3],
+            MuxEvent::Sample(MuxSampleEvent {
+                stream_index: 0,
+                sample_index_in_stream: 0,
+                planned_item,
+            }) if planned_item.output_offset() == 5
+        ));
+        assert!(matches!(
+            &events[4],
             MuxEvent::Boundary(MuxBoundaryEvent {
                 kind: MuxBoundaryEventKind::TrackDrain,
                 stream_index: Some(0),
                 track_id: Some(1),
-                output_offset: 4,
+                output_offset: 9,
                 decode_time: 5,
             })
-        ));
-        assert!(matches!(
-            &events[4],
-            MuxEvent::Sample(MuxSampleEvent {
-                stream_index: 1,
-                sample_index_in_stream: 0,
-                planned_item,
-            }) if planned_item.output_offset() == 4
         ));
         assert!(matches!(
             &events[5],

@@ -37,7 +37,6 @@ const QCP_EVRC_GUID: [u8; 16] = [
 const QCP_SMV_GUID: [u8; 16] = [
     0x75, 0x2B, 0x7C, 0x8D, 0x97, 0xA7, 0x46, 0xED, 0x98, 0x5E, 0xD5, 0x3C, 0x8C, 0xC7, 0x5F, 0x84,
 ];
-const THREE_GPP_VENDOR_CODE: u32 = 0x4750_4143;
 
 pub(in crate::mux) struct ParsedQcpTrack {
     pub(in crate::mux) sample_rate: u32,
@@ -626,7 +625,7 @@ fn build_qcp_sample_entry_box(format: ParsedQcpFormat) -> Result<Vec<u8>, MuxErr
     let config_box = match format.codec_kind {
         QcpCodecKind::Qcelp => super::super::mp4::encode_typed_box(
             &Dqcp {
-                vendor: THREE_GPP_VENDOR_CODE,
+                vendor: 0,
                 decoder_version: format.decoder_version,
                 frames_per_sample: 1,
             },
@@ -634,7 +633,7 @@ fn build_qcp_sample_entry_box(format: ParsedQcpFormat) -> Result<Vec<u8>, MuxErr
         )?,
         QcpCodecKind::Evrc => super::super::mp4::encode_typed_box(
             &Devc {
-                vendor: THREE_GPP_VENDOR_CODE,
+                vendor: 0,
                 decoder_version: format.decoder_version,
                 frames_per_sample: 1,
             },
@@ -642,7 +641,7 @@ fn build_qcp_sample_entry_box(format: ParsedQcpFormat) -> Result<Vec<u8>, MuxErr
         )?,
         QcpCodecKind::Smv => super::super::mp4::encode_typed_box(
             &Dsmv {
-                vendor: THREE_GPP_VENDOR_CODE,
+                vendor: 0,
                 decoder_version: format.decoder_version,
                 frames_per_sample: 1,
             },

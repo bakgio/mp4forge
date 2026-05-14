@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use mp4forge::decrypt::{
     DecryptError, DecryptOptions, DecryptProgress, DecryptProgressPhase, DecryptRewriteError,
-    DecryptionKey, DecryptionKeyId, decrypt_bytes, decrypt_bytes_with_progress,
+    DecryptionKey, DecryptionKeyId, decrypt_bytes, decrypt_bytes_with_progress, decrypt_file,
     decrypt_file_with_progress,
 };
 use mp4forge::extract::extract_box_payload_bytes;
@@ -179,6 +179,57 @@ fn decrypt_file_with_progress_writes_clear_output() {
             DecryptProgressPhase::FinalizeOutput,
         ]
     );
+}
+
+#[test]
+fn decrypt_file_rejects_same_input_and_output_path_with_context() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let input_path = write_temp_file("decrypt-api-same-path-input", &fixture.single_file);
+
+    let error = decrypt_file(
+        &input_path,
+        &input_path,
+        &options_with_keys(&fixture.all_keys),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("conflicts with input"), "{message}");
+}
+
+#[test]
+fn decrypt_errors_report_stable_category_and_stage_metadata() {
+    let missing_fragments = DecryptError::MissingFragmentsInfo;
+    assert_eq!(missing_fragments.category(), "input");
+    assert_eq!(missing_fragments.stage(), "request");
+
+    let layout = DecryptError::Rewrite(DecryptRewriteError::InvalidLayout {
+        reason: "demo".to_string(),
+    });
+    assert_eq!(layout.category(), "layout");
+    assert_eq!(layout.stage(), "rewrite");
+}
+
+#[test]
+fn decrypt_file_with_progress_reports_truncated_progressive_ranges_with_context() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let mut truncated = fixture.media_segment.clone();
+    truncated.truncate(truncated.len().saturating_sub(1));
+    let input_path = write_temp_file("decrypt-api-truncated-progressive-input", &truncated);
+    let output_path = write_temp_file("decrypt-api-truncated-progressive-output", &[]);
+    let options =
+        options_with_keys(&fixture.all_keys).with_fragments_info_bytes(&fixture.init_segment);
+
+    let error =
+        decrypt_file_with_progress(&input_path, &output_path, &options, |_| {}).unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("progressive"), "{message}");
+    assert!(message.contains("buffered tail is"), "{message}");
 }
 
 fn assert_retained_file_fixture_decrypts_bytes(fixture: &RetainedDecryptFileFixture) {

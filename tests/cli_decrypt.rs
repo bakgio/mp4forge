@@ -230,7 +230,7 @@ fn decrypt_command_rejects_invalid_arguments() {
     );
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: at least one --key <ID:KEY> is required\n"
+        "Error [stage=request category=input]: at least one --key <ID:KEY> is required\n"
     );
 
     let mut stderr = Vec::new();
@@ -248,7 +248,85 @@ fn decrypt_command_rejects_invalid_arguments() {
     );
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: invalid decryption key spec \"bad\": expected <id>:<key>\n"
+        "Error [stage=request category=input]: invalid decryption key spec \"bad\": expected <id>:<key>\n"
+    );
+}
+
+#[test]
+fn decrypt_command_rejects_same_input_and_output_path() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let input_path = write_temp_file("cli-decrypt-same-path-input", &fixture.single_file);
+    let args = vec![
+        "--key".to_string(),
+        fixture.all_keys[0].to_spec(),
+        input_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let message = String::from_utf8(stderr).unwrap();
+    assert_eq!(exit_code, 1);
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("conflicts with input"), "{message}");
+}
+
+#[test]
+fn decrypt_command_rejects_output_path_conflicting_with_fragments_info_path() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let init_path = write_temp_file("cli-decrypt-fragments-conflict-init", &fixture.init_segment);
+    let media_path = write_temp_file(
+        "cli-decrypt-fragments-conflict-media",
+        &fixture.media_segment,
+    );
+    let args = vec![
+        "--key".to_string(),
+        fixture.all_keys[0].to_spec(),
+        "--key".to_string(),
+        fixture.all_keys[1].to_spec(),
+        "--fragments-info".to_string(),
+        init_path.to_string_lossy().into_owned(),
+        media_path.to_string_lossy().into_owned(),
+        init_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let message = String::from_utf8(stderr).unwrap();
+    assert_eq!(exit_code, 1);
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("fragments-info path"), "{message}");
+}
+
+#[test]
+fn decrypt_command_reports_missing_input_path_with_context() {
+    let args = vec![
+        "--key".to_string(),
+        "1:00112233445566778899aabbccddeeff".to_string(),
+        "this-file-does-not-exist.mp4".to_string(),
+        "cli-decrypt-missing-output.mp4".to_string(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let message = String::from_utf8(stderr).unwrap();
+    assert_eq!(exit_code, 1);
+    assert!(
+        message.contains("failed to open decrypt input"),
+        "{message}"
+    );
+    assert!(
+        message.contains("this-file-does-not-exist.mp4"),
+        "{message}"
     );
 }
 

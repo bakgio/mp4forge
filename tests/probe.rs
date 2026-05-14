@@ -1073,6 +1073,28 @@ fn probe_detailed_surfaces_additive_family_names_for_new_sample_entry_types() {
         );
     }
 
+    for sample_entry_type in ["DIV3", "DIV4", "BGR3"] {
+        let mut reader = Cursor::new(build_simple_video_movie_file(
+            sample_entry_type,
+            vec![0x52; 4],
+        ));
+        let info = probe_detailed(&mut reader).unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Unknown);
+        assert_eq!(track.sample_entry_type, Some(fourcc(sample_entry_type)));
+        assert_eq!(track.display_width, Some(640));
+        assert_eq!(track.display_height, Some(360));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "unknown"
+        );
+    }
+
     {
         let mut reader = Cursor::new(build_vvc_movie_file());
         let info = probe_detailed(&mut reader).unwrap();
@@ -1450,6 +1472,36 @@ fn probe_media_characteristics_exposes_sample_entry_side_metadata() {
             interlaced: true,
         })
     );
+}
+
+#[test]
+fn probe_detailed_maps_companded_avi_audio_sample_entries_to_pcm_family() {
+    for sample_entry_type in ["alaw", "ulaw"] {
+        let info = probe_detailed(&mut Cursor::new(build_simple_audio_movie_file(
+            sample_entry_type,
+            1,
+            8_000,
+            160,
+            4,
+            Vec::new(),
+            vec![0x55; 4],
+        )))
+        .unwrap();
+        let track = &info.tracks[0];
+        assert_eq!(track.summary.codec, TrackCodec::Unknown);
+        assert_eq!(track.codec_family, TrackCodecFamily::Pcm);
+        assert_eq!(track.sample_entry_type, Some(fourcc(sample_entry_type)));
+        assert_eq!(track.channel_count, Some(1));
+        assert_eq!(track.sample_rate, Some(8_000));
+        assert_eq!(
+            normalized_codec_family_name(
+                track.codec_family,
+                track.sample_entry_type,
+                track.original_format,
+            ),
+            "pcm"
+        );
+    }
 }
 
 #[test]

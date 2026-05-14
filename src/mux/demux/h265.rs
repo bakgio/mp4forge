@@ -690,6 +690,7 @@ fn build_btrt(
         .and_then(|value| value.checked_mul(u64::from(timescale)))
         .ok_or(MuxError::LayoutOverflow("raw H.265 average bitrate"))?
         / media_duration;
+    let avg_bitrate = avg_bitrate & !7;
 
     Ok(Btrt {
         buffer_size_db,

@@ -7,15 +7,8 @@ use tokio::fs::File as TokioFile;
 #[cfg(feature = "async")]
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use crate::FourCc;
-
 use super::super::import::StagedSample;
 use super::super::{MuxError, MuxRawCodec};
-
-const AV01_ENTRY: FourCc = FourCc::from_bytes(*b"av01");
-const VP08_ENTRY: FourCc = FourCc::from_bytes(*b"vp08");
-const VP09_ENTRY: FourCc = FourCc::from_bytes(*b"vp09");
-const VP10_ENTRY: FourCc = FourCc::from_bytes(*b"vp10");
 
 pub(in crate::mux) struct ParsedIvfTrack {
     pub(in crate::mux) width: u16,
@@ -44,7 +37,6 @@ pub(super) struct IndexedIvfTrack {
     pub(super) width: u16,
     pub(super) height: u16,
     pub(super) timescale: u32,
-    pub(super) sample_entry_type: FourCc,
     pub(super) first_sample_span: IndexedIvfSample,
     pub(super) samples: Vec<StagedSample>,
 }
@@ -157,7 +149,6 @@ pub(super) fn scan_ivf_video_file_sync(
         width: parsed_header.width,
         height: parsed_header.height,
         timescale: parsed_header.timescale,
-        sample_entry_type: ivf_video_sample_entry_type(codec),
         first_sample_span: indexed_samples[0],
         samples: build_ivf_staged_samples(&indexed_samples, parsed_header.timestamp_scale, spec)?,
     })
@@ -234,7 +225,6 @@ pub(super) async fn scan_ivf_video_file_async(
         width: parsed_header.width,
         height: parsed_header.height,
         timescale: parsed_header.timescale,
-        sample_entry_type: ivf_video_sample_entry_type(codec),
         first_sample_span: indexed_samples[0],
         samples: build_ivf_staged_samples(&indexed_samples, parsed_header.timestamp_scale, spec)?,
     })
@@ -318,16 +308,6 @@ fn ivf_codec_from_fourcc_bytes(fourcc: [u8; 4]) -> Option<MuxRawCodec> {
         b"VP90" => Some(MuxRawCodec::Vp9),
         b"VP10" => Some(MuxRawCodec::Vp10),
         _ => None,
-    }
-}
-
-fn ivf_video_sample_entry_type(codec: MuxRawCodec) -> FourCc {
-    match codec {
-        MuxRawCodec::Av1 => AV01_ENTRY,
-        MuxRawCodec::Vp8 => VP08_ENTRY,
-        MuxRawCodec::Vp9 => VP09_ENTRY,
-        MuxRawCodec::Vp10 => VP10_ENTRY,
-        _ => unreachable!("only IVF-backed raw video codecs use this helper"),
     }
 }
 

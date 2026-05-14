@@ -194,6 +194,103 @@ fn looks_like_theora_identification_packet(packet: &[u8]) -> bool {
     packet.len() >= 7 && packet[0] == 0x80 && &packet[1..7] == b"theora"
 }
 
+fn ogg_page_crc(page_bytes: &[u8]) -> u32 {
+    let mut crc = 0_u32;
+    for byte in page_bytes {
+        crc ^= u32::from(*byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn validate_ogg_page_crc_sync(
+    file: &mut File,
+    offset: u64,
+    header: &[u8; 27],
+    lacing_values: &[u8],
+    payload_offset: u64,
+    payload_size: u64,
+    spec: &str,
+) -> Result<(), MuxError> {
+    let total_page_size = 27_u64
+        .checked_add(u64::try_from(lacing_values.len()).unwrap())
+        .and_then(|value| value.checked_add(payload_size))
+        .ok_or(MuxError::LayoutOverflow("Ogg page size"))?;
+    let mut page = vec![
+        0_u8;
+        usize::try_from(total_page_size)
+            .map_err(|_| MuxError::LayoutOverflow("Ogg page size"))?
+    ];
+    page[..27].copy_from_slice(header);
+    page[27..27 + lacing_values.len()].copy_from_slice(lacing_values);
+    if payload_size != 0 {
+        read_exact_at_sync(
+            file,
+            payload_offset,
+            &mut page[27 + lacing_values.len()..],
+            spec,
+            "Ogg page payload is truncated while validating CRC",
+        )?;
+    }
+    let expected_crc = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    page[22..26].fill(0);
+    if ogg_page_crc(&page) != expected_crc {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("Ogg page at byte offset {offset} failed CRC validation"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn validate_ogg_page_crc_async(
+    file: &mut TokioFile,
+    offset: u64,
+    header: &[u8; 27],
+    lacing_values: &[u8],
+    payload_offset: u64,
+    payload_size: u64,
+    spec: &str,
+) -> Result<(), MuxError> {
+    let total_page_size = 27_u64
+        .checked_add(u64::try_from(lacing_values.len()).unwrap())
+        .and_then(|value| value.checked_add(payload_size))
+        .ok_or(MuxError::LayoutOverflow("Ogg page size"))?;
+    let mut page = vec![
+        0_u8;
+        usize::try_from(total_page_size)
+            .map_err(|_| MuxError::LayoutOverflow("Ogg page size"))?
+    ];
+    page[..27].copy_from_slice(header);
+    page[27..27 + lacing_values.len()].copy_from_slice(lacing_values);
+    if payload_size != 0 {
+        read_exact_at_async(
+            file,
+            payload_offset,
+            &mut page[27 + lacing_values.len()..],
+            spec,
+            "Ogg page payload is truncated while validating CRC",
+        )
+        .await?;
+    }
+    let expected_crc = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    page[22..26].fill(0);
+    if ogg_page_crc(&page) != expected_crc {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("Ogg page at byte offset {offset} failed CRC validation"),
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn read_ogg_page_header_sync(
     file: &mut File,
     offset: u64,
@@ -236,6 +333,15 @@ pub(super) fn read_ogg_page_header_sync(
         .and_then(|value| value.checked_add(u64::try_from(segment_count).unwrap()))
         .ok_or(MuxError::LayoutOverflow("Ogg payload offset"))?;
     let payload_size = lacing_values.iter().map(|value| u64::from(*value)).sum();
+    validate_ogg_page_crc_sync(
+        file,
+        offset,
+        &header,
+        &lacing_values,
+        payload_offset,
+        payload_size,
+        spec,
+    )?;
     Ok(OggPageHeader {
         header_type: header[5],
         granule_position: u64::from_le_bytes(header[6..14].try_into().unwrap()),
@@ -290,6 +396,16 @@ pub(super) async fn read_ogg_page_header_async(
         .and_then(|value| value.checked_add(u64::try_from(segment_count).unwrap()))
         .ok_or(MuxError::LayoutOverflow("Ogg payload offset"))?;
     let payload_size = lacing_values.iter().map(|value| u64::from(*value)).sum();
+    validate_ogg_page_crc_async(
+        file,
+        offset,
+        &header,
+        &lacing_values,
+        payload_offset,
+        payload_size,
+        spec,
+    )
+    .await?;
     Ok(OggPageHeader {
         header_type: header[5],
         granule_position: u64::from_le_bytes(header[6..14].try_into().unwrap()),

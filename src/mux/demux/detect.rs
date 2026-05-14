@@ -1,6 +1,7 @@
 use crate::FourCc;
 
 use super::super::MuxRawCodec;
+use super::dash::looks_like_dash_manifest_path;
 use super::iamf::looks_like_iamf_prefix;
 use super::vobsub::looks_like_vobsub_prefix;
 
@@ -12,6 +13,7 @@ const WIDE: FourCc = FourCc::from_bytes(*b"wide");
 const MDAT: FourCc = FourCc::from_bytes(*b"mdat");
 const MOOV: FourCc = FourCc::from_bytes(*b"moov");
 const MOOF: FourCc = FourCc::from_bytes(*b"moof");
+const NON_CORE_DTS_IMPORT_ONLY_FAMILY: &str = "non-core DTS-family audio; native raw direct-ingest currently supports big-endian core DTS sync frames, little-endian core DTS sync frames, transformed 14-bit core DTS sync frames, and DTS-family wrappers that expose one contiguous core substream";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::mux) enum DetectedPathTrackKind {
@@ -25,7 +27,13 @@ pub(in crate::mux) enum DetectedPathTrackKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::mux) enum DetectedContainerPathKind {
     Avi,
+    Dash,
+    Ghi,
+    Gsf,
+    Nhml,
+    Nhnt,
     ProgramStream,
+    Saf,
     TransportStream,
     VobSub,
 }
@@ -81,6 +89,18 @@ pub(in crate::mux) fn detect_path_track_kind_from_prefix(prefix: &[u8]) -> Detec
     if looks_like_png_prefix(prefix) {
         return DetectedPathTrackKind::Raw(MuxRawCodec::Png);
     }
+    if looks_like_bmp_prefix(prefix) {
+        return DetectedPathTrackKind::Raw(MuxRawCodec::Bmp);
+    }
+    if looks_like_prores_prefix(prefix) {
+        return DetectedPathTrackKind::Raw(MuxRawCodec::Prores);
+    }
+    if looks_like_y4m_prefix(prefix) {
+        return DetectedPathTrackKind::Raw(MuxRawCodec::Y4m);
+    }
+    if looks_like_j2k_prefix(prefix) {
+        return DetectedPathTrackKind::Raw(MuxRawCodec::J2k);
+    }
     if looks_like_latm_prefix(prefix) {
         return DetectedPathTrackKind::Raw(MuxRawCodec::Latm);
     }
@@ -99,6 +119,9 @@ pub(in crate::mux) fn detect_path_track_kind_from_prefix(prefix: &[u8]) -> Detec
     if looks_like_h263_prefix(prefix) {
         return DetectedPathTrackKind::Raw(MuxRawCodec::H263);
     }
+    if looks_like_mpeg2v_prefix(prefix) {
+        return DetectedPathTrackKind::Raw(MuxRawCodec::Mpeg2v);
+    }
     if looks_like_mp4v_prefix(prefix) {
         return DetectedPathTrackKind::Raw(MuxRawCodec::Mp4v);
     }
@@ -114,6 +137,52 @@ pub(in crate::mux) fn detect_path_track_kind_from_prefix(prefix: &[u8]) -> Detec
     DetectedPathTrackKind::Unknown
 }
 
+pub(in crate::mux) fn detect_container_path_kind_from_path_and_prefix(
+    path: &std::path::Path,
+    prefix: &[u8],
+) -> Option<DetectedContainerPathKind> {
+    if looks_like_ghi_path(path, prefix) {
+        return Some(DetectedContainerPathKind::Ghi);
+    }
+    if looks_like_gsf_path(path, prefix) {
+        return Some(DetectedContainerPathKind::Gsf);
+    }
+    if looks_like_dash_manifest_path(path, prefix) {
+        return Some(DetectedContainerPathKind::Dash);
+    }
+    if looks_like_saf_path(path) {
+        return Some(DetectedContainerPathKind::Saf);
+    }
+    None
+}
+
+fn looks_like_ghi_path(path: &std::path::Path, prefix: &[u8]) -> bool {
+    if prefix.starts_with(b"GHID") {
+        return true;
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    extension.eq_ignore_ascii_case("ghi") || extension.eq_ignore_ascii_case("ghix")
+}
+
+fn looks_like_gsf_path(path: &std::path::Path, prefix: &[u8]) -> bool {
+    if prefix.starts_with(b"GS5F") {
+        return true;
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    extension.eq_ignore_ascii_case("gsf")
+}
+
+fn looks_like_saf_path(path: &std::path::Path) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    extension.eq_ignore_ascii_case("saf") || extension.eq_ignore_ascii_case("lsr")
+}
+
 fn looks_like_avi_prefix(prefix: &[u8]) -> bool {
     prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"AVI "
 }
@@ -124,6 +193,37 @@ fn looks_like_program_stream_prefix(prefix: &[u8]) -> bool {
 
 fn looks_like_transport_stream_prefix(prefix: &[u8]) -> bool {
     prefix.len() >= 376 && prefix[0] == 0x47 && prefix[188] == 0x47
+}
+
+fn looks_like_bmp_prefix(prefix: &[u8]) -> bool {
+    prefix.len() >= 2 && prefix[0] == b'B' && prefix[1] == b'M'
+}
+
+fn looks_like_prores_prefix(prefix: &[u8]) -> bool {
+    if prefix.len() < 8 {
+        return false;
+    }
+    let frame_size = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+    frame_size >= 28 && &prefix[4..8] == b"icpf"
+}
+
+fn looks_like_y4m_prefix(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"YUV4MPEG2 ")
+}
+
+fn looks_like_j2k_prefix(prefix: &[u8]) -> bool {
+    if prefix.len() >= 12
+        && prefix[..4] == 12_u32.to_be_bytes()
+        && &prefix[4..8] == b"jP  "
+        && prefix[8..12] == [0x0D, 0x0A, 0x87, 0x0A]
+    {
+        return true;
+    }
+    prefix.len() >= 4
+        && prefix[0] == 0xFF
+        && prefix[1] == 0x4F
+        && prefix[2] == 0xFF
+        && prefix[3] == 0x51
 }
 
 pub(in crate::mux) fn id3v2_size_from_prefix(prefix: &[u8]) -> Option<usize> {
@@ -372,6 +472,26 @@ fn looks_like_h263_prefix(prefix: &[u8]) -> bool {
     matches!((prefix[4] >> 2) & 0x07, 1..=5)
 }
 
+fn looks_like_mpeg2v_prefix(prefix: &[u8]) -> bool {
+    let mut saw_sequence_header = false;
+    let mut saw_picture = false;
+    let mut index = 0usize;
+    while index + 4 <= prefix.len() {
+        if prefix[index..].starts_with(&[0x00, 0x00, 0x01]) {
+            match prefix[index + 3] {
+                0xB3 => saw_sequence_header = true,
+                0x00 => saw_picture = true,
+                _ => {}
+            }
+            if saw_sequence_header && saw_picture {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 fn looks_like_mp4v_prefix(prefix: &[u8]) -> bool {
     let mut saw_vop = false;
     let mut saw_config = false;
@@ -401,15 +521,80 @@ fn looks_like_mhas_prefix(prefix: &[u8]) -> bool {
 }
 
 fn detect_dts_prefix(prefix: &[u8]) -> Option<DetectedPathTrackKind> {
-    if prefix.starts_with(&[0x7F, 0xFE, 0x80, 0x01]) {
-        return Some(DetectedPathTrackKind::Raw(MuxRawCodec::Dts));
-    }
-    if prefix.starts_with(b"DTSHDHDR")
+    if prefix.starts_with(&[0x7F, 0xFE, 0x80, 0x01])
         || prefix.starts_with(&[0xFE, 0x7F, 0x01, 0x80])
         || prefix.starts_with(&[0x1F, 0xFF, 0xE8, 0x00])
         || prefix.starts_with(&[0xFF, 0x1F, 0x00, 0xE8])
     {
-        return Some(DetectedPathTrackKind::Mp4ImportOnly("DTS-family audio"));
+        return Some(DetectedPathTrackKind::Raw(MuxRawCodec::Dts));
+    }
+    if prefix.starts_with(b"DTSHDHDR") {
+        if dts_wrapper_prefix_exposes_native_core_sync(prefix) {
+            return Some(DetectedPathTrackKind::Raw(MuxRawCodec::Dts));
+        }
+        return Some(DetectedPathTrackKind::Mp4ImportOnly(
+            NON_CORE_DTS_IMPORT_ONLY_FAMILY,
+        ));
     }
     None
+}
+
+fn dts_wrapper_prefix_exposes_native_core_sync(prefix: &[u8]) -> bool {
+    if prefix.len() <= 8 {
+        return false;
+    }
+    prefix[8..].windows(4).any(|window| {
+        matches!(
+            window,
+            [0x7F, 0xFE, 0x80, 0x01]
+                | [0xFE, 0x7F, 0x01, 0x80]
+                | [0x1F, 0xFF, 0xE8, 0x00]
+                | [0xFF, 0x1F, 0x00, 0xE8]
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        DetectedContainerPathKind, DetectedPathTrackKind,
+        detect_container_path_kind_from_path_and_prefix, detect_path_track_kind_from_prefix,
+    };
+    use crate::mux::MuxRawCodec;
+
+    #[test]
+    fn dts_wrapper_prefix_with_visible_core_sync_detects_as_native_raw() {
+        let mut prefix = b"DTSHDHDRdemo".to_vec();
+        prefix.extend_from_slice(&[0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            detect_path_track_kind_from_prefix(&prefix),
+            DetectedPathTrackKind::Raw(MuxRawCodec::Dts)
+        );
+    }
+
+    #[test]
+    fn dts_wrapper_prefix_without_visible_core_sync_stays_import_only() {
+        assert!(matches!(
+            detect_path_track_kind_from_prefix(b"DTSHDHDRdemo"),
+            DetectedPathTrackKind::Mp4ImportOnly(_)
+        ));
+    }
+
+    #[test]
+    fn gsf_signature_detects_as_container_path() {
+        assert_eq!(
+            detect_container_path_kind_from_path_and_prefix(Path::new("demo.bin"), b"GS5F\x01demo"),
+            Some(DetectedContainerPathKind::Gsf)
+        );
+    }
+
+    #[test]
+    fn ghi_extension_detects_as_container_path() {
+        assert_eq!(
+            detect_container_path_kind_from_path_and_prefix(Path::new("demo.ghix"), b"<MPD"),
+            Some(DetectedContainerPathKind::Ghi)
+        );
+    }
 }

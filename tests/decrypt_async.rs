@@ -122,6 +122,48 @@ async fn async_decrypt_helpers_can_run_on_tokio_worker_threads() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_rejects_same_input_and_output_path_with_context() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let input_path = write_temp_file("decrypt-async-same-path-input", &fixture.single_file);
+
+    let error = decrypt_file_async(
+        &input_path,
+        &input_path,
+        &options_with_keys(&fixture.all_keys),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("conflicts with input"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_reports_truncated_progressive_ranges_with_context() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let mut truncated = fixture.single_file.clone();
+    truncated.truncate(truncated.len().saturating_sub(1));
+    let input_path = write_temp_file("decrypt-async-truncated-progressive-input", &truncated);
+    let output_path = write_temp_file("decrypt-async-truncated-progressive-output", &[]);
+
+    let error = decrypt_file_async(
+        &input_path,
+        &output_path,
+        &options_with_keys(&fixture.all_keys),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("progressive"), "{message}");
+    assert!(message.contains("buffered tail is"), "{message}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_decrypt_independent_file_tasks_can_run_concurrently_on_tokio_worker_threads() {
     let fixture = build_decrypt_rewrite_fixture();

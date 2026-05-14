@@ -339,6 +339,51 @@ fn dump_command_matches_shared_fixture_goldens() {
 }
 
 #[test]
+fn dump_command_usage_lists_only_supported_options() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit_code = dump::run(&[], &mut stdout, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        concat!(
+            "USAGE: mp4forge dump [OPTIONS] INPUT.mp4\n",
+            "\n",
+            "OPTIONS:\n",
+            "  -full <type,type>      Show full content for the listed box types\n",
+            "  -a                     Show full content for supported boxes\n",
+            "  -format <text|json|yaml>  Output format (default: text)\n",
+            "  -path <box/path>      Dump only matched parsed subtrees (repeatable)\n",
+            "  -offset                Show box offsets\n",
+            "  -hex                   Use hexadecimal size and offset values\n",
+        )
+    );
+}
+
+#[test]
+fn dump_command_rejects_removed_deprecated_shorthand_options() {
+    let fixture = fixture_path("sample.mp4");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit_code = dump::run(
+        &["-mdat".to_string(), fixture.to_string_lossy().into_owned()],
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error: unknown dump option: -mdat\n"
+    );
+}
+
+#[test]
 fn structured_dump_report_respects_full_payload_controls() {
     let mut default_reader = Cursor::new(build_dump_input_file());
     let default_report =

@@ -17,6 +17,7 @@ use crate::boxes::iso14496_12::{
 use super::super::MuxError;
 use super::super::import::{
     SegmentedMuxSourceSegment, SegmentedMuxSourceSegmentData, SegmentedMuxSourceSpec, StagedSample,
+    build_btrt_from_sample_sizes,
 };
 use super::annexb_common::{
     AnnexBNal, AnnexBNalScanner, IndexedAnnexBTrack, nal_to_rbsp, push_unique_nal,
@@ -536,6 +537,90 @@ fn build_h264_sample_entry_box_from_avc_config(
     }
 
     super::super::mp4::encode_typed_box(&avc1, &child_boxes.concat())
+}
+
+pub(in crate::mux) fn retune_carried_h264_sample_entry_box<I>(
+    sample_entry_box: &[u8],
+    timescale: u32,
+    samples: I,
+) -> Result<Vec<u8>, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    const VISUAL_SAMPLE_ENTRY_HEADER_SIZE: usize = 86;
+
+    if sample_entry_box.len() < VISUAL_SAMPLE_ENTRY_HEADER_SIZE {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: "h264".to_string(),
+            message:
+                "carried H.264 sample entry is truncated before the visual sample entry header"
+                    .to_string(),
+        });
+    }
+    if &sample_entry_box[4..8] != b"avc1" {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: "h264".to_string(),
+            message: "carried H.264 sample entry did not use the `avc1` sample entry type"
+                .to_string(),
+        });
+    }
+
+    let mut avcc_box = None::<Vec<u8>>;
+    let mut child_offset = VISUAL_SAMPLE_ENTRY_HEADER_SIZE;
+    while sample_entry_box.len().saturating_sub(child_offset) >= 8 {
+        let child_size = u32::from_be_bytes(
+            sample_entry_box[child_offset..child_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let child_size = usize::try_from(child_size)
+            .map_err(|_| MuxError::LayoutOverflow("H.264 sample-entry child size"))?;
+        if child_size < 8 || child_offset + child_size > sample_entry_box.len() {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: "h264".to_string(),
+                message: "carried H.264 sample entry contained one truncated child box".to_string(),
+            });
+        }
+        if &sample_entry_box[child_offset + 4..child_offset + 8] == b"avcC" {
+            avcc_box = Some(sample_entry_box[child_offset..child_offset + child_size].to_vec());
+        }
+        child_offset += child_size;
+    }
+
+    let avcc_box = avcc_box.ok_or_else(|| MuxError::UnsupportedTrackImport {
+        spec: "h264".to_string(),
+        message: "carried H.264 sample entry did not contain an `avcC` decoder configuration box"
+            .to_string(),
+    })?;
+    let pasp_box = super::super::mp4::encode_typed_box(
+        &Pasp {
+            h_spacing: 1,
+            v_spacing: 1,
+        },
+        &[],
+    )?;
+    let btrt_box = super::super::mp4::encode_typed_box(
+        &build_btrt_from_sample_sizes(samples, timescale).map_err(|error| match error {
+            MuxError::LayoutOverflow(_) => error,
+            _ => MuxError::LayoutOverflow("carried H.264 bitrate box"),
+        })?,
+        &[],
+    )?;
+    let rebuilt_size = VISUAL_SAMPLE_ENTRY_HEADER_SIZE
+        .checked_add(avcc_box.len())
+        .and_then(|size| size.checked_add(pasp_box.len()))
+        .and_then(|size| size.checked_add(btrt_box.len()))
+        .ok_or(MuxError::LayoutOverflow("carried H.264 sample-entry size"))?;
+    let rebuilt_size = u32::try_from(rebuilt_size)
+        .map_err(|_| MuxError::LayoutOverflow("carried H.264 sample-entry size"))?;
+
+    let mut rebuilt = Vec::with_capacity(usize::try_from(rebuilt_size).unwrap());
+    rebuilt.extend_from_slice(&rebuilt_size.to_be_bytes());
+    rebuilt.extend_from_slice(&sample_entry_box[4..VISUAL_SAMPLE_ENTRY_HEADER_SIZE]);
+    rebuilt.extend_from_slice(&avcc_box);
+    rebuilt.extend_from_slice(&pasp_box);
+    rebuilt.extend_from_slice(&btrt_box);
+    Ok(rebuilt)
 }
 
 const fn h264_profile_supports_config_extensions(profile: u8) -> bool {

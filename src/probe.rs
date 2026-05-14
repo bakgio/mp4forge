@@ -1,6 +1,7 @@
 //! File-summary helpers built on the extraction and box layers, with byte-slice convenience entry
 //! points for in-memory probe flows.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -67,9 +68,13 @@ const VP08: FourCc = FourCc::from_bytes(*b"vp08");
 const VP09: FourCc = FourCc::from_bytes(*b"vp09");
 const VP10: FourCc = FourCc::from_bytes(*b"vp10");
 const VPCC: FourCc = FourCc::from_bytes(*b"vpcC");
+const DIV3_ENTRY: FourCc = FourCc::from_bytes(*b"DIV3");
+const DIV4_ENTRY: FourCc = FourCc::from_bytes(*b"DIV4");
+const BGR3_ENTRY: FourCc = FourCc::from_bytes(*b"BGR3");
 const H263_ENTRY_ALIAS: FourCc = FourCc::from_bytes(*b"H263");
 const JPEG_ENTRY: FourCc = FourCc::from_bytes(*b"jpeg");
 const MJPG_ENTRY_ALIAS: FourCc = FourCc::from_bytes(*b"MJPG");
+const MPEG_ENTRY: FourCc = FourCc::from_bytes(*b"MPEG");
 const PNG_ENTRY: FourCc = FourCc::from_bytes(*b"png ");
 const PNG_ENTRY_ALIAS: FourCc = FourCc::from_bytes(*b"PNG ");
 const ENCV: FourCc = FourCc::from_bytes(*b"encv");
@@ -83,6 +88,7 @@ const SMDM: FourCc = FourCc::from_bytes(*b"SmDm");
 const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
 const MP4V: FourCc = FourCc::from_bytes(*b"mp4v");
 const DOT_MP3: FourCc = FourCc::from_bytes(*b".mp3");
+const ALAW: FourCc = FourCc::from_bytes(*b"alaw");
 const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
 const SPEX: FourCc = FourCc::from_bytes(*b"spex");
 const SAMR: FourCc = FourCc::from_bytes(*b"samr");
@@ -90,6 +96,7 @@ const SAWB: FourCc = FourCc::from_bytes(*b"sawb");
 const SQCP: FourCc = FourCc::from_bytes(*b"sqcp");
 const SEVC: FourCc = FourCc::from_bytes(*b"sevc");
 const SSMV: FourCc = FourCc::from_bytes(*b"ssmv");
+const ULAW: FourCc = FourCc::from_bytes(*b"ulaw");
 const S263: FourCc = FourCc::from_bytes(*b"s263");
 const DOPS: FourCc = FourCc::from_bytes(*b"dOps");
 const AC_3: FourCc = FourCc::from_bytes(*b"ac-3");
@@ -966,6 +973,7 @@ pub fn normalized_codec_family_name(
             Some(MHA1 | MHA2 | MHM1 | MHM2) => "mpeg_h",
             Some(JPEG_ENTRY | MJPG_ENTRY_ALIAS) => "jpeg",
             Some(S263 | H263_ENTRY_ALIAS) => "h263",
+            Some(MPEG_ENTRY) => "mpeg2_video",
             Some(MP4V) => "mpeg4_visual",
             Some(PNG_ENTRY | PNG_ENTRY_ALIAS) => "png",
             Some(VP10) => "vp10",
@@ -1097,6 +1105,22 @@ pub struct SegmentInfo {
     pub composition_time_offset: i32,
     /// Total sample payload size in bytes.
     pub size: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ParsedMoofSegment {
+    summary: SegmentInfo,
+    zero_duration_sample_count: u32,
+    sample_durations: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FragmentedTrackWarningDiagnostics {
+    pub zero_duration_sample_count: u64,
+    pub sample_duration_change_count: u64,
+    pub min_non_zero_sample_duration: Option<u32>,
+    pub max_non_zero_sample_duration: Option<u32>,
+    last_non_zero_sample_duration: Option<u32>,
 }
 
 /// Probes a file and returns the backwards-compatible coarse movie, track, and fragment summary.
@@ -1591,6 +1615,49 @@ pub fn probe_bytes_with_options(
 ) -> Result<ProbeInfo, ProbeError> {
     let mut reader = Cursor::new(input);
     probe_with_options(&mut reader, options)
+}
+
+pub(crate) fn fragmented_track_warning_diagnostics<R>(
+    reader: &mut R,
+) -> Result<BTreeMap<u32, FragmentedTrackWarningDiagnostics>, ProbeError>
+where
+    R: Read + Seek,
+{
+    let infos = extract_boxes(reader, None, &[BoxPath::from([MOOF])])?;
+    let mut diagnostics = BTreeMap::new();
+
+    for info in infos {
+        let parsed = probe_moof_parsed(reader, &info)?;
+        let entry = diagnostics
+            .entry(parsed.summary.track_id)
+            .or_insert_with(FragmentedTrackWarningDiagnostics::default);
+        entry.zero_duration_sample_count += u64::from(parsed.zero_duration_sample_count);
+
+        for sample_duration in parsed.sample_durations {
+            if sample_duration == 0 {
+                continue;
+            }
+
+            if let Some(previous_duration) = entry.last_non_zero_sample_duration
+                && previous_duration != sample_duration
+            {
+                entry.sample_duration_change_count += 1;
+            }
+            entry.last_non_zero_sample_duration = Some(sample_duration);
+            entry.min_non_zero_sample_duration = Some(
+                entry
+                    .min_non_zero_sample_duration
+                    .map_or(sample_duration, |value| value.min(sample_duration)),
+            );
+            entry.max_non_zero_sample_duration = Some(
+                entry
+                    .max_non_zero_sample_duration
+                    .map_or(sample_duration, |value| value.max(sample_duration)),
+            );
+        }
+    }
+
+    Ok(diagnostics)
 }
 
 /// Probes an in-memory MP4 byte slice and returns the additive detailed summary.
@@ -2116,6 +2183,9 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         JPEG_ENTRY,
         MJPG_ENTRY_ALIAS,
         MP4V,
+        DIV3_ENTRY,
+        DIV4_ENTRY,
+        BGR3_ENTRY,
         S263,
         H263_ENTRY_ALIAS,
         PNG_ENTRY,
@@ -2126,9 +2196,9 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         ENCV,
     ];
     let audio_sample_entries = [
-        MP4A, DOT_MP3, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, AC_3, EC_3, AC_4, ALAC, MLPA,
-        DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2, MHM1, MHM2, IPCM, FPCM,
-        ENCA,
+        MP4A, DOT_MP3, ALAW, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, ULAW, AC_3, EC_3, AC_4,
+        ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2, MHM1, MHM2,
+        IPCM, FPCM, ENCA,
     ];
     let mut paths = vec![
         BoxPath::from([TKHD]),
@@ -2158,6 +2228,9 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, MJPG_ENTRY_ALIAS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4V]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4V, ESDS]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DIV3_ENTRY]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DIV4_ENTRY]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, BGR3_ENTRY]),
         BoxPath::from([MDIA, MINF, STBL, STSD, S263]),
         BoxPath::from([MDIA, MINF, STBL, STSD, H263_ENTRY_ALIAS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, PNG_ENTRY]),
@@ -2181,6 +2254,7 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4A, ESDS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4A, WAVE, ESDS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DOT_MP3]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ALAW]),
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS, DOPS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, SPEX]),
@@ -2189,6 +2263,7 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, SQCP]),
         BoxPath::from([MDIA, MINF, STBL, STSD, SEVC]),
         BoxPath::from([MDIA, MINF, STBL, STSD, SSMV]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, ULAW]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, AC_3, DAC3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, EC_3]),
@@ -2530,8 +2605,8 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(extracted.info.box_type());
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
-            MP4V => {
-                track.sample_entry_type = Some(MP4V);
+            MPEG_ENTRY | MP4V => {
+                track.sample_entry_type = Some(extracted.info.box_type());
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
             S263 | H263_ENTRY_ALIAS => {
@@ -2540,6 +2615,16 @@ fn parse_trak_rich_details(
             }
             PNG_ENTRY | PNG_ENTRY_ALIAS => {
                 track.sample_entry_type = Some(extracted.info.box_type());
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            ENCV => {
+                track.summary.codec = TrackCodec::Avc1;
+                track.summary.encrypted = true;
+                track.sample_entry_type = Some(ENCV);
+                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
+            }
+            other if extracted.payload.as_any().is::<VisualSampleEntry>() => {
+                track.sample_entry_type = Some(other);
                 visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
             }
             AV1C => {
@@ -2562,12 +2647,6 @@ fn parse_trak_rich_details(
             VPCC => {
                 vpcc = Some(downcast_clone::<VpCodecConfiguration>(&extracted)?);
             }
-            ENCV => {
-                track.summary.codec = TrackCodec::Avc1;
-                track.summary.encrypted = true;
-                track.sample_entry_type = Some(ENCV);
-                visual_sample_entry = Some(downcast_clone::<VisualSampleEntry>(&extracted)?);
-            }
             MP4A => {
                 track.summary.codec = TrackCodec::Mp4a;
                 track.codec_family = TrackCodecFamily::Mp4Audio;
@@ -2576,6 +2655,11 @@ fn parse_trak_rich_details(
             }
             DOT_MP3 => {
                 track.sample_entry_type = Some(DOT_MP3);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            ALAW => {
+                track.codec_family = TrackCodecFamily::Pcm;
+                track.sample_entry_type = Some(ALAW);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             ENCA => {
@@ -2611,6 +2695,11 @@ fn parse_trak_rich_details(
             }
             SSMV => {
                 track.sample_entry_type = Some(SSMV);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            ULAW => {
+                track.codec_family = TrackCodecFamily::Pcm;
+                track.sample_entry_type = Some(ULAW);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             DOPS => {
@@ -2971,7 +3060,7 @@ fn codec_family_from_sample_entry(sample_entry_type: FourCc) -> TrackCodecFamily
         MP4A => TrackCodecFamily::Mp4Audio,
         OPUS => TrackCodecFamily::Opus,
         AC_3 => TrackCodecFamily::Ac3,
-        IPCM | FPCM => TrackCodecFamily::Pcm,
+        ALAW | ULAW | IPCM | FPCM => TrackCodecFamily::Pcm,
         MP4S => TrackCodecFamily::Unknown,
         STPP => TrackCodecFamily::XmlSubtitle,
         SBTT => TrackCodecFamily::TextSubtitle,
@@ -3280,16 +3369,7 @@ fn probe_moof<R>(reader: &mut R, parent: &BoxInfo) -> Result<SegmentInfo, ProbeE
 where
     R: Read + Seek,
 {
-    let boxes = extract_boxes_with_payload(
-        reader,
-        Some(parent),
-        &[
-            BoxPath::from([TRAF, TFHD]),
-            BoxPath::from([TRAF, TFDT]),
-            BoxPath::from([TRAF, TRUN]),
-        ],
-    )?;
-    parse_moof_segment(boxes, parent.offset())
+    Ok(probe_moof_parsed(reader, parent)?.summary)
 }
 
 #[cfg(feature = "async")]
@@ -3307,13 +3387,29 @@ where
         ],
     )
     .await?;
+    Ok(parse_moof_segment(boxes, parent.offset())?.summary)
+}
+
+fn probe_moof_parsed<R>(reader: &mut R, parent: &BoxInfo) -> Result<ParsedMoofSegment, ProbeError>
+where
+    R: Read + Seek,
+{
+    let boxes = extract_boxes_with_payload(
+        reader,
+        Some(parent),
+        &[
+            BoxPath::from([TRAF, TFHD]),
+            BoxPath::from([TRAF, TFDT]),
+            BoxPath::from([TRAF, TRUN]),
+        ],
+    )?;
     parse_moof_segment(boxes, parent.offset())
 }
 
 fn parse_moof_segment(
     boxes: Vec<ExtractedBox>,
     moof_offset: u64,
-) -> Result<SegmentInfo, ProbeError> {
+) -> Result<ParsedMoofSegment, ProbeError> {
     let mut tfhd = None;
     let mut tfdt = None;
     let mut trun = None;
@@ -3327,42 +3423,64 @@ fn parse_moof_segment(
     }
 
     let tfhd = tfhd.ok_or(ProbeError::MissingRequiredBox("tfhd"))?;
-    let mut segment = SegmentInfo {
-        track_id: tfhd.track_id,
-        moof_offset,
-        default_sample_duration: tfhd.default_sample_duration,
-        ..SegmentInfo::default()
+    let mut parsed = ParsedMoofSegment {
+        summary: SegmentInfo {
+            track_id: tfhd.track_id,
+            moof_offset,
+            default_sample_duration: tfhd.default_sample_duration,
+            ..SegmentInfo::default()
+        },
+        ..ParsedMoofSegment::default()
     };
 
     if let Some(tfdt) = tfdt.as_ref() {
-        segment.base_media_decode_time = tfdt.base_media_decode_time();
+        parsed.summary.base_media_decode_time = tfdt.base_media_decode_time();
     }
 
     if let Some(trun) = trun.as_ref() {
-        segment.sample_count = trun.sample_count;
+        parsed.summary.sample_count = trun.sample_count;
 
         if trun.flags() & crate::boxes::iso14496_12::TRUN_SAMPLE_DURATION_PRESENT != 0 {
-            segment.duration = trun
+            parsed.sample_durations = trun
+                .entries
+                .iter()
+                .map(|entry| entry.sample_duration)
+                .collect();
+            parsed.summary.duration = trun
                 .entries
                 .iter()
                 .map(|entry| entry.sample_duration)
                 .sum::<u32>();
+            parsed.zero_duration_sample_count = parsed
+                .sample_durations
+                .iter()
+                .filter(|sample_duration| **sample_duration == 0)
+                .count()
+                .try_into()
+                .map_err(|_| ProbeError::NumericOverflow {
+                    field_name: "segment zero-duration sample count",
+                })?;
         } else {
-            segment.duration = tfhd
+            parsed.sample_durations =
+                vec![tfhd.default_sample_duration; parsed.summary.sample_count as usize];
+            parsed.summary.duration = tfhd
                 .default_sample_duration
-                .saturating_mul(segment.sample_count);
+                .saturating_mul(parsed.summary.sample_count);
+            if tfhd.default_sample_duration == 0 {
+                parsed.zero_duration_sample_count = parsed.summary.sample_count;
+            }
         }
 
         if trun.flags() & crate::boxes::iso14496_12::TRUN_SAMPLE_SIZE_PRESENT != 0 {
-            segment.size = trun
+            parsed.summary.size = trun
                 .entries
                 .iter()
                 .map(|entry| entry.sample_size)
                 .sum::<u32>();
         } else {
-            segment.size = tfhd
+            parsed.summary.size = tfhd
                 .default_sample_size
-                .saturating_mul(segment.sample_count);
+                .saturating_mul(parsed.summary.sample_count);
         }
 
         let mut duration = 0_u32;
@@ -3379,14 +3497,14 @@ fn parse_moof_segment(
             );
         }
         if let Some(offset) = min_offset {
-            segment.composition_time_offset =
+            parsed.summary.composition_time_offset =
                 offset.try_into().map_err(|_| ProbeError::NumericOverflow {
                     field_name: "segment composition time offset",
                 })?;
         }
     }
 
-    Ok(segment)
+    Ok(parsed)
 }
 
 fn read_payload_as<R, B>(reader: &mut R, info: &BoxInfo) -> Result<B, ProbeError>

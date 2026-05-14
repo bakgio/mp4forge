@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Cursor;
 
 use mp4forge::BoxInfo;
+use mp4forge::boxes::avs3::Av3c;
 use mp4forge::boxes::dolby::Dmlp;
 use mp4forge::boxes::iamf::Iacb;
 use mp4forge::boxes::iso14496_12::{
@@ -25,26 +26,33 @@ use support::{
     TestQcpCodecKind, build_test_av1_sequence_header_obu, build_test_mp4v_decoder_specific_info,
     build_test_vp10_keyframe, encode_supported_box, fixture_path, fourcc,
     write_single_track_mp4_input, write_temp_file, write_test_ac4_file, write_test_adts_file,
-    write_test_aifc_pcm_file, write_test_amr_file, write_test_amr_wb_file, write_test_av1_ivf_file,
-    write_test_avi_ac3_file, write_test_avi_avc1_file, write_test_avi_h263_file,
-    write_test_avi_h264_file, write_test_avi_jpeg_file, write_test_avi_mp3_file,
-    write_test_avi_mp4v_file, write_test_avi_pcm_file, write_test_avi_png_file,
-    write_test_caf_alac_file, write_test_caf_alac_variable_packet_file, write_test_dts_file,
-    write_test_flac_file, write_test_h263_file, write_test_h265_annexb_file, write_test_iamf_file,
-    write_test_jpeg_file, write_test_latm_file, write_test_mhas_file, write_test_mp3_file,
-    write_test_mp4v_file, write_test_ogg_flac_file, write_test_ogg_flac_mapping_file,
-    write_test_ogg_opus_file, write_test_ogg_speex_file, write_test_ogg_theora_file,
-    write_test_ogg_vorbis_file, write_test_png_file, write_test_program_stream_ac3_file,
-    write_test_program_stream_h264_file, write_test_program_stream_h265_file,
-    write_test_program_stream_mp3_file, write_test_program_stream_mp4v_file,
+    write_test_aifc_pcm_file, write_test_aiff_pcm_file, write_test_amr_file,
+    write_test_amr_wb_file, write_test_av1_annex_b_file, write_test_av1_ivf_file,
+    write_test_av1_obu_file, write_test_avi_ac3_file, write_test_avi_avc1_file,
+    write_test_avi_h263_file, write_test_avi_h264_file, write_test_avi_jpeg_file,
+    write_test_avi_mp3_file, write_test_avi_mp4v_file, write_test_avi_pcm_file,
+    write_test_avi_png_file, write_test_caf_alac_file, write_test_caf_alac_variable_packet_file,
+    write_test_dts_file, write_test_dts_little_endian_file, write_test_flac_file,
+    write_test_h263_file, write_test_h265_annexb_file, write_test_iamf_file, write_test_jpeg_file,
+    write_test_latm_file, write_test_mhas_file, write_test_mp3_file, write_test_mp4v_file,
+    write_test_ogg_flac_file, write_test_ogg_flac_mapping_file, write_test_ogg_opus_file,
+    write_test_ogg_speex_file, write_test_ogg_theora_file, write_test_ogg_vorbis_file,
+    write_test_png_file, write_test_program_stream_ac3_file, write_test_program_stream_h264_file,
+    write_test_program_stream_h264_open_ended_file, write_test_program_stream_h265_file,
+    write_test_program_stream_lpcm_file, write_test_program_stream_mp3_file,
+    write_test_program_stream_mp4v_file, write_test_program_stream_mpeg2v_file,
     write_test_program_stream_vobsub_file, write_test_program_stream_vvc_file,
     write_test_qcp_constant_file, write_test_transport_stream_ac3_file,
+    write_test_transport_stream_ac4_file, write_test_transport_stream_av1_file,
+    write_test_transport_stream_avs3_file, write_test_transport_stream_dts_file,
     write_test_transport_stream_dvb_subtitle_file, write_test_transport_stream_dvb_teletext_file,
     write_test_transport_stream_eac3_file, write_test_transport_stream_h264_file,
-    write_test_transport_stream_h265_file, write_test_transport_stream_mp3_file,
-    write_test_transport_stream_mp4v_file, write_test_transport_stream_vvc_file,
+    write_test_transport_stream_h265_file, write_test_transport_stream_latm_file,
+    write_test_transport_stream_mhas_file, write_test_transport_stream_mp3_file,
+    write_test_transport_stream_mp4v_file, write_test_transport_stream_mpeg2v_file,
+    write_test_transport_stream_truehd_file, write_test_transport_stream_vvc_file,
     write_test_truehd_file, write_test_usac_latm_file, write_test_vobsub_files,
-    write_test_vp10_ivf_file, write_test_wave_pcm_file,
+    write_test_vp10_ivf_file, write_test_wave_pcm_file, write_test_wrapped_dts_file_with_tail,
 };
 
 #[test]
@@ -60,12 +68,13 @@ fn mux_command_validates_argument_shape() {
             "  --track <SPEC>                Add one mux input using the path-first track-spec grammar\n",
             "                               Path only: PATH\n",
             "                               Select one MP4 track when needed with: PATH#video, PATH#audio, PATH#audio:N, PATH#text, PATH#text:N, PATH#track:ID\n",
-            "                               Current path-only auto-detection covers MP4, VobSub, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported MPEG-PS MPEG audio streams plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS MPEG audio streams plus AC-3/E-AC-3 audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, VVC Annex B, IVF AV1/VP8/VP9/VP10, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, and CAF ALAC\n",
+            "                               Current path-only auto-detection covers MP4, VobSub, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported MPEG-PS MPEG audio streams plus LPCM audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS MPEG audio streams plus AAC LATM/MHAS plus AC-3/E-AC-3/AC-4/DTS/TrueHD audio plus MPEG-2/AV1/AVS3/MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS-family core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, VVC Annex B, raw AV1 OBU, raw AV1 Annex B, IVF AV1/VP8/VP9/VP10, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, and CAF ALAC\n",
             "                               Broader DTS-family sample-entry variants remain supported through MP4 track import\n",
             "  --segment_duration <SECONDS> Set one target segment duration for supported single-input jobs\n",
             "  --fragment_duration <SECONDS> Set one target fragment duration for supported single-input jobs\n",
             "  --layout <flat|fragmented>   Choose the output container layout; defaults to flat\n",
             "  --out <PATH>                 Force one newly created output destination at PATH\n",
+            "  -warnings                    Emit warning-grade diagnostics to stderr after a successful run\n",
             "\n",
             "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH`. Path-only MP4 inputs import all supported tracks unless you add one selector suffix.\n",
         )
@@ -89,7 +98,7 @@ fn mux_command_rejects_positional_dest_when_out_is_present() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: --out <PATH> may not be used together with a positional DEST path\n"
+        "Error [stage=request category=input]: --out <PATH> may not be used together with a positional DEST path\n"
     );
 }
 
@@ -137,6 +146,52 @@ fn mux_command_writes_real_mp4_output_from_path_only_dts_input() {
     let dts_input = write_test_dts_file("mux-cli-path-only-dts-input", 2);
     let expected_payload = fs::read(&dts_input).unwrap();
     let output = write_temp_file("mux-cli-path-only-dts-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        dts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_little_endian_dts_input() {
+    let dts_input = write_test_dts_little_endian_file("mux-cli-path-only-dts-le-input", 2);
+    let expected_payload = fs::read(&dts_input).unwrap();
+    let output = write_temp_file("mux-cli-path-only-dts-le-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        dts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_wrapped_core_dts_input_with_trailing_family_tail() {
+    let dts_input = write_test_wrapped_dts_file_with_tail(
+        "mux-cli-path-only-dts-wrapped-tail-input",
+        2,
+        b"DTSHDTRAILER",
+    );
+    let expected_payload = fs::read(&dts_input).unwrap();
+    let output = write_temp_file("mux-cli-path-only-dts-wrapped-tail-output", &[]);
     let args = vec![
         "--track".to_string(),
         dts_input.to_string_lossy().into_owned(),
@@ -730,6 +785,40 @@ fn mux_command_writes_real_mp4_output_from_path_only_program_stream_mp4v_input()
 }
 
 #[test]
+fn mux_command_writes_real_mp4_output_from_path_only_program_stream_mpeg2v_input() {
+    let ps_input = write_test_program_stream_mpeg2v_file(
+        "mux-cli-path-only-program-stream-mpeg2v-input",
+        &[b"mpeg2v-a", b"mpeg2v-b"],
+    );
+    let output = write_temp_file("mux-cli-path-only-program-stream-mpeg2v-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ps_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let video_entries = extract_boxes::<VisualSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mp4v"),
+        ]),
+    );
+    assert_eq!(video_entries.len(), 1);
+}
+
+#[test]
 fn mux_command_writes_real_mp4_output_from_path_only_program_stream_input() {
     let ps_input = write_test_program_stream_mp3_file(
         "mux-cli-path-only-program-stream-input",
@@ -796,12 +885,122 @@ fn mux_command_writes_real_mp4_output_from_path_only_program_stream_ac3_input() 
 }
 
 #[test]
+fn mux_command_writes_real_mp4_output_from_path_only_program_stream_mp3_input() {
+    let ps_input = write_test_program_stream_mp3_file(
+        "mux-cli-path-only-program-stream-mp3-input",
+        &[b"mp3-a", b"mp3-b"],
+    );
+    let output = write_temp_file("mux-cli-path-only-program-stream-mp3-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ps_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc(".mp3"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc(".mp3"));
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_program_stream_lpcm_input() {
+    let sample_a = [0x00_u8, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04];
+    let sample_b = [0x00_u8, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00, 0x08];
+    let ps_input = write_test_program_stream_lpcm_file(
+        "mux-cli-path-only-program-stream-lpcm-input",
+        &[&sample_a, &sample_b],
+    );
+    let output = write_temp_file("mux-cli-path-only-program-stream-lpcm-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ps_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ipcm"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ipcm"));
+    assert_eq!(audio_entries[0].channel_count, 2);
+}
+
+#[test]
 fn mux_command_writes_real_mp4_output_from_path_only_program_stream_h264_input() {
     let ps_input = write_test_program_stream_h264_file(
         "mux-cli-path-only-program-stream-h264-input",
         &[b"idr"],
     );
     let output = write_temp_file("mux-cli-path-only-program-stream-h264-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ps_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let video_entries = extract_boxes::<VisualSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("avc1"),
+        ]),
+    );
+    assert_eq!(video_entries.len(), 1);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_program_stream_h264_open_ended_input() {
+    let ps_input = write_test_program_stream_h264_open_ended_file(
+        "mux-cli-path-only-program-stream-h264-open-ended-input",
+        &[b"idr", b"p-frame"],
+    );
+    let output = write_temp_file(
+        "mux-cli-path-only-program-stream-h264-open-ended-output",
+        &[],
+    );
     let args = vec![
         "--track".to_string(),
         ps_input.to_string_lossy().into_owned(),
@@ -899,6 +1098,182 @@ fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_mp4v_input
         ]),
     );
     assert_eq!(video_entries.len(), 1);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_mpeg2v_input() {
+    let ts_input = write_test_transport_stream_mpeg2v_file(
+        "mux-cli-path-only-transport-stream-mpeg2v-input",
+        &[b"mpeg2v-a", b"mpeg2v-b"],
+    );
+    let output = write_temp_file("mux-cli-path-only-transport-stream-mpeg2v-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let video_entries = extract_boxes::<VisualSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mp4v"),
+        ]),
+    );
+    assert_eq!(video_entries.len(), 1);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_av1_input() {
+    let frame_a = build_test_av1_sequence_header_obu(320, 240);
+    let frame_b = build_test_av1_sequence_header_obu(320, 240);
+    let ts_input = write_test_transport_stream_av1_file(
+        "mux-cli-path-only-transport-stream-av1-input",
+        &[&frame_a, &frame_b],
+    );
+    let output = write_temp_file("mux-cli-path-only-transport-stream-av1-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let video_entries = extract_boxes::<VisualSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("av01"),
+        ]),
+    );
+    assert_eq!(video_entries.len(), 1);
+    assert_eq!(video_entries[0].width, 320);
+    assert_eq!(video_entries[0].height, 240);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_avs3_input() {
+    let ts_input = write_test_transport_stream_avs3_file(
+        "mux-cli-path-only-transport-stream-avs3-input",
+        &[b"avs3-a", b"avs3-b"],
+    );
+    let output = write_temp_file("mux-cli-path-only-transport-stream-avs3-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let video_entries = extract_boxes::<VisualSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("avs3"),
+        ]),
+    );
+    let av3c_boxes = extract_boxes::<Av3c>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("avs3"),
+            fourcc("av3c"),
+        ]),
+    );
+    let mdhd_boxes = extract_boxes::<Mdhd>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("mdhd"),
+        ]),
+    );
+    let hdlr_boxes = extract_boxes::<Hdlr>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("hdlr"),
+        ]),
+    );
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("avs3"),
+            fourcc("btrt"),
+        ]),
+    );
+    let stss_boxes = extract_boxes::<Stss>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stss"),
+        ]),
+    );
+    assert_eq!(video_entries.len(), 1);
+    assert_eq!(video_entries[0].width, 0);
+    assert_eq!(video_entries[0].height, 0);
+    assert_eq!(av3c_boxes.len(), 1);
+    assert_eq!(
+        av3c_boxes[0].sequence_header,
+        vec![0x00, 0x00, 0x01, 0xB0, 0x20, 0x10]
+    );
+    assert_eq!(mdhd_boxes.len(), 1);
+    assert_eq!(mdhd_boxes[0].timescale, 90_000);
+    assert_eq!(hdlr_boxes.len(), 1);
+    assert_eq!(hdlr_boxes[0].name, "VideoHandler");
+    assert_eq!(btrt_boxes.len(), 1);
+    assert_eq!(stss_boxes.len(), 1);
+    assert_eq!(stss_boxes[0].entry_count, 0);
+    assert!(stss_boxes[0].sample_number.is_empty());
 }
 
 #[test]
@@ -1085,8 +1460,8 @@ fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_vvc_input(
     assert_eq!(video_entries[0].width, 1280);
     assert_eq!(video_entries[0].height, 720);
     assert_eq!(mdhd_boxes.len(), 1);
-    assert_eq!(mdhd_boxes[0].timescale, 25);
-    assert_eq!(mdhd_boxes[0].duration(), 2);
+    assert_eq!(mdhd_boxes[0].timescale, 90_000);
+    assert_eq!(mdhd_boxes[0].duration(), 0);
     assert_eq!(vvc_boxes.len(), 1);
     assert!(!vvc_boxes[0].decoder_configuration_record.is_empty());
 }
@@ -1126,6 +1501,95 @@ fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_ac3_input(
 }
 
 #[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_latm_input() {
+    let ts_input = write_test_transport_stream_latm_file(
+        "mux-cli-path-only-transport-stream-latm-input",
+        &[b"abc", b"defg"],
+    );
+    let output = write_temp_file("mux-cli-path-only-transport-stream-latm-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mp4a"),
+        ]),
+    );
+    let esds_boxes = extract_boxes::<Esds>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mp4a"),
+            fourcc("esds"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(esds_boxes.len(), 1);
+    assert_eq!(
+        esds_boxes[0]
+            .decoder_config_descriptor()
+            .unwrap()
+            .object_type_indication,
+        0x40
+    );
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_mhas_input() {
+    let ts_input = write_test_transport_stream_mhas_file(
+        "mux-cli-path-only-transport-stream-mhas-input",
+        &[b"frame-one", b"frame-two"],
+    );
+    let output = write_temp_file("mux-cli-path-only-transport-stream-mhas-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mhm1"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+}
+
+#[test]
 fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_eac3_input() {
     let ts_input = write_test_transport_stream_eac3_file(
         "mux-cli-path-only-transport-stream-eac3-input",
@@ -1154,6 +1618,104 @@ fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_eac3_input
             fourcc("stbl"),
             fourcc("stsd"),
             fourcc("ec-3"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_ac4_input() {
+    let ts_input =
+        write_test_transport_stream_ac4_file("mux-cli-path-only-transport-stream-ac4-input", 2);
+    let output = write_temp_file("mux-cli-path-only-transport-stream-ac4-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ac-4"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_truehd_input() {
+    let ts_input = write_test_transport_stream_truehd_file(
+        "mux-cli-path-only-transport-stream-truehd-input",
+        &[b"abcdefgh", b"ijklmnop"],
+    );
+    let output = write_temp_file("mux-cli-path-only-transport-stream-truehd-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mlpa"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_only_transport_stream_dts_input() {
+    let ts_input =
+        write_test_transport_stream_dts_file("mux-cli-path-only-transport-stream-dts-input", 2);
+    let output = write_temp_file("mux-cli-path-only-transport-stream-dts-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        ts_input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("dtsx"),
         ]),
     );
     assert_eq!(audio_entries.len(), 1);
@@ -1475,7 +2037,7 @@ fn mux_command_rejects_invalid_track_specs() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: invalid mux track spec `input.bin#width=640`: public mux track specs only allow selector suffixes such as `#video`, `#audio`, `#text`, or `#track:ID`; raw `#name=value` parameters are no longer accepted\n"
+        "Error [stage=request category=input]: invalid mux track spec `input.bin#width=640`: public mux track specs only allow selector suffixes such as `#video`, `#audio`, `#text`, or `#track:ID`; raw `#name=value` parameters are no longer accepted\n"
     );
 }
 
@@ -1498,7 +2060,7 @@ fn mux_command_rejects_conflicting_duration_flags() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: --segment_duration and --fragment_duration may not be used together\n"
+        "Error [stage=request category=input]: --segment_duration and --fragment_duration may not be used together\n"
     );
 }
 
@@ -1519,7 +2081,7 @@ fn mux_command_rejects_duration_flags_for_flat_layout() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: invalid mux layout `flat`: flat output does not support `--fragment_duration`; use `--layout fragmented` instead\n"
+        "Error [stage=request category=input]: invalid mux layout `flat`: flat output does not support `--fragment_duration`; use `--layout fragmented` instead\n"
     );
 }
 
@@ -1540,7 +2102,7 @@ fn mux_command_rejects_fragmented_layout_without_duration() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: invalid mux layout `fragmented`: fragmented output requires exactly one of `--segment_duration` or `--fragment_duration`\n"
+        "Error [stage=request category=input]: invalid mux layout `fragmented`: fragmented output requires exactly one of `--segment_duration` or `--fragment_duration`\n"
     );
 }
 
@@ -1561,7 +2123,7 @@ fn mux_command_rejects_multiple_video_tracks() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: the current mux surface supports at most one video track per job, but 2 were requested\n"
+        "Error [stage=request category=input]: the current mux surface supports at most one video track per job, but 2 were requested\n"
     );
 }
 
@@ -1586,7 +2148,32 @@ fn mux_command_rejects_fragmented_multi_track_jobs() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: invalid mux layout `fragmented`: the current fragmented mux follow-on only supports single-track jobs\n"
+        "Error [stage=request category=input]: invalid mux layout `fragmented`: the current fragmented mux follow-on only supports single-track jobs\n"
+    );
+}
+
+#[test]
+fn mux_command_rejects_fragmented_destination_path_mode_before_execution() {
+    let destination =
+        build_audio_input_file("mux-cli-fragmented-destination-output", fourcc("isom"));
+    let audio_input = write_test_adts_file("mux-cli-fragmented-destination-audio-input", &[b"aud"]);
+    let args = vec![
+        "--track".to_string(),
+        audio_input.to_string_lossy().into_owned(),
+        "--layout".to_string(),
+        "fragmented".to_string(),
+        "--fragment_duration".to_string(),
+        "2".to_string(),
+        destination.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: invalid mux destination mode `update-or-create-destination`: the current destination-path mux mode only supports flat output; use `--out PATH` for create-new fragmented output\n"
     );
 }
 
@@ -1689,6 +2276,32 @@ fn mux_command_writes_fragmented_output_when_requested() {
             fourcc("moof"),
             fourcc("mdat"),
         ]
+    );
+}
+
+#[test]
+fn mux_command_can_emit_warning_mode_for_fragmented_audio_only_output() {
+    let audio_input =
+        build_audio_input_file("mux-cli-fragmented-warning-audio-input", fourcc("isom"));
+    let output = write_temp_file("mux-cli-fragmented-warning-output", &[]);
+    let args = vec![
+        "-warnings".to_string(),
+        "--track".to_string(),
+        format!("{}#audio", audio_input.display()),
+        "--layout".to_string(),
+        "fragmented".to_string(),
+        "--fragment_duration".to_string(),
+        "0.015".to_string(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Warning: divide output is audio-only; no fragmented video track was selected\n"
     );
 }
 
@@ -1913,6 +2526,58 @@ fn mux_command_writes_real_mp4_output_from_path_first_ivf_tracks() {
 }
 
 #[test]
+fn mux_command_writes_real_mp4_output_from_path_first_raw_av1_obu_tracks() {
+    let av1_frame_a = build_test_av1_sequence_header_obu(640, 360);
+    let av1_frame_b = build_test_av1_sequence_header_obu(640, 360);
+    let video_input =
+        write_test_av1_obu_file("mux-cli-raw-av1-obu-input", &[&av1_frame_a, &av1_frame_b]);
+    let output = write_temp_file("mux-cli-raw-av1-obu-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        video_input.display().to_string(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    let output_bytes = fs::read(output).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(
+        mdat_payload(&output_bytes, root_boxes[2]),
+        [av1_frame_a, av1_frame_b].concat()
+    );
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_first_raw_av1_annexb_tracks() {
+    let av1_frame_a = build_test_av1_sequence_header_obu(640, 360);
+    let av1_frame_b = build_test_av1_sequence_header_obu(640, 360);
+    let video_input = write_test_av1_annex_b_file(
+        "mux-cli-raw-av1-annexb-input",
+        &[av1_frame_a.as_slice(), av1_frame_b.as_slice()],
+    );
+    let output = write_temp_file("mux-cli-raw-av1-annexb-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        video_input.display().to_string(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    let output_bytes = fs::read(output).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(
+        mdat_payload(&output_bytes, root_boxes[2]),
+        [av1_frame_a, av1_frame_b].concat()
+    );
+}
+
+#[test]
 fn mux_command_writes_real_mp4_output_from_path_first_vp10_tracks() {
     let frame_a = build_test_vp10_keyframe(640, 360, 0);
     let frame_b = build_test_vp10_keyframe(640, 360, 0);
@@ -2072,7 +2737,7 @@ fn mux_command_writes_real_mp4_output_from_path_first_amr_tracks() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("samr"));
     assert_eq!(audio_entries[0].channel_count, 1);
     assert_eq!(damr_boxes.len(), 1);
-    assert_eq!(damr_boxes[0].vendor, 0x4750_4143);
+    assert_eq!(damr_boxes[0].vendor, 0);
     assert_eq!(damr_boxes[0].frames_per_sample, 1);
     assert_eq!(mdhd_boxes.len(), 1);
     assert_eq!(mdhd_boxes[0].timescale, 8_000);
@@ -2131,7 +2796,7 @@ fn mux_command_writes_real_mp4_output_from_path_first_amr_wb_tracks() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("sawb"));
     assert_eq!(audio_entries[0].channel_count, 1);
     assert_eq!(damr_boxes.len(), 1);
-    assert_eq!(damr_boxes[0].vendor, 0x4750_4143);
+    assert_eq!(damr_boxes[0].vendor, 0);
     assert_eq!(damr_boxes[0].frames_per_sample, 1);
     assert_eq!(mdhd_boxes.len(), 1);
     assert_eq!(mdhd_boxes[0].timescale, 16_000);
@@ -2193,7 +2858,7 @@ fn mux_command_writes_real_mp4_output_from_path_first_qcp_tracks() {
     assert_eq!(audio_entries.len(), 1);
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("sqcp"));
     assert_eq!(dqcp_boxes.len(), 1);
-    assert_eq!(dqcp_boxes[0].vendor, 0x4750_4143);
+    assert_eq!(dqcp_boxes[0].vendor, 0);
     assert_eq!(dqcp_boxes[0].frames_per_sample, 1);
     assert_eq!(mdhd_boxes.len(), 1);
     assert_eq!(mdhd_boxes[0].timescale, 8_000);
@@ -2705,6 +3370,45 @@ fn mux_command_writes_real_mp4_output_from_path_first_wave_pcm_tracks() {
     let output_bytes = fs::read(output).unwrap();
     let root_boxes = read_root_boxes(&output_bytes);
     let expected_payload = fs::read(&audio_input).unwrap()[44..].to_vec();
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
+
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ipcm"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ipcm"));
+    assert_eq!(audio_entries[0].channel_count, 2);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_first_aiff_pcm_tracks() {
+    let audio_input = write_test_aiff_pcm_file(
+        "mux-cli-raw-aiff-pcm-input",
+        &[[-1_000, 1_000], [2_000, -2_000]],
+    );
+    let output = write_temp_file("mux-cli-raw-aiff-pcm-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        audio_input.display().to_string(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    let output_bytes = fs::read(output).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    let expected_payload = vec![0xFC, 0x18, 0x03, 0xE8, 0x07, 0xD0, 0xF8, 0x30];
     assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
 
     let audio_entries = extract_boxes::<AudioSampleEntry>(

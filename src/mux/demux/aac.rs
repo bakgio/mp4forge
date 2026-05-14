@@ -15,7 +15,10 @@ use crate::boxes::iso14496_14::{
 use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
-use super::super::import::{StagedSample, read_exact_at_sync};
+use super::super::import::{SegmentedMuxSourceSegment, StagedSample, read_exact_at_sync};
+#[cfg(feature = "async")]
+use super::container_common::read_segmented_bytes_async;
+use super::container_common::read_segmented_bytes_sync;
 
 pub(in crate::mux) struct ParsedAdtsTrack {
     pub(in crate::mux) sample_rate: u32,
@@ -143,6 +146,128 @@ pub(in crate::mux) fn scan_adts_file_sync(
     })
 }
 
+pub(in crate::mux) fn scan_adts_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedAdtsTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    let mut expected = None::<(u8, u8, u32, u16)>;
+    while offset < total_size {
+        if total_size - offset < 7 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated ADTS header".to_string(),
+            });
+        }
+        let mut header = [0_u8; 7];
+        read_segmented_bytes_sync(
+            file,
+            segments,
+            total_size,
+            offset,
+            &mut header,
+            spec,
+            "truncated ADTS header",
+        )?;
+        if header[0] != 0xFF || header[1] & 0xF0 != 0xF0 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!("missing ADTS sync word at logical byte offset {offset}"),
+            });
+        }
+
+        let protection_absent = header[1] & 0x01 != 0;
+        let header_length = if protection_absent { 7 } else { 9 };
+        if total_size - offset < u64::from(header_length as u32) {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated ADTS header".to_string(),
+            });
+        }
+        let profile = ((header[2] >> 6) & 0x03) + 1;
+        let sampling_frequency_index = (header[2] >> 2) & 0x0F;
+        let channel_configuration = u16::from((header[2] & 0x01) << 2 | ((header[3] >> 6) & 0x03));
+        let sample_rate = adts_sample_rate(sampling_frequency_index).ok_or_else(|| {
+            MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "unsupported ADTS sampling-frequency index {sampling_frequency_index}"
+                ),
+            }
+        })?;
+        let frame_length = usize::from(
+            ((u16::from(header[3] & 0x03)) << 11)
+                | (u16::from(header[4]) << 3)
+                | u16::from(header[5] >> 5),
+        );
+        let raw_blocks = u32::from(header[6] & 0x03) + 1;
+        if frame_length < header_length
+            || offset
+                .checked_add(u64::try_from(frame_length).unwrap_or(u64::MAX))
+                .is_none_or(|end| end > total_size)
+        {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!("truncated ADTS frame at logical byte offset {offset}"),
+            });
+        }
+
+        let descriptor = (
+            profile,
+            sampling_frequency_index,
+            sample_rate,
+            channel_configuration,
+        );
+        if let Some(expected) = expected {
+            if expected != descriptor {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message:
+                        "AAC frames changed profile, sample rate, or channel layout mid-stream"
+                            .to_string(),
+                });
+            }
+        } else {
+            expected = Some(descriptor);
+        }
+
+        let payload_size = frame_length - header_length;
+        samples.push(StagedSample {
+            data_offset: offset + u64::from(header_length as u32),
+            data_size: u32::try_from(payload_size)
+                .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
+            duration: 1024 * raw_blocks,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        offset = offset
+            .checked_add(
+                u64::try_from(frame_length)
+                    .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
+            )
+            .ok_or(MuxError::LayoutOverflow("AAC frame offset"))?;
+    }
+    let (audio_object_type, sampling_frequency_index, sample_rate, channel_configuration) =
+        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "AAC input contained no ADTS frames".to_string(),
+        })?;
+    Ok(ParsedAdtsTrack {
+        sample_rate,
+        sample_entry_box: build_aac_sample_entry_box(
+            audio_object_type,
+            sampling_frequency_index,
+            channel_configuration,
+            sample_rate,
+            &samples,
+        )?,
+        samples,
+    })
+}
+
 #[cfg(feature = "async")]
 pub(in crate::mux) async fn scan_adts_file_async(
     path: &Path,
@@ -209,6 +334,130 @@ pub(in crate::mux) async fn scan_adts_file_async(
             return Err(MuxError::UnsupportedTrackImport {
                 spec: spec.to_string(),
                 message: format!("truncated ADTS frame at byte offset {offset}"),
+            });
+        }
+
+        let descriptor = (
+            profile,
+            sampling_frequency_index,
+            sample_rate,
+            channel_configuration,
+        );
+        if let Some(expected) = expected {
+            if expected != descriptor {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message:
+                        "AAC frames changed profile, sample rate, or channel layout mid-stream"
+                            .to_string(),
+                });
+            }
+        } else {
+            expected = Some(descriptor);
+        }
+
+        let payload_size = frame_length - header_length;
+        samples.push(StagedSample {
+            data_offset: offset + u64::from(header_length as u32),
+            data_size: u32::try_from(payload_size)
+                .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
+            duration: 1024 * raw_blocks,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        offset = offset
+            .checked_add(
+                u64::try_from(frame_length)
+                    .map_err(|_| MuxError::LayoutOverflow("AAC frame size"))?,
+            )
+            .ok_or(MuxError::LayoutOverflow("AAC frame offset"))?;
+    }
+    let (audio_object_type, sampling_frequency_index, sample_rate, channel_configuration) =
+        expected.ok_or_else(|| MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "AAC input contained no ADTS frames".to_string(),
+        })?;
+    Ok(ParsedAdtsTrack {
+        sample_rate,
+        sample_entry_box: build_aac_sample_entry_box(
+            audio_object_type,
+            sampling_frequency_index,
+            channel_configuration,
+            sample_rate,
+            &samples,
+        )?,
+        samples,
+    })
+}
+
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn scan_adts_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedAdtsTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    let mut expected = None::<(u8, u8, u32, u16)>;
+    while offset < total_size {
+        if total_size - offset < 7 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated ADTS header".to_string(),
+            });
+        }
+        let mut header = [0_u8; 7];
+        read_segmented_bytes_async(
+            file,
+            segments,
+            total_size,
+            offset,
+            &mut header,
+            spec,
+            "truncated ADTS header",
+        )
+        .await?;
+        if header[0] != 0xFF || header[1] & 0xF0 != 0xF0 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!("missing ADTS sync word at logical byte offset {offset}"),
+            });
+        }
+
+        let protection_absent = header[1] & 0x01 != 0;
+        let header_length = if protection_absent { 7 } else { 9 };
+        if total_size - offset < u64::from(header_length as u32) {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated ADTS header".to_string(),
+            });
+        }
+        let profile = ((header[2] >> 6) & 0x03) + 1;
+        let sampling_frequency_index = (header[2] >> 2) & 0x0F;
+        let channel_configuration = u16::from((header[2] & 0x01) << 2 | ((header[3] >> 6) & 0x03));
+        let sample_rate = adts_sample_rate(sampling_frequency_index).ok_or_else(|| {
+            MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "unsupported ADTS sampling-frequency index {sampling_frequency_index}"
+                ),
+            }
+        })?;
+        let frame_length = usize::from(
+            ((u16::from(header[3] & 0x03)) << 11)
+                | (u16::from(header[4]) << 3)
+                | u16::from(header[5] >> 5),
+        );
+        let raw_blocks = u32::from(header[6] & 0x03) + 1;
+        if frame_length < header_length
+            || offset
+                .checked_add(u64::try_from(frame_length).unwrap_or(u64::MAX))
+                .is_none_or(|end| end > total_size)
+        {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!("truncated ADTS frame at logical byte offset {offset}"),
             });
         }
 

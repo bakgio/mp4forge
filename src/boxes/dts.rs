@@ -222,13 +222,13 @@ impl CodecBox for Ddts {
         writer.write_all(&self.avg_bitrate.to_be_bytes())?;
         writer.write_all(&[self.sample_depth])?;
         let mut bit_writer = BitWriter::new(Vec::new());
-        bit_writer.write_bits(&[self.frame_duration << 6], 2)?;
-        bit_writer.write_bits(&[self.stream_construction << 3], 5)?;
+        bit_writer.write_bits(&[self.frame_duration], 2)?;
+        bit_writer.write_bits(&[self.stream_construction], 5)?;
         bit_writer.write_bit(self.core_lfe_present)?;
-        bit_writer.write_bits(&[self.core_layout << 2], 6)?;
+        bit_writer.write_bits(&[self.core_layout], 6)?;
         bit_writer.write_bits(&self.core_size.to_be_bytes(), 14)?;
         bit_writer.write_bit(self.stereo_downmix)?;
-        bit_writer.write_bits(&[self.representation_type << 5], 3)?;
+        bit_writer.write_bits(&[self.representation_type], 3)?;
         bit_writer.write_bits(&self.channel_layout.to_be_bytes(), 16)?;
         bit_writer.write_bit(self.multi_asset_flag)?;
         bit_writer.write_bit(self.lbr_duration_mod)?;
@@ -436,15 +436,15 @@ impl CodecBox for Udts {
             .into());
         }
         let mut bit_writer = BitWriter::new(Vec::new());
-        bit_writer.write_bits(&[self.decoder_profile_code << 2], 6)?;
-        bit_writer.write_bits(&[self.frame_duration_code << 6], 2)?;
-        bit_writer.write_bits(&[self.max_payload_code << 5], 3)?;
-        bit_writer.write_bits(&[self.num_presentations_code << 3], 5)?;
+        bit_writer.write_bits(&[self.decoder_profile_code], 6)?;
+        bit_writer.write_bits(&[self.frame_duration_code], 2)?;
+        bit_writer.write_bits(&[self.max_payload_code], 3)?;
+        bit_writer.write_bits(&[self.num_presentations_code], 5)?;
         bit_writer.write_bits(&self.channel_mask.to_be_bytes(), 32)?;
         bit_writer.write_bit(self.base_sampling_frequency_code)?;
-        bit_writer.write_bits(&[self.sample_rate_mod << 6], 2)?;
-        bit_writer.write_bits(&[self.representation_type << 5], 3)?;
-        bit_writer.write_bits(&[self.stream_index << 5], 3)?;
+        bit_writer.write_bits(&[self.sample_rate_mod], 2)?;
+        bit_writer.write_bits(&[self.representation_type], 3)?;
+        bit_writer.write_bits(&[self.stream_index], 3)?;
         bit_writer.write_bit(self.expansion_box_present)?;
         for flag in &self.id_tag_present {
             bit_writer.write_bit(*flag)?;

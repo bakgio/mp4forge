@@ -5,6 +5,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::write_error_line;
 use crate::decrypt::{
     DecryptError, DecryptOptions, DecryptProgress, DecryptProgressPhase, ParseDecryptionKeyError,
     decrypt_file_with_optional_progress_and_fragments_info_path,
@@ -22,7 +23,7 @@ where
             1
         }
         Err(error) => {
-            let _ = writeln!(stderr, "Error: {error}");
+            let _ = write_error_line(stderr, &error, error.diagnostic_context());
             1
         }
     }
@@ -112,6 +113,17 @@ impl From<DecryptError> for DecryptCliError {
 impl From<ParseDecryptionKeyError> for DecryptCliError {
     fn from(value: ParseDecryptionKeyError) -> Self {
         Self::ParseKey(value)
+    }
+}
+
+impl DecryptCliError {
+    fn diagnostic_context(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Io(..) => Some(("io", "io")),
+            Self::Decrypt(error) => Some((error.stage(), error.category())),
+            Self::ParseKey(..) | Self::InvalidArgument(..) => Some(("request", "input")),
+            Self::UsageRequested => None,
+        }
     }
 }
 

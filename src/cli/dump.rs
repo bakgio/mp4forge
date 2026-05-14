@@ -226,14 +226,6 @@ where
         writer,
         "  -path <box/path>      Dump only matched parsed subtrees (repeatable)"
     )?;
-    writeln!(
-        writer,
-        "  -mdat                  Deprecated shorthand for -full mdat"
-    )?;
-    writeln!(
-        writer,
-        "  -free                  Deprecated shorthand for -full free,skip"
-    )?;
     writeln!(writer, "  -offset                Show box offsets")?;
     writeln!(
         writer,
@@ -635,15 +627,6 @@ where
             }
             "-a" | "--a" => {
                 options.show_all = true;
-                index += 1;
-            }
-            "-mdat" | "--mdat" => {
-                options.full_box_types.insert(MDAT);
-                index += 1;
-            }
-            "-free" | "--free" => {
-                options.full_box_types.insert(FREE);
-                options.full_box_types.insert(SKIP);
                 index += 1;
             }
             "-offset" | "--offset" => {

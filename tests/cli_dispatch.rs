@@ -65,6 +65,8 @@ fn top_level_usage() -> String {
     usage.push_str("  edit         rewrite selected boxes\n");
     usage.push_str("  extract      extract raw boxes by type or path\n");
     #[cfg(feature = "mux")]
+    usage.push_str("  inspect      inspect one direct-ingest input without writing an MP4\n");
+    #[cfg(feature = "mux")]
     usage.push_str("  mux          merge one video track plus audio tracks into one MP4\n");
     usage.push_str("  psshdump     summarize pssh boxes\n");
     usage.push_str("  probe        summarize an MP4 file\n");

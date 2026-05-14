@@ -16,6 +16,7 @@ fn segment_logical_end(segment: &SegmentedMuxSourceSegment) -> u64 {
             SegmentedMuxSourceSegmentData::Prefix(_) => 4,
             SegmentedMuxSourceSegmentData::Bytes(bytes) => u64::try_from(bytes.len()).unwrap(),
             SegmentedMuxSourceSegmentData::FileRange { size, .. } => u64::from(*size),
+            SegmentedMuxSourceSegmentData::ExternalFileRange { size, .. } => u64::from(*size),
         }
 }
 
@@ -121,6 +122,34 @@ pub(in crate::mux) fn read_segmented_bytes_sync(
                 written += to_copy;
                 logical_offset += u64::try_from(to_copy).unwrap();
             }
+            SegmentedMuxSourceSegmentData::ExternalFileRange {
+                path,
+                source_offset,
+                size,
+            } => {
+                let available =
+                    usize::try_from(u64::from(*size) - u64::try_from(segment_offset).unwrap())
+                        .map_err(|_| MuxError::LayoutOverflow("segmented file range"))?;
+                let to_copy = available.min(buf.len() - written);
+                let mut external = File::open(path).map_err(|error| {
+                    MuxError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to open segmented mux source `{}`: {error}",
+                            path.display()
+                        ),
+                    ))
+                })?;
+                read_exact_at_sync(
+                    &mut external,
+                    source_offset + u64::try_from(segment_offset).unwrap(),
+                    &mut buf[written..written + to_copy],
+                    spec,
+                    truncated_message,
+                )?;
+                written += to_copy;
+                logical_offset += u64::try_from(to_copy).unwrap();
+            }
         }
     }
 
@@ -195,6 +224,35 @@ pub(in crate::mux) async fn read_segmented_bytes_async(
                 let to_copy = available.min(buf.len() - written);
                 read_exact_at_async(
                     file,
+                    source_offset + u64::try_from(segment_offset).unwrap(),
+                    &mut buf[written..written + to_copy],
+                    spec,
+                    truncated_message,
+                )
+                .await?;
+                written += to_copy;
+                logical_offset += u64::try_from(to_copy).unwrap();
+            }
+            SegmentedMuxSourceSegmentData::ExternalFileRange {
+                path,
+                source_offset,
+                size,
+            } => {
+                let available =
+                    usize::try_from(u64::from(*size) - u64::try_from(segment_offset).unwrap())
+                        .map_err(|_| MuxError::LayoutOverflow("segmented file range"))?;
+                let to_copy = available.min(buf.len() - written);
+                let mut external = TokioFile::open(path).await.map_err(|error| {
+                    MuxError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to open segmented mux source `{}`: {error}",
+                            path.display()
+                        ),
+                    ))
+                })?;
+                read_exact_at_async(
+                    &mut external,
                     source_offset + u64::try_from(segment_offset).unwrap(),
                     &mut buf[written..written + to_copy],
                     spec,

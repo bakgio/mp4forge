@@ -30,6 +30,8 @@ const DIRECT_TIMESCALE: u32 = 25_000;
 const DEFAULT_SAMPLE_DURATION: u32 = 1_000;
 const SCAN_CHUNK_SIZE: usize = 16 * 1024;
 const VOS_START_CODE: u8 = 0xB0;
+const USER_DATA_START_CODE: u8 = 0xB2;
+const GROUP_OF_VOP_START_CODE: u8 = 0xB3;
 const VO_START_CODE: u8 = 0xB5;
 const VOP_START_CODE: u8 = 0xB6;
 
@@ -37,6 +39,7 @@ pub(in crate::mux) struct ParsedMp4vTrack {
     pub(in crate::mux) width: u16,
     pub(in crate::mux) height: u16,
     pub(in crate::mux) timescale: u32,
+    pub(in crate::mux) decoder_specific_info: Vec<u8>,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
@@ -83,67 +86,7 @@ pub(in crate::mux) async fn scan_mp4v_segmented_async(
     parse_mp4v_segmented_stream_async(file, segments, total_size, spec).await
 }
 
-pub(in crate::mux) fn build_mp4v_sample_entry_box<I>(
-    width: u16,
-    height: u16,
-    compressor_name: &[u8],
-    decoder_specific_info: &[u8],
-    timescale: u32,
-    samples: I,
-) -> Result<Vec<u8>, MuxError>
-where
-    I: IntoIterator<Item = (u32, u32)>,
-{
-    let decoder_bitrates = build_btrt_from_sample_sizes(samples, timescale)?;
-    let mut esds = Esds::default();
-    esds.descriptors = vec![
-        Descriptor {
-            tag: ES_DESCRIPTOR_TAG,
-            es_descriptor: Some(EsDescriptor::default()),
-            ..Descriptor::default()
-        },
-        Descriptor {
-            tag: DECODER_CONFIG_DESCRIPTOR_TAG,
-            decoder_config_descriptor: Some(DecoderConfigDescriptor {
-                object_type_indication: 0x20,
-                stream_type: 4,
-                reserved: true,
-                buffer_size_db: decoder_bitrates.buffer_size_db,
-                max_bitrate: decoder_bitrates.max_bitrate,
-                avg_bitrate: decoder_bitrates.avg_bitrate,
-                ..DecoderConfigDescriptor::default()
-            }),
-            ..Descriptor::default()
-        },
-        Descriptor {
-            tag: DECODER_SPECIFIC_INFO_TAG,
-            size: u32::try_from(decoder_specific_info.len())
-                .map_err(|_| MuxError::LayoutOverflow("MPEG-4 Part 2 decoder config size"))?,
-            data: decoder_specific_info.to_vec(),
-            ..Descriptor::default()
-        },
-        Descriptor {
-            tag: SL_CONFIG_DESCRIPTOR_TAG,
-            size: 1,
-            data: vec![0x02],
-            ..Descriptor::default()
-        },
-    ];
-    esds.normalize_descriptor_sizes_for_mux()
-        .map_err(|_| MuxError::LayoutOverflow("MPEG-4 Part 2 esds"))?;
-    build_visual_sample_entry_box_with_compressor_name(
-        SAMPLE_ENTRY_MP4V,
-        width,
-        height,
-        compressor_name,
-        &[
-            super::super::mp4::encode_typed_box(&esds, &[])?,
-            super::super::mp4::encode_typed_box(&decoder_bitrates, &[])?,
-        ],
-    )
-}
-
-fn build_direct_mp4v_sample_entry_box<I>(
+pub(in crate::mux) fn build_direct_mp4v_sample_entry_box<I>(
     width: u16,
     height: u16,
     decoder_specific_info: &[u8],
@@ -263,6 +206,7 @@ async fn parse_mp4v_segmented_stream_async(
 struct Mp4vScanState {
     config_start: Option<u64>,
     first_vop_start: Option<u64>,
+    first_sample_prefix_start: Option<u64>,
     current_sample_start: Option<u64>,
     current_sync_sample: bool,
     samples: Vec<StagedSample>,
@@ -281,6 +225,7 @@ where
     let mut offset = 0_u64;
     let mut config_start = None::<u64>;
     let mut first_vop_start = None::<u64>;
+    let mut first_sample_prefix_start = None::<u64>;
     let mut current_sample_start = None::<u64>;
     let mut current_sync_sample = false;
 
@@ -308,8 +253,16 @@ where
                 let start_offset = combined_offset
                     .checked_add(u64::try_from(index).unwrap())
                     .ok_or(MuxError::LayoutOverflow("MPEG-4 Part 2 start code offset"))?;
-                if is_mp4v_config_start_code(start_code) {
+                if is_mp4v_config_start_code(start_code) || start_code == USER_DATA_START_CODE {
                     config_start.get_or_insert(start_offset);
+                    continue;
+                }
+                if current_sample_start.is_none()
+                    && first_vop_start.is_none()
+                    && config_start.is_some()
+                    && start_code == GROUP_OF_VOP_START_CODE
+                {
+                    first_sample_prefix_start.get_or_insert(start_offset);
                     continue;
                 }
                 if start_code != VOP_START_CODE {
@@ -320,7 +273,7 @@ where
                     mp4v_vop_is_sync_sample_sync(read_exact, logical_size, start_offset, spec)?;
                 let Some(sample_start) = current_sample_start else {
                     first_vop_start = Some(start_offset);
-                    current_sample_start = Some(start_offset);
+                    current_sample_start = Some(first_sample_prefix_start.unwrap_or(start_offset));
                     current_sync_sample = is_sync_sample;
                     continue;
                 };
@@ -353,6 +306,7 @@ where
     Ok(Mp4vScanState {
         config_start,
         first_vop_start,
+        first_sample_prefix_start,
         current_sample_start,
         current_sync_sample,
         samples,
@@ -370,6 +324,7 @@ async fn scan_mp4v_boundaries_file_async(
     let mut offset = 0_u64;
     let mut config_start = None::<u64>;
     let mut first_vop_start = None::<u64>;
+    let mut first_sample_prefix_start = None::<u64>;
     let mut current_sample_start = None::<u64>;
     let mut current_sync_sample = false;
 
@@ -404,8 +359,16 @@ async fn scan_mp4v_boundaries_file_async(
                 let start_offset = combined_offset
                     .checked_add(u64::try_from(index).unwrap())
                     .ok_or(MuxError::LayoutOverflow("MPEG-4 Part 2 start code offset"))?;
-                if is_mp4v_config_start_code(start_code) {
+                if is_mp4v_config_start_code(start_code) || start_code == USER_DATA_START_CODE {
                     config_start.get_or_insert(start_offset);
+                    continue;
+                }
+                if current_sample_start.is_none()
+                    && first_vop_start.is_none()
+                    && config_start.is_some()
+                    && start_code == GROUP_OF_VOP_START_CODE
+                {
+                    first_sample_prefix_start.get_or_insert(start_offset);
                     continue;
                 }
                 if start_code != VOP_START_CODE {
@@ -417,7 +380,7 @@ async fn scan_mp4v_boundaries_file_async(
                         .await?;
                 let Some(sample_start) = current_sample_start else {
                     first_vop_start = Some(start_offset);
-                    current_sample_start = Some(start_offset);
+                    current_sample_start = Some(first_sample_prefix_start.unwrap_or(start_offset));
                     current_sync_sample = is_sync_sample;
                     continue;
                 };
@@ -450,6 +413,7 @@ async fn scan_mp4v_boundaries_file_async(
     Ok(Mp4vScanState {
         config_start,
         first_vop_start,
+        first_sample_prefix_start,
         current_sample_start,
         current_sync_sample,
         samples,
@@ -468,6 +432,7 @@ async fn scan_mp4v_boundaries_segmented_async(
     let mut offset = 0_u64;
     let mut config_start = None::<u64>;
     let mut first_vop_start = None::<u64>;
+    let mut first_sample_prefix_start = None::<u64>;
     let mut current_sample_start = None::<u64>;
     let mut current_sync_sample = false;
 
@@ -504,8 +469,16 @@ async fn scan_mp4v_boundaries_segmented_async(
                 let start_offset = combined_offset
                     .checked_add(u64::try_from(index).unwrap())
                     .ok_or(MuxError::LayoutOverflow("MPEG-4 Part 2 start code offset"))?;
-                if is_mp4v_config_start_code(start_code) {
+                if is_mp4v_config_start_code(start_code) || start_code == USER_DATA_START_CODE {
                     config_start.get_or_insert(start_offset);
+                    continue;
+                }
+                if current_sample_start.is_none()
+                    && first_vop_start.is_none()
+                    && config_start.is_some()
+                    && start_code == GROUP_OF_VOP_START_CODE
+                {
+                    first_sample_prefix_start.get_or_insert(start_offset);
                     continue;
                 }
                 if start_code != VOP_START_CODE {
@@ -522,7 +495,7 @@ async fn scan_mp4v_boundaries_segmented_async(
                 .await?;
                 let Some(sample_start) = current_sample_start else {
                     first_vop_start = Some(start_offset);
-                    current_sample_start = Some(start_offset);
+                    current_sample_start = Some(first_sample_prefix_start.unwrap_or(start_offset));
                     current_sync_sample = is_sync_sample;
                     continue;
                 };
@@ -555,6 +528,7 @@ async fn scan_mp4v_boundaries_segmented_async(
     Ok(Mp4vScanState {
         config_start,
         first_vop_start,
+        first_sample_prefix_start,
         current_sample_start,
         current_sync_sample,
         samples,
@@ -594,7 +568,8 @@ where
             "MPEG-4 Part 2 decoder config did not precede the first VOP sample",
         ));
     }
-    let config_size = usize::try_from(first_vop_start - config_start)
+    let config_end = scan.first_sample_prefix_start.unwrap_or(first_vop_start);
+    let config_size = usize::try_from(config_end - config_start)
         .map_err(|_| MuxError::LayoutOverflow("MPEG-4 Part 2 decoder config size"))?;
     let mut decoder_specific_info = vec![0_u8; config_size];
     read_exact(
@@ -618,6 +593,7 @@ where
         width,
         height,
         timescale: DIRECT_TIMESCALE,
+        decoder_specific_info: decoder_specific_info.clone(),
         sample_entry_box: build_direct_mp4v_sample_entry_box(
             width,
             height,
@@ -662,7 +638,8 @@ async fn finalize_mp4v_track_file_async(
             "MPEG-4 Part 2 decoder config did not precede the first VOP sample",
         ));
     }
-    let config_size = usize::try_from(first_vop_start - config_start)
+    let config_end = scan.first_sample_prefix_start.unwrap_or(first_vop_start);
+    let config_size = usize::try_from(config_end - config_start)
         .map_err(|_| MuxError::LayoutOverflow("MPEG-4 Part 2 decoder config size"))?;
     let mut decoder_specific_info = vec![0_u8; config_size];
     read_exact_at_async(
@@ -689,6 +666,7 @@ async fn finalize_mp4v_track_file_async(
         width,
         height,
         timescale: DIRECT_TIMESCALE,
+        decoder_specific_info: decoder_specific_info.clone(),
         sample_entry_box: build_direct_mp4v_sample_entry_box(
             width,
             height,
@@ -734,7 +712,8 @@ async fn finalize_mp4v_track_segmented_async(
             "MPEG-4 Part 2 decoder config did not precede the first VOP sample",
         ));
     }
-    let config_size = usize::try_from(first_vop_start - config_start)
+    let config_end = scan.first_sample_prefix_start.unwrap_or(first_vop_start);
+    let config_size = usize::try_from(config_end - config_start)
         .map_err(|_| MuxError::LayoutOverflow("MPEG-4 Part 2 decoder config size"))?;
     let mut decoder_specific_info = vec![0_u8; config_size];
     read_segmented_bytes_async(
@@ -763,6 +742,7 @@ async fn finalize_mp4v_track_segmented_async(
         width,
         height,
         timescale: DIRECT_TIMESCALE,
+        decoder_specific_info: decoder_specific_info.clone(),
         sample_entry_box: build_direct_mp4v_sample_entry_box(
             width,
             height,
@@ -853,7 +833,7 @@ async fn mp4v_vop_is_sync_sample_segmented_async(
     Ok((header[0] >> 6) == 0)
 }
 
-fn parse_mp4v_decoder_specific_info(
+pub(in crate::mux) fn parse_mp4v_decoder_specific_info(
     decoder_specific_info: &[u8],
     spec: &str,
 ) -> Result<(u16, u16), MuxError> {
@@ -915,10 +895,27 @@ fn parse_mp4v_vol_header(bytes: &[u8], spec: &str) -> Result<(u16, u16), MuxErro
         let _par_height = read_bits_u8_labeled(&mut reader, 8, spec, "MPEG-4 Part 2")?;
     }
     if read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")? {
-        return Err(invalid_mp4v(
-            spec,
-            "MPEG-4 Part 2 video object layer control parameters are not supported on the native direct-ingest path yet",
-        ));
+        let _chroma_format = read_bits_u8_labeled(&mut reader, 2, spec, "MPEG-4 Part 2")?;
+        let _low_delay = read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")?;
+        if read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")? {
+            let _first_half_bit_rate =
+                read_bits_u16_labeled(&mut reader, 15, spec, "MPEG-4 Part 2")?;
+            let _ = read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")?;
+            let _latter_half_bit_rate =
+                read_bits_u16_labeled(&mut reader, 15, spec, "MPEG-4 Part 2")?;
+            let _ = read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")?;
+            let _first_half_vbv_buffer_size =
+                read_bits_u16_labeled(&mut reader, 15, spec, "MPEG-4 Part 2")?;
+            let _ = read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")?;
+            let _latter_half_vbv_buffer_size =
+                read_bits_u8_labeled(&mut reader, 3, spec, "MPEG-4 Part 2")?;
+            let _first_half_vbv_occupancy =
+                read_bits_u16_labeled(&mut reader, 11, spec, "MPEG-4 Part 2")?;
+            let _ = read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")?;
+            let _latter_half_vbv_occupancy =
+                read_bits_u16_labeled(&mut reader, 15, spec, "MPEG-4 Part 2")?;
+            let _ = read_bit_labeled(&mut reader, spec, "MPEG-4 Part 2")?;
+        }
     }
     let video_object_layer_shape = read_bits_u8_labeled(&mut reader, 2, spec, "MPEG-4 Part 2")?;
     if video_object_layer_shape != 0 {

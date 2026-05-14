@@ -7,7 +7,7 @@ use tokio::fs::File as TokioFile;
 
 use crate::FourCc;
 use crate::bitio::BitReader;
-use crate::boxes::iso14496_12::Btrt;
+use crate::boxes::iso14496_12::{Btrt, SampleEntry, VisualSampleEntry};
 use crate::boxes::threegpp::D263;
 
 use super::super::MuxError;
@@ -26,7 +26,6 @@ const DEFAULT_H263_LEVEL: u8 = 10;
 const DEFAULT_H263_PROFILE: u8 = 0;
 const H263_HEADER_BYTES: usize = 5;
 const SCAN_CHUNK_SIZE: usize = 16 * 1024;
-const THREE_GPP_VENDOR_CODE: u32 = 0x4750_4143;
 
 pub(in crate::mux) struct ParsedH263Track {
     pub(in crate::mux) width: u16,
@@ -419,7 +418,7 @@ pub(in crate::mux) fn build_h263_sample_entry_box(
 ) -> Result<Vec<u8>, MuxError> {
     let d263 = super::super::mp4::encode_typed_box(
         &D263 {
-            vendor: THREE_GPP_VENDOR_CODE,
+            vendor: 0,
             decoder_version: 0,
             h263_level: DEFAULT_H263_LEVEL,
             h263_profile: DEFAULT_H263_PROFILE,
@@ -441,12 +440,26 @@ pub(in crate::mux) fn build_avi_h263_sample_entry_box(
     btrt: Btrt,
 ) -> Result<Vec<u8>, MuxError> {
     let btrt = super::super::mp4::encode_typed_box(&btrt, &[])?;
-    build_visual_sample_entry_box_with_compressor_name(
-        AVI_SAMPLE_ENTRY_H263,
-        width,
-        height,
-        b"H263",
-        &[btrt],
+    let mut compressorname = [0_u8; 32];
+    compressorname[0] = 4;
+    compressorname[1..5].copy_from_slice(b"H263");
+    super::super::mp4::encode_typed_box(
+        &VisualSampleEntry {
+            sample_entry: SampleEntry {
+                box_type: AVI_SAMPLE_ENTRY_H263,
+                data_reference_index: 1,
+            },
+            width,
+            height,
+            horizresolution: 72,
+            vertresolution: 72,
+            frame_count: 1,
+            compressorname,
+            depth: 0x0018,
+            pre_defined3: -1,
+            ..VisualSampleEntry::default()
+        },
+        &btrt,
     )
 }
 

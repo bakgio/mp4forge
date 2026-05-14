@@ -24,7 +24,6 @@ const AMR_SAMPLES_PER_FRAME: u32 = 160;
 const AMR_WB_SAMPLES_PER_FRAME: u32 = 320;
 const AMR_FRAME_SIZES: [u8; 16] = [12, 13, 15, 17, 19, 20, 26, 31, 5, 0, 0, 0, 0, 0, 0, 0];
 const AMR_WB_FRAME_SIZES: [u8; 16] = [17, 23, 32, 36, 40, 46, 50, 58, 60, 5, 5, 0, 0, 0, 0, 0];
-const THREE_GPP_VENDOR_CODE: u32 = 0x4750_4143;
 
 pub(in crate::mux) struct ParsedAmrTrack {
     pub(in crate::mux) sample_rate: u32,
@@ -361,7 +360,7 @@ async fn validate_amr_magic_async(
 fn build_amr_sample_entry_box(stream: AmrStreamKind, mode_set: u16) -> Result<Vec<u8>, MuxError> {
     let damr_box = super::super::mp4::encode_typed_box(
         &Damr {
-            vendor: THREE_GPP_VENDOR_CODE,
+            vendor: 0,
             decoder_version: 0,
             mode_set,
             mode_change_period: 0,

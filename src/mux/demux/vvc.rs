@@ -110,14 +110,14 @@ pub(in crate::mux) fn stage_annex_b_vvc_segmented_sync(
             "segmented VVC scan chunk is truncated",
         )?;
         for nal in scanner.collect(&chunk) {
-            stage_vvc_nal(&mut state, nal, spec)?;
+            stage_vvc_nal_segmented(&mut state, nal, spec)?;
         }
         offset = offset
             .checked_add(u64::try_from(read_len).unwrap())
             .ok_or(MuxError::LayoutOverflow("segmented VVC scan offset"))?;
     }
     for nal in scanner.finish_collect() {
-        stage_vvc_nal(&mut state, nal, spec)?;
+        stage_vvc_nal_segmented(&mut state, nal, spec)?;
     }
     finalize_vvc_staged_track(path, state, spec)
 }
@@ -149,14 +149,14 @@ pub(in crate::mux) async fn stage_annex_b_vvc_segmented_async(
         )
         .await?;
         for nal in scanner.collect(&chunk) {
-            stage_vvc_nal(&mut state, nal, spec)?;
+            stage_vvc_nal_segmented(&mut state, nal, spec)?;
         }
         offset = offset
             .checked_add(u64::try_from(read_len).unwrap())
             .ok_or(MuxError::LayoutOverflow("segmented VVC scan offset"))?;
     }
     for nal in scanner.finish_collect() {
-        stage_vvc_nal(&mut state, nal, spec)?;
+        stage_vvc_nal_segmented(&mut state, nal, spec)?;
     }
     finalize_vvc_staged_track(path, state, spec)
 }
@@ -233,6 +233,53 @@ impl VvcStageState {
         self.current_has_vcl |= is_vcl;
         Ok(())
     }
+
+    fn append_sample_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+        is_sync_sample: bool,
+        is_vcl: bool,
+    ) -> Result<(), MuxError> {
+        let source_size = u32::try_from(bytes.len())
+            .map_err(|_| MuxError::LayoutOverflow("segmented VVC NAL length"))?;
+        if self.current_sample_offset.is_none() {
+            self.current_sample_offset = Some(self.logical_size);
+        }
+        let prefix = source_size.to_be_bytes();
+        self.segments.push(SegmentedMuxSourceSegment {
+            logical_offset: self.logical_size,
+            data: SegmentedMuxSourceSegmentData::Prefix(prefix),
+        });
+        self.logical_size = self
+            .logical_size
+            .checked_add(4)
+            .ok_or(MuxError::LayoutOverflow(
+                "segmented VVC transformed payload",
+            ))?;
+        self.segments.push(SegmentedMuxSourceSegment {
+            logical_offset: self.logical_size,
+            data: SegmentedMuxSourceSegmentData::Bytes(bytes),
+        });
+        self.current_sample_size = self
+            .current_sample_size
+            .checked_add(
+                4_u32
+                    .checked_add(source_size)
+                    .ok_or(MuxError::LayoutOverflow(
+                        "segmented VVC transformed sample size",
+                    ))?,
+            )
+            .ok_or(MuxError::LayoutOverflow("segmented VVC staged sample size"))?;
+        self.logical_size = self
+            .logical_size
+            .checked_add(u64::from(source_size))
+            .ok_or(MuxError::LayoutOverflow(
+                "segmented VVC transformed payload",
+            ))?;
+        self.current_sync |= is_sync_sample;
+        self.current_has_vcl |= is_vcl;
+        Ok(())
+    }
 }
 
 fn stage_vvc_nal(state: &mut VvcStageState, nal: AnnexBNal, spec: &str) -> Result<(), MuxError> {
@@ -270,6 +317,37 @@ fn stage_vvc_nal(state: &mut VvcStageState, nal: AnnexBNal, spec: &str) -> Resul
                 is_vvc_sync_nal_type(nal_type),
                 is_vcl,
             )?;
+        }
+    }
+    Ok(())
+}
+
+fn stage_vvc_nal_segmented(
+    state: &mut VvcStageState,
+    nal: AnnexBNal,
+    spec: &str,
+) -> Result<(), MuxError> {
+    if nal.bytes.len() < 2 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "VVC NAL units must be at least two bytes long".to_string(),
+        });
+    }
+    let nal_type = vvc_nal_type(&nal.bytes);
+    match nal_type {
+        VVC_NAL_TYPE_VPS => push_unique_nal(&mut state.vps_list, nal.bytes),
+        VVC_NAL_TYPE_SPS => push_unique_nal(&mut state.sps_list, nal.bytes),
+        VVC_NAL_TYPE_PPS => push_unique_nal(&mut state.pps_list, nal.bytes),
+        VVC_NAL_TYPE_PREFIX_APS => state.append_sample_bytes(nal.bytes, false, false)?,
+        VVC_NAL_TYPE_AUD => {
+            if state.current_sample_offset.is_some() {
+                state.finish_current_sample();
+            }
+            state.append_sample_bytes(nal.bytes, false, false)?;
+        }
+        _ => {
+            let is_vcl = is_vvc_vcl_nal_type(nal_type);
+            state.append_sample_bytes(nal.bytes, is_vvc_sync_nal_type(nal_type), is_vcl)?;
         }
     }
     Ok(())

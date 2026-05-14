@@ -11,9 +11,12 @@ use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
 use super::super::import::{
-    StagedSample, build_btrt_from_sample_sizes, build_generic_audio_sample_entry_box,
-    read_exact_at_sync,
+    SegmentedMuxSourceSegment, StagedSample, build_btrt_from_sample_sizes,
+    build_generic_audio_sample_entry_box, read_exact_at_sync,
 };
+#[cfg(feature = "async")]
+use super::container_common::read_segmented_bytes_async;
+use super::container_common::read_segmented_bytes_sync;
 
 const MHM1: FourCc = FourCc::from_bytes(*b"mhm1");
 const MHAS_SAMPLE_RATE_TABLE: [u32; 28] = [
@@ -241,6 +244,15 @@ pub(in crate::mux) fn scan_mhas_file_sync(
     finalize_mhas_track(spec, config, samples, sample_start, saw_frame, offset)
 }
 
+pub(in crate::mux) fn scan_mhas_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedMhasTrack, MuxError> {
+    parse_mhas_segmented_stream_sync(file, segments, total_size, spec)
+}
+
 #[cfg(feature = "async")]
 pub(in crate::mux) async fn scan_mhas_file_async(
     path: &Path,
@@ -367,6 +379,269 @@ pub(in crate::mux) async fn scan_mhas_file_async(
     finalize_mhas_track(spec, config, samples, sample_start, saw_frame, offset)
 }
 
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn scan_mhas_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedMhasTrack, MuxError> {
+    parse_mhas_segmented_stream_async(file, segments, total_size, spec).await
+}
+
+fn parse_mhas_segmented_stream_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedMhasTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut sample_start = 0_u64;
+    let mut config = None::<ParsedMhasConfig>;
+    let mut saw_frame = false;
+    let mut samples = Vec::new();
+    while offset < total_size {
+        let header =
+            read_mhas_packet_header_segmented_sync(file, segments, total_size, offset, spec)?;
+        let payload_offset = offset
+            .checked_add(header.header_size)
+            .ok_or(MuxError::LayoutOverflow("MHAS payload offset"))?;
+        let packet_end = payload_offset
+            .checked_add(header.payload_size)
+            .ok_or(MuxError::LayoutOverflow("MHAS packet range"))?;
+        if packet_end > total_size {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "MHAS packet at logical byte offset {offset} overruns the carried input length"
+                ),
+            });
+        }
+        if header.packet_type > 18 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "MHAS packet at logical byte offset {offset} used unsupported packet type {}",
+                    header.packet_type
+                ),
+            });
+        }
+        if header.payload_size == 0 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "MHAS packet at logical byte offset {offset} declared a zero payload"
+                ),
+            });
+        }
+        if offset == 0 {
+            let sync_byte =
+                read_mhas_sync_marker_segmented_sync(file, segments, payload_offset, spec)?;
+            if header.packet_type != 6 || header.payload_size != 1 || sync_byte != 0xA5 {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message:
+                        "MHAS direct input currently requires a leading sync packet with marker 0xA5"
+                            .to_string(),
+                });
+            }
+        }
+
+        match header.packet_type {
+            1 => {
+                let payload = read_mhas_packet_payload_segmented_sync(
+                    file,
+                    segments,
+                    payload_offset,
+                    header.payload_size,
+                    spec,
+                    "MHAS config packet payload is truncated",
+                )?;
+                let parsed = parse_mhas_config_packet(&payload, spec)?;
+                if let Some(existing) = &config {
+                    if existing != &parsed {
+                        return Err(MuxError::UnsupportedTrackImport {
+                            spec: spec.to_string(),
+                            message:
+                                "MHAS input changed profile, sample rate, frame length, channel layout, or configuration bytes mid-stream"
+                                    .to_string(),
+                        });
+                    }
+                } else {
+                    config = Some(parsed);
+                }
+            }
+            2 => {
+                let current_config =
+                    config
+                        .as_ref()
+                        .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                            spec: spec.to_string(),
+                            message: "MHAS frame packet appeared before any configuration packet"
+                                .to_string(),
+                        })?;
+                let is_sync_sample =
+                    read_mhas_frame_sap_segmented_sync(file, segments, payload_offset, spec)?;
+                let data_size = u32::try_from(packet_end - sample_start)
+                    .map_err(|_| MuxError::LayoutOverflow("MHAS access unit size"))?;
+                samples.push(StagedSample {
+                    data_offset: sample_start,
+                    data_size,
+                    duration: current_config.frame_length,
+                    composition_time_offset: 0,
+                    is_sync_sample: is_sync_sample && samples.is_empty(),
+                });
+                sample_start = packet_end;
+                saw_frame = true;
+            }
+            17 => {
+                let payload = read_mhas_packet_payload_segmented_sync(
+                    file,
+                    segments,
+                    payload_offset,
+                    header.payload_size,
+                    spec,
+                    "MHAS truncation packet payload is truncated",
+                )?;
+                parse_mhas_truncation_packet(&payload, spec)?;
+            }
+            _ => {}
+        }
+        offset = packet_end;
+    }
+
+    finalize_mhas_track(spec, config, samples, sample_start, saw_frame, offset)
+}
+
+#[cfg(feature = "async")]
+async fn parse_mhas_segmented_stream_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedMhasTrack, MuxError> {
+    let mut offset = 0_u64;
+    let mut sample_start = 0_u64;
+    let mut config = None::<ParsedMhasConfig>;
+    let mut saw_frame = false;
+    let mut samples = Vec::new();
+    while offset < total_size {
+        let header =
+            read_mhas_packet_header_segmented_async(file, segments, total_size, offset, spec)
+                .await?;
+        let payload_offset = offset
+            .checked_add(header.header_size)
+            .ok_or(MuxError::LayoutOverflow("MHAS payload offset"))?;
+        let packet_end = payload_offset
+            .checked_add(header.payload_size)
+            .ok_or(MuxError::LayoutOverflow("MHAS packet range"))?;
+        if packet_end > total_size {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "MHAS packet at logical byte offset {offset} overruns the carried input length"
+                ),
+            });
+        }
+        if header.packet_type > 18 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "MHAS packet at logical byte offset {offset} used unsupported packet type {}",
+                    header.packet_type
+                ),
+            });
+        }
+        if header.payload_size == 0 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "MHAS packet at logical byte offset {offset} declared a zero payload"
+                ),
+            });
+        }
+        if offset == 0 {
+            let sync_byte =
+                read_mhas_sync_marker_segmented_async(file, segments, payload_offset, spec).await?;
+            if header.packet_type != 6 || header.payload_size != 1 || sync_byte != 0xA5 {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message:
+                        "MHAS direct input currently requires a leading sync packet with marker 0xA5"
+                            .to_string(),
+                });
+            }
+        }
+
+        match header.packet_type {
+            1 => {
+                let payload = read_mhas_packet_payload_segmented_async(
+                    file,
+                    segments,
+                    payload_offset,
+                    header.payload_size,
+                    spec,
+                    "MHAS config packet payload is truncated",
+                )
+                .await?;
+                let parsed = parse_mhas_config_packet(&payload, spec)?;
+                if let Some(existing) = &config {
+                    if existing != &parsed {
+                        return Err(MuxError::UnsupportedTrackImport {
+                            spec: spec.to_string(),
+                            message:
+                                "MHAS input changed profile, sample rate, frame length, channel layout, or configuration bytes mid-stream"
+                                    .to_string(),
+                        });
+                    }
+                } else {
+                    config = Some(parsed);
+                }
+            }
+            2 => {
+                let current_config =
+                    config
+                        .as_ref()
+                        .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                            spec: spec.to_string(),
+                            message: "MHAS frame packet appeared before any configuration packet"
+                                .to_string(),
+                        })?;
+                let is_sync_sample =
+                    read_mhas_frame_sap_segmented_async(file, segments, payload_offset, spec)
+                        .await?;
+                let data_size = u32::try_from(packet_end - sample_start)
+                    .map_err(|_| MuxError::LayoutOverflow("MHAS access unit size"))?;
+                samples.push(StagedSample {
+                    data_offset: sample_start,
+                    data_size,
+                    duration: current_config.frame_length,
+                    composition_time_offset: 0,
+                    is_sync_sample: is_sync_sample && samples.is_empty(),
+                });
+                sample_start = packet_end;
+                saw_frame = true;
+            }
+            17 => {
+                let payload = read_mhas_packet_payload_segmented_async(
+                    file,
+                    segments,
+                    payload_offset,
+                    header.payload_size,
+                    spec,
+                    "MHAS truncation packet payload is truncated",
+                )
+                .await?;
+                parse_mhas_truncation_packet(&payload, spec)?;
+            }
+            _ => {}
+        }
+        offset = packet_end;
+    }
+
+    finalize_mhas_track(spec, config, samples, sample_start, saw_frame, offset)
+}
+
 fn finalize_mhas_track(
     spec: &str,
     config: Option<ParsedMhasConfig>,
@@ -406,8 +681,15 @@ fn finalize_mhas_track(
 }
 
 fn build_mhas_sample_entry_box(config: &ParsedMhasConfig, btrt: Btrt) -> Result<Vec<u8>, MuxError> {
+    build_mhas_sample_entry_box_with_btrt(config.sample_rate, btrt)
+}
+
+pub(in crate::mux) fn build_mhas_sample_entry_box_with_btrt(
+    sample_rate: u32,
+    btrt: Btrt,
+) -> Result<Vec<u8>, MuxError> {
     let btrt_bytes = super::super::mp4::encode_typed_box(&btrt, &[])?;
-    build_generic_audio_sample_entry_box(MHM1, config.sample_rate, 0, 16, &[btrt_bytes])
+    build_generic_audio_sample_entry_box(MHM1, sample_rate, 0, 16, &[btrt_bytes])
 }
 
 fn read_mhas_packet_header_sync(
@@ -429,6 +711,28 @@ fn read_mhas_packet_header_sync(
     parse_mhas_packet_header(&header, spec)
 }
 
+fn read_mhas_packet_header_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<MhasPacketHeader, MuxError> {
+    let available = usize::try_from((total_size - offset).min(15))
+        .map_err(|_| MuxError::LayoutOverflow("MHAS header probe size"))?;
+    let mut header = vec![0_u8; available];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut header,
+        spec,
+        "MHAS packet header is truncated",
+    )?;
+    parse_mhas_packet_header(&header, spec)
+}
+
 #[cfg(feature = "async")]
 async fn read_mhas_packet_header_async(
     file: &mut TokioFile,
@@ -441,6 +745,30 @@ async fn read_mhas_packet_header_async(
     let mut header = vec![0_u8; available];
     read_exact_at_async(
         file,
+        offset,
+        &mut header,
+        spec,
+        "MHAS packet header is truncated",
+    )
+    .await?;
+    parse_mhas_packet_header(&header, spec)
+}
+
+#[cfg(feature = "async")]
+async fn read_mhas_packet_header_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<MhasPacketHeader, MuxError> {
+    let available = usize::try_from((total_size - offset).min(15))
+        .map_err(|_| MuxError::LayoutOverflow("MHAS header probe size"))?;
+    let mut header = vec![0_u8; available];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        total_size,
         offset,
         &mut header,
         spec,
@@ -479,6 +807,32 @@ fn read_mhas_packet_payload_sync(
     Ok(payload)
 }
 
+fn read_mhas_packet_payload_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    offset: u64,
+    size: u64,
+    spec: &str,
+    truncated_message: &'static str,
+) -> Result<Vec<u8>, MuxError> {
+    let len =
+        usize::try_from(size).map_err(|_| MuxError::LayoutOverflow("MHAS packet payload size"))?;
+    let mut payload = vec![0_u8; len];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        u64::try_from(len)
+            .map_err(|_| MuxError::LayoutOverflow("MHAS packet payload size"))?
+            .checked_add(offset)
+            .ok_or(MuxError::LayoutOverflow("MHAS packet payload range"))?,
+        offset,
+        &mut payload,
+        spec,
+        truncated_message,
+    )?;
+    Ok(payload)
+}
+
 #[cfg(feature = "async")]
 async fn read_mhas_packet_payload_async(
     file: &mut TokioFile,
@@ -494,10 +848,59 @@ async fn read_mhas_packet_payload_async(
     Ok(payload)
 }
 
+#[cfg(feature = "async")]
+async fn read_mhas_packet_payload_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    offset: u64,
+    size: u64,
+    spec: &str,
+    truncated_message: &'static str,
+) -> Result<Vec<u8>, MuxError> {
+    let len =
+        usize::try_from(size).map_err(|_| MuxError::LayoutOverflow("MHAS packet payload size"))?;
+    let mut payload = vec![0_u8; len];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        u64::try_from(len)
+            .map_err(|_| MuxError::LayoutOverflow("MHAS packet payload size"))?
+            .checked_add(offset)
+            .ok_or(MuxError::LayoutOverflow("MHAS packet payload range"))?,
+        offset,
+        &mut payload,
+        spec,
+        truncated_message,
+    )
+    .await?;
+    Ok(payload)
+}
+
 fn read_mhas_sync_marker_sync(file: &mut File, offset: u64, spec: &str) -> Result<u8, MuxError> {
     let mut marker = [0_u8; 1];
     read_exact_at_sync(
         file,
+        offset,
+        &mut marker,
+        spec,
+        "MHAS sync payload is truncated",
+    )?;
+    Ok(marker[0])
+}
+
+fn read_mhas_sync_marker_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    offset: u64,
+    spec: &str,
+) -> Result<u8, MuxError> {
+    let mut marker = [0_u8; 1];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        offset
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("MHAS sync payload range"))?,
         offset,
         &mut marker,
         spec,
@@ -524,10 +927,54 @@ async fn read_mhas_sync_marker_async(
     Ok(marker[0])
 }
 
+#[cfg(feature = "async")]
+async fn read_mhas_sync_marker_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    offset: u64,
+    spec: &str,
+) -> Result<u8, MuxError> {
+    let mut marker = [0_u8; 1];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        offset
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("MHAS sync payload range"))?,
+        offset,
+        &mut marker,
+        spec,
+        "MHAS sync payload is truncated",
+    )
+    .await?;
+    Ok(marker[0])
+}
+
 fn read_mhas_frame_sap_sync(file: &mut File, offset: u64, spec: &str) -> Result<bool, MuxError> {
     let mut byte = [0_u8; 1];
     read_exact_at_sync(
         file,
+        offset,
+        &mut byte,
+        spec,
+        "MHAS frame payload is truncated before the SAP flag",
+    )?;
+    Ok(byte[0] & 0x80 != 0)
+}
+
+fn read_mhas_frame_sap_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    offset: u64,
+    spec: &str,
+) -> Result<bool, MuxError> {
+    let mut byte = [0_u8; 1];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        offset
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("MHAS frame SAP range"))?,
         offset,
         &mut byte,
         spec,
@@ -545,6 +992,29 @@ async fn read_mhas_frame_sap_async(
     let mut byte = [0_u8; 1];
     read_exact_at_async(
         file,
+        offset,
+        &mut byte,
+        spec,
+        "MHAS frame payload is truncated before the SAP flag",
+    )
+    .await?;
+    Ok(byte[0] & 0x80 != 0)
+}
+
+#[cfg(feature = "async")]
+async fn read_mhas_frame_sap_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    offset: u64,
+    spec: &str,
+) -> Result<bool, MuxError> {
+    let mut byte = [0_u8; 1];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        offset
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("MHAS frame SAP range"))?,
         offset,
         &mut byte,
         spec,

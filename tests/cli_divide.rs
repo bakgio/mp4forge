@@ -1,3 +1,5 @@
+#![cfg(feature = "mux")]
+
 #![allow(clippy::field_reassign_with_default)]
 
 mod support;
@@ -11,7 +13,8 @@ use mp4forge::boxes::etsi_ts_102_366::Dac3;
 use mp4forge::boxes::iso14496_12::{
     AVCDecoderConfiguration, AudioSampleEntry, Frma, Ftyp, HEVCDecoderConfiguration, Mdhd,
     SampleEntry, Schm, Sinf, Stco, Stsc, StscEntry, Stsd, Stsz, Stts, SttsEntry,
-    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT, Tfdt, Tfhd, Tkhd, Trun,
+    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+    TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, Tfdt, Tfhd, Tkhd, Trun, TrunEntry,
     VisualSampleEntry, XMLSubtitleSampleEntry,
 };
 use mp4forge::boxes::iso14496_14::{
@@ -23,6 +26,7 @@ use mp4forge::boxes::opus::DOps;
 use mp4forge::boxes::vp::VpCodecConfiguration;
 use mp4forge::cli::divide;
 use mp4forge::codec::MutableBox;
+use mp4forge::mux::{MuxRequest, MuxTrackSpec, mux_to_path};
 use mp4forge::probe::{TrackCodec, probe, probe_detailed};
 
 use support::{
@@ -30,7 +34,7 @@ use support::{
     temp_output_dir, write_temp_file,
 };
 
-const DIVIDE_SCOPE_MESSAGE: &str = "divide currently supports fragmented inputs with at most one video track from AVC, HEVC, Dolby Vision on HEVC, AV1, VP8, or VP9 and one audio track from MP4A-based audio, Opus, AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM; subtitle and text tracks remain unsupported";
+const DIVIDE_SCOPE_MESSAGE: &str = "divide currently supports fragmented inputs with at most one video track from AVC, HEVC, Dolby Vision on HEVC, AV1, VP8, or VP9 and one or more audio tracks from MP4A-based audio, Opus, AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM; subtitle and text tracks remain unsupported";
 
 #[test]
 fn divide_command_writes_playlists_and_segments() {
@@ -50,6 +54,7 @@ fn divide_command_writes_playlists_and_segments() {
     let master_playlist = fs::read_to_string(output_dir.join("playlist.m3u8")).unwrap();
     let video_playlist =
         fs::read_to_string(output_dir.join("video").join("playlist.m3u8")).unwrap();
+    let manifest = fs::read_to_string(output_dir.join("manifest.mpd")).unwrap();
     let init = fs::read(output_dir.join("video").join("init.mp4")).unwrap();
     let segment0 = fs::read(output_dir.join("video").join("0.mp4")).unwrap();
     let segment1 = fs::read(output_dir.join("video").join("1.mp4")).unwrap();
@@ -80,6 +85,9 @@ fn divide_command_writes_playlists_and_segments() {
             "#EXT-X-ENDLIST\n"
         )
     );
+    assert!(manifest.contains("<MPD "));
+    assert!(manifest.contains("contentType=\"video\""));
+    assert!(manifest.contains("media=\"video/$Number$.mp4\""));
     assert!(init.windows(4).any(|window| window == b"ftyp"));
     assert!(init.windows(4).any(|window| window == b"moov"));
     assert!(segment0.windows(4).any(|window| window == b"moof"));
@@ -89,23 +97,615 @@ fn divide_command_writes_playlists_and_segments() {
 }
 
 #[test]
+fn divide_command_writes_hls_only_when_requested() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-hls-only-input", &input);
+    let output_dir = temp_output_dir("divide-hls-only-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "hls".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert!(output_dir.join("playlist.m3u8").is_file());
+    assert!(!output_dir.join("manifest.mpd").exists());
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_writes_hls_with_base_url_event_type_and_start_offset() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-hls-base-url-input", &input);
+    let output_dir = temp_output_dir("divide-hls-base-url-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "hls".to_string(),
+        "-hls-base-url".to_string(),
+        "https://cdn.example.invalid/hls/".to_string(),
+        "-hls-playlist-type".to_string(),
+        "event".to_string(),
+        "-hls-start-time-offset".to_string(),
+        "-3.5".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert_eq!(
+        read_text(&output_dir.join("playlist.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=128,CODECS=\"avc1.64001f\",RESOLUTION=1920x1080\n",
+            "https://cdn.example.invalid/hls/video/playlist.m3u8\n"
+        )
+    );
+    assert_eq!(
+        read_text(&output_dir.join("video").join("playlist.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:7\n",
+            "#EXT-X-TARGETDURATION:1\n",
+            "#EXT-X-PLAYLIST-TYPE:EVENT\n",
+            "#EXT-X-START:TIME-OFFSET=-3.500000\n",
+            "#EXT-X-MAP:URI=\"https://cdn.example.invalid/hls/video/init.mp4\"\n",
+            "#EXTINF:1.000000,\n",
+            "https://cdn.example.invalid/hls/video/0.mp4\n",
+            "#EXTINF:1.000000,\n",
+            "https://cdn.example.invalid/hls/video/1.mp4\n"
+        )
+    );
+    assert!(!output_dir.join("manifest.mpd").exists());
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_writes_hls_program_date_time_when_requested() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-hls-program-date-time-input", &input);
+    let output_dir = temp_output_dir("divide-hls-program-date-time-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "hls".to_string(),
+        "-hls-program-date-time".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+
+    let media_playlist = read_text(&output_dir.join("video").join("playlist.m3u8"));
+    let lines = media_playlist.lines().collect::<Vec<_>>();
+    assert!(lines[5].starts_with("#EXT-X-PROGRAM-DATE-TIME:"));
+    assert_eq!(lines[6], "#EXTINF:1.000000,");
+    assert!(lines[5].ends_with('Z'));
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_writes_manifest_name_overrides() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-manifest-name-input", &input);
+    let output_dir = temp_output_dir("divide-manifest-name-output");
+    let args = vec![
+        "-hls-master-playlist-name".to_string(),
+        "master.m3u8".to_string(),
+        "-hls-media-playlist-name".to_string(),
+        "media.m3u8".to_string(),
+        "-dash-manifest-name".to_string(),
+        "stream.mpd".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+
+    assert!(output_dir.join("master.m3u8").is_file());
+    assert!(!output_dir.join("playlist.m3u8").exists());
+    assert!(output_dir.join("stream.mpd").is_file());
+    assert!(!output_dir.join("manifest.mpd").exists());
+    assert!(output_dir.join("video").join("media.m3u8").is_file());
+    assert!(!output_dir.join("video").join("playlist.m3u8").exists());
+
+    assert_eq!(
+        read_text(&output_dir.join("master.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=128,CODECS=\"avc1.64001f\",RESOLUTION=1920x1080\n",
+            "video/media.m3u8\n"
+        )
+    );
+    let manifest = read_text(&output_dir.join("stream.mpd"));
+    assert!(manifest.contains("initialization=\"video/init.mp4\""));
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_writes_dynamic_dash_only_manifest_when_requested() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-dynamic-dash-input", &input);
+    let output_dir = temp_output_dir("divide-dynamic-dash-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-mode".to_string(),
+        "dynamic".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let manifest = fs::read_to_string(output_dir.join("manifest.mpd")).unwrap();
+    assert!(manifest.contains("type=\"dynamic\""));
+    assert!(manifest.contains("minimumUpdatePeriod=\"PT5S\""));
+    assert!(manifest.contains("availabilityStartTime=\""));
+    assert!(manifest.contains("publishTime=\""));
+    assert!(!manifest.contains("availabilityStartTime=\"1970-01-01T00:00:00Z\""));
+    assert!(!manifest.contains("publishTime=\"1970-01-01T00:00:00Z\""));
+    assert!(!manifest.contains("timeShiftBufferDepth="));
+    assert!(!manifest.contains("suggestedPresentationDelay="));
+    assert!(!manifest.contains("mediaPresentationDuration="));
+    assert!(!output_dir.join("playlist.m3u8").exists());
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_writes_dynamic_dash_manifest_with_defaults_and_repeated_base_urls() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-dynamic-dash-defaults-input", &input);
+    let output_dir = temp_output_dir("divide-dynamic-dash-defaults-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-mode".to_string(),
+        "dynamic".to_string(),
+        "-dash-profile".to_string(),
+        "live".to_string(),
+        "-dash-base-url".to_string(),
+        "https://cdn.example.invalid/root/".to_string(),
+        "-dash-base-url".to_string(),
+        "https://cdn-backup.example.invalid/root/".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let manifest = fs::read_to_string(output_dir.join("manifest.mpd")).unwrap();
+    assert!(manifest.contains("type=\"dynamic\""));
+    assert!(manifest.contains("profiles=\"urn:mpeg:dash:profile:isoff-live:2011\""));
+    assert!(manifest.contains("<BaseURL>https://cdn.example.invalid/root/</BaseURL>"));
+    assert!(manifest.contains("<BaseURL>https://cdn-backup.example.invalid/root/</BaseURL>"));
+    assert!(manifest.contains("minBufferTime=\"PT2S\""));
+    assert!(manifest.contains("minimumUpdatePeriod=\"PT5S\""));
+    assert!(manifest.contains("availabilityStartTime=\""));
+    assert!(manifest.contains("publishTime=\""));
+    assert!(manifest.contains("<Period start=\"PT0S\">"));
+    assert!(!manifest.contains("<Location>"));
+    assert!(!manifest.contains("<UTCTiming "));
+    assert!(!manifest.contains("suggestedPresentationDelay="));
+    assert!(!manifest.contains("timeShiftBufferDepth="));
+    assert!(!manifest.contains("availabilityStartTime=\"1970-01-01T00:00:00Z\""));
+    assert!(!manifest.contains("publishTime=\"1970-01-01T00:00:00Z\""));
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_saves_and_reloads_dash_session_state() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-session-input", &input);
+    let first_output_dir = temp_output_dir("divide-session-first-output");
+    let session_path = first_output_dir.join("dash.session");
+    let first_args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-mode".to_string(),
+        "dynamic".to_string(),
+        "-dash-layout".to_string(),
+        "list".to_string(),
+        "-dash-profile".to_string(),
+        "live".to_string(),
+        "-dash-base-url".to_string(),
+        "https://cdn.example.invalid/root/".to_string(),
+        "-dash-base-url".to_string(),
+        "https://cdn-backup.example.invalid/root/".to_string(),
+        "-dash-session-save".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        first_output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut first_stderr = Vec::new();
+    let first_exit_code = divide::run(&first_args, &mut first_stderr);
+    assert_eq!(
+        first_exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&first_stderr)
+    );
+    assert_eq!(String::from_utf8(first_stderr).unwrap(), "");
+    let session_text = fs::read_to_string(&session_path).unwrap();
+    assert!(session_text.contains("manifest_selection=dash"));
+    assert!(session_text.contains("dash_manifest_mode=dynamic"));
+    assert!(session_text.contains("dash_manifest_layout=list"));
+    assert!(session_text.contains("dash_manifest_profile=live"));
+    assert!(session_text.contains("dash_base_url=https://cdn.example.invalid/root/"));
+    assert!(session_text.contains("dash_base_url=https://cdn-backup.example.invalid/root/"));
+    assert!(session_text.contains("next_period_start_micros=2000000"));
+    assert!(session_text.contains("next_segment_index_track_1=2"));
+
+    let second_output_dir = temp_output_dir("divide-session-second-output");
+    let second_args = vec![
+        "-dash-session-load".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        second_output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut second_stderr = Vec::new();
+    let second_exit_code = divide::run(&second_args, &mut second_stderr);
+    assert_eq!(
+        second_exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&second_stderr)
+    );
+    assert_eq!(String::from_utf8(second_stderr).unwrap(), "");
+    let manifest = fs::read_to_string(second_output_dir.join("manifest.mpd")).unwrap();
+    assert!(manifest.contains("type=\"dynamic\""));
+    assert!(manifest.contains("profiles=\"urn:mpeg:dash:profile:isoff-live:2011\""));
+    assert!(manifest.contains("<Period start=\"PT2S\">"));
+    assert!(manifest.contains("<BaseURL>https://cdn.example.invalid/root/</BaseURL>"));
+    assert!(manifest.contains("<BaseURL>https://cdn-backup.example.invalid/root/</BaseURL>"));
+    assert!(manifest.contains("<SegmentList>"));
+    assert!(manifest.contains("<SegmentURL media=\"video/2.mp4\" />"));
+    assert!(manifest.contains("<SegmentURL media=\"video/3.mp4\" />"));
+    assert!(second_output_dir.join("video").join("2.mp4").is_file());
+    assert!(second_output_dir.join("video").join("3.mp4").is_file());
+    assert!(!second_output_dir.join("video").join("0.mp4").exists());
+    assert!(!second_output_dir.join("playlist.m3u8").exists());
+    assert!(
+        !second_output_dir
+            .join("video")
+            .join("playlist.m3u8")
+            .exists()
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&first_output_dir);
+    let _ = fs::remove_dir_all(&second_output_dir);
+}
+
+#[test]
+fn divide_command_session_reload_still_allows_manifest_override_with_continuity() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-session-override-input", &input);
+    let first_output_dir = temp_output_dir("divide-session-override-first-output");
+    let session_path = first_output_dir.join("dash.session");
+    let first_args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-mode".to_string(),
+        "dynamic".to_string(),
+        "-dash-layout".to_string(),
+        "list".to_string(),
+        "-dash-profile".to_string(),
+        "live".to_string(),
+        "-dash-session-save".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        first_output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut first_stderr = Vec::new();
+    let first_exit_code = divide::run(&first_args, &mut first_stderr);
+    assert_eq!(
+        first_exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&first_stderr)
+    );
+    assert_eq!(String::from_utf8(first_stderr).unwrap(), "");
+
+    let second_output_dir = temp_output_dir("divide-session-override-second-output");
+    let second_args = vec![
+        "-manifest".to_string(),
+        "both".to_string(),
+        "-dash-session-load".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        second_output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut second_stderr = Vec::new();
+    let second_exit_code = divide::run(&second_args, &mut second_stderr);
+    assert_eq!(
+        second_exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&second_stderr)
+    );
+    assert_eq!(String::from_utf8(second_stderr).unwrap(), "");
+    let manifest = fs::read_to_string(second_output_dir.join("manifest.mpd")).unwrap();
+    let video_playlist =
+        fs::read_to_string(second_output_dir.join("video").join("playlist.m3u8")).unwrap();
+    assert!(manifest.contains("type=\"dynamic\""));
+    assert!(manifest.contains("<Period start=\"PT2S\">"));
+    assert!(manifest.contains("<SegmentList>"));
+    assert!(manifest.contains("<SegmentURL media=\"video/2.mp4\" />"));
+    assert!(manifest.contains("<SegmentURL media=\"video/3.mp4\" />"));
+    assert!(video_playlist.contains("#EXT-X-MEDIA-SEQUENCE:2"));
+    assert!(video_playlist.contains("\n2.mp4\n"));
+    assert!(video_playlist.contains("\n3.mp4\n"));
+    assert!(second_output_dir.join("playlist.m3u8").is_file());
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&first_output_dir);
+    let _ = fs::remove_dir_all(&second_output_dir);
+}
+
+#[test]
+fn divide_command_writes_dash_segment_list_when_requested() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-dash-list-input", &input);
+    let output_dir = temp_output_dir("divide-dash-list-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-layout".to_string(),
+        "list".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let manifest = fs::read_to_string(output_dir.join("manifest.mpd")).unwrap();
+    assert!(manifest.contains("<SegmentList>"));
+    assert!(manifest.contains("<Initialization sourceURL=\"video/init.mp4\" />"));
+    assert!(manifest.contains("<SegmentURL media=\"video/0.mp4\" />"));
+    assert!(!manifest.contains("<SegmentTemplate"));
+    assert!(!output_dir.join("playlist.m3u8").exists());
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
 fn divide_command_validates_argument_shape() {
     let mut stderr = Vec::new();
     assert_eq!(divide::run(&[], &mut stderr), 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
         concat!(
-            "USAGE: mp4forge divide INPUT.mp4 OUTPUT_DIR\n",
+            "USAGE: mp4forge divide [OPTIONS] INPUT.mp4 OUTPUT_DIR\n",
             "       mp4forge divide -validate INPUT.mp4\n",
             "\n",
             "OPTIONS:\n",
             "  -validate    Validate the fragmented divide layout without writing output files\n",
+            "  -warnings    Emit warning-grade diagnostics to stderr after a successful run\n",
+            "  -manifest <hls|dash|both>  Manifest families to write (default: both)\n",
+            "  -default-language <tag>  Prefer this audio language in HLS defaults and DASH main-role signaling\n",
+            "  -hls-base-url <url>  Prefix HLS playlist, init, and media segment URIs\n",
+            "  -hls-playlist-type <vod|event|live>  HLS playlist style (default: vod)\n",
+            "  -hls-start-time-offset <seconds>  Add EXT-X-START with a signed seconds offset\n",
+            "  -hls-program-date-time  Add EXT-X-PROGRAM-DATE-TIME to HLS media playlists\n",
+            "  -hls-master-playlist-name <name.m3u8>  Override the root HLS master playlist file name\n",
+            "  -hls-media-playlist-name <name.m3u8>  Override per-track HLS media playlist file names\n",
+            "  -dash-mode <static|dynamic>  DASH manifest mode (default: static)\n",
+            "  -dash-layout <template|list>  DASH manifest layout (default: template)\n",
+            "  -dash-profile <main|live>  DASH profile signaling (default: main)\n",
+            "  -dash-base-url <url>  Add one DASH BaseURL element (repeatable)\n",
+            "  -dash-manifest-name <name.mpd>  Override the root DASH manifest file name\n",
+            "  -dash-session-load <path>  Reload saved DASH session controls and next-period continuity\n",
+            "  -dash-session-save <path>  Save DASH session controls and next-period continuity\n",
+            "\n",
+            "Successful output writes the selected retained HLS playlist tree and/or additive MPD manifest.\n",
+            "DASH metadata such as Period ids, timing descriptors, and dynamic refresh attributes use built-in defaults.\n",
             "\n",
             "Currently supports fragmented inputs with up to one video track from AVC, HEVC, Dolby Vision on HEVC, AV1, VP8, or VP9\n",
-            "and one audio track from MP4A-based audio, Opus, AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM,\n",
+            "and one or more audio tracks from MP4A-based audio, Opus, AC-3, E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM,\n",
             "including encrypted wrappers that preserve those original sample-entry formats. Subtitle and text tracks remain unsupported.\n",
         )
     );
+}
+
+#[test]
+fn divide_command_rejects_removed_dash_override_options() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-removed-dash-option-input", &input);
+    let output_dir = temp_output_dir("divide-removed-dash-option-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-minimum-update-period".to_string(),
+        "5".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: divide option `-dash-minimum-update-period` was removed; mp4forge now uses built-in DASH minimumUpdatePeriod defaults\n"
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_rejects_dash_only_options_when_manifest_selection_is_hls() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-hls-dash-option-invalid-input", &input);
+    let output_dir = temp_output_dir("divide-hls-dash-option-invalid-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "hls".to_string(),
+        "-dash-mode".to_string(),
+        "dynamic".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: divide manifest selection `hls` does not support `-dash-mode`; use `-manifest dash` or `-manifest both`\n"
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_rejects_hls_only_options_when_manifest_selection_is_dash() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-dash-hls-option-invalid-input", &input);
+    let output_dir = temp_output_dir("divide-dash-hls-option-invalid-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-hls-base-url".to_string(),
+        "https://cdn.example.invalid/hls/".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: divide manifest selection `dash` does not support `-hls-base-url`; use `-manifest hls` or `-manifest both`\n"
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_rejects_dynamic_only_dash_options_in_static_mode() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-static-dynamic-option-invalid-input", &input);
+    let output_dir = temp_output_dir("divide-static-dynamic-option-invalid-output");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-profile".to_string(),
+        "live".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: divide DASH profile `live` requires `-dash-mode dynamic`\n"
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_rejects_session_state_options_in_validate_mode() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-validate-session-invalid-input", &input);
+    let session_path = temp_output_dir("divide-validate-session-state").join("dash.session");
+    let args = vec![
+        "-validate".to_string(),
+        "-dash-session-save".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: divide validation mode does not support `-dash-session-save`\n"
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(session_path.parent().unwrap());
+}
+
+#[test]
+fn divide_command_rejects_reusing_the_same_session_state_path() {
+    let input = build_divide_input_file();
+    let input_path = write_temp_file("divide-session-reuse-invalid-input", &input);
+    let output_dir = temp_output_dir("divide-session-reuse-invalid-output");
+    let session_path = output_dir.join("dash.session");
+    let args = vec![
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-session-load".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        "-dash-session-save".to_string(),
+        session_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        format!(
+            "Error [stage=request category=input]: divide DASH session load and save paths must differ: `{}`\n",
+            session_path.display()
+        )
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -132,6 +732,118 @@ fn divide_command_derives_master_playlist_signaling_from_probe_metadata() {
             "video/playlist.m3u8\n"
         )
     );
+    let manifest = read_text(&output_dir.join("manifest.mpd"));
+    assert!(manifest.contains("contentType=\"video\""));
+    assert!(manifest.contains("contentType=\"audio\""));
+    assert!(manifest.contains("codecs=\"avc1.4d401f\""));
+    assert!(manifest.contains("codecs=\"mp4a.40.5\""));
+    assert!(manifest.contains("audioSamplingRate=\"48000\""));
+    assert!(manifest.contains("initialization=\"video/init.mp4\""));
+    assert!(manifest.contains("initialization=\"audio/init.mp4\""));
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_writes_multi_audio_group_outputs() {
+    let input = build_avc_with_aac_and_ac3_divide_input_file();
+    let input_path = write_temp_file("divide-multi-audio-input", &input);
+    let output_dir = temp_output_dir("divide-multi-audio-output");
+    let args = vec![
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert_eq!(
+        read_text(&output_dir.join("playlist.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio_2/playlist.m3u8\",GROUP-ID=\"audio\",NAME=\"audio-2\",AUTOSELECT=YES,DEFAULT=YES,CHANNELS=\"2\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio_3/playlist.m3u8\",GROUP-ID=\"audio\",NAME=\"audio-3\",AUTOSELECT=YES,DEFAULT=NO,CHANNELS=\"6\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=128,CODECS=\"avc1.4d401f,mp4a.40.2,ac-3\",RESOLUTION=640x360,AUDIO=\"audio\"\n",
+            "video/playlist.m3u8\n"
+        )
+    );
+    assert_eq!(
+        read_text(&output_dir.join("audio_2").join("playlist.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:7\n",
+            "#EXT-X-TARGETDURATION:1\n",
+            "#EXT-X-PLAYLIST-TYPE:VOD\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXTINF:1.000000,\n",
+            "0.mp4\n",
+            "#EXT-X-ENDLIST\n"
+        )
+    );
+    assert_eq!(
+        read_text(&output_dir.join("audio_3").join("playlist.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:7\n",
+            "#EXT-X-TARGETDURATION:1\n",
+            "#EXT-X-PLAYLIST-TYPE:VOD\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXTINF:1.000000,\n",
+            "0.mp4\n",
+            "#EXT-X-ENDLIST\n"
+        )
+    );
+    let manifest = read_text(&output_dir.join("manifest.mpd"));
+    assert!(manifest.contains("contentType=\"video\""));
+    assert!(manifest.contains("contentType=\"audio\""));
+    assert!(manifest.contains("codecs=\"mp4a.40.2\""));
+    assert!(manifest.contains("codecs=\"ac-3\""));
+    assert!(manifest.contains("initialization=\"audio_2/init.mp4\""));
+    assert!(manifest.contains("initialization=\"audio_3/init.mp4\""));
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_command_prefers_default_language_for_hls_and_dash() {
+    let input = build_avc_with_aac_and_ac3_divide_input_file_with_languages(*b"eng", *b"fra");
+    let input_path = write_temp_file("divide-default-language-input", &input);
+    let output_dir = temp_output_dir("divide-default-language-output");
+    let args = vec![
+        "-default-language".to_string(),
+        "fra".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert_eq!(
+        read_text(&output_dir.join("playlist.m3u8")),
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio_2/playlist.m3u8\",GROUP-ID=\"audio\",NAME=\"audio-2\",AUTOSELECT=YES,DEFAULT=NO,LANGUAGE=\"eng\",CHANNELS=\"2\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio_3/playlist.m3u8\",GROUP-ID=\"audio\",NAME=\"audio-3\",AUTOSELECT=YES,DEFAULT=YES,LANGUAGE=\"fra\",CHANNELS=\"6\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=128,CODECS=\"avc1.4d401f,mp4a.40.2,ac-3\",RESOLUTION=640x360,AUDIO=\"audio\"\n",
+            "video/playlist.m3u8\n"
+        )
+    );
+    let manifest = read_text(&output_dir.join("manifest.mpd"));
+    assert!(!manifest.contains(concat!(
+        "<AdaptationSet id=\"2\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"eng\">\n",
+        "      <Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"main\" />\n"
+    )));
+    assert!(manifest.contains(concat!(
+        "<AdaptationSet id=\"3\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"fra\">\n",
+        "      <Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"main\" />\n"
+    )));
 
     let _ = fs::remove_file(&input_path);
     let _ = fs::remove_dir_all(&output_dir);
@@ -154,7 +866,7 @@ fn divide_command_rejects_multiple_video_tracks_with_clear_message() {
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
         format!(
-            "Error: {DIVIDE_SCOPE_MESSAGE}; found multiple fragmented video tracks (1 and 2).\n"
+            "Error [stage=request category=input]: {DIVIDE_SCOPE_MESSAGE}; found multiple fragmented video tracks (1 and 2).\n"
         )
     );
 
@@ -253,6 +965,80 @@ fn divide_command_matches_shared_fragmented_fixture_outputs() {
         );
     }
 
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_dash_list_manifest_round_trips_through_mux_input() {
+    let input = build_video_and_audio_divide_input_file();
+    let input_path = write_temp_file("divide-dash-list-import-input", &input);
+    let output_dir = temp_output_dir("divide-dash-list-import-output");
+    let args = vec![
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-layout".to_string(),
+        "list".to_string(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+
+    let manifest_path = output_dir.join("manifest.mpd");
+    let output_path = write_temp_file("divide-dash-list-import-remux-output", &[]);
+    mux_to_path(
+        &MuxRequest::new(vec![MuxTrackSpec::path(&manifest_path)]),
+        &output_path,
+    )
+    .unwrap();
+
+    let remuxed = probe_file(&output_path);
+    assert_eq!(remuxed.segments.len(), 0);
+    assert_eq!(remuxed.tracks.len(), 2);
+    assert_eq!(remuxed.tracks[0].codec, TrackCodec::Avc1);
+    assert_eq!(remuxed.tracks[1].codec, TrackCodec::Mp4a);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn divide_dash_template_manifest_round_trips_through_mux_input() {
+    let input = build_video_and_audio_divide_input_file();
+    let input_path = write_temp_file("divide-dash-template-import-input", &input);
+    let output_dir = temp_output_dir("divide-dash-template-import-output");
+    let args = vec![
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+        "-manifest".to_string(),
+        "dash".to_string(),
+        "-dash-layout".to_string(),
+        "template".to_string(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+
+    let manifest_path = output_dir.join("manifest.mpd");
+    let output_path = write_temp_file("divide-dash-template-import-remux-output", &[]);
+    mux_to_path(
+        &MuxRequest::new(vec![MuxTrackSpec::path(&manifest_path)]),
+        &output_path,
+    )
+    .unwrap();
+
+    let remuxed = probe_file(&output_path);
+    assert_eq!(remuxed.segments.len(), 0);
+    assert_eq!(remuxed.tracks.len(), 2);
+    assert_eq!(remuxed.tracks[0].codec, TrackCodec::Avc1);
+    assert_eq!(remuxed.tracks[1].codec, TrackCodec::Mp4a);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
     let _ = fs::remove_dir_all(&output_dir);
 }
 
@@ -635,7 +1421,7 @@ fn divide_validate_rejects_duplicate_video_layouts_before_writing_output() {
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
         format!(
-            "Error: {DIVIDE_SCOPE_MESSAGE}; found multiple fragmented video tracks (1 and 2).\n"
+            "Error [stage=request category=input]: {DIVIDE_SCOPE_MESSAGE}; found multiple fragmented video tracks (1 and 2).\n"
         )
     );
 }
@@ -659,7 +1445,179 @@ fn divide_validate_rejects_subtitle_layout_with_clear_message() {
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        format!("Error: track 1 uses unsupported codec `stpp`; {DIVIDE_SCOPE_MESSAGE}\n")
+        format!(
+            "Error [stage=request category=input]: track 1 uses unsupported codec `stpp`; {DIVIDE_SCOPE_MESSAGE}\n"
+        )
+    );
+}
+
+#[test]
+fn divide_command_can_emit_warning_mode_for_audio_only_outputs() {
+    let input = build_opus_divide_input_file();
+    let input_path = write_temp_file("divide-warning-audio-only-input", &input);
+    let output_dir = temp_output_dir("divide-warning-audio-only-output");
+    let args = vec![
+        "-warnings".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Warning: divide output is audio-only; no fragmented video track was selected\n"
+    );
+}
+
+#[test]
+fn divide_command_warning_mode_reports_fragmented_decode_gap_and_duration_shift() {
+    let input = build_fragmented_input_file(
+        vec![build_video_trak_with_profile(1, 640, 360, 0x64, 0x00, 0x1f)],
+        vec![
+            build_track_segment(1, 0, 1_000, 8),
+            build_track_segment(1, 3_000, 500, 8),
+        ],
+    );
+    let input_path = write_temp_file("divide-warning-gap-input", &input);
+    let output_dir = temp_output_dir("divide-warning-gap-output");
+    let args = vec![
+        "-warnings".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        concat!(
+            "Warning: track 1 changes segment duration 1 time(s)\n",
+            "Warning: track 1 fragmented segment duration spans 0.500000s to 1.000000s\n",
+            "Warning: track 1 changes authored fragmented sample duration 1 time(s)\n",
+            "Warning: track 1 authored fragmented sample duration spans 0.500000s (500 tick(s)) to 1.000000s (1000 tick(s))\n",
+            "Warning: track 1 changes average fragmented sample duration 1 time(s)\n",
+            "Warning: track 1 fragmented average sample duration spans 0.500000s to 1.000000s\n",
+            "Warning: track 1 has 1 fragmented decode-timeline gap(s)\n",
+            "Warning: track 1 has a largest fragmented decode-timeline gap of 2.000000s (2000 tick(s))\n",
+        )
+    );
+}
+
+#[test]
+fn divide_command_warning_mode_reports_fragmented_decode_regression_and_zero_duration_samples() {
+    let input = build_fragmented_input_file(
+        vec![build_video_trak_with_profile(1, 640, 360, 0x64, 0x00, 0x1f)],
+        vec![
+            build_track_segment(1, 0, 1_000, 8),
+            build_track_segment(1, 500, 0, 8),
+        ],
+    );
+    let input_path = write_temp_file("divide-warning-regression-input", &input);
+    let output_dir = temp_output_dir("divide-warning-regression-output");
+    let args = vec![
+        "-warnings".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        concat!(
+            "Warning: track 1 has 1 zero-duration fragmented segment(s)\n",
+            "Warning: track 1 changes segment duration 1 time(s)\n",
+            "Warning: track 1 fragmented segment duration spans 0.000000s to 1.000000s\n",
+            "Warning: track 1 carries 1 sample(s) inside zero-duration fragmented segment(s)\n",
+            "Warning: track 1 carries 1 zero-duration fragmented sample(s)\n",
+            "Warning: track 1 changes average fragmented sample duration 1 time(s)\n",
+            "Warning: track 1 fragmented average sample duration spans 0.000000s to 1.000000s\n",
+            "Warning: track 1 has 1 fragmented decode-timeline regression(s)\n",
+            "Warning: track 1 has a largest fragmented decode-timeline regression of 0.500000s (500 tick(s))\n",
+        )
+    );
+}
+
+#[test]
+fn divide_command_warning_mode_reports_zero_duration_samples_inside_nonzero_duration_segment() {
+    let input = build_fragmented_input_file(
+        vec![build_video_trak_with_profile(1, 640, 360, 0x64, 0x00, 0x1f)],
+        vec![build_track_segment_with_explicit_sample_durations(
+            1,
+            0,
+            &[0, 1_000],
+            8,
+        )],
+    );
+    let input_path = write_temp_file("divide-warning-zero-duration-sample-input", &input);
+    let output_dir = temp_output_dir("divide-warning-zero-duration-sample-output");
+    let args = vec![
+        "-warnings".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Warning: track 1 carries 1 zero-duration fragmented sample(s)\n"
+    );
+}
+
+#[test]
+fn divide_command_warning_mode_reports_authored_fragmented_sample_duration_jitter() {
+    let input = build_fragmented_input_file(
+        vec![build_video_trak_with_profile(1, 640, 360, 0x64, 0x00, 0x1f)],
+        vec![build_track_segment_with_explicit_sample_durations(
+            1,
+            0,
+            &[500, 1_000],
+            8,
+        )],
+    );
+    let input_path = write_temp_file("divide-warning-sample-jitter-input", &input);
+    let output_dir = temp_output_dir("divide-warning-sample-jitter-output");
+    let args = vec![
+        "-warnings".to_string(),
+        input_path.to_string_lossy().into_owned(),
+        output_dir.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = divide::run(&args, &mut stderr);
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&output_dir);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        concat!(
+            "Warning: track 1 changes authored fragmented sample duration 1 time(s)\n",
+            "Warning: track 1 authored fragmented sample duration spans 0.500000s (500 tick(s)) to 1.000000s (1000 tick(s))\n",
+        )
     );
 }
 
@@ -792,16 +1750,36 @@ fn build_avc_and_mhm1_divide_input_file() -> Vec<u8> {
 }
 
 fn build_video_and_custom_audio_divide_input_file(audio_trak: Vec<u8>) -> Vec<u8> {
-    build_fragmented_input_file(
-        vec![
-            build_video_trak_with_profile(1, 640, 360, 0x4d, 0x40, 0x1f),
-            audio_trak,
-        ],
-        vec![
-            build_track_segment(1, 0, 1_000, 8),
-            build_track_segment(2, 0, 1_000, 6),
-        ],
-    )
+    build_video_and_custom_audio_tracks_divide_input_file(vec![audio_trak])
+}
+
+fn build_avc_with_aac_and_ac3_divide_input_file() -> Vec<u8> {
+    build_video_and_custom_audio_tracks_divide_input_file(vec![
+        build_audio_trak(2, 2, 0x40, &[0x11, 0x90]),
+        build_ac3_trak(3, 6),
+    ])
+}
+
+fn build_avc_with_aac_and_ac3_divide_input_file_with_languages(
+    aac_language: [u8; 3],
+    ac3_language: [u8; 3],
+) -> Vec<u8> {
+    build_video_and_custom_audio_tracks_divide_input_file(vec![
+        build_audio_trak_with_language(2, 2, 0x40, &[0x11, 0x90], aac_language),
+        build_ac3_trak_with_language(3, 6, ac3_language),
+    ])
+}
+
+fn build_video_and_custom_audio_tracks_divide_input_file(audio_traks: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut traks = vec![build_video_trak_with_profile(1, 640, 360, 0x4d, 0x40, 0x1f)];
+    traks.extend(audio_traks);
+
+    let mut segments = vec![build_track_segment(1, 0, 1_000, 8)];
+    for track_id in 2..=traks.len() as u32 {
+        segments.push(build_track_segment(track_id, 0, 1_000, 6));
+    }
+
+    build_fragmented_input_file(traks, segments)
 }
 
 fn build_opus_divide_input_file() -> Vec<u8> {
@@ -1064,12 +2042,29 @@ fn build_audio_trak(
     object_type_indication: u8,
     decoder_specific_info: &[u8],
 ) -> Vec<u8> {
+    build_audio_trak_with_language(
+        track_id,
+        channel_count,
+        object_type_indication,
+        decoder_specific_info,
+        *b"und",
+    )
+}
+
+fn build_audio_trak_with_language(
+    track_id: u32,
+    channel_count: u16,
+    object_type_indication: u8,
+    decoder_specific_info: &[u8],
+    language: [u8; 3],
+) -> Vec<u8> {
     let mut tkhd = Tkhd::default();
     tkhd.track_id = track_id;
 
     let mut mdhd = Mdhd::default();
     mdhd.timescale = 1_000;
     mdhd.duration_v0 = 1_000;
+    mdhd.language = encode_mdhd_language(language);
 
     let mut mp4a = AudioSampleEntry::default();
     mp4a.set_box_type(fourcc("mp4a"));
@@ -1279,6 +2274,18 @@ fn build_ac3_trak(track_id: u32, channel_count: u16) -> Vec<u8> {
     )
 }
 
+fn build_ac3_trak_with_language(track_id: u32, channel_count: u16, language: [u8; 3]) -> Vec<u8> {
+    build_audio_trak_with_type_and_children_and_language(
+        track_id,
+        "ac-3",
+        channel_count,
+        48_000,
+        6,
+        &encode_supported_box(&ac3_config(), &[]),
+        language,
+    )
+}
+
 fn build_ac4_trak(track_id: u32, channel_count: u16) -> Vec<u8> {
     build_audio_trak_with_type_and_children(track_id, "ac-4", channel_count, 48_000, 6, &[])
 }
@@ -1433,6 +2440,51 @@ fn build_track_segment(
     [moof, mdat].concat()
 }
 
+fn build_track_segment_with_explicit_sample_durations(
+    track_id: u32,
+    base_media_decode_time: u32,
+    sample_durations: &[u32],
+    sample_size: u32,
+) -> Vec<u8> {
+    let mut tfhd = Tfhd::default();
+    tfhd.track_id = track_id;
+    tfhd.default_sample_size = sample_size;
+    tfhd.set_flags(TFHD_DEFAULT_SAMPLE_SIZE_PRESENT);
+
+    let mut tfdt = Tfdt::default();
+    tfdt.base_media_decode_time_v0 = base_media_decode_time;
+
+    let mut trun = Trun::default();
+    trun.sample_count = sample_durations.len() as u32;
+    trun.entries = sample_durations
+        .iter()
+        .copied()
+        .map(|sample_duration| TrunEntry {
+            sample_duration,
+            sample_size,
+            ..TrunEntry::default()
+        })
+        .collect();
+    trun.set_flags(TRUN_SAMPLE_DURATION_PRESENT | TRUN_SAMPLE_SIZE_PRESENT);
+
+    let trun = encode_supported_box(&trun, &[]);
+    let traf = encode_raw_box(
+        fourcc("traf"),
+        &[
+            encode_supported_box(&tfhd, &[]),
+            encode_supported_box(&tfdt, &[]),
+            trun,
+        ]
+        .concat(),
+    );
+    let moof = encode_raw_box(fourcc("moof"), &traf);
+    let mdat = encode_raw_box(
+        fourcc("mdat"),
+        &vec![0_u8; sample_size as usize * sample_durations.len()],
+    );
+    [moof, mdat].concat()
+}
+
 fn aac_profile_esds(object_type_indication: u8, decoder_specific_info: &[u8]) -> Esds {
     let mut esds = Esds::default();
     esds.descriptors = vec![
@@ -1455,6 +2507,10 @@ fn aac_profile_esds(object_type_indication: u8, decoder_specific_info: &[u8]) ->
         },
     ];
     esds
+}
+
+fn encode_mdhd_language(language: [u8; 3]) -> [u8; 3] {
+    [language[0] - b'`', language[1] - b'`', language[2] - b'`']
 }
 
 fn build_video_trak_with_type_and_children(
@@ -1529,12 +2585,33 @@ fn build_audio_trak_with_type_and_children(
     sample_size: u32,
     sample_entry_children: &[u8],
 ) -> Vec<u8> {
+    build_audio_trak_with_type_and_children_and_language(
+        track_id,
+        sample_entry_type,
+        channel_count,
+        sample_rate,
+        sample_size,
+        sample_entry_children,
+        *b"und",
+    )
+}
+
+fn build_audio_trak_with_type_and_children_and_language(
+    track_id: u32,
+    sample_entry_type: &str,
+    channel_count: u16,
+    sample_rate: u16,
+    sample_size: u32,
+    sample_entry_children: &[u8],
+    language: [u8; 3],
+) -> Vec<u8> {
     let mut tkhd = Tkhd::default();
     tkhd.track_id = track_id;
 
     let mut mdhd = Mdhd::default();
     mdhd.timescale = 1_000;
     mdhd.duration_v0 = 1_000;
+    mdhd.language = encode_mdhd_language(language);
 
     let mut stsd = Stsd::default();
     stsd.entry_count = 1;

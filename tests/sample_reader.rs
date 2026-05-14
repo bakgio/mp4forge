@@ -32,20 +32,21 @@ fn planned_sample_reader_reads_seekable_samples_in_output_order() {
     let mut reader = PlannedSampleReader::new(&mut sources, &plan);
 
     let first = reader.next_sample().unwrap().unwrap();
-    assert_eq!(first.bytes(), b"SYNC");
-    assert_eq!(first.metadata().track_id(), 1);
+    assert_eq!(first.bytes(), b"hello");
+    assert_eq!(first.metadata().track_id(), 2);
     assert_eq!(first.metadata().output_offset(), 0);
-    assert_eq!(first.metadata().output_end_offset(), 4);
-    assert_eq!(first.metadata().decode_end_time(), 5);
-    assert!(first.metadata().is_sync_sample());
+    assert_eq!(first.metadata().output_end_offset(), 5);
+    assert_eq!(first.metadata().decode_end_time(), 4);
+    assert_eq!(first.metadata().composition_time_offset(), 2);
+    assert!(!first.metadata().is_sync_sample());
 
     let second = reader.next_sample().unwrap().unwrap();
-    assert_eq!(second.bytes(), b"hello");
-    assert_eq!(second.metadata().track_id(), 2);
-    assert_eq!(second.metadata().composition_time_offset(), 2);
-    assert_eq!(second.metadata().output_offset(), 4);
+    assert_eq!(second.bytes(), b"SYNC");
+    assert_eq!(second.metadata().track_id(), 1);
+    assert_eq!(second.metadata().output_offset(), 5);
     assert_eq!(second.metadata().output_end_offset(), 9);
-    assert_eq!(second.metadata().decode_end_time(), 4);
+    assert_eq!(second.metadata().decode_end_time(), 5);
+    assert!(second.metadata().is_sync_sample());
 
     let third = reader.next_sample().unwrap().unwrap();
     assert_eq!(third.bytes(), b"xy");
@@ -247,11 +248,11 @@ async fn async_planned_sample_reader_reads_seekable_samples_in_output_order() {
 
     assert_eq!(
         reader.next_sample().await.unwrap().unwrap().bytes(),
-        b"SYNC"
+        b"hello"
     );
     assert_eq!(
         reader.next_sample().await.unwrap().unwrap().bytes(),
-        b"hello"
+        b"SYNC"
     );
     assert_eq!(reader.next_sample().await.unwrap().unwrap().bytes(), b"xy");
     assert!(reader.next_sample().await.unwrap().is_none());

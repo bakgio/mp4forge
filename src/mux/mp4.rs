@@ -13,8 +13,8 @@ use crate::FourCc;
 use crate::async_io::{AsyncReadSeek, AsyncWrite};
 use crate::boxes::AnyTypeBox;
 use crate::boxes::iso14496_12::{
-    AudioSampleEntry, Co64, Ctts, CttsEntry, Dinf, Dref, Edts, Elst, ElstEntry, Ftyp, Hdlr, Mdhd,
-    Mdia, Mehd, Meta, Mfhd, Minf, Moof, Moov, Mvex, Mvhd, Nmhd, Sbgp, SbgpEntry, Sgpd, Sidx,
+    AudioSampleEntry, Btrt, Co64, Ctts, CttsEntry, Dinf, Dref, Edts, Elst, ElstEntry, Ftyp, Hdlr,
+    Mdhd, Mdia, Mehd, Meta, Mfhd, Minf, Moof, Moov, Mvex, Mvhd, Nmhd, Sbgp, SbgpEntry, Sgpd, Sidx,
     SidxReference, Smhd, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stss, Stsz, Stts, SttsEntry,
     TFHD_DEFAULT_BASE_IS_MOOF, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
     TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
@@ -37,17 +37,15 @@ use super::{
 };
 
 const IDENTITY_MATRIX: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
-const TKHD_FLAGS_TRACK_ENABLED: u32 = 0x0000_0001;
-const TKHD_FLAGS_TRACK_IN_MOVIE: u32 = 0x0000_0002;
-const TKHD_FLAGS_TRACK_IN_PREVIEW: u32 = 0x0000_0004;
 const VMHD_DEFAULT_FLAGS: u32 = 0x0000_0001;
 const NON_KEY_SAMPLE_FLAGS: u32 = 0x0001_0000;
-const ID3_OWNER: &str = env!("CARGO_PKG_REPOSITORY");
-const ID3_VERSION: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+const SDSM: FourCc = FourCc::from_bytes(*b"sdsm");
 const ISOM_UNIX_EPOCH_OFFSET: u64 = 2_082_844_800;
+const AUTO_FLAT_PINNED_TIME: u32 = 0;
 const AUTO_FLAT_MOVIE_TIMESCALE: u32 = 600;
-const DEFAULT_FREE_PADDING_SIZE: usize = 67;
-const TOOL_METADATA_ITEM_TYPE: FourCc = FourCc::from_bytes([0xa9, b't', b'o', b'o']);
+const DEFAULT_FREE_PADDING_SIZE: usize = 33;
+const FRAGMENTED_ID3_OWNER: &str = env!("CARGO_PKG_REPOSITORY");
+const FRAGMENTED_ID3_VALUE: &str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 
 pub(super) fn write_mp4_mux<R, W>(
     sources: &mut [R],
@@ -272,8 +270,8 @@ fn build_container_layout(
         u64::try_from(mdat_header.len()).map_err(|_| MuxError::LayoutOverflow("mdat header"))?,
         mdat_data_start,
     )?;
-    let trailing_bytes = if file_config.auto_flat_profile() {
-        build_free_padding_bytes()?
+    let trailing_bytes = if file_config.auto_flat_profile() || file_config.keep_flat_free_box() {
+        build_free_padding_bytes(file_config)?
     } else {
         Vec::new()
     };
@@ -445,12 +443,75 @@ fn build_fragmented_moov_bytes(
     tracks: &[PreparedTrack<'_>],
 ) -> Result<Vec<u8>, MuxError> {
     let mvhd = build_fragmented_mvhd(file_config, tracks)?;
-    let mut children = vec![encode_typed_box(&mvhd, &[])?, build_meta_bytes()?];
+    let mut children = vec![
+        encode_typed_box(&mvhd, &[])?,
+        build_fragmented_meta_bytes()?,
+    ];
     for track in tracks {
         children.push(build_fragmented_trak_bytes(track)?);
     }
     children.push(build_mvex_bytes(file_config.movie_timescale(), tracks)?);
     encode_typed_box(&Moov, &children.concat())
+}
+
+fn build_fragmented_meta_bytes() -> Result<Vec<u8>, MuxError> {
+    let mut id32 = Id32::default();
+    id32.language = "eng".to_string();
+    id32.id3v2_data = build_fragmented_identity_id3_payload();
+
+    let children = [
+        build_fragmented_identity_hdlr_bytes()?,
+        encode_typed_box(&id32, &[])?,
+    ]
+    .concat();
+    encode_typed_box(&Meta::default(), &children)
+}
+
+fn build_fragmented_identity_hdlr_bytes() -> Result<Vec<u8>, MuxError> {
+    let mut payload = Vec::with_capacity(24);
+    payload.extend_from_slice(&[0, 0, 0, 0]);
+    payload.extend_from_slice(&[0, 0, 0, 0]);
+    payload.extend_from_slice(FourCc::from_bytes(*b"ID32").as_bytes().as_ref());
+    payload.extend_from_slice(&[0; 12]);
+
+    let mut bytes = encode_header_only(
+        FourCc::from_bytes(*b"hdlr"),
+        u64::try_from(payload.len())
+            .map_err(|_| MuxError::LayoutOverflow("fragmented meta hdlr"))?,
+        "fragmented meta hdlr",
+    )?;
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+fn build_fragmented_identity_id3_payload() -> Vec<u8> {
+    let mut frame_payload =
+        Vec::with_capacity(FRAGMENTED_ID3_OWNER.len() + 1 + FRAGMENTED_ID3_VALUE.len());
+    frame_payload.extend_from_slice(FRAGMENTED_ID3_OWNER.as_bytes());
+    frame_payload.push(0);
+    frame_payload.extend_from_slice(FRAGMENTED_ID3_VALUE.as_bytes());
+
+    let mut priv_frame = Vec::with_capacity(10 + frame_payload.len());
+    priv_frame.extend_from_slice(b"PRIV");
+    priv_frame.extend_from_slice(&encode_synchsafe_u32(frame_payload.len() as u32));
+    priv_frame.extend_from_slice(&[0, 0]);
+    priv_frame.extend_from_slice(&frame_payload);
+
+    let mut id3 = Vec::with_capacity(10 + priv_frame.len());
+    id3.extend_from_slice(b"ID3");
+    id3.extend_from_slice(&[4, 0, 0]);
+    id3.extend_from_slice(&encode_synchsafe_u32(priv_frame.len() as u32));
+    id3.extend_from_slice(&priv_frame);
+    id3
+}
+
+fn encode_synchsafe_u32(value: u32) -> [u8; 4] {
+    [
+        ((value >> 21) & 0x7F) as u8,
+        ((value >> 14) & 0x7F) as u8,
+        ((value >> 7) & 0x7F) as u8,
+        (value & 0x7F) as u8,
+    ]
 }
 
 fn build_fragmented_mvhd(
@@ -482,6 +543,8 @@ fn build_fragmented_trak_bytes(track: &PreparedTrack<'_>) -> Result<Vec<u8>, Mux
 
 fn build_fragmented_tkhd(track: &PreparedTrack<'_>) -> Result<Tkhd, MuxError> {
     let mut tkhd = build_tkhd_with_movie_timescale(track, track.config.timescale())?;
+    tkhd.set_flags(tkhd.flags() | 0x0000_0004);
+    tkhd.alternate_group = 0;
     tkhd.set_version(0);
     tkhd.creation_time_v0 = u32::try_from(ISOM_UNIX_EPOCH_OFFSET)
         .map_err(|_| MuxError::LayoutOverflow("fragmented tkhd creation_time"))?;
@@ -544,7 +607,7 @@ fn build_fragmented_mdia_bytes(track: &PreparedTrack<'_>) -> Result<Vec<u8>, Mux
 }
 
 fn build_fragmented_mdhd(track: &PreparedTrack<'_>) -> Result<Mdhd, MuxError> {
-    let mut mdhd = build_mdhd(track)?;
+    let mut mdhd = build_mdhd_base(track)?;
     mdhd.set_version(0);
     mdhd.creation_time_v0 = u32::try_from(ISOM_UNIX_EPOCH_OFFSET)
         .map_err(|_| MuxError::LayoutOverflow("fragmented mdhd creation_time"))?;
@@ -606,36 +669,27 @@ fn build_fragmented_stsd_bytes(track: &PreparedTrack<'_>) -> Result<Vec<u8>, Mux
     encode_typed_box(&stsd, &sample_entry_box)
 }
 
-fn build_meta_bytes() -> Result<Vec<u8>, MuxError> {
-    let mut hdlr = Hdlr::default();
-    hdlr.handler_type = FourCc::from_bytes(*b"ID32");
-    let mut id32 = Id32::default();
-    id32.language = "eng".to_string();
-    id32.id3v2_data = build_mux_identity_id3_payload(ID3_VERSION);
-    encode_typed_box(
-        &Meta::default(),
-        &[encode_typed_box(&hdlr, &[])?, encode_typed_box(&id32, &[])?].concat(),
-    )
-}
-
 fn build_mvex_bytes(
     movie_timescale: u32,
     tracks: &[PreparedTrack<'_>],
 ) -> Result<Vec<u8>, MuxError> {
-    let mut fragment_duration = 0_u64;
-    for track in tracks {
-        fragment_duration =
-            fragment_duration.max(fragmented_mehd_duration(movie_timescale, track)?);
+    let mut children = Vec::new();
+    if !fragmented_mvex_uses_implicit_duration(tracks) {
+        let mut fragment_duration = 0_u64;
+        for track in tracks {
+            fragment_duration =
+                fragment_duration.max(fragmented_mehd_duration(movie_timescale, track)?);
+        }
+        let mut mehd = Mehd::default();
+        if fragment_duration > u64::from(u32::MAX) {
+            mehd.set_version(1);
+            mehd.fragment_duration_v1 = fragment_duration;
+        } else {
+            mehd.fragment_duration_v0 = u32::try_from(fragment_duration)
+                .map_err(|_| MuxError::LayoutOverflow("fragmented mehd duration"))?;
+        }
+        children.push(encode_typed_box(&mehd, &[])?);
     }
-    let mut mehd = Mehd::default();
-    if fragment_duration > u64::from(u32::MAX) {
-        mehd.set_version(1);
-        mehd.fragment_duration_v1 = fragment_duration;
-    } else {
-        mehd.fragment_duration_v0 = u32::try_from(fragment_duration)
-            .map_err(|_| MuxError::LayoutOverflow("fragmented mehd duration"))?;
-    }
-    let mut children = vec![encode_typed_box(&mehd, &[])?];
     for track in tracks {
         let mut trex = Trex::default();
         trex.track_id = track.config.track_id();
@@ -648,6 +702,12 @@ fn build_mvex_bytes(
         children.push(encode_typed_box(&trex, &[])?);
     }
     encode_typed_box(&Mvex, &children.concat())
+}
+
+fn fragmented_mvex_uses_implicit_duration(tracks: &[PreparedTrack<'_>]) -> bool {
+    tracks.len() == 1
+        && tracks[0].edit_media_time.is_none()
+        && sample_entry_matches(tracks[0].sample_entry_box, &[b"vp08"])
 }
 
 fn build_fragment_moof_bytes(
@@ -891,15 +951,16 @@ fn build_ftyp_bytes(
     file_config: &MuxFileConfig,
     tracks: &[PreparedTrack<'_>],
 ) -> Result<Vec<u8>, MuxError> {
-    let (major_brand, minor_version, compatible_brands) = if file_config.auto_flat_profile() {
-        infer_auto_flat_ftyp_profile(tracks)
-    } else {
-        (
-            file_config.major_brand(),
-            file_config.minor_version(),
-            file_config.compatible_brands().to_vec(),
-        )
-    };
+    let (major_brand, minor_version, compatible_brands) =
+        if file_config.auto_flat_profile() && !file_config.keep_flat_authority_brands() {
+            infer_auto_flat_ftyp_profile(tracks)
+        } else {
+            (
+                file_config.major_brand(),
+                file_config.minor_version(),
+                file_config.compatible_brands().to_vec(),
+            )
+        };
     let ftyp = Ftyp {
         major_brand,
         minor_version,
@@ -924,6 +985,15 @@ fn infer_auto_flat_ftyp_profile(tracks: &[PreparedTrack<'_>]) -> (FourCc, u32, V
             &[b"hvc1", b"hev1", b"dvh1", b"dvhe"],
         )
     });
+    let has_prores = tracks.iter().any(|track| {
+        sample_entry_matches(
+            track.sample_entry_box,
+            &[b"apco", b"apcn", b"apch", b"apcs", b"ap4x", b"ap4h"],
+        )
+    });
+    let has_avs3 = tracks
+        .iter()
+        .any(|track| sample_entry_matches(track.sample_entry_box, &[b"avs3"]));
     let has_vvc = tracks
         .iter()
         .any(|track| sample_entry_matches(track.sample_entry_box, &[b"vvc1", b"vvi1"]));
@@ -955,6 +1025,13 @@ fn infer_auto_flat_ftyp_profile(tracks: &[PreparedTrack<'_>]) -> (FourCc, u32, V
         brands.push(FourCc::from_bytes(*b"3g2a"));
         return (FourCc::from_bytes(*b"3g2a"), 65_536, brands);
     }
+    if has_prores {
+        return (
+            FourCc::from_bytes(*b"qt  "),
+            0x200,
+            vec![FourCc::from_bytes(*b"qt  ")],
+        );
+    }
     if has_av1 {
         return (
             FourCc::from_bytes(*b"iso4"),
@@ -967,6 +1044,13 @@ fn infer_auto_flat_ftyp_profile(tracks: &[PreparedTrack<'_>]) -> (FourCc, u32, V
             FourCc::from_bytes(*b"iso4"),
             1,
             vec![FourCc::from_bytes(*b"iso4")],
+        );
+    }
+    if has_avs3 {
+        return (
+            FourCc::from_bytes(*b"iso4"),
+            1,
+            vec![FourCc::from_bytes(*b"iso4"), FourCc::from_bytes(*b"cav3")],
         );
     }
     if has_vvc {
@@ -1129,8 +1213,34 @@ fn prepare_track<'a>(
     let mut prepared_samples = Vec::with_capacity(samples.len());
     let mut max_decode_end_media = 0_u64;
     let mut max_presentation_end_media = 0_u64;
+    let timing_override = config.flat_timing_override();
+    if let Some(override_value) = timing_override {
+        if override_value.sample_durations.len() != samples.len() {
+            return Err(MuxError::InvalidOutputLayout {
+                layout: "flat",
+                message: format!(
+                    "track {} authored a timing override with {} sample durations for {} samples",
+                    config.track_id(),
+                    override_value.sample_durations.len(),
+                    samples.len(),
+                ),
+            });
+        }
+        if override_value.composition_offsets.len() != samples.len() {
+            return Err(MuxError::InvalidOutputLayout {
+                layout: "flat",
+                message: format!(
+                    "track {} authored a timing override with {} composition offsets for {} samples",
+                    config.track_id(),
+                    override_value.composition_offsets.len(),
+                    samples.len(),
+                ),
+            });
+        }
+    }
+    let mut overridden_decode_time_media = 0_u64;
 
-    for sample in samples {
+    for (sample_index, sample) in samples.into_iter().enumerate() {
         let staged = sample.staged();
         if let Some(previous_decode_time) = previous_decode_time
             && staged.decode_time() < previous_decode_time
@@ -1143,34 +1253,57 @@ fn prepare_track<'a>(
         }
         previous_decode_time = Some(staged.decode_time());
 
-        let duration_media = scale_movie_time_to_track(
-            config.track_id(),
-            u64::from(staged.duration()),
-            file_config.movie_timescale(),
-            config.timescale(),
-        )?;
-        let composition_offset_media = scale_movie_offset_to_track(
-            config.track_id(),
-            i64::from(staged.composition_time_offset()),
-            file_config.movie_timescale(),
-            config.timescale(),
-        )?;
-        let decode_time_media = scale_movie_time_to_track(
-            config.track_id(),
-            staged.decode_time(),
-            file_config.movie_timescale(),
-            config.timescale(),
-        )?;
-        let decode_end_movie = staged
-            .decode_time()
-            .checked_add(u64::from(staged.duration()))
-            .ok_or(MuxError::LayoutOverflow("track decode end"))?;
-        let decode_end_media = scale_movie_time_to_track(
-            config.track_id(),
-            decode_end_movie,
-            file_config.movie_timescale(),
-            config.timescale(),
-        )?;
+        let (duration_media, composition_offset_media, decode_time_media, decode_end_media) =
+            if let Some(override_value) = timing_override {
+                let duration_media = u64::from(override_value.sample_durations[sample_index]);
+                let composition_offset_media = override_value.composition_offsets[sample_index];
+                let decode_time_media = overridden_decode_time_media;
+                let decode_end_media = decode_time_media
+                    .checked_add(duration_media)
+                    .ok_or(MuxError::LayoutOverflow("track decode end"))?;
+                overridden_decode_time_media = decode_end_media;
+                (
+                    duration_media,
+                    composition_offset_media,
+                    decode_time_media,
+                    decode_end_media,
+                )
+            } else {
+                let duration_media = scale_movie_time_to_track(
+                    config.track_id(),
+                    u64::from(staged.duration()),
+                    file_config.movie_timescale(),
+                    config.timescale(),
+                )?;
+                let composition_offset_media = scale_movie_offset_to_track(
+                    config.track_id(),
+                    i64::from(staged.composition_time_offset()),
+                    file_config.movie_timescale(),
+                    config.timescale(),
+                )?;
+                let decode_time_media = scale_movie_time_to_track(
+                    config.track_id(),
+                    staged.decode_time(),
+                    file_config.movie_timescale(),
+                    config.timescale(),
+                )?;
+                let decode_end_movie = staged
+                    .decode_time()
+                    .checked_add(u64::from(staged.duration()))
+                    .ok_or(MuxError::LayoutOverflow("track decode end"))?;
+                let decode_end_media = scale_movie_time_to_track(
+                    config.track_id(),
+                    decode_end_movie,
+                    file_config.movie_timescale(),
+                    config.timescale(),
+                )?;
+                (
+                    duration_media,
+                    composition_offset_media,
+                    decode_time_media,
+                    decode_end_media,
+                )
+            };
         max_decode_end_media = max_decode_end_media.max(decode_end_media);
         let presentation_end_media = i128::from(decode_time_media)
             .saturating_add(i128::from(composition_offset_media))
@@ -1201,26 +1334,6 @@ fn prepare_track<'a>(
         .map_or(media_duration, |edit_media_time| {
             media_duration.saturating_sub(edit_media_time)
         });
-    let flat_timing_override = if file_config.auto_flat_profile() {
-        if let Some(override_value) = config.flat_timing_override() {
-            if override_value.sample_durations.len() != prepared_samples.len() {
-                return Err(MuxError::InvalidOutputLayout {
-                    layout: "flat",
-                    message: format!(
-                        "track {} authored a flat timing override with {} sample durations for {} samples",
-                        config.track_id(),
-                        override_value.sample_durations.len(),
-                        prepared_samples.len(),
-                    ),
-                });
-            }
-            Some(override_value)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
     Ok(PreparedTrack {
         config,
         sample_entry_box: config.sample_entry_box(),
@@ -1233,7 +1346,7 @@ fn prepare_track<'a>(
         media_duration,
         presentation_duration_media,
         edit_media_time: config.edit_media_time(),
-        flat_timing_override,
+        flat_timing_override: timing_override,
     })
 }
 
@@ -1296,19 +1409,30 @@ fn build_flat_iods_bytes(
     let has_mhm1 = tracks
         .iter()
         .any(|track| sample_entry_matches(track.sample_entry_box, &[b"mhm1"]));
+    let has_dts = tracks.iter().any(|track| {
+        sample_entry_matches(
+            track.sample_entry_box,
+            &[
+                b"dtsc", b"dtse", b"dtsh", b"dtsl", b"dtsm", b"dtsx", b"dtsy",
+            ],
+        )
+    });
     let has_mp4s = tracks
         .iter()
         .any(|track| sample_entry_matches(track.sample_entry_box, &[b"mp4s"]));
     let has_mp4v = tracks
         .iter()
         .any(|track| sample_entry_matches(track.sample_entry_box, &[b"mp4v"]));
+    let has_mpeg2_mp4v = tracks.iter().any(|track| {
+        sample_entry_esds_oti_matches(track.sample_entry_box, &[b"mp4v"], 0x61).unwrap_or(false)
+    });
     let has_theora_mp4v = tracks.iter().any(|track| {
         sample_entry_esds_oti_matches(track.sample_entry_box, &[b"mp4v"], 0xDF).unwrap_or(false)
     });
     let has_other_iods_codec = tracks.iter().any(|track| {
         sample_entry_matches(
             track.sample_entry_box,
-            &[b"mp4v", b"mp4s", b"Opus", b"spex", b"mhm1"],
+            &[b"mp4v", b"mp4s", b"Opus", b"spex"],
         )
     });
     let has_non_mp4a_audio = has_audio
@@ -1319,7 +1443,21 @@ fn build_flat_iods_bytes(
     let has_avc = tracks
         .iter()
         .any(|track| sample_entry_matches(track.sample_entry_box, &[b"avc1"]));
-    if !has_mp4a && !has_avc && !has_other_iods_codec && !has_mp4s {
+    let has_transport_clocked_mhm1 = tracks.iter().any(|track| {
+        sample_entry_matches(track.sample_entry_box, &[b"mhm1"])
+            && sample_entry_audio_sample_rate_int(track.sample_entry_box)
+                .is_some_and(|sample_rate| sample_rate != track.config.timescale())
+    });
+    if has_transport_clocked_mhm1 && !has_avc && !has_mp4a && !has_other_iods_codec && !has_mp4s {
+        return Ok(None);
+    }
+    if !(has_mp4a
+        || has_avc
+        || has_other_iods_codec
+        || has_mp4s
+        || has_mhm1
+        || (has_dts && file_config.allow_audio_only_iods()))
+    {
         return Ok(None);
     }
 
@@ -1332,6 +1470,8 @@ fn build_flat_iods_bytes(
             0xfe
         } else if has_mhm1 {
             0x0c
+        } else if has_dts && !has_avc {
+            0xfe
         } else if has_vorbis_mp4a {
             0x10
         } else if has_mp4a {
@@ -1350,6 +1490,8 @@ fn build_flat_iods_bytes(
             0x15
         } else if has_avc {
             0x7f
+        } else if has_mpeg2_mp4v {
+            0x0c
         } else if has_theora_mp4v {
             0xfe
         } else if has_mp4v {
@@ -1374,28 +1516,36 @@ fn build_flat_udta_bytes(file_config: &MuxFileConfig) -> Result<Option<Vec<u8>>,
     if !file_config.auto_flat_profile() {
         return Ok(None);
     }
+    let Some(encoding_metadata) = file_config.flat_source_encoding_metadata() else {
+        return Ok(None);
+    };
+    if encoding_metadata.is_empty() {
+        return Ok(None);
+    }
 
-    let mut hdlr = Hdlr::default();
-    hdlr.handler_type = FourCc::from_bytes(*b"mdir");
-    hdlr.name.clear();
+    let mut metadata_handler = Hdlr::default();
+    metadata_handler.handler_type = FourCc::from_bytes(*b"mdir");
+    metadata_handler.name.clear();
 
-    let mut tool_item = IlstMetaContainer::default();
-    tool_item.set_box_type(TOOL_METADATA_ITEM_TYPE);
-    let tool_data = Data {
+    let mut encoding_tool_item = IlstMetaContainer::default();
+    encoding_tool_item.set_box_type(FourCc::from_bytes([0xA9, b'e', b'n', b'c']));
+
+    let encoding_tool_data = Data {
         data_type: DATA_TYPE_STRING_UTF8,
         data_lang: 0,
-        data: ID3_VERSION.as_bytes().to_vec(),
+        data: encoding_metadata.as_bytes().to_vec(),
     };
-    let tool_item_bytes = encode_typed_box(&tool_item, &encode_typed_box(&tool_data, &[])?)?;
-    let ilst_bytes = encode_typed_box(&Ilst, &tool_item_bytes)?;
-    let meta_bytes = encode_typed_box(
-        &Meta::default(),
-        &[encode_typed_box(&hdlr, &[])?, ilst_bytes].concat(),
-    )?;
+    let encoding_tool_data_bytes = encode_typed_box(&encoding_tool_data, &[])?;
+    let encoding_tool_item_bytes =
+        encode_typed_box(&encoding_tool_item, &encoding_tool_data_bytes)?;
+    let ilst_bytes = encode_typed_box(&Ilst, &encoding_tool_item_bytes)?;
+    let meta_children = [encode_typed_box(&metadata_handler, &[])?, ilst_bytes].concat();
+    let meta_bytes = encode_typed_box(&Meta::default(), &meta_children)?;
     Ok(Some(encode_typed_box(&Udta, &meta_bytes)?))
 }
 
-fn build_free_padding_bytes() -> Result<Vec<u8>, MuxError> {
+fn build_free_padding_bytes(file_config: &MuxFileConfig) -> Result<Vec<u8>, MuxError> {
+    let _ = file_config;
     encode_raw_box(
         FourCc::from_bytes(*b"free"),
         &[0_u8; DEFAULT_FREE_PADDING_SIZE],
@@ -1430,11 +1580,15 @@ fn build_mvhd(file_config: &MuxFileConfig, tracks: &[PreparedTrack<'_>]) -> Resu
     mvhd.volume = 0x0100;
     mvhd.matrix = IDENTITY_MATRIX;
     mvhd.next_track_id = next_track_id;
+    if file_config.auto_flat_profile() {
+        mvhd.creation_time_v0 = AUTO_FLAT_PINNED_TIME;
+        mvhd.modification_time_v0 = AUTO_FLAT_PINNED_TIME;
+    }
     Ok(mvhd)
 }
 
 fn flat_movie_header_timescale(file_config: &MuxFileConfig) -> u32 {
-    if file_config.auto_flat_profile() {
+    if file_config.auto_flat_profile() && !file_config.preserve_auto_flat_movie_timescale() {
         AUTO_FLAT_MOVIE_TIMESCALE
     } else {
         file_config.movie_timescale()
@@ -1480,7 +1634,13 @@ fn build_trak_bytes(
 }
 
 fn build_tkhd(file_config: &MuxFileConfig, track: &PreparedTrack<'_>) -> Result<Tkhd, MuxError> {
-    build_tkhd_with_movie_timescale(track, flat_movie_header_timescale(file_config))
+    let mut tkhd =
+        build_tkhd_with_movie_timescale(track, flat_movie_header_timescale(file_config))?;
+    if file_config.auto_flat_profile() {
+        tkhd.creation_time_v0 = AUTO_FLAT_PINNED_TIME;
+        tkhd.modification_time_v0 = AUTO_FLAT_PINNED_TIME;
+    }
+    Ok(tkhd)
 }
 
 fn build_tkhd_with_movie_timescale(
@@ -1488,9 +1648,7 @@ fn build_tkhd_with_movie_timescale(
     movie_timescale: u32,
 ) -> Result<Tkhd, MuxError> {
     let mut tkhd = Tkhd::default();
-    tkhd.set_flags(
-        TKHD_FLAGS_TRACK_ENABLED | TKHD_FLAGS_TRACK_IN_MOVIE | TKHD_FLAGS_TRACK_IN_PREVIEW,
-    );
+    tkhd.set_flags(track.config.tkhd_flags());
     tkhd.track_id = track.config.track_id();
     let movie_duration = flat_movie_duration(track, movie_timescale);
     if movie_duration > u64::from(u32::MAX) {
@@ -1501,9 +1659,9 @@ fn build_tkhd_with_movie_timescale(
             u32::try_from(movie_duration).map_err(|_| MuxError::LayoutOverflow("tkhd duration"))?;
     }
     tkhd.layer = 0;
-    tkhd.alternate_group = 1;
+    tkhd.alternate_group = track.config.alternate_group();
     tkhd.volume = track.config.volume();
-    tkhd.matrix = IDENTITY_MATRIX;
+    tkhd.matrix = track.config.matrix();
     tkhd.width = u32::from(track.config.track_width()) << 16;
     tkhd.height = u32::from(track.config.track_height()) << 16;
     Ok(tkhd)
@@ -1516,7 +1674,7 @@ fn build_mdia_bytes(
     mdat_header_size: u64,
     mdat_data_start: u64,
 ) -> Result<Vec<u8>, MuxError> {
-    let mdhd = build_mdhd(track)?;
+    let mdhd = build_mdhd(file_config, track)?;
     let hdlr = build_hdlr(track);
     let minf = build_minf_bytes(
         file_config,
@@ -1534,7 +1692,7 @@ fn build_mdia_bytes(
     encode_typed_box(&Mdia, &children)
 }
 
-fn build_mdhd(track: &PreparedTrack<'_>) -> Result<Mdhd, MuxError> {
+fn build_mdhd_base(track: &PreparedTrack<'_>) -> Result<Mdhd, MuxError> {
     let mut mdhd = Mdhd::default();
     mdhd.timescale = track.config.timescale();
     let media_duration = track
@@ -1552,16 +1710,33 @@ fn build_mdhd(track: &PreparedTrack<'_>) -> Result<Mdhd, MuxError> {
     Ok(mdhd)
 }
 
+fn build_mdhd(file_config: &MuxFileConfig, track: &PreparedTrack<'_>) -> Result<Mdhd, MuxError> {
+    let mut mdhd = build_mdhd_base(track)?;
+    if file_config.auto_flat_profile() {
+        mdhd.creation_time_v0 = AUTO_FLAT_PINNED_TIME;
+        mdhd.modification_time_v0 = AUTO_FLAT_PINNED_TIME;
+    }
+    Ok(mdhd)
+}
+
 fn build_hdlr(track: &PreparedTrack<'_>) -> Hdlr {
     let mut hdlr = Hdlr::default();
     hdlr.handler_type = match track.config.kind() {
         MuxTrackKind::Audio => FourCc::from_bytes(*b"soun"),
-        MuxTrackKind::Video => FourCc::from_bytes(*b"vide"),
+        MuxTrackKind::Video => video_handler_type(track.config.sample_entry_box()),
         MuxTrackKind::Text => FourCc::from_bytes(*b"text"),
         MuxTrackKind::Subtitle => subtitle_handler_type(track.config.sample_entry_box()),
     };
     hdlr.name = track.config.handler_name().to_string();
     hdlr
+}
+
+fn video_handler_type(sample_entry_box: &[u8]) -> FourCc {
+    if sample_entry_matches(sample_entry_box, &[b"mp4s"]) {
+        SDSM
+    } else {
+        FourCc::from_bytes(*b"vide")
+    }
 }
 
 fn subtitle_handler_type(sample_entry_box: &[u8]) -> FourCc {
@@ -1707,9 +1882,15 @@ fn build_stsd_bytes(track: &PreparedTrack<'_>) -> Result<Vec<u8>, MuxError> {
 
 fn build_stts(track: &PreparedTrack<'_>) -> Result<Stts, MuxError> {
     let entries = if let Some(override_value) = track.flat_timing_override {
-        run_length_encode_u32(override_value.sample_durations.iter().copied())
+        encode_stts_runs(
+            track.config.stts_run_encoding_mode(),
+            override_value.sample_durations.iter().copied(),
+        )
     } else {
-        run_length_encode_u32(track.samples.iter().map(|sample| sample.duration_media))
+        encode_stts_runs(
+            track.config.stts_run_encoding_mode(),
+            track.samples.iter().map(|sample| sample.duration_media),
+        )
     };
     let mut stts = Stts::default();
     stts.entry_count =
@@ -1722,6 +1903,18 @@ fn build_stts(track: &PreparedTrack<'_>) -> Result<Stts, MuxError> {
         })
         .collect();
     Ok(stts)
+}
+
+fn encode_stts_runs<I>(encoding_mode: super::SttsRunEncodingMode, values: I) -> Vec<(u32, u32)>
+where
+    I: IntoIterator<Item = u32>,
+{
+    match encoding_mode {
+        super::SttsRunEncodingMode::CollapseIdentical => run_length_encode_u32(values),
+        super::SttsRunEncodingMode::PreservePerSample => {
+            values.into_iter().map(|value| (1, value)).collect()
+        }
+    }
 }
 
 fn build_ctts(track: &PreparedTrack<'_>) -> Result<Option<Ctts>, MuxError> {
@@ -2151,6 +2344,17 @@ fn canonicalize_fragmented_sample_entry_box(sample_entry_box: &[u8]) -> Result<V
             )
         }
         value
+            if value == FourCc::from_bytes(*b"ac-3")
+                || value == FourCc::from_bytes(*b"ac-4")
+                || value == FourCc::from_bytes(*b"Opus") =>
+        {
+            canonicalize_fragmented_audio_sample_entry_box(
+                sample_entry_box,
+                false,
+                &[FourCc::from_bytes(*b"btrt")],
+            )
+        }
+        value
             if value == FourCc::from_bytes(*b"dtsc")
                 || value == FourCc::from_bytes(*b"dtse")
                 || value == FourCc::from_bytes(*b"dtsh")
@@ -2216,6 +2420,31 @@ fn canonicalize_fragmented_audio_sample_entry_box(
     encode_typed_box(&sample_entry, &child_payload)
 }
 
+pub(crate) fn append_audio_sample_entry_btrt(
+    sample_entry_box: &[u8],
+    btrt: &Btrt,
+) -> Result<Vec<u8>, MuxError> {
+    let (sample_entry, child_boxes, trailing_bytes) =
+        decode_audio_sample_entry_parts(sample_entry_box)?;
+    if child_boxes.iter().any(|child_box| {
+        sample_entry_box_type(child_box).ok() == Some(FourCc::from_bytes(*b"btrt"))
+    }) {
+        return Ok(sample_entry_box.to_vec());
+    }
+
+    let mut child_payload = child_boxes.concat();
+    child_payload.extend_from_slice(&encode_typed_box(btrt, &[])?);
+    child_payload.extend_from_slice(&trailing_bytes);
+    encode_typed_box(&sample_entry, &child_payload)
+}
+
+pub(crate) fn strip_audio_sample_entry_immediate_children(
+    sample_entry_box: &[u8],
+    stripped_children: &[FourCc],
+) -> Result<Vec<u8>, MuxError> {
+    canonicalize_fragmented_audio_sample_entry_box(sample_entry_box, false, stripped_children)
+}
+
 fn canonicalize_fragmented_esds_box(esds_box: &[u8]) -> Result<Vec<u8>, MuxError> {
     let mut esds = decode_typed_box::<Esds>(esds_box)?;
     for descriptor in &mut esds.descriptors {
@@ -2268,6 +2497,11 @@ fn decode_audio_sample_entry_parts(
     .map_err(|_| MuxError::LayoutOverflow("audio sample-entry decode"))?;
     split_box_children_and_trailing(sample_entry_box, cursor.position())
         .map(|(children, trailing)| (sample_entry, children, trailing))
+}
+
+fn sample_entry_audio_sample_rate_int(sample_entry_box: &[u8]) -> Option<u32> {
+    let (sample_entry, _, _) = decode_audio_sample_entry_parts(sample_entry_box).ok()?;
+    Some(u32::from(sample_entry.sample_rate_int()))
 }
 
 fn decode_typed_box<B>(encoded_box: &[u8]) -> Result<B, MuxError>
@@ -2336,48 +2570,6 @@ fn sample_entry_box_type(sample_entry_box: &[u8]) -> Result<FourCc, MuxError> {
     let info = BoxInfo::read(&mut cursor)
         .map_err(|_| MuxError::LayoutOverflow("sample-entry box header"))?;
     Ok(info.box_type())
-}
-
-fn build_mux_identity_id3_payload(version: &str) -> Vec<u8> {
-    if version.is_empty() {
-        return Vec::new();
-    }
-
-    let owner = ID3_OWNER.as_bytes();
-    let value = version.as_bytes();
-    let frame_payload_size = owner
-        .len()
-        .checked_add(1)
-        .and_then(|size| size.checked_add(value.len()))
-        .and_then(|size| u32::try_from(size).ok())
-        .unwrap_or(0);
-
-    let mut frames = Vec::new();
-    frames.extend_from_slice(b"PRIV");
-    frames.extend_from_slice(&encode_synchsafe_u32(frame_payload_size));
-    frames.extend_from_slice(&0_u16.to_be_bytes());
-    frames.extend_from_slice(owner);
-    frames.push(0);
-    frames.extend_from_slice(value);
-
-    let mut id3 = Vec::new();
-    id3.extend_from_slice(b"ID3");
-    id3.push(0x04);
-    id3.push(0x00);
-    id3.push(0x00);
-    id3.extend_from_slice(&encode_synchsafe_u32(
-        u32::try_from(frames.len()).unwrap_or(0),
-    ));
-    id3.extend_from_slice(&frames);
-    id3
-}
-
-fn encode_synchsafe_u32(value: u32) -> [u8; 4] {
-    let encoded = (value & 0x7F)
-        | (((value >> 7) & 0x7F) << 8)
-        | (((value >> 14) & 0x7F) << 16)
-        | (((value >> 21) & 0x7F) << 24);
-    encoded.to_be_bytes()
 }
 
 fn copy_fragment_payloads<R, W>(

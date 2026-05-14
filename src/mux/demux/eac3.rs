@@ -21,11 +21,13 @@ use super::container_common::read_segmented_bytes_sync;
 
 pub(in crate::mux) struct ParsedEac3Track {
     pub(in crate::mux) sample_rate: u32,
+    pub(in crate::mux) decoder_config: Eac3DecoderConfig,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
-struct Eac3DecoderConfig {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::mux) struct Eac3DecoderConfig {
     sample_rate: u32,
     channel_count: u16,
     fscod: u8,
@@ -100,6 +102,7 @@ pub(in crate::mux) fn scan_eac3_file_sync(
     })?;
     Ok(ParsedEac3Track {
         sample_rate: decoder_config.sample_rate,
+        decoder_config,
         sample_entry_box: build_eac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
     })
@@ -172,6 +175,7 @@ pub(in crate::mux) fn scan_eac3_segmented_sync(
     })?;
     Ok(ParsedEac3Track {
         sample_rate: decoder_config.sample_rate,
+        decoder_config,
         sample_entry_box: build_eac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
     })
@@ -244,6 +248,7 @@ pub(in crate::mux) async fn scan_eac3_file_async(
     })?;
     Ok(ParsedEac3Track {
         sample_rate: decoder_config.sample_rate,
+        decoder_config,
         sample_entry_box: build_eac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
     })
@@ -318,6 +323,7 @@ pub(in crate::mux) async fn scan_eac3_segmented_async(
     })?;
     Ok(ParsedEac3Track {
         sample_rate: decoder_config.sample_rate,
+        decoder_config,
         sample_entry_box: build_eac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
     })
@@ -417,9 +423,24 @@ fn parse_eac3_frame_header(
     ))
 }
 
-fn build_eac3_sample_entry_box(
+pub(in crate::mux) fn build_eac3_sample_entry_box(
     parsed: &Eac3DecoderConfig,
     samples: &[StagedSample],
+) -> Result<Vec<u8>, MuxError> {
+    build_eac3_sample_entry_box_with_timescale(parsed, samples, parsed.sample_rate)
+}
+
+pub(in crate::mux) fn build_eac3_sample_entry_box_with_timescale(
+    parsed: &Eac3DecoderConfig,
+    samples: &[StagedSample],
+    timescale: u32,
+) -> Result<Vec<u8>, MuxError> {
+    build_eac3_sample_entry_box_with_btrt(parsed, build_eac3_btrt(samples, timescale)?)
+}
+
+pub(in crate::mux) fn build_eac3_sample_entry_box_with_btrt(
+    parsed: &Eac3DecoderConfig,
+    btrt: Btrt,
 ) -> Result<Vec<u8>, MuxError> {
     let mut sample_entry = AudioSampleEntry::default();
     sample_entry.set_box_type(FourCc::from_bytes(*b"ec-3"));
@@ -427,11 +448,10 @@ fn build_eac3_sample_entry_box(
         box_type: FourCc::from_bytes(*b"ec-3"),
         data_reference_index: 1,
     };
-    sample_entry.channel_count = parsed.channel_count;
+    sample_entry.channel_count = eac3_sample_entry_channel_count(parsed);
     sample_entry.sample_size = 16;
     sample_entry.sample_rate = parsed.sample_rate << 16;
 
-    let btrt = build_eac3_btrt(samples, parsed.sample_rate)?;
     let dec3 = super::super::mp4::encode_typed_box(
         &Dec3 {
             data_rate: u16::try_from(btrt.avg_bitrate / 1_000)
@@ -455,6 +475,23 @@ fn build_eac3_sample_entry_box(
     let mut children = dec3;
     children.extend_from_slice(&btrt);
     super::super::mp4::encode_typed_box(&sample_entry, &children)
+}
+
+const fn eac3_sample_entry_channel_count(parsed: &Eac3DecoderConfig) -> u16 {
+    // Keep the authored `AudioSampleEntry.channel_count` aligned with the EC-3
+    // sample-entry convention used by the retained flat-parity overlap, which
+    // keeps the base dependent-layout count separate from the `dec3` LFE flag.
+    match parsed.acmod {
+        0 => 2,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 3,
+        5 => 4,
+        6 => 4,
+        7 => 5,
+        _ => parsed.channel_count,
+    }
 }
 
 fn build_eac3_btrt(samples: &[StagedSample], sample_rate: u32) -> Result<Btrt, MuxError> {

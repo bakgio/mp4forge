@@ -37,11 +37,19 @@ const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: [u8; 16] = [
 ];
 
 pub(in crate::mux) struct ParsedPcmTrack {
+    pub(in crate::mux) container_kind: PcmContainerKind,
     pub(in crate::mux) sample_rate: u32,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) data_offset: u64,
     pub(in crate::mux) frame_size: u32,
     pub(in crate::mux) frame_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::mux) enum PcmContainerKind {
+    Wave,
+    Aiff,
+    Aifc,
 }
 
 #[derive(Clone, Copy)]
@@ -101,7 +109,14 @@ fn parse_pcm_stream_sync(
     if &header[..4] == RIFF && &header[8..12] == WAVE {
         validate_riff_wave_header(&header, file_size, spec)?;
         let (format, data_offset, data_size) = parse_wave_chunks_sync(file, file_size, spec)?;
-        return finalize_pcm_track(format, data_offset, data_size, None, spec);
+        return finalize_pcm_track(
+            PcmContainerKind::Wave,
+            format,
+            data_offset,
+            data_size,
+            None,
+            spec,
+        );
     }
     if &header[..4] == FORM && (&header[8..12] == AIFF || &header[8..12] == AIFC) {
         validate_aiff_form_header(&header, file_size, spec)?;
@@ -109,6 +124,11 @@ fn parse_pcm_stream_sync(
         let (common, data_offset, data_size) =
             parse_aiff_chunks_sync(file, file_size, is_aifc, spec)?;
         return finalize_pcm_track(
+            if is_aifc {
+                PcmContainerKind::Aifc
+            } else {
+                PcmContainerKind::Aiff
+            },
             common.format,
             data_offset,
             data_size,
@@ -147,7 +167,14 @@ async fn parse_pcm_stream_async(
         validate_riff_wave_header(&header, file_size, spec)?;
         let (format, data_offset, data_size) =
             parse_wave_chunks_async(file, file_size, spec).await?;
-        return finalize_pcm_track(format, data_offset, data_size, None, spec);
+        return finalize_pcm_track(
+            PcmContainerKind::Wave,
+            format,
+            data_offset,
+            data_size,
+            None,
+            spec,
+        );
     }
     if &header[..4] == FORM && (&header[8..12] == AIFF || &header[8..12] == AIFC) {
         validate_aiff_form_header(&header, file_size, spec)?;
@@ -155,6 +182,11 @@ async fn parse_pcm_stream_async(
         let (common, data_offset, data_size) =
             parse_aiff_chunks_async(file, file_size, is_aifc, spec).await?;
         return finalize_pcm_track(
+            if is_aifc {
+                PcmContainerKind::Aifc
+            } else {
+                PcmContainerKind::Aiff
+            },
             common.format,
             data_offset,
             data_size,
@@ -1068,6 +1100,7 @@ fn parse_pcm_format_without_stride(
 }
 
 fn finalize_pcm_track(
+    container_kind: PcmContainerKind,
     format: ParsedPcmFormat,
     data_offset: u64,
     data_size: u32,
@@ -1107,6 +1140,7 @@ fn finalize_pcm_track(
     }
     let sample_entry_box = build_wave_sample_entry_box(&format)?;
     Ok(ParsedPcmTrack {
+        container_kind,
         sample_rate: format.sample_rate,
         sample_entry_box,
         data_offset,

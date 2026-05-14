@@ -13,7 +13,10 @@ use crate::boxes::iso14496_12::{AudioSampleEntry, Btrt, SampleEntry};
 use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
-use super::super::import::{StagedSample, read_exact_at_sync};
+use super::super::import::{SegmentedMuxSourceSegment, StagedSample, read_exact_at_sync};
+#[cfg(feature = "async")]
+use super::container_common::read_segmented_bytes_async;
+use super::container_common::read_segmented_bytes_sync;
 pub(in crate::mux) struct ParsedAc4Track {
     pub(in crate::mux) media_time_scale: u32,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
@@ -207,6 +210,53 @@ pub(in crate::mux) fn scan_ac4_file_sync(
     })
 }
 
+pub(in crate::mux) fn scan_ac4_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedAc4Track, MuxError> {
+    let first_frame = read_ac4_frame_header_segmented_sync(file, segments, total_size, 0, spec)?;
+    let first_payload =
+        read_ac4_frame_payload_segmented_sync(file, segments, total_size, 0, first_frame, spec)?;
+    let parsed_stream = parse_ac4_stream(&first_payload, spec)?;
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    while offset < total_size {
+        let frame = read_ac4_frame_header_segmented_sync(file, segments, total_size, offset, spec)?;
+        samples.push(StagedSample {
+            data_offset: offset
+                .checked_add(frame.header_size)
+                .ok_or(MuxError::LayoutOverflow("AC-4 payload offset"))?,
+            data_size: u32::try_from(frame.frame_payload_size)
+                .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?,
+            duration: parsed_stream.sample_duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        offset = offset
+            .checked_add(frame.total_frame_size)
+            .ok_or(MuxError::LayoutOverflow("AC-4 frame offset"))?;
+    }
+    if samples.is_empty() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "AC-4 input contained no syncframes".to_string(),
+        });
+    }
+    Ok(ParsedAc4Track {
+        media_time_scale: parsed_stream.media_time_scale,
+        sample_entry_box: build_ac4_sample_entry_box(
+            parsed_stream.channel_count,
+            parsed_stream.sample_rate,
+            parsed_stream.media_time_scale,
+            &samples,
+            &serialize_ac4_dac4(&parsed_stream, spec)?,
+        )?,
+        samples,
+    })
+}
+
 #[cfg(feature = "async")]
 pub(in crate::mux) async fn scan_ac4_file_async(
     path: &Path,
@@ -221,6 +271,57 @@ pub(in crate::mux) async fn scan_ac4_file_async(
     let mut samples = Vec::new();
     while offset < file_size {
         let frame = read_ac4_frame_header_async(&mut file, file_size, offset, spec).await?;
+        samples.push(StagedSample {
+            data_offset: offset
+                .checked_add(frame.header_size)
+                .ok_or(MuxError::LayoutOverflow("AC-4 payload offset"))?,
+            data_size: u32::try_from(frame.frame_payload_size)
+                .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?,
+            duration: parsed_stream.sample_duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        offset = offset
+            .checked_add(frame.total_frame_size)
+            .ok_or(MuxError::LayoutOverflow("AC-4 frame offset"))?;
+    }
+    if samples.is_empty() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "AC-4 input contained no syncframes".to_string(),
+        });
+    }
+    Ok(ParsedAc4Track {
+        media_time_scale: parsed_stream.media_time_scale,
+        sample_entry_box: build_ac4_sample_entry_box(
+            parsed_stream.channel_count,
+            parsed_stream.sample_rate,
+            parsed_stream.media_time_scale,
+            &samples,
+            &serialize_ac4_dac4(&parsed_stream, spec)?,
+        )?,
+        samples,
+    })
+}
+
+#[cfg(feature = "async")]
+pub(in crate::mux) async fn scan_ac4_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    spec: &str,
+) -> Result<ParsedAc4Track, MuxError> {
+    let first_frame =
+        read_ac4_frame_header_segmented_async(file, segments, total_size, 0, spec).await?;
+    let first_payload =
+        read_ac4_frame_payload_segmented_async(file, segments, total_size, 0, first_frame, spec)
+            .await?;
+    let parsed_stream = parse_ac4_stream(&first_payload, spec)?;
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    while offset < total_size {
+        let frame =
+            read_ac4_frame_header_segmented_async(file, segments, total_size, offset, spec).await?;
         samples.push(StagedSample {
             data_offset: offset
                 .checked_add(frame.header_size)
@@ -292,6 +393,49 @@ fn read_ac4_frame_header_sync(
     parse_ac4_frame_header(&header, file_size, offset, spec)
 }
 
+fn read_ac4_frame_header_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<Ac4FrameHeader, MuxError> {
+    let mut header = [0_u8; 7];
+    if total_size - offset < 4 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated AC-4 syncframe header".to_string(),
+        });
+    }
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut header[..4],
+        spec,
+        "truncated AC-4 syncframe header",
+    )?;
+    if u16::from_be_bytes([header[2], header[3]]) == 0xFFFF {
+        if total_size - offset < 7 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated extended AC-4 syncframe header".to_string(),
+            });
+        }
+        read_segmented_bytes_sync(
+            file,
+            segments,
+            total_size,
+            offset,
+            &mut header,
+            spec,
+            "truncated extended AC-4 syncframe header",
+        )?;
+    }
+    parse_ac4_frame_header(&header, total_size, offset, spec)
+}
+
 #[cfg(feature = "async")]
 async fn read_ac4_frame_header_async(
     file: &mut TokioFile,
@@ -331,6 +475,52 @@ async fn read_ac4_frame_header_async(
         .await?;
     }
     parse_ac4_frame_header(&header, file_size, offset, spec)
+}
+
+#[cfg(feature = "async")]
+async fn read_ac4_frame_header_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<Ac4FrameHeader, MuxError> {
+    let mut header = [0_u8; 7];
+    if total_size - offset < 4 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated AC-4 syncframe header".to_string(),
+        });
+    }
+    read_segmented_bytes_async(
+        file,
+        segments,
+        total_size,
+        offset,
+        &mut header[..4],
+        spec,
+        "truncated AC-4 syncframe header",
+    )
+    .await?;
+    if u16::from_be_bytes([header[2], header[3]]) == 0xFFFF {
+        if total_size - offset < 7 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated extended AC-4 syncframe header".to_string(),
+            });
+        }
+        read_segmented_bytes_async(
+            file,
+            segments,
+            total_size,
+            offset,
+            &mut header,
+            spec,
+            "truncated extended AC-4 syncframe header",
+        )
+        .await?;
+    }
+    parse_ac4_frame_header(&header, total_size, offset, spec)
 }
 
 fn parse_ac4_frame_header(
@@ -424,6 +614,33 @@ fn read_ac4_frame_payload_sync(
     Ok(payload)
 }
 
+fn read_ac4_frame_payload_segmented_sync(
+    file: &mut File,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    header: Ac4FrameHeader,
+    spec: &str,
+) -> Result<Vec<u8>, MuxError> {
+    let mut payload = vec![
+        0_u8;
+        usize::try_from(header.frame_payload_size)
+            .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?
+    ];
+    read_segmented_bytes_sync(
+        file,
+        segments,
+        total_size,
+        offset
+            .checked_add(header.header_size)
+            .ok_or(MuxError::LayoutOverflow("AC-4 payload offset"))?,
+        &mut payload,
+        spec,
+        "truncated AC-4 frame payload",
+    )?;
+    Ok(payload)
+}
+
 #[cfg(feature = "async")]
 async fn read_ac4_frame_payload_async(
     file: &mut TokioFile,
@@ -438,6 +655,35 @@ async fn read_ac4_frame_payload_async(
     ];
     read_exact_at_async(
         file,
+        offset
+            .checked_add(header.header_size)
+            .ok_or(MuxError::LayoutOverflow("AC-4 payload offset"))?,
+        &mut payload,
+        spec,
+        "truncated AC-4 frame payload",
+    )
+    .await?;
+    Ok(payload)
+}
+
+#[cfg(feature = "async")]
+async fn read_ac4_frame_payload_segmented_async(
+    file: &mut TokioFile,
+    segments: &[SegmentedMuxSourceSegment],
+    total_size: u64,
+    offset: u64,
+    header: Ac4FrameHeader,
+    spec: &str,
+) -> Result<Vec<u8>, MuxError> {
+    let mut payload = vec![
+        0_u8;
+        usize::try_from(header.frame_payload_size)
+            .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?
+    ];
+    read_segmented_bytes_async(
+        file,
+        segments,
+        total_size,
         offset
             .checked_add(header.header_size)
             .ok_or(MuxError::LayoutOverflow("AC-4 payload offset"))?,
