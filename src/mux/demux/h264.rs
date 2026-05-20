@@ -751,17 +751,20 @@ fn finalize_h264_staged_track(
     }
     state.trim_leading_non_sync_samples(spec)?;
 
-    let sample_timing = derive_h264_sample_timing_from_poc(
-        &state.sample_first_vcl_nals,
-        &state.samples,
-        &sps_info,
-        &pps_info,
-        sample_duration,
-        u64::from(sample_duration),
-        spec,
-    );
+    let single_sample = state.samples.len() == 1;
+    let sample_timing = (!single_sample).then(|| {
+        derive_h264_sample_timing_from_poc(
+            &state.sample_first_vcl_nals,
+            &state.samples,
+            &sps_info,
+            &pps_info,
+            sample_duration,
+            u64::from(sample_duration),
+            spec,
+        )
+    });
     let mut source_edit_media_time = None;
-    if let Some(sample_timing) = sample_timing {
+    if let Some(Some(sample_timing)) = sample_timing {
         for (sample, composition_time_offset) in state
             .samples
             .iter_mut()
@@ -784,17 +787,21 @@ fn finalize_h264_staged_track(
             .iter()
             .map(|sample| (sample.duration, sample.composition_time_offset)),
     )?;
-    let sample_entry_box = retune_carried_h264_sample_entry_box(
-        &authored_sample_entry_box,
-        timescale,
-        Some(authored_media_duration),
-        state
-            .samples
-            .iter()
-            .map(|sample| (sample.data_size, sample.duration)),
-        false,
-        false,
-    )?;
+    let sample_entry_box = if single_sample {
+        authored_sample_entry_box
+    } else {
+        retune_carried_h264_sample_entry_box(
+            &authored_sample_entry_box,
+            timescale,
+            Some(authored_media_duration),
+            state
+                .samples
+                .iter()
+                .map(|sample| (sample.data_size, sample.duration)),
+            false,
+            false,
+        )?
+    };
     let track_width = display_track_width(sps_info.width, sps_info.pixel_aspect_ratio.as_ref());
     Ok(IndexedAnnexBTrack {
         segmented_source: SegmentedMuxSourceSpec {

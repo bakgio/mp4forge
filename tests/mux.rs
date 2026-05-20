@@ -6957,6 +6957,104 @@ fn mux_to_path_flat_auto_profile_keeps_avc_plus_aac_visual_profile_at_7f() {
 }
 
 #[test]
+fn mux_to_path_flat_single_sample_h264_plus_aac_omits_video_lead_in_boxes() {
+    let h264_input = write_test_h264_annexb_file("mux-flat-h264-aac-lead-in-h264-input", &[b"idr"]);
+    let aac_input = write_test_adts_file("mux-flat-h264-aac-lead-in-aac-input", &[b"abcdef"]);
+    let output_path = write_temp_file("mux-flat-h264-aac-lead-in-output", &[]);
+    let request = MuxRequest::new(vec![
+        MuxTrackSpec::path(&h264_input),
+        MuxTrackSpec::path(&aac_input),
+    ]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let video_ctts = extract_boxes::<Ctts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("ctts"),
+        ]),
+    );
+    let video_elst = extract_boxes::<Elst>(
+        &output_bytes,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("edts"), fourcc("elst")]),
+    );
+    let video_btrt = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("avc1"),
+            fourcc("btrt"),
+        ]),
+    );
+    assert!(video_ctts.is_empty());
+    assert!(video_elst.is_empty());
+    assert!(video_btrt.is_empty());
+}
+
+#[test]
+fn mux_to_path_flat_single_sample_h264_multi_audio_omits_video_lead_in_boxes() {
+    let h264_input =
+        write_test_h264_annexb_file("mux-flat-h264-multi-audio-lead-in-h264-input", &[b"idr"]);
+    let aac_input =
+        write_test_adts_file("mux-flat-h264-multi-audio-lead-in-aac-input", &[b"abcdef"]);
+    let mp3_input =
+        write_test_mp3_file("mux-flat-h264-multi-audio-lead-in-mp3-input", &[b"abcdef"]);
+    let output_path = write_temp_file("mux-flat-h264-multi-audio-lead-in-output", &[]);
+    let request = MuxRequest::new(vec![
+        MuxTrackSpec::path(&h264_input),
+        MuxTrackSpec::path(&aac_input),
+        MuxTrackSpec::path(&mp3_input),
+    ]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let video_ctts = extract_boxes::<Ctts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("ctts"),
+        ]),
+    );
+    let video_elst = extract_boxes::<Elst>(
+        &output_bytes,
+        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("edts"), fourcc("elst")]),
+    );
+    let video_btrt = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("avc1"),
+            fourcc("btrt"),
+        ]),
+    );
+
+    assert!(video_ctts.is_empty());
+    assert!(video_elst.is_empty());
+    assert!(video_btrt.is_empty());
+}
+
+#[test]
 fn mux_to_path_flat_auto_profile_keeps_avc_plus_aac_plus_ac3_visual_profile_at_7f() {
     let h264_input =
         write_test_h264_annexb_file("mux-flat-h264-aac-ac3-iods-h264-input", &[b"idr"]);

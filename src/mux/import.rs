@@ -922,6 +922,7 @@ struct ImportedTrackHeaderPolicy {
     source_movie_timescale: Option<u32>,
     source_media_duration: Option<u64>,
     source_edit_segment_duration: Option<u64>,
+    source_stss_first_only: bool,
 }
 
 const DEFAULT_IMPORTED_TKHD_FLAGS: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
@@ -947,6 +948,7 @@ const fn default_imported_track_header_policy(kind: MuxTrackKind) -> ImportedTra
         source_movie_timescale: None,
         source_media_duration: None,
         source_edit_segment_duration: None,
+        source_stss_first_only: false,
     }
 }
 
@@ -2148,7 +2150,10 @@ fn finish_prepared_request(
                 .unwrap_or_else(|| default_imported_track_header_policy(imported_track.kind))
                 .matrix,
         )
-        .with_sync_sample_table_mode(sync_sample_table_mode_for_imported_track(imported_track))
+        .with_sync_sample_table_mode(sync_sample_table_mode_for_imported_track(
+            imported_track,
+            request.output_layout(),
+        ))
         .with_stts_run_encoding_mode(stts_run_encoding_mode_for_imported_track(imported_track))
         .with_stsc_run_encoding_mode(stsc_run_encoding_mode_for_imported_track(imported_track));
         let config = if request.output_layout() == MuxOutputLayout::Fragmented
@@ -4074,6 +4079,7 @@ where
             source_movie_timescale,
             components.sample_roll_distance,
             components.emit_roll_sbgp,
+            false,
             true,
             None,
             None,
@@ -4256,6 +4262,9 @@ where
         source_movie_timescale,
         sample_roll_distance,
         emit_roll_sbgp,
+        stss
+            .as_ref()
+            .is_some_and(|stss| stss.entry_count == 1 && stss.sample_number.as_slice() == [1]),
         stts.entry_count == 0,
         Some(flat_chunk_sample_counts),
         Some(stsc),
@@ -4278,6 +4287,7 @@ fn build_track_candidate_from_components(
     source_movie_timescale: u32,
     sample_roll_distance: Option<i16>,
     emit_roll_sbgp: bool,
+    source_stss_first_only: bool,
     source_had_empty_stts: bool,
     flat_chunk_sample_counts: Option<Vec<u32>>,
     flat_stsc: Option<Stsc>,
@@ -4375,6 +4385,7 @@ fn build_track_candidate_from_components(
                 source_movie_timescale: Some(source_movie_timescale),
                 source_media_duration: Some(mdhd.duration()),
                 source_edit_segment_duration,
+                source_stss_first_only,
             }),
             width,
             height,
@@ -7400,7 +7411,7 @@ mod tests {
             },
             &[
                 crate::mux::mp4::encode_typed_box(
-                    &crate::boxes::iso14496_14::Esds::default(),
+                    &esds,
                     &[],
                 )
                 .unwrap(),
@@ -7440,6 +7451,96 @@ mod tests {
             super::sample_entry_box_type(&child_boxes[0]),
             Some(FourCc::from_bytes(*b"esds"))
         );
+    }
+
+    #[test]
+    fn normalize_imported_fragmented_mp4a_sample_entry_box_preserves_imported_decoder_bitrates() {
+        let mut imported_track = imported_track(MuxTrackKind::Audio, Some(1), 0);
+        imported_track.timescale = 48_000;
+        let mut esds = mp4a_profile_esds(0x40, &[0x12, 0x10]);
+        for descriptor in &mut esds.descriptors {
+            if descriptor.tag == crate::boxes::iso14496_14::ES_DESCRIPTOR_TAG
+                && let Some(es_descriptor) = descriptor.es_descriptor.as_mut()
+            {
+                es_descriptor.es_id = 9;
+            }
+            if descriptor.tag == crate::boxes::iso14496_14::DECODER_CONFIG_DESCRIPTOR_TAG
+                && let Some(config) = descriptor.decoder_config_descriptor.as_mut()
+            {
+                config.buffer_size_db = 17;
+                config.max_bitrate = 128_000;
+                config.avg_bitrate = 121_839;
+            }
+        }
+        imported_track.sample_entry_box = crate::mux::mp4::encode_typed_box(
+            &crate::boxes::iso14496_12::AudioSampleEntry {
+                sample_entry: crate::boxes::iso14496_12::SampleEntry {
+                    box_type: FourCc::from_bytes(*b"mp4a"),
+                    data_reference_index: 1,
+                },
+                channel_count: 2,
+                sample_size: 16,
+                sample_rate: 48_000 << 16,
+                ..crate::boxes::iso14496_12::AudioSampleEntry::default()
+            },
+            &[
+                crate::mux::mp4::encode_typed_box(&esds, &[]).unwrap(),
+                crate::mux::mp4::encode_typed_box(
+                    &crate::boxes::iso14496_12::Btrt {
+                        buffer_size_db: 4_096,
+                        max_bitrate: 133_952,
+                        avg_bitrate: 121_832,
+                    },
+                    &[],
+                )
+                .unwrap(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        imported_track.samples = vec![
+            ImportedSample {
+                source_index: 0,
+                data_offset: 0,
+                data_size: 512,
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            ImportedSample {
+                source_index: 0,
+                data_offset: 512,
+                data_size: 1_536,
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+        ];
+
+        let normalized = super::normalize_imported_sample_entry_box(
+            &imported_track,
+            None,
+            MuxOutputLayout::Fragmented,
+        )
+        .unwrap();
+        let child_boxes =
+            crate::mux::mp4::audio_sample_entry_immediate_children(&normalized).unwrap();
+        let normalized_esds =
+            crate::mux::mp4::decode_typed_box::<crate::boxes::iso14496_14::Esds>(&child_boxes[0])
+                .unwrap();
+
+        let mut normalized_decoder_config = None;
+        for descriptor in normalized_esds.descriptors {
+            if descriptor.tag == crate::boxes::iso14496_14::DECODER_CONFIG_DESCRIPTOR_TAG {
+                normalized_decoder_config = descriptor.decoder_config_descriptor;
+            }
+        }
+        let normalized_decoder_config = normalized_decoder_config.unwrap();
+
+        assert_eq!(child_boxes.len(), 1);
+        assert_eq!(normalized_decoder_config.buffer_size_db, 0);
+        assert_eq!(normalized_decoder_config.max_bitrate, 128_000);
+        assert_eq!(normalized_decoder_config.avg_bitrate, 121_839);
     }
 
     #[test]
@@ -8164,6 +8265,76 @@ mod tests {
                 1,
                 vec![FourCc::from_bytes(*b"isom"), FourCc::from_bytes(*b"iso4")],
             )
+        );
+    }
+
+    #[test]
+    fn sync_sample_table_mode_for_imported_track_uses_auto_for_fragmented_hevc() {
+        let mut imported_track = imported_track(MuxTrackKind::Video, Some(1), 0);
+        imported_track.sample_entry_box = crate::mux::mp4::encode_typed_box(
+            &crate::boxes::iso14496_12::VisualSampleEntry {
+                sample_entry: crate::boxes::iso14496_12::SampleEntry {
+                    box_type: FourCc::from_bytes(*b"hvc1"),
+                    data_reference_index: 1,
+                },
+                width: 1,
+                height: 1,
+                ..crate::boxes::iso14496_12::VisualSampleEntry::default()
+            },
+            &[],
+        )
+        .unwrap();
+        imported_track.mux_policy = super::imported_track_mux_policy_for_sample_entry_type(
+            FourCc::from_bytes(*b"hvc1"),
+            &imported_track.sample_entry_box,
+            MuxTrackKind::Video,
+        );
+
+        assert_eq!(
+            super::sync_sample_table_mode_for_imported_track(
+                &imported_track,
+                MuxOutputLayout::Fragmented,
+            ),
+            super::SyncSampleTableMode::Auto
+        );
+        assert_eq!(
+            super::sync_sample_table_mode_for_imported_track(&imported_track, MuxOutputLayout::Flat),
+            super::SyncSampleTableMode::ForceFirstOnly
+        );
+    }
+
+    #[test]
+    fn sync_sample_table_mode_for_imported_track_preserves_first_only_fragmented_hevc() {
+        let mut imported_track = imported_track(MuxTrackKind::Video, Some(1), 0);
+        imported_track.sample_entry_box = crate::mux::mp4::encode_typed_box(
+            &crate::boxes::iso14496_12::VisualSampleEntry {
+                sample_entry: crate::boxes::iso14496_12::SampleEntry {
+                    box_type: FourCc::from_bytes(*b"hvc1"),
+                    data_reference_index: 1,
+                },
+                width: 1,
+                height: 1,
+                ..crate::boxes::iso14496_12::VisualSampleEntry::default()
+            },
+            &[],
+        )
+        .unwrap();
+        imported_track.mux_policy = super::imported_track_mux_policy_for_sample_entry_type(
+            FourCc::from_bytes(*b"hvc1"),
+            &imported_track.sample_entry_box,
+            MuxTrackKind::Video,
+        )
+        .with_header_policy(ImportedTrackHeaderPolicy {
+            source_stss_first_only: true,
+            ..super::default_imported_track_header_policy(MuxTrackKind::Video)
+        });
+
+        assert_eq!(
+            super::sync_sample_table_mode_for_imported_track(
+                &imported_track,
+                MuxOutputLayout::Fragmented,
+            ),
+            super::SyncSampleTableMode::ForceFirstOnly
         );
     }
 
@@ -8907,7 +9078,21 @@ fn imported_track_suppresses_fragmented_roll_grouping(
 
 fn sync_sample_table_mode_for_imported_track(
     imported_track: &ImportedTrack,
+    output_layout: MuxOutputLayout,
 ) -> SyncSampleTableMode {
+    if output_layout == MuxOutputLayout::Fragmented
+        && sample_entry_box_type(&imported_track.sample_entry_box)
+            .is_some_and(|value| {
+                (value == FourCc::from_bytes(*b"hev1") || value == FourCc::from_bytes(*b"hvc1"))
+                    && !sample_entry_carries_dolby_vision_config(&imported_track.sample_entry_box)
+            })
+        && !imported_track
+            .mux_policy
+            .header_policy()
+            .is_some_and(|header_policy| header_policy.source_stss_first_only)
+    {
+        return SyncSampleTableMode::Auto;
+    }
     imported_track.mux_policy.sync_sample_table_mode
 }
 
@@ -11563,33 +11748,46 @@ fn normalize_imported_mp4a_sample_entry_box(
         for descriptor in &mut esds.descriptors {
             if descriptor.tag == crate::boxes::iso14496_14::ES_DESCRIPTOR_TAG
                 && let Some(es_descriptor) = descriptor.es_descriptor.as_mut()
+                && es_descriptor.es_id != 0
             {
                 es_descriptor.es_id = 0;
+                updated_esds = true;
             }
             if descriptor.tag == DECODER_CONFIG_DESCRIPTOR_TAG
                 && let Some(config) = descriptor.decoder_config_descriptor.as_mut()
             {
-                config.buffer_size_db = if matches!(output_layout, MuxOutputLayout::Fragmented) {
-                    0
+                if matches!(output_layout, MuxOutputLayout::Fragmented) {
+                    if config.buffer_size_db != 0 {
+                        config.buffer_size_db = 0;
+                        updated_esds = true;
+                    }
                 } else {
-                    btrt.buffer_size_db
-                };
-                config.max_bitrate = btrt.max_bitrate;
-                config.avg_bitrate = btrt.avg_bitrate;
-                updated_esds = true;
+                    if config.buffer_size_db != btrt.buffer_size_db {
+                        config.buffer_size_db = btrt.buffer_size_db;
+                        updated_esds = true;
+                    }
+                    if config.max_bitrate != btrt.max_bitrate {
+                        config.max_bitrate = btrt.max_bitrate;
+                        updated_esds = true;
+                    }
+                    if config.avg_bitrate != btrt.avg_bitrate {
+                        config.avg_bitrate = btrt.avg_bitrate;
+                        updated_esds = true;
+                    }
+                }
             }
         }
         esds.normalize_descriptor_sizes_for_mux()
             .map_err(|_| MuxError::LayoutOverflow("AAC esds normalization"))?;
-            normalized_children.push(super::mp4::encode_typed_box(&esds, &[])?);
-        }
-        if !updated_esds && !stripped_child {
-            return Ok(imported_track.sample_entry_box.clone());
-        }
-        super::mp4::replace_audio_sample_entry_immediate_children(
-            &imported_track.sample_entry_box,
-            &normalized_children,
-        )
+        normalized_children.push(super::mp4::encode_typed_box(&esds, &[])?);
+    }
+    if !updated_esds && !stripped_child {
+        return Ok(imported_track.sample_entry_box.clone());
+    }
+    super::mp4::replace_audio_sample_entry_immediate_children(
+        &imported_track.sample_entry_box,
+        &normalized_children,
+    )
 }
 
 fn normalize_imported_fragmented_dolby_audio_sample_entry_box(
