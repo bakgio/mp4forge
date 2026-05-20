@@ -6,12 +6,12 @@ use tokio::fs::File as TokioFile;
 
 use crate::FourCc;
 use crate::boxes::AnyTypeBox;
-use crate::boxes::iso14496_12::{AudioSampleEntry, Btrt, SampleEntry};
+use crate::boxes::iso14496_12::{AudioSampleEntry, SampleEntry};
 
 use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
-use super::super::import::{StagedSample, build_btrt_from_sample_sizes, read_exact_at_sync};
+use super::super::import::{StagedSample, read_exact_at_sync};
 #[cfg(feature = "async")]
 use super::caf_common::read_caf_chunk_header_async;
 use super::caf_common::read_caf_chunk_header_sync;
@@ -451,18 +451,11 @@ fn finalize_caf_alac_track(
             packet_table.as_ref(),
         )?
     };
-    let btrt = build_btrt_from_sample_sizes(
-        samples
-            .iter()
-            .map(|sample| (sample.data_size, sample.duration)),
-        description.sample_rate,
-    )?;
     let sample_entry_box = build_alac_sample_entry_box(
         description.sample_rate,
         channel_count,
         sample_size_bits,
         &parsed_cookie.sample_entry_payload,
-        btrt,
     )?;
     Ok(ParsedCafAlacTrack {
         sample_rate: description.sample_rate,
@@ -674,7 +667,6 @@ fn build_alac_sample_entry_box(
     channel_count: u16,
     sample_size: u16,
     cookie: &[u8],
-    btrt: Btrt,
 ) -> Result<Vec<u8>, MuxError> {
     let mut sample_entry = AudioSampleEntry::default();
     sample_entry.set_box_type(ALAC);
@@ -686,8 +678,7 @@ fn build_alac_sample_entry_box(
     sample_entry.sample_size = sample_size;
     sample_entry.sample_rate = sample_rate << 16;
 
-    let mut child_boxes = vec![super::super::mp4::encode_raw_box(ALAC, cookie)?];
-    child_boxes.push(super::super::mp4::encode_typed_box(&btrt, &[])?);
+    let child_boxes = [super::super::mp4::encode_raw_box(ALAC, cookie)?];
 
     super::super::mp4::encode_typed_box(&sample_entry, &child_boxes.concat())
 }

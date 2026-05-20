@@ -70,6 +70,7 @@ pub(super) use alac::scan_caf_alac_file_sync;
 #[cfg(feature = "async")]
 pub(super) use amr::{scan_amr_file_async, scan_amr_wb_file_async};
 pub(super) use amr::{scan_amr_file_sync, scan_amr_wb_file_sync};
+pub(super) use annexb_common::{nal_to_rbsp, read_ue_labeled};
 #[cfg(feature = "async")]
 pub(super) use av1::scan_av1_file_async;
 pub(super) use av1::{ParsedAv1Track, ParsedAv1TrackSource, scan_av1_file_sync};
@@ -106,6 +107,7 @@ pub(super) use flac::{scan_flac_file_sync, scan_ogg_flac_file_sync};
 #[cfg(feature = "async")]
 pub(super) use h263::scan_h263_file_async;
 pub(super) use h263::scan_h263_file_sync;
+pub(super) use h264::build_h264_sample_entry_from_avc_config_with_box_type_and_options;
 #[cfg(feature = "async")]
 pub(super) use h264::stage_annex_b_h264_async;
 pub(super) use h264::stage_annex_b_h264_sync;
@@ -130,6 +132,7 @@ pub(super) use mhas::scan_mhas_file_sync;
 #[cfg(feature = "async")]
 pub(super) use mp3::scan_mp3_file_async;
 pub(super) use mp3::scan_mp3_file_sync;
+pub(super) use mp4v::mp4v_profile_level_indication;
 #[cfg(feature = "async")]
 pub(super) use mp4v::scan_mp4v_file_async;
 pub(super) use mp4v::scan_mp4v_file_sync;
@@ -180,6 +183,7 @@ pub(super) use theora::scan_ogg_theora_file_sync;
 #[cfg(feature = "async")]
 pub(super) use truehd::scan_truehd_file_async;
 pub(super) use truehd::scan_truehd_file_sync;
+pub(super) use ts::TransportStreamScanResult;
 #[cfg(feature = "async")]
 pub(super) use ts::scan_transport_stream_async;
 pub(super) use ts::scan_transport_stream_sync;

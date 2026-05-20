@@ -20,11 +20,13 @@ use super::container_common::read_segmented_bytes_async;
 use super::container_common::read_segmented_bytes_sync;
 
 pub(in crate::mux) struct ParsedAc3Track {
+    pub(in crate::mux) decoder_config: Ac3DecoderConfig,
     pub(in crate::mux) sample_rate: u32,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
+#[derive(Clone, Copy)]
 pub(in crate::mux) struct Ac3DecoderConfig {
     pub(in crate::mux) sample_rate: u32,
     pub(in crate::mux) channel_count: u16,
@@ -98,6 +100,7 @@ pub(in crate::mux) fn scan_ac3_file_sync(
         message: "AC-3 input contained no syncframes".to_string(),
     })?;
     Ok(ParsedAc3Track {
+        decoder_config,
         sample_rate: decoder_config.sample_rate,
         sample_entry_box: build_ac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
@@ -168,6 +171,7 @@ pub(in crate::mux) fn scan_ac3_segmented_sync(
         message: "AC-3 input contained no syncframes".to_string(),
     })?;
     Ok(ParsedAc3Track {
+        decoder_config,
         sample_rate: decoder_config.sample_rate,
         sample_entry_box: build_ac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
@@ -238,6 +242,7 @@ pub(in crate::mux) async fn scan_ac3_file_async(
         message: "AC-3 input contained no syncframes".to_string(),
     })?;
     Ok(ParsedAc3Track {
+        decoder_config,
         sample_rate: decoder_config.sample_rate,
         sample_entry_box: build_ac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
@@ -310,6 +315,7 @@ pub(in crate::mux) async fn scan_ac3_segmented_async(
         message: "AC-3 input contained no syncframes".to_string(),
     })?;
     Ok(ParsedAc3Track {
+        decoder_config,
         sample_rate: decoder_config.sample_rate,
         sample_entry_box: build_ac3_sample_entry_box(&decoder_config, &samples)?,
         samples,
@@ -399,13 +405,41 @@ pub(in crate::mux) fn build_ac3_sample_entry_box(
     parsed: &Ac3DecoderConfig,
     samples: &[StagedSample],
 ) -> Result<Vec<u8>, MuxError> {
+    build_ac3_sample_entry_box_from_sample_iter(
+        parsed,
+        parsed.sample_rate,
+        samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+    )
+}
+
+pub(in crate::mux) fn build_ac3_sample_entry_box_with_btrt<I>(
+    parsed: &Ac3DecoderConfig,
+    sample_rate: u32,
+    samples: I,
+) -> Result<Vec<u8>, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    build_ac3_sample_entry_box_from_sample_iter(parsed, sample_rate, samples)
+}
+
+fn build_ac3_sample_entry_box_from_sample_iter<I>(
+    parsed: &Ac3DecoderConfig,
+    sample_rate: u32,
+    samples: I,
+) -> Result<Vec<u8>, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
     let mut sample_entry = AudioSampleEntry::default();
     sample_entry.set_box_type(FourCc::from_bytes(*b"ac-3"));
     sample_entry.sample_entry = SampleEntry {
         box_type: FourCc::from_bytes(*b"ac-3"),
         data_reference_index: 1,
     };
-    sample_entry.channel_count = parsed.channel_count;
+    sample_entry.channel_count = 2;
     sample_entry.sample_size = 16;
     sample_entry.sample_rate = parsed.sample_rate << 16;
 
@@ -420,15 +454,17 @@ pub(in crate::mux) fn build_ac3_sample_entry_box(
         },
         &[],
     )?;
-    let btrt =
-        super::super::mp4::encode_typed_box(&build_ac3_btrt(samples, parsed.sample_rate)?, &[])?;
+    let btrt = super::super::mp4::encode_typed_box(&build_ac3_btrt(samples, sample_rate)?, &[])?;
     let mut children = dac3;
     children.extend_from_slice(&btrt);
     super::super::mp4::encode_typed_box(&sample_entry, &children)
 }
 
-fn build_ac3_btrt(samples: &[StagedSample], sample_rate: u32) -> Result<Btrt, MuxError> {
-    if samples.is_empty() || sample_rate == 0 {
+fn build_ac3_btrt<I>(samples: I, sample_rate: u32) -> Result<Btrt, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    if sample_rate == 0 {
         return Ok(Btrt::default());
     }
 
@@ -439,17 +475,19 @@ fn build_ac3_btrt(samples: &[StagedSample], sample_rate: u32) -> Result<Btrt, Mu
     let mut current_window_payload_bytes = 0_u64;
     let mut window_start_decode_time = 0_u64;
     let mut sample_decode_time = 0_u64;
+    let mut saw_sample = false;
 
-    for sample in samples {
-        buffer_size_db = buffer_size_db.max(sample.data_size);
+    for (data_size, duration) in samples {
+        saw_sample = true;
+        buffer_size_db = buffer_size_db.max(data_size);
         total_payload_bytes = total_payload_bytes
-            .checked_add(u64::from(sample.data_size))
+            .checked_add(u64::from(data_size))
             .ok_or(MuxError::LayoutOverflow("AC-3 total payload bytes"))?;
         total_duration = total_duration
-            .checked_add(u64::from(sample.duration))
+            .checked_add(u64::from(duration))
             .ok_or(MuxError::LayoutOverflow("AC-3 total duration"))?;
         current_window_payload_bytes = current_window_payload_bytes
-            .checked_add(u64::from(sample.data_size))
+            .checked_add(u64::from(data_size))
             .ok_or(MuxError::LayoutOverflow("AC-3 bitrate window payload"))?;
         if sample_decode_time > window_start_decode_time.saturating_add(u64::from(sample_rate)) {
             max_window_payload_bytes = max_window_payload_bytes.max(current_window_payload_bytes);
@@ -457,8 +495,12 @@ fn build_ac3_btrt(samples: &[StagedSample], sample_rate: u32) -> Result<Btrt, Mu
             current_window_payload_bytes = 0;
         }
         sample_decode_time = sample_decode_time
-            .checked_add(u64::from(sample.duration))
+            .checked_add(u64::from(duration))
             .ok_or(MuxError::LayoutOverflow("AC-3 decode time"))?;
+    }
+
+    if !saw_sample {
+        return Ok(Btrt::default());
     }
 
     if total_duration == 0 {

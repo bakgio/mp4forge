@@ -13,6 +13,7 @@ use super::detect::DetectedPathTrackKind;
 pub(super) struct OggPageHeader {
     pub(super) header_type: u8,
     pub(super) granule_position: u64,
+    pub(super) serial_no: u32,
     pub(super) lacing_values: Vec<u8>,
     pub(super) payload_offset: u64,
     pub(super) payload_size: u64,
@@ -345,6 +346,7 @@ pub(super) fn read_ogg_page_header_sync(
     Ok(OggPageHeader {
         header_type: header[5],
         granule_position: u64::from_le_bytes(header[6..14].try_into().unwrap()),
+        serial_no: u32::from_le_bytes(header[14..18].try_into().unwrap()),
         lacing_values,
         payload_offset,
         payload_size,
@@ -409,6 +411,7 @@ pub(super) async fn read_ogg_page_header_async(
     Ok(OggPageHeader {
         header_type: header[5],
         granule_position: u64::from_le_bytes(header[6..14].try_into().unwrap()),
+        serial_no: u32::from_le_bytes(header[14..18].try_into().unwrap()),
         lacing_values,
         payload_offset,
         payload_size,

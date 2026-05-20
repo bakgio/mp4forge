@@ -52,6 +52,8 @@ use coordination::MuxCoordinationPlan;
 pub(crate) use coordination::{
     MuxDurationBoundaryKind, TrackCoordinationDirective, build_capped_duration_chunk_sample_counts,
     build_duration_chunk_sample_counts, build_duration_chunk_sample_counts_with_start_time,
+    build_fragmented_duration_chunk_sample_counts_with_start_time,
+    build_sync_aligned_fragmented_duration_chunk_sample_counts,
     build_sync_aligned_segment_chunk_sample_counts,
     rebalance_small_multi_audio_chunk_sample_counts,
 };
@@ -1168,7 +1170,9 @@ pub struct MuxFileConfig {
     keep_flat_free_box: bool,
     keep_flat_authority_brands: bool,
     preserve_auto_flat_movie_timescale: bool,
+    emit_default_flat_tool_metadata: bool,
     flat_source_encoding_metadata: Option<String>,
+    flat_source_encoder_metadata: Option<String>,
 }
 
 impl MuxFileConfig {
@@ -1186,7 +1190,9 @@ impl MuxFileConfig {
             keep_flat_free_box: false,
             keep_flat_authority_brands: false,
             preserve_auto_flat_movie_timescale: false,
+            emit_default_flat_tool_metadata: true,
             flat_source_encoding_metadata: None,
+            flat_source_encoder_metadata: None,
         }
     }
 
@@ -1291,6 +1297,18 @@ impl MuxFileConfig {
         self
     }
 
+    pub(crate) const fn emit_default_flat_tool_metadata(&self) -> bool {
+        self.emit_default_flat_tool_metadata
+    }
+
+    pub(crate) const fn with_emit_default_flat_tool_metadata(
+        mut self,
+        emit_default_flat_tool_metadata: bool,
+    ) -> Self {
+        self.emit_default_flat_tool_metadata = emit_default_flat_tool_metadata;
+        self
+    }
+
     pub(crate) fn flat_source_encoding_metadata(&self) -> Option<&str> {
         self.flat_source_encoding_metadata.as_deref()
     }
@@ -1300,6 +1318,18 @@ impl MuxFileConfig {
         flat_source_encoding_metadata: Option<String>,
     ) -> Self {
         self.flat_source_encoding_metadata = flat_source_encoding_metadata;
+        self
+    }
+
+    pub(crate) fn flat_source_encoder_metadata(&self) -> Option<&str> {
+        self.flat_source_encoder_metadata.as_deref()
+    }
+
+    pub(crate) fn with_flat_source_encoder_metadata(
+        mut self,
+        flat_source_encoder_metadata: Option<String>,
+    ) -> Self {
+        self.flat_source_encoder_metadata = flat_source_encoder_metadata;
         self
     }
 }
@@ -1361,24 +1391,35 @@ pub struct MuxTrackConfig {
     handler_name: String,
     track_width: u16,
     track_height: u16,
+    track_width_fixed_16_16: Option<u32>,
+    track_height_fixed_16_16: Option<u32>,
     tkhd_flags: u32,
     alternate_group: i16,
     volume: i16,
     matrix: [i32; 9],
     edit_media_time: Option<u64>,
     sample_roll_distance: Option<i16>,
+    emit_roll_sbgp: bool,
     sample_entry_box: Vec<u8>,
     sync_sample_table_mode: SyncSampleTableMode,
     stts_run_encoding_mode: SttsRunEncodingMode,
     stsc_run_encoding_mode: StscRunEncodingMode,
     flat_timing_override: Option<FlatTimingOverride>,
+    flat_audio_profile_level_indication: Option<u8>,
+    fragmented_reference_group_fragment_counts: Option<Vec<u32>>,
+    flat_source_track_creation_time: Option<u64>,
+    flat_source_media_creation_time: Option<u64>,
+    omit_flat_iods: bool,
+    flat_stsc_override: Option<crate::boxes::iso14496_12::Stsc>,
+    preserved_flat_stbl_boxes: Vec<Vec<u8>>,
+    preserved_flat_trak_boxes: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyncSampleTableMode {
     Auto,
     ForceEmpty,
-    ForceAll,
+    ForceFirstOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1412,17 +1453,28 @@ impl MuxTrackConfig {
             handler_name: "SoundHandler".to_string(),
             track_width: 0,
             track_height: 0,
+            track_width_fixed_16_16: None,
+            track_height_fixed_16_16: None,
             tkhd_flags: DEFAULT_TKHD_FLAGS,
             alternate_group: default_alternate_group_for_kind(MuxTrackKind::Audio),
             volume: 0x0100,
             matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
+            emit_roll_sbgp: true,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
+            flat_audio_profile_level_indication: None,
+            fragmented_reference_group_fragment_counts: None,
+            flat_source_track_creation_time: None,
+            flat_source_media_creation_time: None,
+            omit_flat_iods: false,
+            flat_stsc_override: None,
+            preserved_flat_stbl_boxes: Vec::new(),
+            preserved_flat_trak_boxes: Vec::new(),
         }
     }
 
@@ -1442,17 +1494,28 @@ impl MuxTrackConfig {
             handler_name: "VideoHandler".to_string(),
             track_width: width,
             track_height: height,
+            track_width_fixed_16_16: None,
+            track_height_fixed_16_16: None,
             tkhd_flags: DEFAULT_TKHD_FLAGS,
             alternate_group: default_alternate_group_for_kind(MuxTrackKind::Video),
             volume: 0,
             matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
+            emit_roll_sbgp: true,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
+            flat_audio_profile_level_indication: None,
+            fragmented_reference_group_fragment_counts: None,
+            flat_source_track_creation_time: None,
+            flat_source_media_creation_time: None,
+            omit_flat_iods: false,
+            flat_stsc_override: None,
+            preserved_flat_stbl_boxes: Vec::new(),
+            preserved_flat_trak_boxes: Vec::new(),
         }
     }
 
@@ -1472,17 +1535,28 @@ impl MuxTrackConfig {
             handler_name: "TextHandler".to_string(),
             track_width: width,
             track_height: height,
+            track_width_fixed_16_16: None,
+            track_height_fixed_16_16: None,
             tkhd_flags: DEFAULT_TKHD_FLAGS,
             alternate_group: default_alternate_group_for_kind(MuxTrackKind::Text),
             volume: 0,
             matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
+            emit_roll_sbgp: true,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
+            flat_audio_profile_level_indication: None,
+            fragmented_reference_group_fragment_counts: None,
+            flat_source_track_creation_time: None,
+            flat_source_media_creation_time: None,
+            omit_flat_iods: false,
+            flat_stsc_override: None,
+            preserved_flat_stbl_boxes: Vec::new(),
+            preserved_flat_trak_boxes: Vec::new(),
         }
     }
 
@@ -1502,17 +1576,28 @@ impl MuxTrackConfig {
             handler_name: "SubtitleHandler".to_string(),
             track_width: width,
             track_height: height,
+            track_width_fixed_16_16: None,
+            track_height_fixed_16_16: None,
             tkhd_flags: DEFAULT_TKHD_FLAGS,
             alternate_group: default_alternate_group_for_kind(MuxTrackKind::Subtitle),
             volume: 0,
             matrix: DEFAULT_TKHD_MATRIX,
             edit_media_time: None,
             sample_roll_distance: None,
+            emit_roll_sbgp: true,
             sample_entry_box,
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
+            flat_audio_profile_level_indication: None,
+            fragmented_reference_group_fragment_counts: None,
+            flat_source_track_creation_time: None,
+            flat_source_media_creation_time: None,
+            omit_flat_iods: false,
+            flat_stsc_override: None,
+            preserved_flat_stbl_boxes: Vec::new(),
+            preserved_flat_trak_boxes: Vec::new(),
         }
     }
 
@@ -1551,8 +1636,28 @@ impl MuxTrackConfig {
         self.track_height
     }
 
+    pub(crate) const fn track_width_fixed_16_16(&self) -> Option<u32> {
+        self.track_width_fixed_16_16
+    }
+
+    pub(crate) const fn track_height_fixed_16_16(&self) -> Option<u32> {
+        self.track_height_fixed_16_16
+    }
+
     pub(crate) const fn tkhd_flags(&self) -> u32 {
         self.tkhd_flags
+    }
+
+    pub(crate) const fn flat_source_track_creation_time(&self) -> Option<u64> {
+        self.flat_source_track_creation_time
+    }
+
+    pub(crate) const fn flat_source_media_creation_time(&self) -> Option<u64> {
+        self.flat_source_media_creation_time
+    }
+
+    pub(crate) const fn omit_flat_iods(&self) -> bool {
+        self.omit_flat_iods
     }
 
     pub(crate) const fn alternate_group(&self) -> i16 {
@@ -1577,6 +1682,10 @@ impl MuxTrackConfig {
         self.sample_roll_distance
     }
 
+    pub(crate) const fn emit_roll_sbgp(&self) -> bool {
+        self.emit_roll_sbgp
+    }
+
     /// Returns the full encoded sample-entry box written under `stsd`.
     pub fn sample_entry_box(&self) -> &[u8] {
         &self.sample_entry_box
@@ -1599,6 +1708,27 @@ impl MuxTrackConfig {
         self
     }
 
+    pub(crate) const fn with_flat_source_track_creation_time(
+        mut self,
+        flat_source_track_creation_time: Option<u64>,
+    ) -> Self {
+        self.flat_source_track_creation_time = flat_source_track_creation_time;
+        self
+    }
+
+    pub(crate) const fn with_flat_source_media_creation_time(
+        mut self,
+        flat_source_media_creation_time: Option<u64>,
+    ) -> Self {
+        self.flat_source_media_creation_time = flat_source_media_creation_time;
+        self
+    }
+
+    pub(crate) const fn with_omit_flat_iods(mut self, omit_flat_iods: bool) -> Self {
+        self.omit_flat_iods = omit_flat_iods;
+        self
+    }
+
     pub(crate) const fn with_alternate_group(mut self, alternate_group: i16) -> Self {
         self.alternate_group = alternate_group;
         self
@@ -1615,6 +1745,16 @@ impl MuxTrackConfig {
         self
     }
 
+    pub(crate) const fn with_tkhd_dimensions_fixed_16_16(
+        mut self,
+        track_width_fixed_16_16: u32,
+        track_height_fixed_16_16: u32,
+    ) -> Self {
+        self.track_width_fixed_16_16 = Some(track_width_fixed_16_16);
+        self.track_height_fixed_16_16 = Some(track_height_fixed_16_16);
+        self
+    }
+
     /// Returns a copy of this configuration with one edit-list media-time trim.
     pub const fn with_edit_media_time(mut self, edit_media_time: u64) -> Self {
         self.edit_media_time = Some(edit_media_time);
@@ -1623,6 +1763,11 @@ impl MuxTrackConfig {
 
     pub(crate) const fn with_sample_roll_distance(mut self, sample_roll_distance: i16) -> Self {
         self.sample_roll_distance = Some(sample_roll_distance);
+        self
+    }
+
+    pub(crate) const fn with_emit_roll_sbgp(mut self, emit_roll_sbgp: bool) -> Self {
+        self.emit_roll_sbgp = emit_roll_sbgp;
         self
     }
 
@@ -1667,6 +1812,67 @@ impl MuxTrackConfig {
         flat_timing_override: FlatTimingOverride,
     ) -> Self {
         self.flat_timing_override = Some(flat_timing_override);
+        self
+    }
+
+    pub(crate) const fn flat_audio_profile_level_indication(&self) -> Option<u8> {
+        self.flat_audio_profile_level_indication
+    }
+
+    pub(crate) const fn with_flat_audio_profile_level_indication(
+        mut self,
+        flat_audio_profile_level_indication: u8,
+    ) -> Self {
+        self.flat_audio_profile_level_indication = Some(flat_audio_profile_level_indication);
+        self
+    }
+
+    pub(crate) fn fragmented_reference_group_fragment_counts(&self) -> Option<&[u32]> {
+        self.fragmented_reference_group_fragment_counts.as_deref()
+    }
+
+    pub(crate) fn with_fragmented_reference_group_fragment_counts(
+        mut self,
+        fragmented_reference_group_fragment_counts: Vec<u32>,
+    ) -> Self {
+        self.fragmented_reference_group_fragment_counts =
+            Some(fragmented_reference_group_fragment_counts);
+        self
+    }
+
+    pub(crate) fn flat_stsc_override(&self) -> Option<&crate::boxes::iso14496_12::Stsc> {
+        self.flat_stsc_override.as_ref()
+    }
+
+    pub(crate) fn with_flat_stsc_override(
+        mut self,
+        flat_stsc_override: crate::boxes::iso14496_12::Stsc,
+    ) -> Self {
+        self.flat_stsc_override = Some(flat_stsc_override);
+        self
+    }
+
+    pub(crate) fn preserved_flat_stbl_boxes(&self) -> &[Vec<u8>] {
+        &self.preserved_flat_stbl_boxes
+    }
+
+    pub(crate) fn with_preserved_flat_stbl_boxes(
+        mut self,
+        preserved_flat_stbl_boxes: Vec<Vec<u8>>,
+    ) -> Self {
+        self.preserved_flat_stbl_boxes = preserved_flat_stbl_boxes;
+        self
+    }
+
+    pub(crate) fn preserved_flat_trak_boxes(&self) -> &[Vec<u8>] {
+        &self.preserved_flat_trak_boxes
+    }
+
+    pub(crate) fn with_preserved_flat_trak_boxes(
+        mut self,
+        preserved_flat_trak_boxes: Vec<Vec<u8>>,
+    ) -> Self {
+        self.preserved_flat_trak_boxes = preserved_flat_trak_boxes;
         self
     }
 }

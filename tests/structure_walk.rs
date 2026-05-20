@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
-use mp4forge::boxes::iso14496_12::{Meta, Moov, Trak, Udta};
+use mp4forge::boxes::etsi_ts_102_366::Dac3;
+use mp4forge::boxes::iso14496_12::{AudioSampleEntry, Btrt, Meta, Moov, SampleEntry, Trak, Udta};
 use mp4forge::codec::{CodecBox, marshal};
 use mp4forge::header::HeaderError;
 #[cfg(feature = "async")]
@@ -120,6 +121,43 @@ impl AsyncWalkVisitor<Cursor<Vec<u8>>> for AsyncDescendMoovVisitor<'_> {
     }
 }
 
+#[cfg(feature = "async")]
+struct AsyncAudioSampleEntryTailVisitor<'a> {
+    visited: &'a mut Vec<BoxPath>,
+}
+
+#[cfg(feature = "async")]
+impl AsyncWalkVisitor<Cursor<Vec<u8>>> for AsyncAudioSampleEntryTailVisitor<'_> {
+    type Future<'a>
+        = AsyncWalkFuture<'a>
+    where
+        Self: 'a;
+
+    fn visit<'a, 'r>(&'a mut self, handle: &'a mut AsyncCursorWalkHandle<'r>) -> Self::Future<'a>
+    where
+        'r: 'a,
+    {
+        Box::pin(async move {
+            self.visited.push(handle.path().clone());
+            match handle.info().box_type() {
+                box_type if box_type == fourcc("ac-3") => {
+                    let (payload, read) = handle.read_payload_async().await?;
+                    assert_eq!(read, 28);
+                    assert!(payload.as_ref().as_any().is::<AudioSampleEntry>());
+                    Ok(WalkControl::Descend)
+                }
+                box_type if box_type == fourcc("dac3") => {
+                    let (payload, read) = handle.read_payload_async().await?;
+                    assert_eq!(read, 3);
+                    assert!(payload.as_ref().as_any().is::<Dac3>());
+                    Ok(WalkControl::Continue)
+                }
+                other => panic!("unexpected box {other}"),
+            }
+        })
+    }
+}
+
 #[test]
 fn walk_structure_tracks_paths_and_supports_raw_payload_reads() {
     let unknown = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
@@ -229,6 +267,150 @@ fn walk_structure_reports_invalid_zero_sized_boxes() {
     assert!(matches!(error, WalkError::Header(HeaderError::InvalidSize)));
 }
 
+#[test]
+fn walk_structure_ignores_truncated_trailing_root_box_after_valid_boxes() {
+    let moov = encode_supported_box(&Moov, &[]);
+    let mut truncated_mdat = Vec::new();
+    truncated_mdat.extend_from_slice(&32_u32.to_be_bytes());
+    truncated_mdat.extend_from_slice(b"mdat");
+    truncated_mdat.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let file = [moov, truncated_mdat].concat();
+
+    let mut visited = Vec::new();
+    walk_structure(&mut Cursor::new(file), |handle| {
+        visited.push(handle.path().clone());
+        Ok(WalkControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        visited,
+        vec![
+            BoxPath::from([fourcc("moov")]),
+            BoxPath::from([fourcc("mdat")]),
+        ]
+    );
+}
+
+#[test]
+fn walk_structure_stops_audio_sample_entry_children_before_zero_tail() {
+    let sample_entry = AudioSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: fourcc("ac-3"),
+            data_reference_index: 1,
+        },
+        channel_count: 2,
+        sample_size: 16,
+        sample_rate: 48_000 << 16,
+        ..AudioSampleEntry::default()
+    };
+    let dac3 = Dac3 {
+        fscod: 0,
+        bsid: 8,
+        bsmod: 0,
+        acmod: 7,
+        lfe_on: 1,
+        bit_rate_code: 15,
+    };
+
+    let mut payload = Vec::new();
+    marshal(&mut payload, &sample_entry, None).unwrap();
+    payload.extend_from_slice(&encode_supported_box(&dac3, &[]));
+    payload.extend_from_slice(&[0; 8]);
+    let file = encode_raw_box(fourcc("ac-3"), &payload);
+
+    let mut visited = Vec::new();
+    walk_structure(&mut Cursor::new(file), |handle| {
+        visited.push(handle.path().clone());
+        match handle.info().box_type() {
+            box_type if box_type == fourcc("ac-3") => {
+                let (payload, read) = handle.read_payload()?;
+                assert_eq!(read, 28);
+                assert!(payload.as_ref().as_any().is::<AudioSampleEntry>());
+                Ok(WalkControl::Descend)
+            }
+            box_type if box_type == fourcc("dac3") => {
+                let (payload, read) = handle.read_payload()?;
+                assert_eq!(read, 3);
+                assert!(payload.as_ref().as_any().is::<Dac3>());
+                Ok(WalkControl::Continue)
+            }
+            other => panic!("unexpected box {other}"),
+        }
+    })
+    .unwrap();
+
+    assert_eq!(
+        visited,
+        vec![
+            BoxPath::from([fourcc("ac-3")]),
+            BoxPath::from([fourcc("ac-3"), fourcc("dac3")]),
+        ]
+    );
+}
+
+#[test]
+fn walk_structure_accepts_zero_typed_audio_sample_entry_child_boxes() {
+    let sample_entry = AudioSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: fourcc("ac-3"),
+            data_reference_index: 1,
+        },
+        channel_count: 2,
+        sample_size: 16,
+        sample_rate: 48_000 << 16,
+        ..AudioSampleEntry::default()
+    };
+    let dac3 = Dac3 {
+        fscod: 0,
+        bsid: 8,
+        bsmod: 0,
+        acmod: 7,
+        lfe_on: 1,
+        bit_rate_code: 15,
+    };
+    let btrt = Btrt {
+        buffer_size_db: 1_792,
+        max_bitrate: 473_088,
+        avg_bitrate: 448_120,
+    };
+
+    let mut payload = Vec::new();
+    marshal(&mut payload, &sample_entry, None).unwrap();
+    payload.extend_from_slice(&encode_supported_box(&dac3, &[]));
+    payload.extend_from_slice(&encode_raw_box(FourCc::from_u32(0), &[]));
+    payload.extend_from_slice(&encode_supported_box(&btrt, &[]));
+    let file = encode_raw_box(fourcc("ac-3"), &payload);
+
+    let mut visited = Vec::new();
+    walk_structure(&mut Cursor::new(file), |handle| {
+        visited.push(handle.path().clone());
+        match handle.info().box_type() {
+            box_type if box_type == fourcc("ac-3") => {
+                let (payload, read) = handle.read_payload()?;
+                assert_eq!(read, 28);
+                assert!(payload.as_ref().as_any().is::<AudioSampleEntry>());
+                Ok(WalkControl::Descend)
+            }
+            box_type if box_type == fourcc("dac3") => Ok(WalkControl::Continue),
+            box_type if box_type == FourCc::from_u32(0) => Ok(WalkControl::Continue),
+            box_type if box_type == fourcc("btrt") => Ok(WalkControl::Continue),
+            other => panic!("unexpected box {other}"),
+        }
+    })
+    .unwrap();
+
+    assert_eq!(
+        visited,
+        vec![
+            BoxPath::from([fourcc("ac-3")]),
+            BoxPath::from([fourcc("ac-3"), fourcc("dac3")]),
+            BoxPath::from([fourcc("ac-3"), FourCc::from_u32(0)]),
+            BoxPath::from([fourcc("ac-3"), fourcc("btrt")]),
+        ]
+    );
+}
+
 #[cfg(feature = "async")]
 #[tokio::test]
 async fn async_walk_structure_tracks_paths_and_supports_raw_payload_reads() {
@@ -255,6 +437,51 @@ async fn async_walk_structure_tracks_paths_and_supports_raw_payload_reads() {
             BoxPath::from([fourcc("moov"), fourcc("meta")]),
             BoxPath::from([fourcc("moov"), fourcc("udta")]),
             BoxPath::from([fourcc("moov"), fourcc("udta"), fourcc("zzzz")]),
+        ]
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_walk_structure_stops_audio_sample_entry_children_before_zero_tail() {
+    let sample_entry = AudioSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: fourcc("ac-3"),
+            data_reference_index: 1,
+        },
+        channel_count: 2,
+        sample_size: 16,
+        sample_rate: 48_000 << 16,
+        ..AudioSampleEntry::default()
+    };
+    let dac3 = Dac3 {
+        fscod: 0,
+        bsid: 8,
+        bsmod: 0,
+        acmod: 7,
+        lfe_on: 1,
+        bit_rate_code: 15,
+    };
+
+    let mut payload = Vec::new();
+    marshal(&mut payload, &sample_entry, None).unwrap();
+    payload.extend_from_slice(&encode_supported_box(&dac3, &[]));
+    payload.extend_from_slice(&[0; 8]);
+    let file = encode_raw_box(fourcc("ac-3"), &payload);
+
+    let mut visited = Vec::new();
+    let visitor = AsyncAudioSampleEntryTailVisitor {
+        visited: &mut visited,
+    };
+    walk_structure_async(&mut Cursor::new(file), visitor)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        visited,
+        vec![
+            BoxPath::from([fourcc("ac-3")]),
+            BoxPath::from([fourcc("ac-3"), fourcc("dac3")]),
         ]
     );
 }
@@ -289,6 +516,34 @@ async fn async_walk_structure_from_box_reuses_parent_metadata_and_paths() {
             BoxPath::from([fourcc("moov")]),
             BoxPath::from([fourcc("moov"), fourcc("trak")]),
             BoxPath::from([fourcc("moov"), fourcc("udta")]),
+        ]
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_walk_structure_ignores_truncated_trailing_root_box_after_valid_boxes() {
+    let moov = encode_supported_box(&Moov, &[]);
+    let mut truncated_mdat = Vec::new();
+    truncated_mdat.extend_from_slice(&32_u32.to_be_bytes());
+    truncated_mdat.extend_from_slice(b"mdat");
+    truncated_mdat.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let file = [moov, truncated_mdat].concat();
+
+    let mut visited = Vec::new();
+    let visitor = AsyncTrackingVisitor {
+        visited: &mut visited,
+    };
+
+    walk_structure_async(&mut Cursor::new(file), visitor)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        visited,
+        vec![
+            BoxPath::from([fourcc("moov")]),
+            BoxPath::from([fourcc("mdat")]),
         ]
     );
 }

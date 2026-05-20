@@ -672,8 +672,11 @@ fn finalize_program_stream_video_track_sync(
     let prefix = read_program_stream_video_prefix_sync(file, &builder, spec)?;
     match detect_path_track_kind_from_prefix(&prefix) {
         DetectedPathTrackKind::Raw(super::super::MuxRawCodec::Mpeg2v) => {
-            let parsed =
+            let mut parsed =
                 scan_mpeg2v_segmented_sync(file, &builder.segments, builder.total_size, spec)?;
+            if parsed.eof_terminated_trailing_sample {
+                parsed.samples.pop();
+            }
             let (timescale, source_edit_media_time, samples) =
                 normalize_program_stream_mpeg2v_samples(
                 spec,
@@ -718,30 +721,31 @@ fn finalize_program_stream_video_track_sync(
         }
         DetectedPathTrackKind::Raw(super::super::MuxRawCodec::Mp4v) => {
             let parsed = scan_mp4v_segmented_sync(file, &builder.segments, builder.total_size, spec)?;
+            let (timescale, source_edit_media_time, samples) =
+                normalize_program_stream_mp4v_samples(
+                    spec,
+                    parsed.timescale,
+                    parsed.samples,
+                    &builder.sample_offsets,
+                    &builder.sample_pts,
+                    &builder.sample_dts,
+                )?;
             Ok(CompositeTrackCandidate {
                 track: TrackCandidate {
                     track_id: program_stream_track_id(builder.stream_id),
                     kind: MuxTrackKind::Video,
-                    timescale: parsed.timescale,
+                    timescale,
                     language: *b"und",
                     handler_name: direct_ingest_handler_name("mp4v"),
                     mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
                     width: parsed.width,
                     height: parsed.height,
-                    sample_entry_box: parsed.sample_entry_box,
-                    source_edit_media_time: None,
-                    samples: parsed
-                        .samples
-                        .into_iter()
-                        .map(|sample| CandidateSample {
-                            source_index: usize::MAX,
-                            data_offset: sample.data_offset,
-                            data_size: sample.data_size,
-                            duration: sample.duration,
-                            composition_time_offset: sample.composition_time_offset,
-                            is_sync_sample: sample.is_sync_sample,
-                        })
-                        .collect(),
+                    sample_entry_box: super::super::mp4::strip_visual_sample_entry_immediate_children(
+                        &parsed.sample_entry_box,
+                        &[FourCc::from_bytes(*b"pasp")],
+                    )?,
+                    source_edit_media_time,
+                    samples,
                 },
                 source_spec: SegmentedMuxSourceSpec {
                     path: path.to_path_buf(),
@@ -1406,6 +1410,7 @@ fn normalize_program_stream_mp3_samples(
         });
     }
 
+    let mut duration_remainder = 0_u64;
     samples
         .into_iter()
         .map(|sample| {
@@ -1413,17 +1418,15 @@ fn normalize_program_stream_mp3_samples(
                 .checked_mul(u64::from(PROGRAM_STREAM_MEDIA_TIMESCALE))
                 .ok_or(MuxError::LayoutOverflow(
                     "program stream MPEG audio duration",
+                ))?
+                .checked_add(duration_remainder)
+                .ok_or(MuxError::LayoutOverflow(
+                    "program stream MPEG audio duration",
                 ))?;
-            if scaled_duration % u64::from(sample_rate) != 0 {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message:
-                        "program stream MPEG audio cadence does not rescale cleanly onto the 90_000 media clock"
-                            .to_string(),
-                });
-            }
+            let duration = scaled_duration / u64::from(sample_rate);
+            duration_remainder = scaled_duration % u64::from(sample_rate);
             Ok(CandidateSample {
-                duration: u32::try_from(scaled_duration / u64::from(sample_rate))
+                duration: u32::try_from(duration)
                     .map_err(|_| MuxError::LayoutOverflow("program stream MPEG audio duration"))?,
                 ..sample
             })
@@ -1477,7 +1480,7 @@ fn normalize_program_stream_mpeg2v_samples(
         samples.pop();
     }
 
-    if sample_pts.len() < samples.len() || sample_pts.len() > samples.len() + 1 {
+    if sample_pts.len() > samples.len() + 1 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
             message: format!(
@@ -1519,12 +1522,13 @@ fn normalize_program_stream_mpeg2v_samples(
                             .to_string(),
                 });
             }
-            let duration = if let Some(next_anchor_index) = sample_to_anchor[index + 1..]
+            let duration = if let Some((next_sample_index, next_anchor_index)) = sample_to_anchor
+                [index + 1..]
                 .iter()
-                .flatten()
-                .copied()
-                .next()
-            {
+                .enumerate()
+                .find_map(|(delta, anchor)| {
+                    anchor.map(|anchor_index| (index + 1 + delta, anchor_index))
+                }) {
                 let next_dts = sample_dts[next_anchor_index];
                 if next_dts <= current_dts {
                     return Err(MuxError::UnsupportedTrackImport {
@@ -1534,8 +1538,13 @@ fn normalize_program_stream_mpeg2v_samples(
                                 .to_string(),
                     });
                 }
-                u32::try_from(next_dts - current_dts)
-                    .map_err(|_| MuxError::LayoutOverflow("program stream MPEG-2 video duration"))?
+                if next_sample_index == index + 1 {
+                    u32::try_from(next_dts - current_dts).map_err(|_| {
+                        MuxError::LayoutOverflow("program stream MPEG-2 video duration")
+                    })?
+                } else {
+                    scaled_sample_duration
+                }
             } else {
                 scaled_sample_duration
             };
@@ -1552,13 +1561,182 @@ fn normalize_program_stream_mpeg2v_samples(
             }
             (duration, composition_time_offset)
         } else {
-            (sample.duration, last_composition_time_offset)
+            let duration = if sample_to_anchor[index + 1..].iter().any(Option::is_some) {
+                scaled_sample_duration
+            } else {
+                sample.duration
+            };
+            (duration, last_composition_time_offset)
         };
         if duration == 0 {
             return Err(MuxError::UnsupportedTrackImport {
                 spec: spec.to_string(),
                 message:
                     "program stream MPEG-2 video frame duration underflowed after media-timescale normalization"
+                        .to_string(),
+            });
+        }
+        normalized.push(CandidateSample {
+            source_index: usize::MAX,
+            data_offset: sample.data_offset,
+            data_size: sample.data_size,
+            duration,
+            composition_time_offset,
+            is_sync_sample: sample.is_sync_sample,
+        });
+    }
+
+    Ok((
+        PROGRAM_STREAM_MEDIA_TIMESCALE,
+        source_edit_media_time,
+        normalized,
+    ))
+}
+
+fn normalize_program_stream_mp4v_samples(
+    spec: &str,
+    elementary_timescale: u32,
+    mut samples: Vec<StagedSample>,
+    sample_offsets: &[u64],
+    sample_pts: &[u64],
+    sample_dts: &[u64],
+) -> Result<(u32, Option<u64>, Vec<CandidateSample>), MuxError> {
+    if sample_pts.is_empty() {
+        return Ok((
+            elementary_timescale,
+            None,
+            samples
+                .into_iter()
+                .map(|sample| CandidateSample {
+                    source_index: usize::MAX,
+                    data_offset: sample.data_offset,
+                    data_size: sample.data_size,
+                    duration: sample.duration,
+                    composition_time_offset: sample.composition_time_offset,
+                    is_sync_sample: sample.is_sync_sample,
+                })
+                .collect(),
+        ));
+    }
+
+    if sample_pts.len() != sample_dts.len() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "program stream MPEG-4 Part 2 video timing anchors disagreed between presentation and decode timestamps"
+                .to_string(),
+        });
+    }
+    if sample_offsets.len() != sample_pts.len() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message:
+                "program stream MPEG-4 Part 2 video timing anchors disagreed between payload offsets and timestamps"
+                    .to_string(),
+        });
+    }
+
+    if sample_pts.len() + 1 == samples.len() {
+        samples.pop();
+    }
+
+    if sample_pts.len() > samples.len() + 1 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!(
+                "program stream MPEG-4 Part 2 video PES timing anchors ({}) did not match parsed picture count ({})",
+                sample_pts.len(),
+                samples.len(),
+            ),
+        });
+    }
+
+    let anchor_to_sample =
+        map_program_stream_mpeg2v_anchor_offsets_to_picture_samples(sample_offsets, &samples);
+    let mut sample_to_anchor = build_program_stream_mpeg2v_sample_anchor_map(
+        spec,
+        sample_offsets,
+        &anchor_to_sample,
+        samples.len(),
+    )?;
+    if sample_to_anchor.len() > 1
+        && sample_to_anchor.last().is_some_and(Option::is_some)
+        && sample_pts.len() == samples.len()
+        && sample_dts.len() == samples.len()
+    {
+        samples.pop();
+        sample_to_anchor.pop();
+    }
+
+    let mut normalized = Vec::with_capacity(samples.len());
+    let mut source_edit_media_time = None;
+    let mut last_composition_time_offset = 0_i32;
+    for (index, sample) in samples.into_iter().enumerate() {
+        let scaled_sample_duration = scale_mp4v_duration_to_program_stream_clock(
+            spec,
+            elementary_timescale,
+            sample.duration,
+        )?;
+        let (duration, composition_time_offset) = if let Some(anchor_index) =
+            sample_to_anchor[index]
+        {
+            let current_pts = sample_pts[anchor_index];
+            let current_dts = sample_dts[anchor_index];
+            if current_pts < current_dts {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message:
+                        "program stream MPEG-4 Part 2 video presentation timestamps must not precede decode timestamps"
+                            .to_string(),
+                });
+            }
+            let duration = if let Some((next_sample_index, next_anchor_index)) = sample_to_anchor
+                [index + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(delta, anchor)| {
+                    anchor.map(|anchor_index| (index + 1 + delta, anchor_index))
+                }) {
+                let next_dts = sample_dts[next_anchor_index];
+                if next_dts <= current_dts {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: spec.to_string(),
+                        message:
+                            "program stream MPEG-4 Part 2 video decode timestamps must increase monotonically"
+                                .to_string(),
+                    });
+                }
+                if next_sample_index == index + 1 {
+                    u32::try_from(next_dts - current_dts).map_err(|_| {
+                        MuxError::LayoutOverflow("program stream MPEG-4 Part 2 video duration")
+                    })?
+                } else {
+                    scaled_sample_duration
+                }
+            } else {
+                scaled_sample_duration
+            };
+            let composition_time_offset =
+                i32::try_from(current_pts - current_dts).map_err(|_| {
+                    MuxError::LayoutOverflow(
+                        "program stream MPEG-4 Part 2 video composition offset",
+                    )
+                })?;
+            last_composition_time_offset = composition_time_offset;
+            if index == 0 && composition_time_offset > 0 {
+                source_edit_media_time =
+                    Some(u64::try_from(composition_time_offset).map_err(|_| {
+                        MuxError::LayoutOverflow("program stream MPEG-4 Part 2 video edit")
+                    })?);
+            }
+            (duration, composition_time_offset)
+        } else {
+            (scaled_sample_duration, last_composition_time_offset)
+        };
+        if duration == 0 {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message:
+                    "program stream MPEG-4 Part 2 video frame duration underflowed after media-timescale normalization"
                         .to_string(),
             });
         }
@@ -1652,6 +1830,35 @@ fn scale_mpeg2v_duration_to_program_stream_clock(
         .map_err(|_| MuxError::LayoutOverflow("program stream MPEG-2 video duration"))
 }
 
+fn scale_mp4v_duration_to_program_stream_clock(
+    spec: &str,
+    elementary_timescale: u32,
+    duration: u32,
+) -> Result<u32, MuxError> {
+    if elementary_timescale == 0 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "program stream MPEG-4 Part 2 video reported a zero media timescale"
+                .to_string(),
+        });
+    }
+    let scaled = u64::from(duration)
+        .checked_mul(u64::from(PROGRAM_STREAM_MEDIA_TIMESCALE))
+        .ok_or(MuxError::LayoutOverflow(
+            "program stream MPEG-4 Part 2 video duration",
+        ))?;
+    if scaled % u64::from(elementary_timescale) != 0 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message:
+                "program stream MPEG-4 Part 2 video cadence does not rescale cleanly onto the 90_000 media clock"
+                    .to_string(),
+        });
+    }
+    u32::try_from(scaled / u64::from(elementary_timescale))
+        .map_err(|_| MuxError::LayoutOverflow("program stream MPEG-4 Part 2 video duration"))
+}
+
 #[cfg(feature = "async")]
 async fn finalize_program_stream_video_track_async(
     path: &Path,
@@ -1662,8 +1869,12 @@ async fn finalize_program_stream_video_track_async(
     let prefix = read_program_stream_video_prefix_async(file, &builder, spec).await?;
     match detect_path_track_kind_from_prefix(&prefix) {
         DetectedPathTrackKind::Raw(super::super::MuxRawCodec::Mpeg2v) => {
-            let parsed = scan_mpeg2v_segmented_async(file, &builder.segments, builder.total_size, spec)
-                .await?;
+            let mut parsed =
+                scan_mpeg2v_segmented_async(file, &builder.segments, builder.total_size, spec)
+                    .await?;
+            if parsed.eof_terminated_trailing_sample {
+                parsed.samples.pop();
+            }
             let (timescale, source_edit_media_time, samples) =
                 normalize_program_stream_mpeg2v_samples(
                 spec,
@@ -1709,30 +1920,31 @@ async fn finalize_program_stream_video_track_async(
         DetectedPathTrackKind::Raw(super::super::MuxRawCodec::Mp4v) => {
             let parsed =
                 scan_mp4v_segmented_async(file, &builder.segments, builder.total_size, spec).await?;
+            let (timescale, source_edit_media_time, samples) =
+                normalize_program_stream_mp4v_samples(
+                    spec,
+                    parsed.timescale,
+                    parsed.samples,
+                    &builder.sample_offsets,
+                    &builder.sample_pts,
+                    &builder.sample_dts,
+                )?;
             Ok(CompositeTrackCandidate {
                 track: TrackCandidate {
                     track_id: program_stream_track_id(builder.stream_id),
                     kind: MuxTrackKind::Video,
-                    timescale: parsed.timescale,
+                    timescale,
                     language: *b"und",
                     handler_name: direct_ingest_handler_name("mp4v"),
                     mux_policy: direct_ingest_mux_policy("mp4v", MuxTrackKind::Video),
                     width: parsed.width,
                     height: parsed.height,
-                    sample_entry_box: parsed.sample_entry_box,
-                    source_edit_media_time: None,
-                    samples: parsed
-                        .samples
-                        .into_iter()
-                        .map(|sample| CandidateSample {
-                            source_index: usize::MAX,
-                            data_offset: sample.data_offset,
-                            data_size: sample.data_size,
-                            duration: sample.duration,
-                            composition_time_offset: sample.composition_time_offset,
-                            is_sync_sample: sample.is_sync_sample,
-                        })
-                        .collect(),
+                    sample_entry_box: super::super::mp4::strip_visual_sample_entry_immediate_children(
+                        &parsed.sample_entry_box,
+                        &[FourCc::from_bytes(*b"pasp")],
+                    )?,
+                    source_edit_media_time,
+                    samples,
                 },
                 source_spec: SegmentedMuxSourceSpec {
                     path: path.to_path_buf(),
@@ -2195,6 +2407,23 @@ fn parse_pack_header_sync(
     offset: u64,
     spec: &str,
 ) -> Result<u64, MuxError> {
+    if file_size - offset < 12 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated program stream pack header".to_string(),
+        });
+    }
+    let mut first_byte = [0_u8; 1];
+    read_exact_at_sync(
+        file,
+        offset + 4,
+        &mut first_byte,
+        spec,
+        "truncated program stream pack header",
+    )?;
+    if first_byte[0] & 0xF0 == 0x20 {
+        return Ok(offset + 12);
+    }
     if file_size - offset < 14 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -2202,10 +2431,11 @@ fn parse_pack_header_sync(
         });
     }
     let mut header = [0_u8; 10];
+    header[0] = first_byte[0];
     read_exact_at_sync(
         file,
-        offset + 4,
-        &mut header,
+        offset + 5,
+        &mut header[1..],
         spec,
         "truncated program stream pack header",
     )?;
@@ -2235,6 +2465,24 @@ async fn parse_pack_header_async(
     offset: u64,
     spec: &str,
 ) -> Result<u64, MuxError> {
+    if file_size - offset < 12 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated program stream pack header".to_string(),
+        });
+    }
+    let mut first_byte = [0_u8; 1];
+    read_exact_at_async(
+        file,
+        offset + 4,
+        &mut first_byte,
+        spec,
+        "truncated program stream pack header",
+    )
+    .await?;
+    if first_byte[0] & 0xF0 == 0x20 {
+        return Ok(offset + 12);
+    }
     if file_size - offset < 14 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -2242,10 +2490,11 @@ async fn parse_pack_header_async(
         });
     }
     let mut header = [0_u8; 10];
+    header[0] = first_byte[0];
     read_exact_at_async(
         file,
-        offset + 4,
-        &mut header,
+        offset + 5,
+        &mut header[1..],
         spec,
         "truncated program stream pack header",
     )
@@ -2473,40 +2722,38 @@ fn parse_pes_packet_sync(
         "truncated program stream PES header",
     )?;
     let pes_packet_length = u16::from_be_bytes([header[0], header[1]]);
-    if header[2] & 0xC0 != 0x80 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "unsupported PES header flags on the native direct-ingest program-stream path"
-                .to_string(),
-        });
-    }
-    let header_data_length = u64::from(header[4]);
-    let payload_offset = offset + 9 + header_data_length;
-    if payload_offset > file_size {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "truncated program stream PES payload".to_string(),
-        });
-    }
-    let presentation_time = if header[3] & 0x80 != 0 {
-        Some(parse_program_stream_pes_timestamp_sync(
-            file,
-            offset + 9,
-            file_size,
-            spec,
-        )?)
+    let (payload_offset, presentation_time, decode_time) = if header[2] & 0xC0 == 0x80 {
+        let header_data_length = u64::from(header[4]);
+        let payload_offset = offset + 9 + header_data_length;
+        if payload_offset > file_size {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated program stream PES payload".to_string(),
+            });
+        }
+        let presentation_time = if header[3] & 0x80 != 0 {
+            Some(parse_program_stream_pes_timestamp_sync(
+                file,
+                offset + 9,
+                file_size,
+                spec,
+            )?)
+        } else {
+            None
+        };
+        let decode_time = if header[3] & 0x40 != 0 {
+            Some(parse_program_stream_pes_timestamp_sync(
+                file,
+                offset + 14,
+                file_size,
+                spec,
+            )?)
+        } else {
+            presentation_time
+        };
+        (payload_offset, presentation_time, decode_time)
     } else {
-        None
-    };
-    let decode_time = if header[3] & 0x40 != 0 {
-        Some(parse_program_stream_pes_timestamp_sync(
-            file,
-            offset + 14,
-            file_size,
-            spec,
-        )?)
-    } else {
-        presentation_time
+        parse_mpeg1_pes_header_sync(file, file_size, offset, spec)?
     };
     let packet_end = if pes_packet_length == 0 {
         if !matches!(stream_id, 0xE0..=0xEF) {
@@ -2562,30 +2809,31 @@ async fn parse_pes_packet_async(
     )
     .await?;
     let pes_packet_length = u16::from_be_bytes([header[0], header[1]]);
-    if header[2] & 0xC0 != 0x80 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "unsupported PES header flags on the native direct-ingest program-stream path"
-                .to_string(),
-        });
-    }
-    let header_data_length = u64::from(header[4]);
-    let payload_offset = offset + 9 + header_data_length;
-    if payload_offset > file_size {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "truncated program stream PES payload".to_string(),
-        });
-    }
-    let presentation_time = if header[3] & 0x80 != 0 {
-        Some(parse_program_stream_pes_timestamp_async(file, offset + 9, file_size, spec).await?)
+    let (payload_offset, presentation_time, decode_time) = if header[2] & 0xC0 == 0x80 {
+        let header_data_length = u64::from(header[4]);
+        let payload_offset = offset + 9 + header_data_length;
+        if payload_offset > file_size {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: "truncated program stream PES payload".to_string(),
+            });
+        }
+        let presentation_time = if header[3] & 0x80 != 0 {
+            Some(parse_program_stream_pes_timestamp_async(file, offset + 9, file_size, spec).await?)
+        } else {
+            None
+        };
+        let decode_time = if header[3] & 0x40 != 0 {
+            Some(
+                parse_program_stream_pes_timestamp_async(file, offset + 14, file_size, spec)
+                    .await?,
+            )
+        } else {
+            presentation_time
+        };
+        (payload_offset, presentation_time, decode_time)
     } else {
-        None
-    };
-    let decode_time = if header[3] & 0x40 != 0 {
-        Some(parse_program_stream_pes_timestamp_async(file, offset + 14, file_size, spec).await?)
-    } else {
-        presentation_time
+        parse_mpeg1_pes_header_async(file, file_size, offset, spec).await?
     };
     let packet_end = if pes_packet_length == 0 {
         if !matches!(stream_id, 0xE0..=0xEF) {
@@ -2616,6 +2864,131 @@ async fn parse_pes_packet_async(
         presentation_time,
         decode_time,
     })
+}
+
+fn parse_mpeg1_pes_header_sync(
+    file: &mut File,
+    file_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<(u64, Option<u64>, Option<u64>), MuxError> {
+    let mut cursor = offset + 6;
+    let mut next = read_program_stream_byte_sync(file, file_size, cursor, spec)?;
+    while next == 0xFF {
+        cursor += 1;
+        next = read_program_stream_byte_sync(file, file_size, cursor, spec)?;
+    }
+    if next & 0xC0 == 0x40 {
+        cursor += 2;
+        next = read_program_stream_byte_sync(file, file_size, cursor, spec)?;
+    }
+    if next & 0xF0 == 0x20 {
+        let presentation_time =
+            parse_program_stream_pes_timestamp_sync(file, cursor, file_size, spec)?;
+        return Ok((cursor + 5, Some(presentation_time), Some(presentation_time)));
+    }
+    if next & 0xF0 == 0x30 {
+        let presentation_time =
+            parse_program_stream_pes_timestamp_sync(file, cursor, file_size, spec)?;
+        let decode_time =
+            parse_program_stream_pes_timestamp_sync(file, cursor + 5, file_size, spec)?;
+        return Ok((cursor + 10, Some(presentation_time), Some(decode_time)));
+    }
+    if next == 0x0F {
+        return Ok((cursor + 1, None, None));
+    }
+    Err(MuxError::UnsupportedTrackImport {
+        spec: spec.to_string(),
+        message: "unsupported PES header flags on the native direct-ingest program-stream path"
+            .to_string(),
+    })
+}
+
+#[cfg(feature = "async")]
+async fn parse_mpeg1_pes_header_async(
+    file: &mut TokioFile,
+    file_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<(u64, Option<u64>, Option<u64>), MuxError> {
+    let mut cursor = offset + 6;
+    let mut next = read_program_stream_byte_async(file, file_size, cursor, spec).await?;
+    while next == 0xFF {
+        cursor += 1;
+        next = read_program_stream_byte_async(file, file_size, cursor, spec).await?;
+    }
+    if next & 0xC0 == 0x40 {
+        cursor += 2;
+        next = read_program_stream_byte_async(file, file_size, cursor, spec).await?;
+    }
+    if next & 0xF0 == 0x20 {
+        let presentation_time =
+            parse_program_stream_pes_timestamp_async(file, cursor, file_size, spec).await?;
+        return Ok((cursor + 5, Some(presentation_time), Some(presentation_time)));
+    }
+    if next & 0xF0 == 0x30 {
+        let presentation_time =
+            parse_program_stream_pes_timestamp_async(file, cursor, file_size, spec).await?;
+        let decode_time =
+            parse_program_stream_pes_timestamp_async(file, cursor + 5, file_size, spec).await?;
+        return Ok((cursor + 10, Some(presentation_time), Some(decode_time)));
+    }
+    if next == 0x0F {
+        return Ok((cursor + 1, None, None));
+    }
+    Err(MuxError::UnsupportedTrackImport {
+        spec: spec.to_string(),
+        message: "unsupported PES header flags on the native direct-ingest program-stream path"
+            .to_string(),
+    })
+}
+
+fn read_program_stream_byte_sync(
+    file: &mut File,
+    file_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<u8, MuxError> {
+    if offset >= file_size {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated program stream PES header".to_string(),
+        });
+    }
+    let mut byte = [0_u8; 1];
+    read_exact_at_sync(
+        file,
+        offset,
+        &mut byte,
+        spec,
+        "truncated program stream PES header",
+    )?;
+    Ok(byte[0])
+}
+
+#[cfg(feature = "async")]
+async fn read_program_stream_byte_async(
+    file: &mut TokioFile,
+    file_size: u64,
+    offset: u64,
+    spec: &str,
+) -> Result<u8, MuxError> {
+    if offset >= file_size {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "truncated program stream PES header".to_string(),
+        });
+    }
+    let mut byte = [0_u8; 1];
+    read_exact_at_async(
+        file,
+        offset,
+        &mut byte,
+        spec,
+        "truncated program stream PES header",
+    )
+    .await?;
+    Ok(byte[0])
 }
 
 fn parse_program_stream_pes_timestamp_sync(
@@ -2683,7 +3056,20 @@ fn parse_program_stream_pes_timestamp_bytes(pts: &[u8; 5], spec: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{PROGRAM_STREAM_MEDIA_TIMESCALE, normalize_program_stream_mpeg2v_samples};
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::path::PathBuf;
+
+    use super::{
+        PADDING_STREAM_START_CODE, PRIVATE_STREAM_1_START_CODE, PRIVATE_STREAM_2_START_CODE,
+        PROGRAM_STREAM_MAP_START_CODE, PROGRAM_STREAM_MEDIA_TIMESCALE, ProgramStreamTrackBuilder,
+        ProgramStreamTrackKind, SYSTEM_HEADER_START_CODE, append_file_range_segment,
+        normalize_program_stream_mpeg2v_samples, parse_pes_packet_sync,
+        read_program_stream_start_code_sync, scan_mpeg2v_segmented_sync, scan_program_stream_sync,
+        skip_length_delimited_ps_packet_sync, validate_program_stream_header_sync,
+    };
+    use crate::mux::MuxTrackKind;
+    use crate::mux::import::SegmentedMuxSourceSegment;
     use crate::mux::import::StagedSample;
 
     #[test]
@@ -2759,5 +3145,142 @@ mod tests {
             vec![3600, 3600, 3600, 3600]
         );
         assert!(normalized[0].is_sync_sample);
+    }
+
+    #[test]
+    fn program_stream_mpeg2v_fixture_maps_expected_flat_sampleization() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("mux")
+            .join("program_stream_video.mpeg");
+        let spec = format!("{}#video", path.display());
+        let mut file = File::open(&path).unwrap();
+        let file_size = file.metadata().unwrap().len();
+        validate_program_stream_header_sync(&mut file, file_size, &spec).unwrap();
+        let mut builders = BTreeMap::<u8, ProgramStreamTrackBuilder>::new();
+        let mut offset = 0_u64;
+        while offset < file_size {
+            let start_code =
+                read_program_stream_start_code_sync(&mut file, file_size, offset, &spec).unwrap();
+            match start_code[3] {
+                0xBA => {
+                    offset =
+                        super::parse_pack_header_sync(&mut file, file_size, offset, &spec).unwrap();
+                }
+                SYSTEM_HEADER_START_CODE
+                | PROGRAM_STREAM_MAP_START_CODE
+                | PADDING_STREAM_START_CODE
+                | PRIVATE_STREAM_2_START_CODE => {
+                    offset = skip_length_delimited_ps_packet_sync(
+                        &mut file,
+                        file_size,
+                        offset,
+                        &spec,
+                        start_code[3],
+                    )
+                    .unwrap();
+                }
+                PRIVATE_STREAM_1_START_CODE => {
+                    offset = super::parse_private_stream_1_pes_packet_sync(
+                        &mut file,
+                        file_size,
+                        offset,
+                        &spec,
+                        start_code[3],
+                    )
+                    .unwrap()
+                    .packet_end;
+                }
+                0xC0..=0xDF => {
+                    let parsed =
+                        parse_pes_packet_sync(&mut file, file_size, offset, &spec, start_code[3])
+                            .unwrap();
+                    let builder = builders.entry(start_code[3]).or_insert_with(|| {
+                        ProgramStreamTrackBuilder {
+                            stream_id: start_code[3],
+                            kind: ProgramStreamTrackKind::Mp3,
+                            lpcm_format: None,
+                            segments: Vec::<SegmentedMuxSourceSegment>::new(),
+                            total_size: 0,
+                            sample_offsets: Vec::new(),
+                            sample_pts: Vec::new(),
+                            sample_dts: Vec::new(),
+                        }
+                    });
+                    append_file_range_segment(
+                        &mut builder.segments,
+                        &mut builder.total_size,
+                        parsed.payload_offset,
+                        parsed.payload_size,
+                    );
+                    offset = parsed.packet_end;
+                }
+                0xE0..=0xEF => {
+                    let parsed =
+                        parse_pes_packet_sync(&mut file, file_size, offset, &spec, start_code[3])
+                            .unwrap();
+                    let builder = builders.entry(start_code[3]).or_insert_with(|| {
+                        ProgramStreamTrackBuilder {
+                            stream_id: start_code[3],
+                            kind: ProgramStreamTrackKind::Video,
+                            lpcm_format: None,
+                            segments: Vec::<SegmentedMuxSourceSegment>::new(),
+                            total_size: 0,
+                            sample_offsets: Vec::new(),
+                            sample_pts: Vec::new(),
+                            sample_dts: Vec::new(),
+                        }
+                    });
+                    if let Some(presentation_time) = parsed.presentation_time {
+                        builder.sample_offsets.push(builder.total_size);
+                        builder.sample_pts.push(presentation_time);
+                        builder
+                            .sample_dts
+                            .push(parsed.decode_time.unwrap_or(presentation_time));
+                    }
+                    append_file_range_segment(
+                        &mut builder.segments,
+                        &mut builder.total_size,
+                        parsed.payload_offset,
+                        parsed.payload_size,
+                    );
+                    offset = parsed.packet_end;
+                }
+                0xB9 => break,
+                other => panic!("unexpected start code 0x{other:02X}"),
+            }
+        }
+        let builder = builders.remove(&0xE0).unwrap();
+        let _parsed =
+            scan_mpeg2v_segmented_sync(&mut file, &builder.segments, builder.total_size, &spec)
+                .unwrap();
+        let tracks = scan_program_stream_sync(&path, &spec).unwrap();
+        let video = tracks
+            .into_iter()
+            .find(|candidate| candidate.track.kind == MuxTrackKind::Video)
+            .unwrap();
+        let samples = video.track.samples;
+        assert_eq!(video.track.timescale, PROGRAM_STREAM_MEDIA_TIMESCALE);
+        assert_eq!(video.track.source_edit_media_time, Some(3003));
+        assert_eq!(samples.len(), 29);
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.is_sync_sample)
+                .count(),
+            3
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.duration)
+                .collect::<Vec<_>>(),
+            {
+                let mut durations = vec![3003; 28];
+                durations.push(1001);
+                durations
+            }
+        );
     }
 }

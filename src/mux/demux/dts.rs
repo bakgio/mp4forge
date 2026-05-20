@@ -80,7 +80,6 @@ enum DtsInputEncoding {
 }
 
 struct NormalizedDtsStream {
-    bytes: Vec<u8>,
     descriptor: Option<DtsTrackDescriptor>,
     samples: Vec<StagedSample>,
     consumed_input_size: usize,
@@ -95,7 +94,18 @@ pub(in crate::mux) fn scan_dts_file_sync(
     let file_size = file.metadata()?.len();
     let (start_offset, encoding) = sniff_dts_payload_sync(&mut file, file_size, spec)?;
     if start_offset == 0 && matches!(encoding, DtsInputEncoding::CoreBigEndian16) {
-        parse_dts_stream_sync(&mut file, start_offset, file_size, spec)
+        match parse_dts_stream_sync(&mut file, start_offset, file_size, spec) {
+            Ok(parsed) => Ok(parsed),
+            Err(MuxError::UnsupportedTrackImport { .. }) => parse_transformed_dts_stream_sync(
+                path,
+                &mut file,
+                start_offset,
+                file_size,
+                encoding,
+                spec,
+            ),
+            Err(error) => Err(error),
+        }
     } else {
         parse_transformed_dts_stream_sync(path, &mut file, start_offset, file_size, encoding, spec)
     }
@@ -155,7 +165,21 @@ pub(in crate::mux) async fn scan_dts_file_async(
     let file_size = file.metadata().await?.len();
     let (start_offset, encoding) = sniff_dts_payload_async(&mut file, file_size, spec).await?;
     if start_offset == 0 && matches!(encoding, DtsInputEncoding::CoreBigEndian16) {
-        parse_dts_stream_async(&mut file, start_offset, file_size, spec).await
+        match parse_dts_stream_async(&mut file, start_offset, file_size, spec).await {
+            Ok(parsed) => Ok(parsed),
+            Err(MuxError::UnsupportedTrackImport { .. }) => {
+                parse_transformed_dts_stream_async(
+                    path,
+                    &mut file,
+                    start_offset,
+                    file_size,
+                    encoding,
+                    spec,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
     } else {
         parse_transformed_dts_stream_async(path, &mut file, start_offset, file_size, encoding, spec)
             .await
@@ -220,7 +244,7 @@ fn parse_dts_stream_sync(
             });
         }
         if let Some(current) = descriptor {
-            if current != parsed.descriptor {
+            if !dts_stream_descriptor_matches(current, parsed.descriptor) {
                 return Err(MuxError::UnsupportedTrackImport {
                     spec: spec.to_string(),
                     message: "DTS frames changed decoder configuration mid-stream".to_string(),
@@ -508,13 +532,7 @@ fn parse_transformed_dts_stream_sync(
 
     let input = read_dts_stream_range_sync(file, start_offset, file_size, spec)?;
     let normalized = normalize_dts_stream_bytes(&input, encoding, spec, false)?;
-    let staged_bytes = match encoding {
-        // Keep the original little-endian core wire bytes in mdat so flat direct-ingest parity
-        // matches the retained path-only importer behavior while we still parse headers through a
-        // normalized big-endian view.
-        DtsInputEncoding::CoreLittleEndian16 => input[..normalized.consumed_input_size].to_vec(),
-        _ => normalized.bytes,
-    };
+    let staged_bytes = input[..normalized.consumed_input_size].to_vec();
     let total_size = u64::try_from(staged_bytes.len())
         .map_err(|_| MuxError::LayoutOverflow("DTS transformed source size"))?;
     let transformed_source = SegmentedMuxSourceSpec {
@@ -525,10 +543,17 @@ fn parse_transformed_dts_stream_sync(
         }],
         total_size,
     };
+    let carried_samples = rebuild_carried_dts_samples(
+        normalized
+            .frame_input_sizes
+            .iter()
+            .copied()
+            .zip(normalized.samples.iter().map(|sample| sample.duration)),
+    )?;
     finalize_parsed_dts_track(
         spec,
         normalized.descriptor,
-        normalized.samples,
+        carried_samples,
         Some(transformed_source),
         DTSC,
     )
@@ -578,10 +603,7 @@ async fn parse_transformed_dts_stream_async(
 
     let input = read_dts_stream_range_async(file, start_offset, file_size, spec).await?;
     let normalized = normalize_dts_stream_bytes(&input, encoding, spec, false)?;
-    let staged_bytes = match encoding {
-        DtsInputEncoding::CoreLittleEndian16 => input[..normalized.consumed_input_size].to_vec(),
-        _ => normalized.bytes,
-    };
+    let staged_bytes = input[..normalized.consumed_input_size].to_vec();
     let total_size = u64::try_from(staged_bytes.len())
         .map_err(|_| MuxError::LayoutOverflow("DTS transformed source size"))?;
     let transformed_source = SegmentedMuxSourceSpec {
@@ -592,10 +614,17 @@ async fn parse_transformed_dts_stream_async(
         }],
         total_size,
     };
+    let carried_samples = rebuild_carried_dts_samples(
+        normalized
+            .frame_input_sizes
+            .iter()
+            .copied()
+            .zip(normalized.samples.iter().map(|sample| sample.duration)),
+    )?;
     finalize_parsed_dts_track(
         spec,
         normalized.descriptor,
-        normalized.samples,
+        carried_samples,
         Some(transformed_source),
         DTSC,
     )
@@ -674,10 +703,63 @@ fn normalize_dts_stream_bytes(
         {
             break;
         }
-        let (normalized_frame, parsed, frame_input_size) =
+        let frame_start = input_offset;
+        let (normalized_frame, mut parsed, frame_input_size) =
             normalize_one_dts_frame(input, input_offset, encoding, spec)?;
+        let mut next_input_offset = frame_start
+            .checked_add(frame_input_size)
+            .ok_or(MuxError::LayoutOverflow("DTS transformed input offset"))?;
+        let mut sample_input_size = frame_input_size;
+        if let Some(next_sync_offset) = find_next_valid_dts_encoding_sync(
+            input,
+            frame_start.saturating_add(1),
+            encoding,
+            descriptor,
+            spec,
+        )
+        .filter(|next_sync_offset| *next_sync_offset < next_input_offset)
+        {
+            sample_input_size = next_sync_offset
+                .checked_sub(frame_start)
+                .ok_or(MuxError::LayoutOverflow("DTS carried frame span"))?;
+            next_input_offset = next_sync_offset;
+        }
+        if next_input_offset < input.len()
+            && !input_starts_with_dts_encoding(input, next_input_offset, encoding)
+        {
+            if let Some(next_sync_offset) = find_next_valid_dts_encoding_sync(
+                input,
+                next_input_offset,
+                encoding,
+                descriptor,
+                spec,
+            ) {
+                sample_input_size = next_sync_offset
+                    .checked_sub(frame_start)
+                    .ok_or(MuxError::LayoutOverflow("DTS carried frame span"))?;
+                next_input_offset = next_sync_offset;
+            } else if allow_non_core_tail {
+                break;
+            } else if descriptor.is_some() {
+                sample_input_size = input
+                    .len()
+                    .checked_sub(frame_start)
+                    .ok_or(MuxError::LayoutOverflow("DTS carried frame tail"))?;
+                next_input_offset = input.len();
+            } else {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: format!(
+                        "missing core DTS sync word at byte offset {next_input_offset}"
+                    ),
+                });
+            }
+        }
+        if sample_input_size > frame_input_size {
+            parsed.descriptor.sample_depth = 24;
+        }
         if let Some(current) = descriptor {
-            if current != parsed.descriptor {
+            if !dts_stream_descriptor_matches(current, parsed.descriptor) {
                 return Err(MuxError::UnsupportedTrackImport {
                     spec: spec.to_string(),
                     message: "DTS frames changed decoder configuration mid-stream".to_string(),
@@ -690,7 +772,7 @@ fn normalize_dts_stream_bytes(
             .map_err(|_| MuxError::LayoutOverflow("DTS transformed output offset"))?;
         output.extend_from_slice(&normalized_frame);
         frame_input_sizes.push(
-            u32::try_from(frame_input_size)
+            u32::try_from(sample_input_size)
                 .map_err(|_| MuxError::LayoutOverflow("DTS transformed frame input size"))?,
         );
         samples.push(StagedSample {
@@ -700,13 +782,10 @@ fn normalize_dts_stream_bytes(
             composition_time_offset: 0,
             is_sync_sample: true,
         });
-        input_offset = input_offset
-            .checked_add(frame_input_size)
-            .ok_or(MuxError::LayoutOverflow("DTS transformed input offset"))?;
+        input_offset = next_input_offset;
     }
 
     Ok(NormalizedDtsStream {
-        bytes: output,
         descriptor,
         samples,
         consumed_input_size: input_offset,
@@ -723,6 +802,49 @@ fn input_starts_with_dts_encoding(
         return false;
     };
     prefix == dts_encoding_sync_bytes(encoding)
+}
+
+fn find_next_valid_dts_encoding_sync(
+    input: &[u8],
+    input_offset: usize,
+    encoding: DtsInputEncoding,
+    expected_descriptor: Option<DtsTrackDescriptor>,
+    spec: &str,
+) -> Option<usize> {
+    let sync = dts_encoding_sync_bytes(encoding);
+    let suffix = input.get(input_offset..)?;
+    for candidate_offset in suffix
+        .windows(sync.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == sync).then_some(input_offset + offset))
+    {
+        let Ok((_, parsed, _)) = normalize_one_dts_frame(input, candidate_offset, encoding, spec)
+        else {
+            continue;
+        };
+        if expected_descriptor
+            .is_none_or(|descriptor| dts_sync_descriptor_matches(descriptor, parsed.descriptor))
+        {
+            return Some(candidate_offset);
+        }
+    }
+    None
+}
+
+fn dts_sync_descriptor_matches(
+    expected: DtsTrackDescriptor,
+    candidate: DtsTrackDescriptor,
+) -> bool {
+    expected.sample_rate == candidate.sample_rate
+        && expected.sample_duration == candidate.sample_duration
+        && expected.channel_count == candidate.channel_count
+}
+
+fn dts_stream_descriptor_matches(
+    expected: DtsTrackDescriptor,
+    candidate: DtsTrackDescriptor,
+) -> bool {
+    dts_sync_descriptor_matches(expected, candidate)
 }
 
 fn dts_encoding_sync_bytes(encoding: DtsInputEncoding) -> &'static [u8; 4] {
@@ -748,7 +870,7 @@ fn normalize_one_dts_frame(
     )?;
     let normalized_frame_size = usize::try_from(parsed.frame_size)
         .map_err(|_| MuxError::LayoutOverflow("DTS frame size"))?;
-    let frame_input_size = match encoding {
+    let mut frame_input_size = match encoding {
         DtsInputEncoding::CoreBigEndian16 | DtsInputEncoding::CoreLittleEndian16 => {
             normalized_frame_size
         }
@@ -756,14 +878,25 @@ fn normalize_one_dts_frame(
             packed_14bit_frame_size(normalized_frame_size)?
         }
     };
-    let frame_end = input_offset
+    let mut frame_end = input_offset
         .checked_add(frame_input_size)
         .ok_or(MuxError::LayoutOverflow("DTS frame end"))?;
     if frame_end > input.len() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!("truncated DTS frame at byte offset {input_offset}"),
-        });
+        if matches!(
+            encoding,
+            DtsInputEncoding::CoreBigEndian16 | DtsInputEncoding::CoreLittleEndian16
+        ) {
+            frame_end = input.len();
+            frame_input_size = input
+                .len()
+                .checked_sub(input_offset)
+                .ok_or(MuxError::LayoutOverflow("DTS frame end"))?;
+        } else {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!("truncated DTS frame at byte offset {input_offset}"),
+            });
+        }
     }
     let normalized_frame = match encoding {
         DtsInputEncoding::CoreBigEndian16 => input[input_offset..frame_end].to_vec(),
@@ -1011,18 +1144,44 @@ fn finalize_parsed_dts_track(
             message: "DTS input contained frames with zero duration".to_string(),
         });
     }
-    let btrt = build_btrt_from_sample_sizes(
-        samples
-            .iter()
-            .map(|sample| (sample.data_size, sample.duration)),
-        DTS_MEDIA_TIMESCALE,
-    )?;
     Ok(ParsedDtsTrack {
         media_timescale: DTS_MEDIA_TIMESCALE,
-        sample_entry_box: build_dts_sample_entry_box(descriptor, btrt, sample_entry_type)?,
+        sample_entry_box: build_dts_sample_entry_box(
+            descriptor,
+            build_btrt_from_sample_sizes(
+                samples
+                    .iter()
+                    .map(|sample| (sample.data_size, sample.duration)),
+                DTS_MEDIA_TIMESCALE,
+            )?,
+            sample_entry_type,
+        )?,
         samples,
         transformed_source,
     })
+}
+
+fn rebuild_carried_dts_samples<I>(
+    sample_spans_and_durations: I,
+) -> Result<Vec<StagedSample>, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    let mut data_offset = 0_u64;
+    let mut samples = Vec::new();
+    for (data_size, duration) in sample_spans_and_durations {
+        samples.push(StagedSample {
+            data_offset,
+            data_size,
+            duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        data_offset = data_offset
+            .checked_add(u64::from(data_size))
+            .ok_or(MuxError::LayoutOverflow("DTS carried sample offset"))?;
+    }
+    Ok(samples)
 }
 
 fn rebuild_wrapped_dts_family_samples(
@@ -1199,8 +1358,8 @@ fn build_dts_sample_entry_box(
         descriptor.sample_rate << 16
     };
 
-    let btrt_bytes = super::super::mp4::encode_typed_box(&btrt, &[])?;
-    super::super::mp4::encode_typed_box(&sample_entry, &btrt_bytes)
+    let child_box_bytes = super::super::mp4::encode_typed_box(&btrt, &[])?;
+    super::super::mp4::encode_typed_box(&sample_entry, &child_box_bytes)
 }
 
 /// Rewrites carried transport DTS sample entries onto the transport-oriented box type.
@@ -1326,5 +1485,28 @@ fn unsupported_raw_dts(spec: &str, message: String) -> MuxError {
     MuxError::UnsupportedTrackImport {
         spec: spec.to_string(),
         message: format!("{message}; {RAW_DTS_DIRECT_INGEST_NOTE}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dts_core_sample_entry_uses_btrt_child() {
+        let sample_entry_box = build_dts_sample_entry_box(
+            DtsTrackDescriptor {
+                sample_rate: 48_000,
+                sample_duration: 4096,
+                channel_count: 4,
+                sample_depth: 24,
+            },
+            Btrt::default(),
+            DTSC,
+        )
+        .unwrap();
+
+        assert!(sample_entry_box.windows(4).any(|window| window == b"btrt"));
+        assert!(!sample_entry_box.windows(4).any(|window| window == b"ddts"));
     }
 }

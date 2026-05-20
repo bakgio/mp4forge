@@ -173,10 +173,19 @@ pub(in crate::mux) fn scan_ac4_file_sync(
     let first_frame = read_ac4_frame_header_sync(&mut file, file_size, 0, spec)?;
     let first_payload = read_ac4_frame_payload_sync(&mut file, 0, first_frame, spec)?;
     let parsed_stream = parse_ac4_stream(&first_payload, spec)?;
+    let first_is_sync_sample = read_ac4_frame_sync_flag(&first_payload, spec)?;
     let mut offset = 0_u64;
     let mut samples = Vec::new();
     while offset < file_size {
         let frame = read_ac4_frame_header_sync(&mut file, file_size, offset, spec)?;
+        let is_sync_sample = if offset == 0 {
+            first_is_sync_sample
+        } else {
+            read_ac4_frame_sync_flag(
+                &read_ac4_frame_payload_sync(&mut file, offset, frame, spec)?,
+                spec,
+            )?
+        };
         samples.push(StagedSample {
             data_offset: offset
                 .checked_add(frame.header_size)
@@ -185,7 +194,7 @@ pub(in crate::mux) fn scan_ac4_file_sync(
                 .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?,
             duration: parsed_stream.sample_duration,
             composition_time_offset: 0,
-            is_sync_sample: true,
+            is_sync_sample,
         });
         offset = offset
             .checked_add(frame.total_frame_size)
@@ -220,10 +229,19 @@ pub(in crate::mux) fn scan_ac4_segmented_sync(
     let first_payload =
         read_ac4_frame_payload_segmented_sync(file, segments, total_size, 0, first_frame, spec)?;
     let parsed_stream = parse_ac4_stream(&first_payload, spec)?;
+    let first_is_sync_sample = read_ac4_frame_sync_flag(&first_payload, spec)?;
     let mut offset = 0_u64;
     let mut samples = Vec::new();
     while offset < total_size {
         let frame = read_ac4_frame_header_segmented_sync(file, segments, total_size, offset, spec)?;
+        let is_sync_sample = if offset == 0 {
+            first_is_sync_sample
+        } else {
+            read_ac4_frame_sync_flag(
+                &read_ac4_frame_payload_segmented_sync(file, segments, total_size, offset, frame, spec)?,
+                spec,
+            )?
+        };
         samples.push(StagedSample {
             data_offset: offset
                 .checked_add(frame.header_size)
@@ -232,7 +250,7 @@ pub(in crate::mux) fn scan_ac4_segmented_sync(
                 .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?,
             duration: parsed_stream.sample_duration,
             composition_time_offset: 0,
-            is_sync_sample: true,
+            is_sync_sample,
         });
         offset = offset
             .checked_add(frame.total_frame_size)
@@ -267,10 +285,19 @@ pub(in crate::mux) async fn scan_ac4_file_async(
     let first_frame = read_ac4_frame_header_async(&mut file, file_size, 0, spec).await?;
     let first_payload = read_ac4_frame_payload_async(&mut file, 0, first_frame, spec).await?;
     let parsed_stream = parse_ac4_stream(&first_payload, spec)?;
+    let first_is_sync_sample = read_ac4_frame_sync_flag(&first_payload, spec)?;
     let mut offset = 0_u64;
     let mut samples = Vec::new();
     while offset < file_size {
         let frame = read_ac4_frame_header_async(&mut file, file_size, offset, spec).await?;
+        let is_sync_sample = if offset == 0 {
+            first_is_sync_sample
+        } else {
+            read_ac4_frame_sync_flag(
+                &read_ac4_frame_payload_async(&mut file, offset, frame, spec).await?,
+                spec,
+            )?
+        };
         samples.push(StagedSample {
             data_offset: offset
                 .checked_add(frame.header_size)
@@ -279,7 +306,7 @@ pub(in crate::mux) async fn scan_ac4_file_async(
                 .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?,
             duration: parsed_stream.sample_duration,
             composition_time_offset: 0,
-            is_sync_sample: true,
+            is_sync_sample,
         });
         offset = offset
             .checked_add(frame.total_frame_size)
@@ -317,11 +344,21 @@ pub(in crate::mux) async fn scan_ac4_segmented_async(
         read_ac4_frame_payload_segmented_async(file, segments, total_size, 0, first_frame, spec)
             .await?;
     let parsed_stream = parse_ac4_stream(&first_payload, spec)?;
+    let first_is_sync_sample = read_ac4_frame_sync_flag(&first_payload, spec)?;
     let mut offset = 0_u64;
     let mut samples = Vec::new();
     while offset < total_size {
         let frame =
             read_ac4_frame_header_segmented_async(file, segments, total_size, offset, spec).await?;
+        let is_sync_sample = if offset == 0 {
+            first_is_sync_sample
+        } else {
+            read_ac4_frame_sync_flag(
+                &read_ac4_frame_payload_segmented_async(file, segments, total_size, offset, frame, spec)
+                    .await?,
+                spec,
+            )?
+        };
         samples.push(StagedSample {
             data_offset: offset
                 .checked_add(frame.header_size)
@@ -330,7 +367,7 @@ pub(in crate::mux) async fn scan_ac4_segmented_async(
                 .map_err(|_| MuxError::LayoutOverflow("AC-4 frame payload size"))?,
             duration: parsed_stream.sample_duration,
             composition_time_offset: 0,
-            is_sync_sample: true,
+            is_sync_sample,
         });
         offset = offset
             .checked_add(frame.total_frame_size)
@@ -801,36 +838,66 @@ fn parse_ac4_stream(frame_payload: &[u8], spec: &str) -> Result<ParsedAc4Stream,
             presentation_index,
         )?);
     }
-    let max_group_index = presentations
-        .iter()
-        .map(|presentation| presentation.group_index)
-        .max()
-        .unwrap_or(0);
-    if max_group_index > 0 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "path-only AC-4 import currently supports only the first substream group"
-                .to_string(),
-        });
+    let mut referenced_group_indices = Vec::new();
+    for presentation in &presentations {
+        if !referenced_group_indices.contains(&presentation.group_index) {
+            referenced_group_indices.push(presentation.group_index);
+        }
     }
-    let group_frame_rate_factor = presentations
-        .first()
-        .map(|presentation| match presentation.frame_rate_multiply_info {
+    let mut parsed_groups = Vec::with_capacity(referenced_group_indices.len());
+    for group_index in &referenced_group_indices {
+        let group_presentation = presentations
+            .iter()
+            .find(|presentation| presentation.group_index == *group_index)
+            .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!("AC-4 substream group {group_index} is not referenced by any presentation"),
+            })?;
+        let group_frame_rate_factor = match group_presentation.frame_rate_multiply_info {
             0 => 1,
             value => u32::from(value) * 2,
+        };
+        let parsed_group = parse_ac4_substream_group(
+            &mut reader,
+            spec,
+            group_frame_rate_factor,
+            fs_index,
+            group_presentation.presentation_version,
+        )?;
+        parsed_groups.push(parsed_group);
+    }
+    let default_speaker_group_mask = presentations
+        .first()
+        .and_then(|presentation| {
+            referenced_group_indices
+                .iter()
+                .position(|group_index| *group_index == presentation.group_index)
+                .and_then(|position| parsed_groups.get(position))
         })
-        .unwrap_or(1);
-    let parsed_group =
-        parse_ac4_substream_group(&mut reader, spec, group_frame_rate_factor, fs_index)?;
-    let default_speaker_group_mask = parsed_group
-        .substreams
-        .iter()
-        .fold(0_u32, |mask, substream| mask | substream.channel_mask);
+        .map(|group| {
+            group.substreams.iter().fold(0_u32, |mask, substream| {
+                mask | substream.channel_mask
+            })
+        })
+        .unwrap_or(0);
     for presentation in &mut presentations {
-        presentation.group = Some(parsed_group.clone());
+        let group_position = referenced_group_indices
+            .iter()
+            .position(|group_index| *group_index == presentation.group_index)
+            .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "AC-4 presentation references unknown substream group {}",
+                    presentation.group_index
+                ),
+            })?;
+        presentation.group = Some(
+            parsed_groups[group_position].clone(),
+        );
         populate_ac4_presentation_channels(presentation);
         normalize_ac4_presentation_for_dsi(presentation);
     }
+    append_legacy_ac4_presentations(&mut presentations);
 
     let presentation = presentations
         .first()
@@ -860,6 +927,37 @@ fn parse_ac4_stream(frame_payload: &[u8], spec: &str) -> Result<ParsedAc4Stream,
     })
 }
 
+fn read_ac4_frame_sync_flag(frame_payload: &[u8], spec: &str) -> Result<bool, MuxError> {
+    let mut reader = Ac4BitCursor::new(frame_payload);
+    let bitstream_version = u8::try_from(read_ac4_variable_bits_prefixed(
+        &mut reader,
+        spec,
+        "bitstream_version",
+        2,
+        Some(3),
+    )?)
+    .map_err(|_| MuxError::UnsupportedTrackImport {
+        spec: spec.to_string(),
+        message: "AC-4 bitstream version does not fit in u8".to_string(),
+    })?;
+    if bitstream_version <= 1 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "path-only AC-4 import currently requires bitstream_version > 1".to_string(),
+        });
+    }
+    let _sequence_counter = reader.read_bits(10, spec, "sequence_counter")?;
+    if reader.read_bool(spec, "b_wait_frames")? {
+        let wait_frames = reader.read_bits(3, spec, "wait_frames")?;
+        if wait_frames > 0 {
+            reader.skip_bits(2, spec, "wait_frames reserved bits")?;
+        }
+    }
+    let _fs_index = reader.read_bits(1, spec, "fs_index")?;
+    let _frame_rate_index = reader.read_bits(4, spec, "frame_rate_index")?;
+    reader.read_bool(spec, "b_iframe_global")
+}
+
 fn parse_ac4_presentation(
     reader: &mut Ac4BitCursor<'_>,
     spec: &str,
@@ -880,7 +978,7 @@ fn parse_ac4_presentation(
     }
 
     let presentation_version = parse_ac4_presentation_version(reader, spec)?;
-    if presentation_version > 1 {
+    if presentation_version > 2 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
             message: format!(
@@ -922,7 +1020,10 @@ fn parse_ac4_presentation(
     };
     let _ = fs_index;
     let group_index = parse_ac4_group_index(reader, spec, bitstream_version)?;
-    let pre_virtualized = reader.read_bool(spec, "b_pre_virtualized")?;
+    let mut pre_virtualized = reader.read_bool(spec, "b_pre_virtualized")?;
+    if presentation_version == 2 {
+        pre_virtualized = true;
+    }
     let has_add_emdf_substreams = reader.read_bool(spec, "b_add_emdf_substreams")?;
     skip_ac4_presentation_substream_info(reader, spec)?;
 
@@ -1009,6 +1110,10 @@ fn normalize_ac4_presentation_for_dsi(presentation: &mut ParsedAc4Presentation) 
         presentation.presentation_channel_mask,
         presentation.presentation_channel_mode,
     );
+    if presentation.top_channel_pairs == 0 && (presentation.presentation_channel_mask & 0x80) != 0
+    {
+        presentation.top_channel_pairs = 1;
+    }
     if uses_stereo_fallback {
         presentation.presentation_channel_mode = 1;
         presentation.presentation_channel_mask = 0x01;
@@ -1037,11 +1142,33 @@ fn normalize_ac4_presentation_for_dsi(presentation: &mut ParsedAc4Presentation) 
     }
 }
 
+fn append_legacy_ac4_presentations(presentations: &mut Vec<ParsedAc4Presentation>) {
+    if presentations
+        .iter()
+        .any(|presentation| presentation.presentation_version == 1)
+    {
+        return;
+    }
+
+    let legacy = presentations
+        .iter()
+        .filter(|presentation| presentation.presentation_version == 2)
+        .cloned()
+        .map(|mut presentation| {
+            presentation.presentation_version = 1;
+            presentation.pre_virtualized = false;
+            presentation
+        })
+        .collect::<Vec<_>>();
+    presentations.extend(legacy);
+}
+
 fn parse_ac4_substream_group(
     reader: &mut Ac4BitCursor<'_>,
     spec: &str,
     frame_rate_factor: u32,
     fs_index: u8,
+    presentation_version: u8,
 ) -> Result<ParsedAc4SubstreamGroup, MuxError> {
     let substreams_present = reader.read_bool(spec, "b_substreams_present")?;
     let high_sample_rate_extension = reader.read_bool(spec, "b_hsf_ext")?;
@@ -1078,6 +1205,7 @@ fn parse_ac4_substream_group(
             frame_rate_factor,
             substreams_present,
             fs_index,
+            presentation_version,
         )?);
         if high_sample_rate_extension {
             skip_ac4_hsf_ext_substream_info(reader, spec, substreams_present)?;
@@ -1113,8 +1241,9 @@ fn parse_ac4_channel_coded_substream(
     frame_rate_factor: u32,
     substreams_present: bool,
     fs_index: u8,
+    presentation_version: u8,
 ) -> Result<ParsedAc4Substream, MuxError> {
-    let channel_mode = parse_ac4_channel_mode(reader, spec)?;
+    let channel_mode = parse_ac4_channel_mode(reader, spec, presentation_version)?;
     let mut channel_mask = *AC4_CHANNEL_MASK_BY_MODE
         .get(usize::from(channel_mode))
         .ok_or_else(|| MuxError::UnsupportedTrackImport {
@@ -1192,7 +1321,11 @@ fn parse_ac4_channel_coded_substream(
     })
 }
 
-fn parse_ac4_channel_mode(reader: &mut Ac4BitCursor<'_>, spec: &str) -> Result<u8, MuxError> {
+fn parse_ac4_channel_mode(
+    reader: &mut Ac4BitCursor<'_>,
+    spec: &str,
+    presentation_version: u8,
+) -> Result<u8, MuxError> {
     let mut code = reader.read_bits(1, spec, "channel_mode")?;
     if code == 0 {
         return Ok(0);
@@ -1210,6 +1343,8 @@ fn parse_ac4_channel_mode(reader: &mut Ac4BitCursor<'_>, spec: &str) -> Result<u
     }
     code = (code << 3) | reader.read_bits(3, spec, "channel_mode")?;
     match code {
+        120 if presentation_version == 2 => return Ok(1),
+        121 if presentation_version == 2 => return Ok(1),
         120 => return Ok(5),
         121 => return Ok(6),
         122 => return Ok(7),
@@ -1649,7 +1784,7 @@ fn serialize_ac4_presentation_body(
     write_ac4_bits(&mut writer, 1, 1)?;
     write_ac4_bits(
         &mut writer,
-        u32::from(presentation.top_channel_pairs != 0),
+        u32::from(presentation.pre_virtualized || presentation.top_channel_pairs != 0),
         1,
     )?;
     write_ac4_bits(&mut writer, 0, 4)?;
@@ -1844,4 +1979,5 @@ mod tests {
             "{parsed:#?}"
         );
     }
+
 }

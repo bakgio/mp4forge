@@ -403,15 +403,23 @@ fn append_vorbis_audio_packets(
     for (_, packet_bytes) in &audio_packets {
         nominal_durations.push(u64::from(parser.packet_duration(packet_bytes, spec)?));
     }
-    let mut prior_page_duration = 0_u64;
     let last_index = audio_packets.len().saturating_sub(1);
     for (index, (packet, _packet_bytes)) in audio_packets.into_iter().enumerate() {
         let mut duration = nominal_durations[index];
         if eos && index == last_index && granule_position != u64::MAX {
-            let remaining = granule_position
-                .saturating_sub(*decoded_samples)
-                .saturating_sub(prior_page_duration);
-            if remaining < duration {
+            let remaining = granule_position.saturating_sub(*decoded_samples);
+            if duration == 0 {
+                duration = if remaining > 0 {
+                    remaining
+                } else {
+                    nominal_durations[..index]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|value| *value != 0)
+                        .unwrap_or(0)
+                };
+            } else if remaining > 0 && remaining < duration {
                 duration = remaining;
             }
         }
@@ -439,9 +447,6 @@ fn append_vorbis_audio_packets(
         *decoded_samples = decoded_samples
             .checked_add(duration)
             .ok_or(MuxError::LayoutOverflow("Ogg Vorbis decoded sample count"))?;
-        prior_page_duration = prior_page_duration
-            .checked_add(nominal_durations[index])
-            .ok_or(MuxError::LayoutOverflow("Ogg Vorbis page duration"))?;
     }
     Ok(())
 }

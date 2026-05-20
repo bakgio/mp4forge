@@ -27,15 +27,18 @@ const MHAS_SAMPLE_RATE_TABLE: [u32; 28] = [
 
 pub(in crate::mux) struct ParsedMhasTrack {
     pub(in crate::mux) sample_rate: u32,
+    pub(in crate::mux) audio_profile_level_indication: u8,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedMhasConfig {
+    profile_level_indication: u8,
     sample_rate: u32,
     frame_length: u32,
     channel_count: u16,
+    config_payload_size: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -221,7 +224,7 @@ pub(in crate::mux) fn scan_mhas_file_sync(
                     data_size,
                     duration: current_config.frame_length,
                     composition_time_offset: 0,
-                    is_sync_sample: is_sync_sample && samples.is_empty(),
+                    is_sync_sample,
                 });
                 sample_start = packet_end;
                 saw_frame = true;
@@ -355,7 +358,7 @@ pub(in crate::mux) async fn scan_mhas_file_async(
                     data_size,
                     duration: current_config.frame_length,
                     composition_time_offset: 0,
-                    is_sync_sample: is_sync_sample && samples.is_empty(),
+                    is_sync_sample,
                 });
                 sample_start = packet_end;
                 saw_frame = true;
@@ -489,7 +492,7 @@ fn parse_mhas_segmented_stream_sync(
                     data_size,
                     duration: current_config.frame_length,
                     composition_time_offset: 0,
-                    is_sync_sample: is_sync_sample && samples.is_empty(),
+                    is_sync_sample,
                 });
                 sample_start = packet_end;
                 saw_frame = true;
@@ -617,7 +620,7 @@ async fn parse_mhas_segmented_stream_async(
                     data_size,
                     duration: current_config.frame_length,
                     composition_time_offset: 0,
-                    is_sync_sample: is_sync_sample && samples.is_empty(),
+                    is_sync_sample,
                 });
                 sample_start = packet_end;
                 saw_frame = true;
@@ -645,7 +648,7 @@ async fn parse_mhas_segmented_stream_async(
 fn finalize_mhas_track(
     spec: &str,
     config: Option<ParsedMhasConfig>,
-    samples: Vec<StagedSample>,
+    mut samples: Vec<StagedSample>,
     sample_start: u64,
     saw_frame: bool,
     final_offset: u64,
@@ -667,6 +670,9 @@ fn finalize_mhas_track(
                 .to_string(),
         });
     }
+    if config.config_payload_size > 40 {
+        collapse_consecutive_mhas_sync_runs(&mut samples);
+    }
     let btrt = build_btrt_from_sample_sizes(
         samples
             .iter()
@@ -675,13 +681,90 @@ fn finalize_mhas_track(
     )?;
     Ok(ParsedMhasTrack {
         sample_rate: config.sample_rate,
+        audio_profile_level_indication: config.profile_level_indication,
         sample_entry_box: build_mhas_sample_entry_box(&config, btrt)?,
         samples,
     })
 }
 
+fn collapse_consecutive_mhas_sync_runs(samples: &mut [StagedSample]) {
+    let mut previous_sync_index = None::<usize>;
+    for index in 0..samples.len() {
+        if !samples[index].is_sync_sample {
+            previous_sync_index = None;
+            continue;
+        }
+        if let Some(previous_sync_index) = previous_sync_index {
+            samples[previous_sync_index].is_sync_sample = false;
+        }
+        previous_sync_index = Some(index);
+    }
+}
+
 fn build_mhas_sample_entry_box(config: &ParsedMhasConfig, btrt: Btrt) -> Result<Vec<u8>, MuxError> {
     build_mhas_sample_entry_box_with_btrt(config.sample_rate, btrt)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::collapse_consecutive_mhas_sync_runs;
+    use crate::mux::import::StagedSample;
+
+    #[test]
+    fn collapse_consecutive_mhas_sync_runs_keeps_only_last_sample_in_each_run() {
+        let mut samples = vec![
+            StagedSample {
+                data_offset: 0,
+                data_size: 1,
+                duration: 1024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            StagedSample {
+                data_offset: 1,
+                data_size: 1,
+                duration: 1024,
+                composition_time_offset: 0,
+                is_sync_sample: false,
+            },
+            StagedSample {
+                data_offset: 2,
+                data_size: 1,
+                duration: 1024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            StagedSample {
+                data_offset: 3,
+                data_size: 1,
+                duration: 1024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            StagedSample {
+                data_offset: 4,
+                data_size: 1,
+                duration: 1024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            StagedSample {
+                data_offset: 5,
+                data_size: 1,
+                duration: 1024,
+                composition_time_offset: 0,
+                is_sync_sample: false,
+            },
+        ];
+
+        collapse_consecutive_mhas_sync_runs(&mut samples);
+
+        assert!(samples[0].is_sync_sample);
+        assert!(!samples[2].is_sync_sample);
+        assert!(!samples[3].is_sync_sample);
+        assert!(samples[4].is_sync_sample);
+    }
 }
 
 pub(in crate::mux) fn build_mhas_sample_entry_box_with_btrt(
@@ -1026,7 +1109,7 @@ async fn read_mhas_frame_sap_segmented_async(
 
 fn parse_mhas_config_packet(payload: &[u8], spec: &str) -> Result<ParsedMhasConfig, MuxError> {
     let mut reader = MhasBitCursor::new(payload);
-    let _profile_level =
+    let profile_level_indication =
         u8::try_from(reader.read_bits(8, spec, "MHAS profile-level indication")?).unwrap();
     let sample_rate_index =
         usize::try_from(reader.read_bits(5, spec, "MHAS sample-rate index")?).unwrap();
@@ -1085,9 +1168,11 @@ fn parse_mhas_config_packet(payload: &[u8], spec: &str) -> Result<ParsedMhasConf
         });
     }
     Ok(ParsedMhasConfig {
+        profile_level_indication,
         sample_rate,
         frame_length,
         channel_count,
+        config_payload_size: payload.len(),
     })
 }
 

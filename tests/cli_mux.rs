@@ -35,9 +35,10 @@ use support::{
     write_test_dts_file, write_test_dts_little_endian_file, write_test_flac_file,
     write_test_h263_file, write_test_h265_annexb_file, write_test_iamf_file, write_test_jpeg_file,
     write_test_latm_file, write_test_mhas_file, write_test_mp3_file, write_test_mp4v_file,
-    write_test_ogg_flac_file, write_test_ogg_flac_mapping_file, write_test_ogg_opus_file,
-    write_test_ogg_speex_file, write_test_ogg_theora_file, write_test_ogg_vorbis_file,
-    write_test_png_file, write_test_program_stream_ac3_file, write_test_program_stream_h264_file,
+    write_test_ogg_flac_file, write_test_ogg_flac_mapping_file,
+    write_test_ogg_flac_split_header_file, write_test_ogg_opus_file, write_test_ogg_speex_file,
+    write_test_ogg_theora_file, write_test_ogg_vorbis_file, write_test_png_file,
+    write_test_program_stream_ac3_file, write_test_program_stream_h264_file,
     write_test_program_stream_h264_open_ended_file, write_test_program_stream_h265_file,
     write_test_program_stream_lpcm_file, write_test_program_stream_mp3_file,
     write_test_program_stream_mp4v_file, write_test_program_stream_mpeg2v_file,
@@ -512,7 +513,7 @@ fn mux_command_writes_real_mp4_output_from_path_only_avi_mp3_input() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc(".mp3"));
     assert_eq!(audio_entries[0].channel_count, 2);
     assert_eq!(mdhd_boxes.len(), 1);
-    assert_eq!(mdhd_boxes[0].timescale, 48_000);
+    assert_eq!(mdhd_boxes[0].timescale, 1_000);
 }
 
 #[test]
@@ -561,7 +562,7 @@ fn mux_command_writes_real_mp4_output_from_path_only_avi_ac3_input() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ac-3"));
     assert_eq!(audio_entries[0].channel_count, 2);
     assert_eq!(mdhd_boxes.len(), 1);
-    assert_eq!(mdhd_boxes[0].timescale, 48_000);
+    assert_eq!(mdhd_boxes[0].timescale, 1_000);
 }
 
 #[test]
@@ -3303,7 +3304,52 @@ fn mux_command_writes_real_mp4_output_from_path_first_ogg_flac_mapping_tracks() 
     assert_eq!(audio_entries.len(), 1);
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("fLaC"));
     assert_eq!(audio_entries[0].channel_count, 2);
-    assert_eq!(mdhd_boxes[0].timescale, 48_000);
+    assert_eq!(mdhd_boxes[0].timescale, 1_000);
+}
+
+#[test]
+fn mux_command_writes_real_mp4_output_from_path_first_ogg_flac_split_header_tracks() {
+    let audio_input = write_test_ogg_flac_split_header_file(
+        "mux-cli-raw-ogg-flac-split-input",
+        &[b"abc", b"def"],
+    );
+    let output = write_temp_file("mux-cli-raw-ogg-flac-split-output", &[]);
+    let args = vec![
+        "--track".to_string(),
+        audio_input.display().to_string(),
+        output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    let output_bytes = fs::read(output).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+        ]),
+    );
+    let mdhd_boxes = extract_boxes::<Mdhd>(
+        &output_bytes,
+        mp4forge::walk::BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("mdhd"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("fLaC"));
+    assert_eq!(audio_entries[0].channel_count, 2);
+    assert_eq!(mdhd_boxes[0].timescale, 1_000);
 }
 
 #[test]

@@ -21,10 +21,12 @@ use crate::boxes::iso14496_14::{
     ES_DESCRIPTOR_TAG, EsDescriptor, Esds, SL_CONFIG_DESCRIPTOR_TAG,
 };
 
+#[cfg(feature = "async")]
+use super::super::import::read_exact_at_async;
 use super::super::import::{
     CandidateSample, TrackCandidate, build_generic_audio_sample_entry_box,
     build_generic_media_sample_entry_box, direct_ingest_handler_name, direct_ingest_mux_policy,
-    read_exact_at_async, read_exact_at_sync,
+    read_exact_at_sync,
 };
 use super::super::{MuxError, MuxTrackKind};
 use super::jpeg::parse_jpeg_bytes;

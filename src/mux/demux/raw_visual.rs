@@ -8,7 +8,9 @@ const CMPD: FourCc = FourCc::from_bytes(*b"cmpd");
 const COLR_NCLC: FourCc = FourCc::from_bytes(*b"nclc");
 const COLR_NCLX: FourCc = FourCc::from_bytes(*b"nclx");
 const MJP2: FourCc = FourCc::from_bytes(*b"mjp2");
+const AUXI: FourCc = FourCc::from_bytes(*b"auxi");
 const UNCC: FourCc = FourCc::from_bytes(*b"uncC");
+const AUXILIARY_ALPHA_URN: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UncvPixelLayout {
@@ -396,14 +398,18 @@ pub(super) fn build_prores_sample_entry_box(
     compressorname[0] =
         u8::try_from(visible_len).map_err(|_| MuxError::LayoutOverflow("compressor name"))?;
     compressorname[1..1 + visible_len].copy_from_slice(&compressor_name[..visible_len]);
-    let child_boxes = [
-        build_pasp_box(1, 1)?,
-        build_nclc_colr_box(
-            colour_primaries,
-            transfer_characteristics,
-            matrix_coefficients,
-        )?,
-    ];
+    let mut child_boxes = Vec::new();
+    if sample_entry_type == FourCc::from_bytes(*b"ap4h")
+        || sample_entry_type == FourCc::from_bytes(*b"ap4x")
+    {
+        child_boxes.push(build_auxi_alpha_box()?);
+    }
+    child_boxes.push(build_pasp_box(1, 1)?);
+    child_boxes.push(build_nclc_colr_box(
+        colour_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+    )?);
     super::super::mp4::encode_typed_box(
         &VisualSampleEntry {
             sample_entry: SampleEntry {
@@ -423,6 +429,14 @@ pub(super) fn build_prores_sample_entry_box(
         },
         &child_boxes.concat(),
     )
+}
+
+fn build_auxi_alpha_box() -> Result<Vec<u8>, MuxError> {
+    let mut payload = Vec::with_capacity(4 + AUXILIARY_ALPHA_URN.len() + 1);
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(AUXILIARY_ALPHA_URN.as_bytes());
+    payload.push(0);
+    super::super::mp4::encode_raw_box(AUXI, &payload)
 }
 
 fn build_uncv_cmpd_box(layout: UncvPixelLayout) -> Result<Vec<u8>, MuxError> {

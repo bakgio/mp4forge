@@ -858,8 +858,8 @@ pub(in crate::mux) fn build_avi_jpeg_sample_entry_box(
     height: u16,
 ) -> Result<Vec<u8>, MuxError> {
     let mut compressorname = [0_u8; 32];
-    compressorname[0] = 4;
-    compressorname[1..5].copy_from_slice(b"MJPG");
+    compressorname[0] = 19;
+    compressorname[1..20].copy_from_slice(b"Codec Not Supported");
     super::super::mp4::encode_typed_box(
         &VisualSampleEntry {
             sample_entry: SampleEntry {

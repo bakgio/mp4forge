@@ -17,7 +17,7 @@ use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
 use super::super::import::{
-    SegmentedMuxSourceSegment, StagedSample, build_btrt_from_sample_sizes,
+    SegmentedMuxSourceSegment, StagedSample, build_btrt_from_sample_sizes_with_total_duration,
     build_visual_sample_entry_box_with_compressor_name, read_exact_at_sync,
 };
 use super::annexb_common::{read_bit_labeled, read_bits_u8_labeled, read_bits_u16_labeled};
@@ -96,7 +96,32 @@ pub(in crate::mux) fn build_direct_mp4v_sample_entry_box<I>(
 where
     I: IntoIterator<Item = (u32, u32)>,
 {
-    let decoder_bitrates = build_btrt_from_sample_sizes(samples, timescale)?;
+    build_direct_mp4v_sample_entry_box_with_total_duration(
+        width,
+        height,
+        decoder_specific_info,
+        timescale,
+        samples,
+        None,
+    )
+}
+
+pub(in crate::mux) fn build_direct_mp4v_sample_entry_box_with_total_duration<I>(
+    width: u16,
+    height: u16,
+    decoder_specific_info: &[u8],
+    timescale: u32,
+    samples: I,
+    total_duration_override: Option<u64>,
+) -> Result<Vec<u8>, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    let decoder_bitrates = build_btrt_from_sample_sizes_with_total_duration(
+        samples,
+        timescale,
+        total_duration_override,
+    )?;
     let mut esds = Esds::default();
     esds.descriptors = vec![
         Descriptor {
@@ -853,6 +878,19 @@ pub(in crate::mux) fn parse_mp4v_decoder_specific_info(
     }
     let _ = vol_start;
     parse_mp4v_vol_header(&decoder_specific_info[vol_header_offset..vol_end], spec)
+}
+
+pub(in crate::mux) fn mp4v_profile_level_indication(decoder_specific_info: &[u8]) -> Option<u8> {
+    for index in 0..decoder_specific_info.len().saturating_sub(4) {
+        if decoder_specific_info[index..index + 3] != [0x00, 0x00, 0x01] {
+            continue;
+        }
+        if decoder_specific_info[index + 3] != VOS_START_CODE {
+            continue;
+        }
+        return decoder_specific_info.get(index + 4).copied();
+    }
+    None
 }
 
 fn find_mp4v_vol_start(bytes: &[u8]) -> Option<(usize, usize)> {

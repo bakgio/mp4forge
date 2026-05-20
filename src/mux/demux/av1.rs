@@ -11,10 +11,10 @@ use crate::FourCc;
 use crate::boxes::av1::AV1CodecConfiguration;
 use crate::boxes::iso14496_12::{Colr, Pasp};
 
+use super::super::import::build_visual_sample_entry_box;
 use super::super::import::{
     SegmentedMuxSourceSegment, SegmentedMuxSourceSegmentData, SegmentedMuxSourceSpec, StagedSample,
 };
-use super::super::import::{build_btrt_from_sample_sizes, build_visual_sample_entry_box};
 use super::super::{MuxError, MuxRawCodec};
 #[cfg(feature = "async")]
 use super::container_common::read_segmented_bytes_async;
@@ -881,8 +881,8 @@ fn build_transport_av1_sample_entry_box_from_sample(
 fn build_raw_av1_sample_entry_box_from_sample(
     profile: RawAv1TrackProfile,
     sample: &[u8],
-    samples: &[StagedSample],
-    timescale: u32,
+    _samples: &[StagedSample],
+    _timescale: u32,
     spec: &str,
 ) -> Result<(Vec<u8>, u16, u16), MuxError> {
     let (config, colr, width, height) = parse_av1_sample_entry_details(sample, spec)?;
@@ -897,13 +897,6 @@ fn build_raw_av1_sample_entry_box_from_sample(
         )?);
     }
     child_boxes.push(super::super::mp4::encode_typed_box(&colr, &[])?);
-    let btrt = build_btrt_from_sample_sizes(
-        samples
-            .iter()
-            .map(|sample| (sample.data_size, sample.duration)),
-        timescale,
-    )?;
-    child_boxes.push(super::super::mp4::encode_typed_box(&btrt, &[])?);
     let sample_entry_box =
         build_visual_sample_entry_box(FourCc::from_bytes(*b"av01"), width, height, &child_boxes)?;
     Ok((sample_entry_box, width, height))

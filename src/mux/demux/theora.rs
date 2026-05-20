@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -49,7 +50,8 @@ pub(in crate::mux) fn scan_ogg_theora_file_sync(
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
     let mut offset = 0_u64;
-    let mut packet_builder = OggPacketBuilder::default();
+    let mut packet_builders = BTreeMap::<u32, OggPacketBuilder>::new();
+    let mut target_serial = None::<u32>;
     let mut header_packets = Vec::new();
     let mut config = None;
     let mut comment_seen = false;
@@ -60,17 +62,26 @@ pub(in crate::mux) fn scan_ogg_theora_file_sync(
 
     while offset < file_size {
         let page = read_ogg_page_header_sync(&mut file, offset, spec)?;
-        if packet_builder.is_empty() && page.header_type & 0x01 != 0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "Ogg Theora input started in the middle of a continued packet".to_string(),
-            });
-        }
         offset = page
             .payload_offset
             .checked_add(page.payload_size)
             .ok_or(MuxError::LayoutOverflow("Ogg page range"))?;
+        if target_serial.is_some_and(|serial_no| serial_no != page.serial_no) {
+            continue;
+        }
+        let packet_builder = packet_builders.entry(page.serial_no).or_default();
+        if packet_builder.is_empty() && page.header_type & 0x01 != 0 {
+            if target_serial == Some(page.serial_no) {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: "Ogg Theora input started in the middle of a continued packet"
+                        .to_string(),
+                });
+            }
+            continue;
+        }
         let mut page_cursor = page.payload_offset;
+        let mut completed_packets = Vec::new();
         for lacing in &page.lacing_values {
             packet_builder.push_span(page_cursor, u32::from(*lacing))?;
             page_cursor += u64::from(*lacing);
@@ -81,6 +92,9 @@ pub(in crate::mux) fn scan_ogg_theora_file_sync(
             if packet.total_size == 0 {
                 continue;
             }
+            completed_packets.push(packet);
+        }
+        for packet in completed_packets {
             let packet_bytes = read_spans_sync(
                 &mut file,
                 &packet.spans,
@@ -88,8 +102,15 @@ pub(in crate::mux) fn scan_ogg_theora_file_sync(
                 spec,
                 "Ogg Theora packet is truncated",
             )?;
-            if config.is_none() {
-                config = Some(parse_theora_identification_header(&packet_bytes, spec)?);
+            if target_serial.is_none() {
+                let Some(parsed_config) =
+                    parse_theora_identification_header(&packet_bytes, spec).ok()
+                else {
+                    continue;
+                };
+                config = Some(parsed_config);
+                target_serial = Some(page.serial_no);
+                packet_builders.retain(|serial_no, _| *serial_no == page.serial_no);
                 header_packets.push(packet_bytes);
                 continue;
             }
@@ -132,10 +153,15 @@ pub(in crate::mux) fn scan_ogg_theora_file_sync(
         }
     }
 
+    let mut fallback_packet_builder = OggPacketBuilder::default();
+    let packet_builder = target_serial
+        .and_then(|serial_no| packet_builders.get_mut(&serial_no))
+        .unwrap_or(&mut fallback_packet_builder);
+
     finalize_theora_track(
         path,
         spec,
-        &mut packet_builder,
+        packet_builder,
         config,
         header_packets,
         logical_size,
@@ -153,7 +179,8 @@ pub(in crate::mux) async fn scan_ogg_theora_file_async(
     let mut file = TokioFile::open(path).await?;
     let file_size = file.metadata().await?.len();
     let mut offset = 0_u64;
-    let mut packet_builder = OggPacketBuilder::default();
+    let mut packet_builders = BTreeMap::<u32, OggPacketBuilder>::new();
+    let mut target_serial = None::<u32>;
     let mut header_packets = Vec::new();
     let mut config = None;
     let mut comment_seen = false;
@@ -164,17 +191,26 @@ pub(in crate::mux) async fn scan_ogg_theora_file_async(
 
     while offset < file_size {
         let page = read_ogg_page_header_async(&mut file, offset, spec).await?;
-        if packet_builder.is_empty() && page.header_type & 0x01 != 0 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "Ogg Theora input started in the middle of a continued packet".to_string(),
-            });
-        }
         offset = page
             .payload_offset
             .checked_add(page.payload_size)
             .ok_or(MuxError::LayoutOverflow("Ogg page range"))?;
+        if target_serial.is_some_and(|serial_no| serial_no != page.serial_no) {
+            continue;
+        }
+        let packet_builder = packet_builders.entry(page.serial_no).or_default();
+        if packet_builder.is_empty() && page.header_type & 0x01 != 0 {
+            if target_serial == Some(page.serial_no) {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: "Ogg Theora input started in the middle of a continued packet"
+                        .to_string(),
+                });
+            }
+            continue;
+        }
         let mut page_cursor = page.payload_offset;
+        let mut completed_packets = Vec::new();
         for lacing in &page.lacing_values {
             packet_builder.push_span(page_cursor, u32::from(*lacing))?;
             page_cursor += u64::from(*lacing);
@@ -185,6 +221,9 @@ pub(in crate::mux) async fn scan_ogg_theora_file_async(
             if packet.total_size == 0 {
                 continue;
             }
+            completed_packets.push(packet);
+        }
+        for packet in completed_packets {
             let packet_bytes: Vec<u8> = read_spans_async(
                 &mut file,
                 &packet.spans,
@@ -193,8 +232,15 @@ pub(in crate::mux) async fn scan_ogg_theora_file_async(
                 "Ogg Theora packet is truncated",
             )
             .await?;
-            if config.is_none() {
-                config = Some(parse_theora_identification_header(&packet_bytes, spec)?);
+            if target_serial.is_none() {
+                let Some(parsed_config) =
+                    parse_theora_identification_header(&packet_bytes, spec).ok()
+                else {
+                    continue;
+                };
+                config = Some(parsed_config);
+                target_serial = Some(page.serial_no);
+                packet_builders.retain(|serial_no, _| *serial_no == page.serial_no);
                 header_packets.push(packet_bytes);
                 continue;
             }
@@ -237,10 +283,15 @@ pub(in crate::mux) async fn scan_ogg_theora_file_async(
         }
     }
 
+    let mut fallback_packet_builder = OggPacketBuilder::default();
+    let packet_builder = target_serial
+        .and_then(|serial_no| packet_builders.get_mut(&serial_no))
+        .unwrap_or(&mut fallback_packet_builder);
+
     finalize_theora_track(
         path,
         spec,
-        &mut packet_builder,
+        packet_builder,
         config,
         header_packets,
         logical_size,

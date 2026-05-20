@@ -12,8 +12,9 @@ use mp4forge::boxes::av1::AV1CodecConfiguration;
 use mp4forge::boxes::avs3::Av3c;
 use mp4forge::boxes::dolby::Dmlp;
 use mp4forge::boxes::dts::{Ddts, Udts};
+use mp4forge::boxes::etsi_ts_102_366::Dec3;
 use mp4forge::boxes::etsi_ts_103_190::Dac4;
-use mp4forge::boxes::flac::DfLa;
+use mp4forge::boxes::flac::{DfLa, FlacMetadataBlock};
 use mp4forge::boxes::iamf::Iacb;
 use mp4forge::boxes::iso14496_12::{
     AVCDecoderConfiguration, AudioSampleEntry, Btrt, Chnl, Co64, Colr, Ctts, Dinf, Dref, DvsC,
@@ -60,7 +61,10 @@ use support::{
     build_test_vp9_keyframe, build_test_vp10_keyframe, encode_raw_box, encode_supported_box,
     fixture_path, fourcc, temp_output_dir, write_single_track_mp4_input, write_temp_file,
     write_temp_file_with_extension, write_test_ac3_44100_file, write_test_ac3_file,
-    write_test_ac4_file, write_test_adts_file, write_test_aifc_pcm_file, write_test_aiff_pcm_file,
+    write_test_ac4_file, write_test_adts_file, write_test_aifc_alaw_file,
+    write_test_aifc_alaw_file_with_declared_bits,
+    write_test_aifc_float64_file, write_test_aifc_pcm_file, write_test_aifc_ulaw_file,
+    write_test_aiff_pcm_file,
     write_test_amr_file, write_test_amr_wb_file, write_test_av1_annex_b_file,
     write_test_av1_ivf_file, write_test_av1_obu_file, write_test_avi_ac3_file,
     write_test_avi_alaw_file, write_test_avi_audio_tag_file, write_test_avi_avc1_file,
@@ -73,14 +77,16 @@ use support::{
     write_test_caf_alac_variable_packet_file, write_test_dts_14bit_big_endian_file,
     write_test_dts_14bit_little_endian_file, write_test_dts_file,
     write_test_dts_little_endian_file, write_test_eac3_file, write_test_flac_file,
+    write_test_eac3_file_with_dependent_substream,
     write_test_flac_file_with_frames, write_test_flac_file_with_frames_and_block_size,
     write_test_h263_file, write_test_h264_annexb_file, write_test_h265_annexb_file,
     write_test_h265_annexb_file_with_timing, write_test_iamf_file, write_test_jpeg_file,
     write_test_latm_file, write_test_mhas_file, write_test_mp3_44100_file, write_test_mp3_file,
     write_test_mp3_file_with_leading_id3_tag, write_test_mp4v_file, write_test_mpeg2v_file,
-    write_test_ogg_flac_file, write_test_ogg_flac_mapping_file, write_test_ogg_opus_file,
-    write_test_ogg_speex_file, write_test_ogg_theora_file, write_test_ogg_vorbis_file,
-    write_test_png_file, write_test_program_stream_ac3_file, write_test_program_stream_h264_file,
+    write_test_ogg_flac_file, write_test_ogg_flac_mapping_file,
+    write_test_ogg_flac_split_header_file, write_test_ogg_opus_file, write_test_ogg_speex_file,
+    write_test_ogg_theora_file, write_test_ogg_vorbis_file, write_test_png_file,
+    write_test_program_stream_ac3_file, write_test_program_stream_h264_file,
     write_test_program_stream_h264_open_ended_file, write_test_program_stream_h265_file,
     write_test_program_stream_lpcm_file, write_test_program_stream_mp2_file,
     write_test_program_stream_mp3_file, write_test_program_stream_mp4v_file,
@@ -98,6 +104,7 @@ use support::{
     write_test_transport_stream_mp3_file, write_test_transport_stream_mp4v_file,
     write_test_transport_stream_mpeg2v_file, write_test_transport_stream_truehd_file,
     write_test_transport_stream_vvc_file, write_test_truehd_file, write_test_usac_latm_file,
+    write_test_aifc_ulaw_file_with_declared_bits,
     write_test_vobsub_files, write_test_vp8_ivf_file, write_test_vp9_ivf_file,
     write_test_vp10_ivf_file, write_test_wave_pcm_file, write_test_wrapped_dts_file,
     write_test_wrapped_dts_file_with_tail,
@@ -145,6 +152,42 @@ fn corrupt_mpeg2ts_section_crc(input: &Path, target_pid: u16, prefix: &str) -> P
         return write_temp_file(prefix, &bytes);
     }
     panic!("target MPEG-TS section PID {target_pid:#06x} not found");
+}
+
+fn decode_alaw_pcm_sample(value: u8) -> i16 {
+    let value = value ^ 0x55;
+    let mut sample = i16::from(value & 0x0F) << 4;
+    let segment = i16::from((value & 0x70) >> 4);
+    sample += 8;
+    if segment != 0 {
+        sample += 0x100;
+    }
+    if segment > 1 {
+        sample <<= u32::try_from(segment - 1).unwrap();
+    }
+    if value & 0x80 == 0 { -sample } else { sample }
+}
+
+fn decode_ulaw_pcm_sample(value: u8) -> i16 {
+    let value = !value;
+    let mut sample = (i16::from(value & 0x0F) << 3) + 0x84;
+    sample <<= u32::from((value & 0x70) >> 4);
+    if value & 0x80 != 0 {
+        0x84 - sample
+    } else {
+        sample - 0x84
+    }
+}
+
+fn decode_companded_pcm_payload<F>(bytes: &[u8], decode: F) -> Vec<u8>
+where
+    F: Fn(u8) -> i16,
+{
+    let mut decoded = Vec::with_capacity(bytes.len().saturating_mul(2));
+    for &value in bytes {
+        decoded.extend_from_slice(&decode(value).to_le_bytes());
+    }
+    decoded
 }
 
 #[test]
@@ -968,7 +1011,7 @@ fn mux_to_path_imports_path_only_avi_mulaw_inputs() {
             fourcc("minf"),
             fourcc("stbl"),
             fourcc("stsd"),
-            fourcc("ulaw"),
+            fourcc("MLAW"),
         ]),
     );
     let mdhd_boxes = extract_boxes::<Mdhd>(
@@ -991,13 +1034,28 @@ fn mux_to_path_imports_path_only_avi_mulaw_inputs() {
             fourcc("stts"),
         ]),
     );
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("MLAW"),
+            fourcc("btrt"),
+        ]),
+    );
     assert_eq!(audio_entries.len(), 1);
-    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ulaw"));
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("MLAW"));
     assert_eq!(audio_entries[0].channel_count, 1);
     assert_eq!(audio_entries[0].sample_rate, 8_000 << 16);
-    assert_eq!(audio_entries[0].sample_size, 8);
+    assert_eq!(audio_entries[0].sample_size, 16);
     assert_eq!(mdhd_boxes.len(), 1);
     assert_eq!(mdhd_boxes[0].timescale, 8_000);
+    assert_eq!(btrt_boxes.len(), 1);
+    assert!(btrt_boxes[0].avg_bitrate > 0);
     assert_eq!(
         stts_boxes[0].entries,
         vec![SttsEntry {
@@ -1027,7 +1085,7 @@ fn mux_to_path_imports_path_only_avi_ibm_mulaw_inputs() {
             fourcc("minf"),
             fourcc("stbl"),
             fourcc("stsd"),
-            fourcc("ulaw"),
+            fourcc("MLAW"),
         ]),
     );
     let stts_boxes = extract_boxes::<Stts>(
@@ -1042,10 +1100,10 @@ fn mux_to_path_imports_path_only_avi_ibm_mulaw_inputs() {
         ]),
     );
     assert_eq!(audio_entries.len(), 1);
-    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ulaw"));
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("MLAW"));
     assert_eq!(audio_entries[0].channel_count, 1);
     assert_eq!(audio_entries[0].sample_rate, 8_000 << 16);
-    assert_eq!(audio_entries[0].sample_size, 8);
+    assert_eq!(audio_entries[0].sample_size, 16);
     assert_eq!(
         stts_boxes[0].entries,
         vec![SttsEntry {
@@ -1541,7 +1599,7 @@ fn mux_to_path_imports_path_only_avi_extensible_mulaw_inputs() {
             fourcc("minf"),
             fourcc("stbl"),
             fourcc("stsd"),
-            fourcc("ulaw"),
+            fourcc("MLAW"),
         ]),
     );
     let mdhd_boxes = extract_boxes::<Mdhd>(
@@ -1565,10 +1623,10 @@ fn mux_to_path_imports_path_only_avi_extensible_mulaw_inputs() {
         ]),
     );
     assert_eq!(audio_entries.len(), 1);
-    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ulaw"));
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("MLAW"));
     assert_eq!(audio_entries[0].channel_count, 1);
     assert_eq!(audio_entries[0].sample_rate, 8_000 << 16);
-    assert_eq!(audio_entries[0].sample_size, 8);
+    assert_eq!(audio_entries[0].sample_size, 16);
     assert_eq!(mdhd_boxes.len(), 1);
     assert_eq!(mdhd_boxes[0].timescale, 8_000);
     assert_eq!(
@@ -2198,6 +2256,11 @@ fn mux_to_path_imports_path_only_avi_jpeg_inputs() {
     assert_eq!(video_entries.len(), 1);
     assert_eq!(video_entries[0].width, 1);
     assert_eq!(video_entries[0].height, 1);
+    assert_eq!(video_entries[0].compressorname[0], 19);
+    assert_eq!(
+        &video_entries[0].compressorname[1..20],
+        b"Codec Not Supported"
+    );
     assert_eq!(stss_boxes.len(), 1);
     assert_eq!(stss_boxes[0].entry_count, 0);
     assert!(stss_boxes[0].sample_number.is_empty());
@@ -3238,7 +3301,7 @@ fn mux_to_path_imports_path_only_program_stream_lpcm_inputs() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ipcm"));
     assert_eq!(audio_entries[0].channel_count, 2);
     assert_eq!(pcm_configs.len(), 1);
-    assert_eq!(pcm_configs[0].format_flags, 0);
+    assert_eq!(pcm_configs[0].format_flags, 1);
     assert_eq!(pcm_configs[0].pcm_sample_size, 16);
     assert_eq!(mdhd_boxes.len(), 1);
     assert_eq!(mdhd_boxes[0].timescale, 48_000);
@@ -5890,6 +5953,44 @@ fn mux_to_path_fragmented_imported_opus_uses_track_timescale() {
 }
 
 #[test]
+fn mux_to_path_fragmented_imported_eac3_groups_fragment_references() {
+    let payloads = std::iter::repeat_n(b"ec3".as_slice(), 375).collect::<Vec<_>>();
+    let raw_input = write_test_eac3_file("mux-fragment-imported-eac3-raw-input", &payloads);
+    let flat_source = write_temp_file("mux-fragment-imported-eac3-flat-source", &[]);
+    mux_to_path(
+        &MuxRequest::new(vec![MuxTrackSpec::path(&raw_input)]),
+        &flat_source,
+    )
+    .unwrap();
+
+    let output_path = write_temp_file("mux-fragment-imported-eac3-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
+        flat_source,
+        MuxMp4TrackSelector::Audio { occurrence: 1 },
+    )])
+    .with_output_layout(MuxOutputLayout::Fragmented)
+    .with_duration_mode(MuxDurationMode::Fragment { seconds: 5.0 });
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let sidx_boxes = extract_boxes::<Sidx>(&output_bytes, BoxPath::from([fourcc("sidx")]));
+    let trun_boxes = extract_boxes::<Trun>(
+        &output_bytes,
+        BoxPath::from([fourcc("moof"), fourcc("traf"), fourcc("trun")]),
+    );
+    assert_eq!(sidx_boxes.len(), 1);
+    assert_eq!(sidx_boxes[0].references.len(), 2);
+    assert_eq!(
+        trun_boxes
+            .iter()
+            .map(|trun| trun.sample_count)
+            .collect::<Vec<_>>(),
+        vec![157, 31, 157, 30]
+    );
+}
+
+#[test]
 fn mux_to_path_fragmented_imported_alac_uses_dominant_trex_duration() {
     let input = build_imported_track_input_file(
         "mux-fragment-imported-alac",
@@ -6099,6 +6200,300 @@ fn mux_to_path_fragmented_imported_dtsx_preserves_udts_child_boxes() {
             .windows(4)
             .any(|bytes| bytes == b"btrt")
     );
+}
+
+#[test]
+fn mux_to_path_fragmented_imported_dtsc_preserves_existing_ddts() {
+    let expected_ddts = Ddts {
+        sampling_frequency: 48_000,
+        max_bitrate: 1_536_000,
+        avg_bitrate: 768_000,
+        sample_depth: 16,
+        frame_duration: 1,
+        stream_construction: 0,
+        core_lfe_present: false,
+        core_layout: 0,
+        core_size: 1_024,
+        stereo_downmix: false,
+        representation_type: 0,
+        channel_layout: 3,
+        multi_asset_flag: false,
+        lbr_duration_mod: false,
+    };
+    let input = build_imported_track_input_file(
+        "mux-fragment-imported-dtsc-preserve-ddts",
+        &MuxFileConfig::new(48_000)
+            .with_major_brand(fourcc("isom"))
+            .with_compatible_brand(fourcc("mp42")),
+        &MuxTrackConfig::new_audio(
+            1,
+            48_000,
+            audio_sample_entry_box_with_children(
+                "dtsc",
+                &[
+                    encode_supported_box(&expected_ddts, &[]),
+                    encode_supported_box(&Btrt::default(), &[]),
+                ]
+                .concat(),
+            ),
+        ),
+        3_072,
+        &[
+            TestMuxSample {
+                bytes: b"one",
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            TestMuxSample {
+                bytes: b"two",
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            TestMuxSample {
+                bytes: b"tri",
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+        ],
+    );
+    let output_path = write_temp_file("mux-fragment-imported-dtsc-preserve-ddts-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
+        input,
+        MuxMp4TrackSelector::Audio { occurrence: 1 },
+    )])
+    .with_output_layout(MuxOutputLayout::Fragmented)
+    .with_duration_mode(MuxDurationMode::Fragment { seconds: 10.0 });
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let ddts_boxes = extract_boxes::<Ddts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("dtsc"),
+            fourcc("ddts"),
+        ]),
+    );
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("dtsc"),
+            fourcc("btrt"),
+        ]),
+    );
+    assert_eq!(ddts_boxes, vec![expected_ddts]);
+    assert!(btrt_boxes.is_empty());
+}
+
+#[test]
+fn mux_to_path_fragmented_imported_flac_preserves_dfla_and_strips_btrt() {
+    let mut expected_dfla = DfLa::default();
+    expected_dfla.metadata_blocks = vec![FlacMetadataBlock {
+            last_metadata_block_flag: true,
+            block_type: 0,
+            length: 34,
+            block_data: vec![0; 34],
+        }];
+    let input = build_imported_track_input_file(
+        "mux-fragment-imported-flac-preserve-dfla",
+        &MuxFileConfig::new(48_000)
+            .with_major_brand(fourcc("isom"))
+            .with_compatible_brand(fourcc("mp42")),
+        &MuxTrackConfig::new_audio(
+            1,
+            48_000,
+            audio_sample_entry_box_with_children(
+                "fLaC",
+                &[
+                    encode_supported_box(&expected_dfla, &[]),
+                    encode_supported_box(&Btrt::default(), &[]),
+                ]
+                .concat(),
+            ),
+        ),
+        2_048,
+        &[
+            TestMuxSample {
+                bytes: b"flac-a",
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+            TestMuxSample {
+                bytes: b"flac-b",
+                duration: 1_024,
+                composition_time_offset: 0,
+                is_sync_sample: true,
+            },
+        ],
+    );
+    let output_path = write_temp_file("mux-fragment-imported-flac-preserve-dfla-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
+        input,
+        MuxMp4TrackSelector::Audio { occurrence: 1 },
+    )])
+    .with_output_layout(MuxOutputLayout::Fragmented)
+    .with_duration_mode(MuxDurationMode::Fragment { seconds: 10.0 });
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let dfla_boxes = extract_boxes::<DfLa>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+            fourcc("dfLa"),
+        ]),
+    );
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+            fourcc("btrt"),
+        ]),
+    );
+    assert_eq!(dfla_boxes, vec![expected_dfla]);
+    assert!(btrt_boxes.is_empty());
+}
+
+#[test]
+fn mux_to_path_fragmented_raw_flac_preserves_dfla_and_strips_btrt() {
+    let flac_input = write_test_flac_file("mux-fragment-raw-flac-input", b"flac-frame");
+    let output_path = write_temp_file("mux-fragment-raw-flac-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)])
+        .with_output_layout(MuxOutputLayout::Fragmented)
+        .with_duration_mode(MuxDurationMode::Fragment { seconds: 10.0 });
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let dfla_boxes = extract_boxes::<DfLa>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+            fourcc("dfLa"),
+        ]),
+    );
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+            fourcc("btrt"),
+        ]),
+    );
+    assert_eq!(dfla_boxes.len(), 1);
+    assert!(btrt_boxes.is_empty());
+}
+
+#[test]
+fn mux_to_path_fragmented_ogg_flac_split_header_strips_dfla() {
+    let flac_input = write_test_ogg_flac_split_header_file(
+        "mux-fragment-ogg-flac-split-input",
+        &[b"abc", b"def"],
+    );
+    let output_path = write_temp_file("mux-fragment-ogg-flac-split-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)])
+        .with_output_layout(MuxOutputLayout::Fragmented)
+        .with_duration_mode(MuxDurationMode::Fragment { seconds: 10.0 });
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let dfla_boxes = extract_boxes::<DfLa>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+            fourcc("dfLa"),
+        ]),
+    );
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+            fourcc("btrt"),
+        ]),
+    );
+    assert!(dfla_boxes.is_empty());
+    assert!(btrt_boxes.is_empty());
+}
+
+#[test]
+fn mux_to_path_fragmented_raw_mhas_strips_btrt() {
+    let mhas_input =
+        write_test_mhas_file("mux-fragment-raw-mhas-input", &[b"frame-one", b"frame-two"]);
+    let output_path = write_temp_file("mux-fragment-raw-mhas-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mhas_input)])
+        .with_output_layout(MuxOutputLayout::Fragmented)
+        .with_duration_mode(MuxDurationMode::Fragment { seconds: 10.0 });
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let btrt_boxes = extract_boxes::<Btrt>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("mhm1"),
+            fourcc("btrt"),
+        ]),
+    );
+    assert!(btrt_boxes.is_empty());
 }
 
 #[test]
@@ -8213,6 +8608,59 @@ fn mux_to_path_imports_path_only_ogg_flac_mapping_header_inputs() {
 }
 
 #[test]
+fn mux_to_path_imports_path_only_ogg_flac_split_header_inputs() {
+    let flac_input =
+        write_test_ogg_flac_split_header_file("mux-raw-ogg-flac-split-input", &[b"abc", b"def"]);
+    let output_path = write_temp_file("mux-raw-ogg-flac-split-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fLaC"),
+        ]),
+    );
+    let mdhd_boxes = extract_boxes::<Mdhd>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("mdhd"),
+        ]),
+    );
+    let stts_boxes = extract_boxes::<Stts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stts"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("fLaC"));
+    assert_eq!(audio_entries[0].channel_count, 2);
+    assert_eq!(mdhd_boxes[0].timescale, 1_000);
+    assert_eq!(stts_boxes[0].entries.len(), 2);
+    assert_eq!(stts_boxes[0].entries[0].sample_count, 1);
+    assert_eq!(stts_boxes[0].entries[0].sample_delta, 1);
+    assert_eq!(stts_boxes[0].entries[1].sample_count, 1);
+    assert_eq!(stts_boxes[0].entries[1].sample_delta, 0);
+}
+
+#[test]
 fn mux_to_path_imports_path_only_ogg_opus_inputs() {
     let opus_input = write_test_ogg_opus_file("mux-raw-opus-input", &[b"abc", b"def"]);
     let output_path = write_temp_file("mux-raw-opus-output", &[]);
@@ -9719,7 +10167,7 @@ fn mux_to_path_imports_path_only_wave_pcm_inputs() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ipcm"));
     assert_eq!(audio_entries[0].channel_count, 2);
     assert_eq!(pcm_configs.len(), 1);
-    assert_eq!(pcm_configs[0].format_flags, 1);
+    assert_eq!(pcm_configs[0].format_flags, 0);
     assert_eq!(pcm_configs[0].pcm_sample_size, 16);
     assert_eq!(chnl_boxes.len(), 1);
     assert_eq!(
@@ -9961,6 +10409,313 @@ fn mux_to_path_imports_path_only_aifc_pcm_inputs() {
 }
 
 #[test]
+fn mux_to_path_imports_path_only_aifc_float64_inputs() {
+    let frames = [&[0.5_f64, -0.5_f64][..], &[1.25_f64, -1.25_f64][..]];
+    let input = write_test_aifc_float64_file("mux-raw-aifc-float64-input", 48_000, 2, &frames);
+    let output_path = write_temp_file("mux-raw-aifc-float64-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(&output_path).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    let expected_payload = frames
+        .iter()
+        .flat_map(|frame| frame.iter().flat_map(|sample| sample.to_be_bytes()))
+        .collect::<Vec<_>>();
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
+
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fpcm"),
+        ]),
+    );
+    let pcm_configs = extract_boxes::<PcmC>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fpcm"),
+            fourcc("pcmC"),
+        ]),
+    );
+    let mdhd_boxes = extract_boxes::<Mdhd>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("mdhd"),
+        ]),
+    );
+    let stts_boxes = extract_boxes::<Stts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stts"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("fpcm"));
+    assert_eq!(audio_entries[0].channel_count, 2);
+    assert_eq!(audio_entries[0].sample_size, 64);
+    let sample_entry_boxes = extract_box_bytes(
+        &mut Cursor::new(&output_bytes),
+        None,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("fpcm"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(sample_entry_boxes.len(), 1);
+    assert_eq!(&sample_entry_boxes[0][18..22], &[0, 0, 0, 0]);
+    assert_eq!(pcm_configs.len(), 1);
+    assert_eq!(pcm_configs[0].format_flags, 1);
+    assert_eq!(pcm_configs[0].pcm_sample_size, 64);
+    assert_eq!(mdhd_boxes[0].timescale, 48_000);
+    assert_eq!(stts_boxes[0].entries.len(), 1);
+    assert_eq!(stts_boxes[0].entries[0].sample_count, 2);
+    assert_eq!(stts_boxes[0].entries[0].sample_delta, 1);
+}
+
+#[test]
+fn mux_to_path_imports_path_only_aifc_alaw_inputs() {
+    let packets = [&[0xD5_u8, 0x55, 0x26, 0xA6][..]];
+    let input = write_test_aifc_alaw_file("mux-raw-aifc-alaw-input", 8_000, 1, &packets);
+    let output_path = write_temp_file("mux-raw-aifc-alaw-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(&output_path).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    let expected_payload = decode_companded_pcm_payload(packets[0], decode_alaw_pcm_sample);
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
+
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ipcm"),
+        ]),
+    );
+    let pcm_configs = extract_boxes::<PcmC>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ipcm"),
+            fourcc("pcmC"),
+        ]),
+    );
+    let stsz_boxes = extract_boxes::<Stsz>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsz"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ipcm"));
+    assert_eq!(audio_entries[0].channel_count, 1);
+    assert_eq!(audio_entries[0].sample_size, 16);
+    assert_eq!(pcm_configs.len(), 1);
+    assert_eq!(pcm_configs[0].format_flags, 1);
+    assert_eq!(pcm_configs[0].pcm_sample_size, 16);
+    assert_eq!(stsz_boxes[0].sample_count, 4);
+    assert_eq!(stsz_boxes[0].sample_size, 2);
+}
+
+#[test]
+fn mux_to_path_imports_path_only_aifc_alaw_inputs_with_packed_16_bit_declaration() {
+    let packets = [&[0xD5_u8, 0x55, 0x26, 0xA6][..]];
+    let input = write_test_aifc_alaw_file_with_declared_bits(
+        "mux-raw-aifc-alaw-16-input",
+        8_000,
+        1,
+        16,
+        &packets,
+    );
+    let output_path = write_temp_file("mux-raw-aifc-alaw-16-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(&output_path).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), packets[0]);
+
+    let stts_boxes = extract_boxes::<Stts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stts"),
+        ]),
+    );
+    let stsz_boxes = extract_boxes::<Stsz>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsz"),
+        ]),
+    );
+    assert_eq!(stts_boxes[0].entries.len(), 1);
+    assert_eq!(stts_boxes[0].entries[0].sample_count, 2);
+    assert_eq!(stsz_boxes[0].sample_count, 2);
+    assert_eq!(stsz_boxes[0].sample_size, 2);
+}
+
+#[test]
+fn mux_to_path_imports_path_only_aifc_ulaw_inputs() {
+    let packets = [&[0xFF_u8, 0x7F, 0xDB, 0x5B][..]];
+    let input = write_test_aifc_ulaw_file("mux-raw-aifc-ulaw-input", 8_000, 1, &packets);
+    let output_path = write_temp_file("mux-raw-aifc-ulaw-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(&output_path).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    let expected_payload = decode_companded_pcm_payload(packets[0], decode_ulaw_pcm_sample);
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), expected_payload);
+
+    let audio_entries = extract_boxes::<AudioSampleEntry>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ipcm"),
+        ]),
+    );
+    let pcm_configs = extract_boxes::<PcmC>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ipcm"),
+            fourcc("pcmC"),
+        ]),
+    );
+    let stsz_boxes = extract_boxes::<Stsz>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsz"),
+        ]),
+    );
+    assert_eq!(audio_entries.len(), 1);
+    assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ipcm"));
+    assert_eq!(audio_entries[0].channel_count, 1);
+    assert_eq!(audio_entries[0].sample_size, 16);
+    assert_eq!(pcm_configs.len(), 1);
+    assert_eq!(pcm_configs[0].format_flags, 1);
+    assert_eq!(pcm_configs[0].pcm_sample_size, 16);
+    assert_eq!(stsz_boxes[0].sample_count, 4);
+    assert_eq!(stsz_boxes[0].sample_size, 2);
+}
+
+#[test]
+fn mux_to_path_imports_path_only_aifc_ulaw_inputs_with_packed_16_bit_declaration() {
+    let packets = [&[0xFF_u8, 0x7F, 0xDB, 0x5B][..]];
+    let input = write_test_aifc_ulaw_file_with_declared_bits(
+        "mux-raw-aifc-ulaw-16-input",
+        8_000,
+        1,
+        16,
+        &packets,
+    );
+    let output_path = write_temp_file("mux-raw-aifc-ulaw-16-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(&output_path).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), packets[0]);
+
+    let stts_boxes = extract_boxes::<Stts>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stts"),
+        ]),
+    );
+    let stsz_boxes = extract_boxes::<Stsz>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsz"),
+        ]),
+    );
+    assert_eq!(stts_boxes[0].entries.len(), 1);
+    assert_eq!(stts_boxes[0].entries[0].sample_count, 2);
+    assert_eq!(stsz_boxes[0].sample_count, 2);
+    assert_eq!(stsz_boxes[0].sample_size, 2);
+}
+
+#[test]
 fn mux_to_path_imports_path_only_ogg_vorbis_inputs() {
     let vorbis_input = write_test_ogg_vorbis_file("mux-raw-vorbis-input", &[b"abc", b"def"]);
     let output_path = write_temp_file("mux-raw-vorbis-output", &[]);
@@ -10123,7 +10878,7 @@ fn mux_to_path_imports_path_only_ogg_speex_inputs() {
     assert_eq!(stts_boxes[0].entries[0].sample_count, 1);
     assert_eq!(stts_boxes[0].entries[0].sample_delta, 1);
     assert_eq!(stts_boxes[0].entries[1].sample_count, 1);
-    assert_eq!(stts_boxes[0].entries[1].sample_delta, 320);
+    assert_eq!(stts_boxes[0].entries[1].sample_delta, 0);
 }
 
 #[test]
@@ -11820,6 +12575,45 @@ fn mux_to_path_imports_raw_eac3_inputs() {
 }
 
 #[test]
+fn mux_to_path_imports_raw_eac3_inputs_with_dependent_substreams() {
+    let eac3_input = write_test_eac3_file_with_dependent_substream(
+        "mux-raw-eac3-dependent-input",
+        &[b"ec3"],
+    );
+    let expected = fs::read(&eac3_input).unwrap();
+    let output_path = write_temp_file("mux-raw-eac3-dependent-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(eac3_input)]);
+
+    mux_to_path(&request, &output_path).unwrap();
+
+    let output_bytes = fs::read(output_path).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
+    assert_eq!(
+        mdat_payload(&output_bytes, root_boxes[2]),
+        expected.as_slice()
+    );
+
+    let dec3_boxes = extract_boxes::<Dec3>(
+        &output_bytes,
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("mdia"),
+            fourcc("minf"),
+            fourcc("stbl"),
+            fourcc("stsd"),
+            fourcc("ec-3"),
+            fourcc("dec3"),
+        ]),
+    );
+
+    assert_eq!(dec3_boxes.len(), 1);
+    assert_eq!(dec3_boxes[0].ec3_substreams.len(), 1);
+    assert_eq!(dec3_boxes[0].ec3_substreams[0].num_dep_sub, 1);
+    assert_eq!(dec3_boxes[0].ec3_substreams[0].chan_loc, 2);
+}
+
+#[test]
 fn mux_to_path_reimports_hevc_outputs_with_decoder_configuration() {
     let h265_input = write_test_h265_annexb_file("mux-hevc-reimport-source", &[b"hevc"]);
     let intermediate = write_temp_file("mux-hevc-reimport-intermediate", &[]);
@@ -13165,6 +13959,24 @@ async fn mux_to_path_async_matches_sync_ogg_flac_mapping_output() {
         write_test_ogg_flac_mapping_file("mux-async-ogg-flac-mapping-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-ogg-flac-mapping-sync-output", &[]);
     let async_output = write_temp_file("mux-async-ogg-flac-mapping-async-output", &[]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(flac_input)]);
+
+    mux_to_path(&request, &sync_output).unwrap();
+    mux_to_path_async(&request, &async_output).await.unwrap();
+
+    assert_eq!(
+        fs::read(sync_output).unwrap(),
+        fs::read(async_output).unwrap()
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_to_path_async_matches_sync_ogg_flac_split_header_output() {
+    let flac_input =
+        write_test_ogg_flac_split_header_file("mux-async-ogg-flac-split-input", &[b"abc", b"def"]);
+    let sync_output = write_temp_file("mux-async-ogg-flac-split-sync-output", &[]);
+    let async_output = write_temp_file("mux-async-ogg-flac-split-async-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::path(flac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();

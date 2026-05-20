@@ -14,7 +14,7 @@ use crate::FourCc;
 #[cfg(feature = "async")]
 use crate::async_io::{AsyncReadSeek, AsyncWrite};
 use crate::boxes::iso14496_12::{
-    Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
+    AudioSampleEntry, Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
 };
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
@@ -454,7 +454,7 @@ where
             &self.info,
             payload_size,
             read,
-            boxed.as_any().is::<VisualSampleEntry>(),
+            payload_uses_optional_trailing_bytes(boxed.as_ref()),
             &payload,
         )?);
         Ok((boxed, read))
@@ -862,7 +862,7 @@ where
     R: Read + Seek,
 {
     let offset = info.offset() + info.header_size() + payload_read;
-    let size = if payload.as_any().is::<VisualSampleEntry>() {
+    let size = if payload_uses_optional_trailing_bytes(payload) {
         visual_sample_entry_child_payload_size(
             reader,
             offset,
@@ -880,11 +880,11 @@ fn children_layout_for_buffered_payload(
     info: &BoxInfo,
     payload_size: u64,
     payload_read: u64,
-    is_visual_sample_entry: bool,
+    uses_optional_trailing_bytes: bool,
     payload: &[u8],
 ) -> Result<ChildrenLayout, WalkError> {
     let offset = info.offset() + info.header_size() + payload_read;
-    let size = if is_visual_sample_entry {
+    let size = if uses_optional_trailing_bytes {
         let payload_read = usize::try_from(payload_read)
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
         let remaining = payload
@@ -896,6 +896,10 @@ fn children_layout_for_buffered_payload(
     };
 
     Ok(ChildrenLayout { offset, size })
+}
+
+fn payload_uses_optional_trailing_bytes(payload: &dyn DynCodecBox) -> bool {
+    payload.as_any().is::<VisualSampleEntry>() || payload.as_any().is::<AudioSampleEntry>()
 }
 
 fn visual_sample_entry_child_payload_size<R>(
@@ -1012,7 +1016,7 @@ where
     }
 
     let end = reader.seek(SeekFrom::End(0))?;
-    Ok(start == end)
+    Ok(start >= end)
 }
 
 #[cfg(feature = "async")]
@@ -1029,7 +1033,7 @@ where
     }
 
     let end = reader.seek(SeekFrom::End(0)).await?;
-    Ok(start == end)
+    Ok(start >= end)
 }
 
 /// Errors raised while walking a box tree.

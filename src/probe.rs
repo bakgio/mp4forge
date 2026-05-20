@@ -26,16 +26,23 @@ use crate::boxes::iso23001_5::PcmC;
 use crate::boxes::opus::DOps;
 use crate::boxes::vp::VpCodecConfiguration;
 use crate::codec::{CodecBox, CodecError, ImmutableBox, unmarshal};
-use crate::extract::{ExtractError, ExtractedBox, extract_boxes, extract_boxes_with_payload};
+use crate::extract::{
+    ExtractError, ExtractedBox, extract_boxes, extract_boxes_with_payload,
+};
 #[cfg(feature = "async")]
 use crate::extract::{extract_boxes_async, extract_boxes_with_payload_async};
 use crate::header::HeaderError;
 use crate::walk::BoxPath;
+use miniz_oxide::inflate::decompress_to_vec_zlib;
 #[cfg(feature = "async")]
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const FTYP: FourCc = FourCc::from_bytes(*b"ftyp");
 const MOOV: FourCc = FourCc::from_bytes(*b"moov");
+const CMOV: FourCc = FourCc::from_bytes(*b"cmov");
+const DCOM: FourCc = FourCc::from_bytes(*b"dcom");
+const CMVD: FourCc = FourCc::from_bytes(*b"cmvd");
+const ZLIB: FourCc = FourCc::from_bytes(*b"zlib");
 const MVHD: FourCc = FourCc::from_bytes(*b"mvhd");
 const TRAK: FourCc = FourCc::from_bytes(*b"trak");
 const MOOF: FourCc = FourCc::from_bytes(*b"moof");
@@ -89,6 +96,7 @@ const MP4A: FourCc = FourCc::from_bytes(*b"mp4a");
 const MP4V: FourCc = FourCc::from_bytes(*b"mp4v");
 const DOT_MP3: FourCc = FourCc::from_bytes(*b".mp3");
 const ALAW: FourCc = FourCc::from_bytes(*b"alaw");
+const MLAW: FourCc = FourCc::from_bytes(*b"MLAW");
 const OPUS: FourCc = FourCc::from_bytes(*b"Opus");
 const SPEX: FourCc = FourCc::from_bytes(*b"spex");
 const SAMR: FourCc = FourCc::from_bytes(*b"samr");
@@ -1254,7 +1262,16 @@ where
     R: Read + Seek,
 {
     let paths = root_probe_box_paths(options);
-    let infos = extract_boxes(reader, None, &paths)?;
+    let infos = match extract_boxes(reader, None, &paths) {
+        Ok(infos) => infos,
+        Err(error) => {
+            if let Some(root_bytes) = extract_compressed_movie_root_bytes_sync(reader)? {
+                let mut cursor = Cursor::new(root_bytes);
+                return probe_codec_detailed_with_options(&mut cursor, options);
+            }
+            return Err(error.into());
+        }
+    };
 
     let mut summary = CodecDetailedProbeInfo::default();
     let mut mdat_appeared = false;
@@ -1290,7 +1307,187 @@ where
         }
     }
 
+    if (summary.tracks.is_empty() || summary.timescale == 0)
+        && let Some(root_bytes) = extract_compressed_movie_root_bytes_sync(reader)?
+    {
+        let mut cursor = Cursor::new(root_bytes);
+        let fallback = probe_codec_detailed_with_options(&mut cursor, options)?;
+        if !fallback.tracks.is_empty() || fallback.timescale != 0 {
+            return Ok(fallback);
+        }
+    }
+
     Ok(summary)
+}
+
+pub(crate) fn extract_compressed_movie_root_bytes_sync<R>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: Read + Seek,
+{
+    let ftyp_bytes = extract_root_box_bytes_sync(reader, FTYP)?;
+    let Some(moov_box_bytes) = extract_root_box_bytes_sync(reader, MOOV)? else {
+        return Ok(None);
+    };
+    let Some(decoded_moov_box_bytes) =
+        decode_compressed_movie_moov_box_bytes(&moov_box_bytes)?
+    else {
+        return Ok(None);
+    };
+
+    let mut root_bytes = Vec::with_capacity(
+        ftyp_bytes.as_ref().map_or(0, Vec::len) + decoded_moov_box_bytes.len(),
+    );
+    if let Some(ftyp_box_bytes) = ftyp_bytes {
+        root_bytes.extend_from_slice(&ftyp_box_bytes);
+    }
+    root_bytes.extend_from_slice(&decoded_moov_box_bytes);
+    Ok(Some(root_bytes))
+}
+
+fn decode_compressed_movie_moov_box_bytes(
+    moov_box_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, ProbeError> {
+    let Some(cmov_box_bytes) = find_child_box_bytes_sync(moov_box_bytes, CMOV)? else {
+        return Ok(None);
+    };
+    let Some(dcom_payload) = find_child_box_payload_bytes_sync(&cmov_box_bytes, DCOM)? else {
+        return Err(ProbeError::MissingRequiredBox("dcom"));
+    };
+    if dcom_payload.as_slice() != ZLIB.as_bytes() {
+        return Err(ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported compressed movie method `{}`",
+                String::from_utf8_lossy(&dcom_payload)
+            ),
+        )));
+    }
+    let Some(cmvd_payload) = find_child_box_payload_bytes_sync(&cmov_box_bytes, CMVD)? else {
+        return Err(ProbeError::MissingRequiredBox("cmvd"));
+    };
+    if cmvd_payload.len() < 4 {
+        return Err(ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed movie payload is truncated before the encoded size field",
+        )));
+    }
+
+    let declared_len = u32::from_be_bytes(cmvd_payload[..4].try_into().unwrap());
+    let decompressed = decompress_to_vec_zlib(&cmvd_payload[4..]).map_err(|error| {
+        ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to inflate compressed movie payload: {error:?}"),
+        ))
+    })?;
+    if decompressed.len() != usize::try_from(declared_len).unwrap_or(usize::MAX) {
+        return Err(ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compressed movie payload declared {} bytes but inflated to {} bytes",
+                declared_len,
+                decompressed.len()
+            ),
+        )));
+    }
+
+    let mut inflated_cursor = Cursor::new(decompressed.as_slice());
+    let inflated_moov_info = BoxInfo::read(&mut inflated_cursor)?;
+    if inflated_moov_info.box_type() != MOOV {
+        return Err(ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inflated compressed movie payload did not yield a moov box",
+        )));
+    }
+
+    Ok(Some(decompressed))
+}
+
+fn extract_root_box_bytes_sync<R>(reader: &mut R, box_type: FourCc) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: Read + Seek,
+{
+    reader.seek(SeekFrom::Start(0))?;
+    loop {
+        let start = reader.stream_position()?;
+        let info = match BoxInfo::read(reader) {
+            Ok(info) => info,
+            Err(HeaderError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                reader.seek(SeekFrom::Start(start))?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let box_bytes = read_box_bytes_sync(reader, info)?;
+        if info.box_type() == box_type {
+            return Ok(Some(box_bytes));
+        }
+    }
+}
+
+fn read_box_bytes_sync<R>(reader: &mut R, info: BoxInfo) -> Result<Vec<u8>, ProbeError>
+where
+    R: Read + Seek,
+{
+    info.seek_to_start(reader)?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(info.size()).map_err(|_| ProbeError::NumericOverflow {
+            field_name: "box size",
+        })?
+    ];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn find_child_box_bytes_sync(parent_box_bytes: &[u8], child_type: FourCc) -> Result<Option<Vec<u8>>, ProbeError> {
+    let mut cursor = Cursor::new(parent_box_bytes);
+    let parent_info = BoxInfo::read(&mut cursor)?;
+    let parent_end = parent_info.offset() + parent_info.size();
+    let mut next_offset = parent_info.offset() + parent_info.header_size();
+    while next_offset < parent_end {
+        Seek::seek(&mut cursor, SeekFrom::Start(next_offset))?;
+        let child_info = BoxInfo::read(&mut cursor)?;
+        let child_start = usize::try_from(child_info.offset()).map_err(|_| ProbeError::NumericOverflow {
+            field_name: "child box start",
+        })?;
+        let child_end = usize::try_from(child_info.offset() + child_info.size()).map_err(|_| ProbeError::NumericOverflow {
+            field_name: "child box end",
+        })?;
+        if child_end > parent_box_bytes.len() {
+            return Err(ProbeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child box exceeds the available parent bytes",
+            )));
+        }
+        if child_info.box_type() == child_type {
+            return Ok(Some(parent_box_bytes[child_start..child_end].to_vec()));
+        }
+        next_offset = child_info.offset() + child_info.size();
+    }
+    Ok(None)
+}
+
+fn find_child_box_payload_bytes_sync(
+    parent_box_bytes: &[u8],
+    child_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError> {
+    let Some(child_box_bytes) = find_child_box_bytes_sync(parent_box_bytes, child_type)? else {
+        return Ok(None);
+    };
+    let mut cursor = Cursor::new(child_box_bytes.as_slice());
+    let child_info = BoxInfo::read(&mut cursor)?;
+    let payload_start = usize::try_from(child_info.header_size()).map_err(|_| ProbeError::NumericOverflow {
+        field_name: "child box payload start",
+    })?;
+    if payload_start > child_box_bytes.len() {
+        return Err(ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "child box payload start exceeds the encoded child box length",
+        )));
+    }
+    Ok(Some(child_box_bytes[payload_start..].to_vec()))
 }
 
 /// Probes a file through the additive Tokio-based async surface with expansion controls and
@@ -1873,63 +2070,212 @@ pub fn detect_aac_profile(esds: &Esds) -> Result<Option<AacProfileInfo>, ProbeEr
         ))?;
 
     let mut reader = BitReader::new(Cursor::new(specific_info));
-    let mut remaining_bits = specific_info.len() * 8;
-
-    let (audio_object_type, read_bits) = get_audio_object_type(&mut reader)?;
-    remaining_bits = remaining_bits.saturating_sub(read_bits);
+    let (audio_object_type, mut bit_offset) = get_audio_object_type(&mut reader)?;
 
     let sampling_frequency_index = read_bits_u8(&mut reader, 4)?;
-    remaining_bits = remaining_bits.saturating_sub(4);
+    bit_offset = bit_offset.saturating_add(4);
     if sampling_frequency_index == 0x0f {
         let _ = read_bits_u32(&mut reader, 24)?;
-        remaining_bits = remaining_bits.saturating_sub(24);
+        bit_offset = bit_offset.saturating_add(24);
     }
 
-    if audio_object_type == 2 && remaining_bits >= 20 {
-        let _ = read_bits_u8(&mut reader, 4)?;
-        remaining_bits = remaining_bits.saturating_sub(4);
-        let sync_extension_type = read_bits_u16(&mut reader, 11)?;
-        remaining_bits = remaining_bits.saturating_sub(11);
-        if sync_extension_type == 0x02b7 {
-            let (ext_audio_object_type, _) = get_audio_object_type(&mut reader)?;
-            if ext_audio_object_type == 5 || ext_audio_object_type == 22 {
-                let sbr = read_bits_u8(&mut reader, 1)?;
-                remaining_bits = remaining_bits.saturating_sub(1);
-                if sbr != 0 {
-                    if ext_audio_object_type == 5 {
-                        let ext_sampling_frequency_index = read_bits_u8(&mut reader, 4)?;
-                        remaining_bits = remaining_bits.saturating_sub(4);
-                        if ext_sampling_frequency_index == 0x0f {
-                            let _ = read_bits_u32(&mut reader, 24)?;
-                            remaining_bits = remaining_bits.saturating_sub(24);
-                        }
-                        if remaining_bits >= 12 {
-                            let sync_extension_type = read_bits_u16(&mut reader, 11)?;
-                            if sync_extension_type == 0x0548 {
-                                let ps = read_bits_u8(&mut reader, 1)?;
-                                if ps != 0 {
-                                    return Ok(Some(AacProfileInfo {
-                                        object_type_indication: 0x40,
-                                        audio_object_type: 29,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-
-                    return Ok(Some(AacProfileInfo {
-                        object_type_indication: 0x40,
-                        audio_object_type: 5,
-                    }));
-                }
-            }
-        }
+    if audio_object_type == 2
+        && let Some(extension) =
+            detect_aac_sync_extension_info(specific_info, bit_offset.saturating_add(4))
+    {
+        return Ok(Some(AacProfileInfo {
+            object_type_indication: 0x40,
+            audio_object_type: extension.audio_object_type,
+        }));
     }
 
     Ok(Some(AacProfileInfo {
         object_type_indication: 0x40,
         audio_object_type,
     }))
+}
+
+/// Detects the effective AAC sample rate signaled by one `esds` descriptor stream.
+pub fn detect_aac_effective_sample_rate(esds: &Esds) -> Result<Option<u32>, ProbeError> {
+    let Some(decoder_config) = esds.decoder_config_descriptor() else {
+        return Ok(None);
+    };
+    if decoder_config.object_type_indication != 0x40 {
+        return Ok(None);
+    }
+
+    let specific_info = esds
+        .decoder_specific_info()
+        .ok_or(ProbeError::MissingDescriptor(
+            "decoder specific info descriptor",
+        ))?;
+
+    let mut reader = BitReader::new(Cursor::new(specific_info));
+    let (audio_object_type, mut bit_offset) = get_audio_object_type(&mut reader)?;
+    let (sample_rate, sample_rate_bits) = read_aac_sample_rate_with_bits(&mut reader)?;
+    bit_offset = bit_offset.saturating_add(sample_rate_bits);
+    let _ = read_bits_u8(&mut reader, 4)?;
+    bit_offset = bit_offset.saturating_add(4);
+
+    if matches!(audio_object_type, 5 | 29) {
+        return Ok(Some(read_aac_sample_rate(&mut reader)?));
+    }
+
+    if audio_object_type == 2
+        && let Some(extension) = detect_aac_sync_extension_info(specific_info, bit_offset)
+        && let Some(sample_rate) = extension.sample_rate
+    {
+        return Ok(Some(sample_rate));
+    }
+
+    Ok(Some(sample_rate))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AacSyncExtensionInfo {
+    audio_object_type: u8,
+    sample_rate: Option<u32>,
+}
+
+fn detect_aac_sync_extension_info(
+    specific_info: &[u8],
+    search_start_bit: usize,
+) -> Option<AacSyncExtensionInfo> {
+    let total_bits = specific_info.len().checked_mul(8)?;
+    if search_start_bit
+        .checked_add(17)
+        .is_none_or(|minimum| minimum > total_bits)
+    {
+        return None;
+    }
+
+    for sync_bit in search_start_bit..=total_bits.saturating_sub(17) {
+        if read_bits_from_slice(specific_info, sync_bit, 11)? != 0x02b7 {
+            continue;
+        }
+        let (ext_audio_object_type, ext_aot_bits) =
+            get_audio_object_type_from_slice(specific_info, sync_bit.saturating_add(11))?;
+        if ext_audio_object_type != 5 && ext_audio_object_type != 22 {
+            continue;
+        }
+
+        let mut bit_offset = sync_bit
+            .saturating_add(11)
+            .saturating_add(ext_aot_bits);
+        let sbr = read_bits_from_slice(specific_info, bit_offset, 1)?;
+        bit_offset = bit_offset.saturating_add(1);
+        if sbr == 0 {
+            continue;
+        }
+
+        if ext_audio_object_type == 5 {
+            let ext_sampling_frequency_index =
+                read_bits_from_slice(specific_info, bit_offset, 4)? as u8;
+            bit_offset = bit_offset.saturating_add(4);
+            let sample_rate = if ext_sampling_frequency_index == 0x0f {
+                let sample_rate = read_bits_from_slice(specific_info, bit_offset, 24)?;
+                bit_offset = bit_offset.saturating_add(24);
+                if bit_offset > total_bits {
+                    continue;
+                }
+                Some(sample_rate)
+            } else {
+                aac_sampling_frequency(ext_sampling_frequency_index)
+            };
+            if ext_sampling_frequency_index == 0x0f && sample_rate.is_none() {
+                continue;
+            }
+            if bit_offset.saturating_add(12) <= total_bits
+                && read_bits_from_slice(specific_info, bit_offset, 11)? == 0x0548
+                && read_bits_from_slice(specific_info, bit_offset.saturating_add(11), 1)? != 0
+            {
+                return Some(AacSyncExtensionInfo {
+                    audio_object_type: 29,
+                    sample_rate,
+                });
+            }
+            return Some(AacSyncExtensionInfo {
+                audio_object_type: 5,
+                sample_rate,
+            });
+        }
+
+        return Some(AacSyncExtensionInfo {
+            audio_object_type: 5,
+            sample_rate: None,
+        });
+    }
+
+    None
+}
+
+fn read_aac_sample_rate<R>(reader: &mut BitReader<R>) -> Result<u32, ProbeError>
+where
+    R: Read,
+{
+    Ok(read_aac_sample_rate_with_bits(reader)?.0)
+}
+
+fn read_aac_sample_rate_with_bits<R>(reader: &mut BitReader<R>) -> Result<(u32, usize), ProbeError>
+where
+    R: Read,
+{
+    let sampling_frequency_index = read_bits_u8(reader, 4)?;
+    if sampling_frequency_index == 0x0f {
+        return Ok((read_bits_u32(reader, 24)?, 28));
+    }
+
+    Ok((
+        aac_sampling_frequency(sampling_frequency_index).ok_or(ProbeError::MissingDescriptor(
+            "supported AAC sampling-frequency index",
+        ))?,
+        4,
+    ))
+}
+
+const fn aac_sampling_frequency(index: u8) -> Option<u32> {
+    match index {
+        0 => Some(96_000),
+        1 => Some(88_200),
+        2 => Some(64_000),
+        3 => Some(48_000),
+        4 => Some(44_100),
+        5 => Some(32_000),
+        6 => Some(24_000),
+        7 => Some(22_050),
+        8 => Some(16_000),
+        9 => Some(12_000),
+        10 => Some(11_025),
+        11 => Some(8_000),
+        12 => Some(7_350),
+        _ => None,
+    }
+}
+
+fn get_audio_object_type_from_slice(data: &[u8], bit_offset: usize) -> Option<(u8, usize)> {
+    let audio_object_type = u8::try_from(read_bits_from_slice(data, bit_offset, 5)?).ok()?;
+    if audio_object_type != 0x1f {
+        return Some((audio_object_type, 5));
+    }
+
+    let extended = u8::try_from(read_bits_from_slice(data, bit_offset.saturating_add(5), 6)?)
+        .ok()?;
+    Some((extended.saturating_add(32), 11))
+}
+
+fn read_bits_from_slice(data: &[u8], bit_offset: usize, width: usize) -> Option<u32> {
+    let end = bit_offset.checked_add(width)?;
+    if end > data.len().checked_mul(8)? || width > 32 {
+        return None;
+    }
+
+    let mut value = 0_u32;
+    for index in bit_offset..end {
+        let byte = *data.get(index / 8)?;
+        let shift = 7_u8.saturating_sub(u8::try_from(index % 8).ok()?);
+        value = (value << 1) | u32::from((byte >> shift) & 1);
+    }
+    Some(value)
 }
 
 /// Finds sample indices whose AVC payload contains an IDR NAL unit.
@@ -2196,9 +2542,9 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         ENCV,
     ];
     let audio_sample_entries = [
-        MP4A, DOT_MP3, ALAW, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, ULAW, AC_3, EC_3, AC_4,
-        ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2, MHM1, MHM2,
-        IPCM, FPCM, ENCA,
+        MP4A, DOT_MP3, ALAW, MLAW, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, ULAW, AC_3, EC_3,
+        AC_4, ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2,
+        MHM1, MHM2, IPCM, FPCM, ENCA,
     ];
     let mut paths = vec![
         BoxPath::from([TKHD]),
@@ -2255,6 +2601,7 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, MP4A, WAVE, ESDS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DOT_MP3]),
         BoxPath::from([MDIA, MINF, STBL, STSD, ALAW]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, MLAW]),
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, OPUS, DOPS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, SPEX]),
@@ -2662,6 +3009,11 @@ fn parse_trak_rich_details(
                 track.sample_entry_type = Some(ALAW);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
+            MLAW => {
+                track.codec_family = TrackCodecFamily::Pcm;
+                track.sample_entry_type = Some(MLAW);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
             ENCA => {
                 track.summary.codec = TrackCodec::Mp4a;
                 track.summary.encrypted = true;
@@ -3060,7 +3412,7 @@ fn codec_family_from_sample_entry(sample_entry_type: FourCc) -> TrackCodecFamily
         MP4A => TrackCodecFamily::Mp4Audio,
         OPUS => TrackCodecFamily::Opus,
         AC_3 => TrackCodecFamily::Ac3,
-        ALAW | ULAW | IPCM | FPCM => TrackCodecFamily::Pcm,
+        ALAW | MLAW | ULAW | IPCM | FPCM => TrackCodecFamily::Pcm,
         MP4S => TrackCodecFamily::Unknown,
         STPP => TrackCodecFamily::XmlSubtitle,
         SBTT => TrackCodecFamily::TextSubtitle,
@@ -3582,20 +3934,6 @@ where
         value = (value << 8) | u16::from(byte);
     }
     u8::try_from(value).map_err(|_| ProbeError::NumericOverflow {
-        field_name: "bitfield read",
-    })
-}
-
-fn read_bits_u16<R>(reader: &mut BitReader<R>, width: usize) -> Result<u16, ProbeError>
-where
-    R: Read,
-{
-    let bits = reader.read_bits(width).map_err(ProbeError::Io)?;
-    let mut value = 0_u32;
-    for byte in bits {
-        value = (value << 8) | u32::from(byte);
-    }
-    u16::try_from(value).map_err(|_| ProbeError::NumericOverflow {
         field_name: "bitfield read",
     })
 }

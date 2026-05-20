@@ -28,7 +28,6 @@ pub(in crate::mux) struct ParsedOggSpeexTrack {
 
 struct CompletedSpeexPageState {
     packets: Vec<super::ogg_common::CompletedOggPacket>,
-    granule_position: u64,
     eos: bool,
 }
 
@@ -89,7 +88,6 @@ pub(in crate::mux) fn scan_ogg_speex_file_sync(
             &mut decoded_samples,
             CompletedSpeexPageState {
                 packets: completed,
-                granule_position: page.granule_position,
                 eos: page.header_type & 0x04 != 0,
             },
         )?;
@@ -160,7 +158,6 @@ pub(in crate::mux) async fn scan_ogg_speex_file_async(
             &mut decoded_samples,
             CompletedSpeexPageState {
                 packets: completed,
-                granule_position: page.granule_position,
                 eos: page.header_type & 0x04 != 0,
             },
         )
@@ -219,7 +216,6 @@ fn process_speex_completed_page_sync(
         transformed_segments,
         samples,
         audio_packets,
-        page.granule_position,
         page.eos,
     )
 }
@@ -267,7 +263,6 @@ async fn process_speex_completed_page_async(
         transformed_segments,
         samples,
         audio_packets,
-        page.granule_position,
         page.eos,
     )
 }
@@ -279,18 +274,15 @@ fn append_speex_audio_packets(
     transformed_segments: &mut Vec<SegmentedMuxSourceSegment>,
     samples: &mut Vec<StagedSample>,
     audio_packets: Vec<super::ogg_common::CompletedOggPacket>,
-    granule_position: u64,
     eos: bool,
 ) -> Result<(), MuxError> {
     let last_index = audio_packets.len().saturating_sub(1);
     for (index, packet) in audio_packets.into_iter().enumerate() {
-        let mut duration = 1_u64;
-        if eos && index == last_index && granule_position != u64::MAX {
-            // Retained Ogg Speex imports authored by the local comparison baseline keep the final
-            // packet duration equal to the terminal granule position itself instead of trimming it
-            // by the synthetic one-tick placeholder durations used for earlier packets.
-            duration = granule_position.max(1);
-        }
+        let duration = if eos && index == last_index {
+            0_u64
+        } else {
+            1_u64
+        };
         let data_offset = *logical_size;
         for span in &packet.spans {
             transformed_segments.push(SegmentedMuxSourceSegment {

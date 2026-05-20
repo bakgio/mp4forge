@@ -7,7 +7,7 @@ use tokio::fs::File as TokioFile;
 
 use crate::FourCc;
 use crate::bitio::BitReader;
-use crate::boxes::iso14496_12::{Btrt, SampleEntry, VisualSampleEntry};
+use crate::boxes::iso14496_12::{Btrt, Colr, Pasp, SampleEntry, VisualSampleEntry};
 use crate::boxes::threegpp::D263;
 
 use super::super::MuxError;
@@ -20,10 +20,14 @@ use super::annexb_common::{read_bits_u8_labeled, read_bits_u32_labeled};
 
 const SAMPLE_ENTRY_S263: FourCc = FourCc::from_bytes(*b"s263");
 const AVI_SAMPLE_ENTRY_H263: FourCc = FourCc::from_bytes(*b"H263");
-const DEFAULT_TIMESCALE: u32 = 15_000;
-const DEFAULT_SAMPLE_DURATION: u32 = 1_000;
+const DEFAULT_TIMESCALE: u32 = 1_200_000;
+const DEFAULT_SAMPLE_DURATION: u32 = 40_040;
+const DEFAULT_FIRST_SAMPLE_DURATION: u32 = 48_000;
 const DEFAULT_H263_LEVEL: u8 = 10;
 const DEFAULT_H263_PROFILE: u8 = 0;
+const DEFAULT_H263_COLOUR_PRIMARIES: u16 = 2;
+const DEFAULT_H263_TRANSFER_CHARACTERISTICS: u16 = 2;
+const DEFAULT_H263_MATRIX_COEFFICIENTS: u16 = 0;
 const H263_HEADER_BYTES: usize = 5;
 const SCAN_CHUNK_SIZE: usize = 16 * 1024;
 
@@ -316,9 +320,16 @@ fn finalize_h263_track(
         composition_time_offset: 0,
         is_sync_sample: current_sync_sample,
     });
+    for sample in &mut samples {
+        sample.is_sync_sample = true;
+    }
+    if let Some(first_sample) = samples.first_mut() {
+        first_sample.duration = DEFAULT_FIRST_SAMPLE_DURATION;
+    }
+    let (display_width, display_height) = display_dimensions_from_coded(width, height);
     Ok(ParsedH263Track {
-        width,
-        height,
+        width: display_width,
+        height: display_height,
         timescale: DEFAULT_TIMESCALE,
         sample_entry_box: build_h263_sample_entry_box(width, height)?,
         samples,
@@ -425,12 +436,35 @@ pub(in crate::mux) fn build_h263_sample_entry_box(
         },
         &[],
     )?;
+    let mut child_boxes = vec![d263];
+    if let Some((h_spacing, v_spacing)) = default_h263_pixel_aspect_ratio(width, height) {
+        child_boxes.push(super::super::mp4::encode_typed_box(
+            &Pasp {
+                h_spacing,
+                v_spacing,
+            },
+            &[],
+        )?);
+    }
+    child_boxes.push(super::super::mp4::encode_typed_box(
+        &Colr {
+            colour_type: FourCc::from_bytes(*b"nclx"),
+            colour_primaries: DEFAULT_H263_COLOUR_PRIMARIES,
+            transfer_characteristics: DEFAULT_H263_TRANSFER_CHARACTERISTICS,
+            matrix_coefficients: DEFAULT_H263_MATRIX_COEFFICIENTS,
+            full_range_flag: false,
+            reserved: 0,
+            profile: Vec::new(),
+            unknown: Vec::new(),
+        },
+        &[],
+    )?);
     build_visual_sample_entry_box_with_compressor_name(
         SAMPLE_ENTRY_S263,
         width,
         height,
         &[],
-        &[d263],
+        &child_boxes,
     )
 }
 
@@ -465,6 +499,22 @@ pub(in crate::mux) fn build_avi_h263_sample_entry_box(
 
 fn looks_like_h263_start_code(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && (u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) >> 10) == 0x20
+}
+
+fn default_h263_pixel_aspect_ratio(width: u16, height: u16) -> Option<(u32, u32)> {
+    match (width, height) {
+        (176, 144) | (352, 288) | (704, 576) | (1408, 1152) => Some((12, 11)),
+        _ => None,
+    }
+}
+
+fn display_dimensions_from_coded(width: u16, height: u16) -> (u16, u16) {
+    if let Some((h_spacing, v_spacing)) = default_h263_pixel_aspect_ratio(width, height) {
+        let widened = u64::from(width) * u64::from(h_spacing);
+        let display_width = widened.div_ceil(u64::from(v_spacing));
+        return (u16::try_from(display_width).unwrap_or(u16::MAX), height);
+    }
+    (width, height)
 }
 
 fn invalid_h263(spec: &str, message: &str) -> MuxError {

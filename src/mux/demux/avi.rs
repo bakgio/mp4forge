@@ -75,7 +75,7 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const SAMPLE_ENTRY_IPCM: FourCc = FourCc::from_bytes(*b"ipcm");
 const SAMPLE_ENTRY_FPCM: FourCc = FourCc::from_bytes(*b"fpcm");
 const SAMPLE_ENTRY_ALAW: FourCc = FourCc::from_bytes(*b"alaw");
-const SAMPLE_ENTRY_ULAW: FourCc = FourCc::from_bytes(*b"ulaw");
+const SAMPLE_ENTRY_MLAW: FourCc = FourCc::from_bytes(*b"MLAW");
 const SAMPLE_ENTRY_MS_ADPCM: FourCc = FourCc::from_bytes([0x6D, 0x73, 0x00, 0x02]);
 const SAMPLE_ENTRY_IMA_ADPCM: FourCc = FourCc::from_bytes([0x6D, 0x73, 0x00, 0x11]);
 const SAMPLE_ENTRY_IBM_CVSD: FourCc = FourCc::from_bytes(*b"CSVD");
@@ -393,7 +393,7 @@ fn finalize_avi_tracks_sync(
                             descriptor.stream_index,
                             audio_format,
                             chunks,
-                            SAMPLE_ENTRY_ULAW,
+                            SAMPLE_ENTRY_MLAW,
                             "ulaw",
                         )?)
                     }
@@ -681,7 +681,7 @@ async fn finalize_avi_tracks_async(
                             descriptor.stream_index,
                             audio_format,
                             chunks,
-                            SAMPLE_ENTRY_ULAW,
+                            SAMPLE_ENTRY_MLAW,
                             "ulaw",
                         )?)
                     }
@@ -1012,13 +1012,6 @@ fn finalize_avi_companded_track(
             &format!("AVI audio stream {stream_index} declared a zero block align"),
         ));
     }
-    let sample_entry_box = build_generic_audio_sample_entry_box(
-        sample_entry_type,
-        audio_format.sample_rate,
-        audio_format.channel_count,
-        audio_format.bits_per_sample,
-        &[],
-    )?;
     let mut samples = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         if !chunk
@@ -1051,6 +1044,28 @@ fn finalize_avi_companded_track(
             is_sync_sample: true,
         });
     }
+    let sample_entry_sample_size = if sample_entry_type == SAMPLE_ENTRY_MLAW {
+        16
+    } else {
+        audio_format.bits_per_sample
+    };
+    let mut child_boxes = Vec::new();
+    if sample_entry_type == SAMPLE_ENTRY_MLAW {
+        child_boxes.push(super::super::mp4::encode_typed_box(
+            &build_btrt_from_sample_sizes(
+                samples.iter().map(|sample| (sample.data_size, sample.duration)),
+                audio_format.sample_rate,
+            )?,
+            &[],
+        )?);
+    }
+    let sample_entry_box = build_generic_audio_sample_entry_box(
+        sample_entry_type,
+        audio_format.sample_rate,
+        audio_format.channel_count,
+        sample_entry_sample_size,
+        &child_boxes,
+    )?;
     Ok(TrackCandidate {
         track_id: stream_index + 1,
         kind: MuxTrackKind::Audio,
@@ -1541,92 +1556,28 @@ fn finalize_avi_mp4v_track_sync(
         }
         Err(error) => return Err(error),
     };
-    let (samples, sample_sizes) = if let Some(parsed_samples) = parsed_samples {
-        let mut logical_chunk_offset = 0_u64;
-        let mut samples = Vec::with_capacity(parsed_samples.len());
-        let mut sample_sizes = Vec::with_capacity(parsed_samples.len());
-        for (chunk, sample) in chunks.iter().zip(parsed_samples.into_iter()) {
-            let sample_start = sample
-                .data_offset
-                .checked_sub(logical_chunk_offset)
-                .ok_or_else(|| {
-                    invalid_avi(
-                        spec,
-                        &format!(
-                            "AVI MPEG-4 Part 2 stream {} produced one sample before its chunk start",
-                            descriptor.stream_index
-                        ),
-                    )
-                })?;
-            let sample_end = sample_start
-                .checked_add(u64::from(sample.data_size))
-                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample end"))?;
-            if sample_end > u64::from(chunk.data_size) {
-                return Err(invalid_avi(
-                    spec,
-                    &format!(
-                        "AVI MPEG-4 Part 2 stream {} produced one sample that overran its chunk payload",
-                        descriptor.stream_index
-                    ),
-                ));
-            }
-            let data_offset = chunk
-                .data_offset
-                .checked_add(sample_start)
-                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample offset"))?;
-            sample_sizes.push((sample.data_size, sample.duration));
-            samples.push(CandidateSample {
-                source_index,
-                data_offset,
-                data_size: sample.data_size,
-                duration: sample.duration,
-                composition_time_offset: sample.composition_time_offset,
-                is_sync_sample: sample.is_sync_sample,
-            });
-            logical_chunk_offset = logical_chunk_offset
-                .checked_add(u64::from(chunk.data_size))
-                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 logical offset"))?;
-        }
-        (samples, sample_sizes)
+    let native_samples = if let Some(parsed_samples) = parsed_samples {
+        build_native_avi_mp4v_candidate_samples(
+            spec,
+            descriptor.stream_index,
+            source_index,
+            &chunks,
+            parsed_samples,
+        )?
     } else {
-        let mut samples = Vec::with_capacity(chunks.len());
-        let mut sample_sizes = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            if chunk.data_size == 0 {
-                return Err(invalid_avi(
-                    spec,
-                    &format!(
-                        "AVI video stream {} carried one zero-length chunk",
-                        descriptor.stream_index
-                    ),
-                ));
-            }
-            let mut frame = vec![
-                0_u8;
-                usize::try_from(chunk.data_size).map_err(|_| {
-                    MuxError::LayoutOverflow("AVI video chunk size")
-                })?
-            ];
-            read_exact_at_sync(
-                file,
-                chunk.data_offset,
-                &mut frame,
-                spec,
-                "AVI video chunk is truncated",
-            )?;
-            let is_sync_sample =
-                avi_mp4v_chunk_is_sync_sample(spec, descriptor.stream_index, &frame)?;
-            sample_sizes.push((chunk.data_size, timing.sample_duration));
-            samples.push(CandidateSample {
-                source_index,
-                data_offset: chunk.data_offset,
-                data_size: chunk.data_size,
-                duration: timing.sample_duration,
-                composition_time_offset: 0,
-                is_sync_sample,
-            });
-        }
-        (samples, sample_sizes)
+        None
+    };
+    let (samples, sample_sizes) = match native_samples {
+        Some(native) => native,
+        None => build_fallback_avi_mp4v_candidate_samples_sync(
+            file,
+            spec,
+            descriptor.stream_index,
+            source_index,
+            timing.sample_duration,
+            &decoder_specific_info,
+            &chunks,
+        )?,
     };
     Ok(TrackCandidate {
         track_id: descriptor.stream_index + 1,
@@ -1698,93 +1649,31 @@ async fn finalize_avi_mp4v_track_async(
         }
         Err(error) => return Err(error),
     };
-    let (samples, sample_sizes) = if let Some(parsed_samples) = parsed_samples {
-        let mut logical_chunk_offset = 0_u64;
-        let mut samples = Vec::with_capacity(parsed_samples.len());
-        let mut sample_sizes = Vec::with_capacity(parsed_samples.len());
-        for (chunk, sample) in chunks.iter().zip(parsed_samples.into_iter()) {
-            let sample_start = sample
-                .data_offset
-                .checked_sub(logical_chunk_offset)
-                .ok_or_else(|| {
-                    invalid_avi(
-                        spec,
-                        &format!(
-                            "AVI MPEG-4 Part 2 stream {} produced one sample before its chunk start",
-                            descriptor.stream_index
-                        ),
-                    )
-                })?;
-            let sample_end = sample_start
-                .checked_add(u64::from(sample.data_size))
-                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample end"))?;
-            if sample_end > u64::from(chunk.data_size) {
-                return Err(invalid_avi(
-                    spec,
-                    &format!(
-                        "AVI MPEG-4 Part 2 stream {} produced one sample that overran its chunk payload",
-                        descriptor.stream_index
-                    ),
-                ));
-            }
-            let data_offset = chunk
-                .data_offset
-                .checked_add(sample_start)
-                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample offset"))?;
-            sample_sizes.push((sample.data_size, sample.duration));
-            samples.push(CandidateSample {
-                source_index,
-                data_offset,
-                data_size: sample.data_size,
-                duration: sample.duration,
-                composition_time_offset: sample.composition_time_offset,
-                is_sync_sample: sample.is_sync_sample,
-            });
-            logical_chunk_offset = logical_chunk_offset
-                .checked_add(u64::from(chunk.data_size))
-                .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 logical offset"))?;
-        }
-        (samples, sample_sizes)
+    let native_samples = if let Some(parsed_samples) = parsed_samples {
+        build_native_avi_mp4v_candidate_samples(
+            spec,
+            descriptor.stream_index,
+            source_index,
+            &chunks,
+            parsed_samples,
+        )?
     } else {
-        let mut samples = Vec::with_capacity(chunks.len());
-        let mut sample_sizes = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            if chunk.data_size == 0 {
-                return Err(invalid_avi(
-                    spec,
-                    &format!(
-                        "AVI video stream {} carried one zero-length chunk",
-                        descriptor.stream_index
-                    ),
-                ));
-            }
-            let mut frame = vec![
-                0_u8;
-                usize::try_from(chunk.data_size).map_err(|_| {
-                    MuxError::LayoutOverflow("AVI video chunk size")
-                })?
-            ];
-            read_exact_at_async(
+        None
+    };
+    let (samples, sample_sizes) = match native_samples {
+        Some(native) => native,
+        None => {
+            build_fallback_avi_mp4v_candidate_samples_async(
                 file,
-                chunk.data_offset,
-                &mut frame,
                 spec,
-                "AVI video chunk is truncated",
-            )
-            .await?;
-            let is_sync_sample =
-                avi_mp4v_chunk_is_sync_sample(spec, descriptor.stream_index, &frame)?;
-            sample_sizes.push((chunk.data_size, timing.sample_duration));
-            samples.push(CandidateSample {
+                descriptor.stream_index,
                 source_index,
-                data_offset: chunk.data_offset,
-                data_size: chunk.data_size,
-                duration: timing.sample_duration,
-                composition_time_offset: 0,
-                is_sync_sample,
-            });
+                timing.sample_duration,
+                &decoder_specific_info,
+                &chunks,
+            )
+            .await?
         }
-        (samples, sample_sizes)
     };
     Ok(TrackCandidate {
         track_id: descriptor.stream_index + 1,
@@ -1805,6 +1694,211 @@ async fn finalize_avi_mp4v_track_async(
         source_edit_media_time: None,
         samples,
     })
+}
+
+fn build_native_avi_mp4v_candidate_samples(
+    spec: &str,
+    stream_index: u32,
+    source_index: usize,
+    chunks: &[AviChunkSpan],
+    parsed_samples: Vec<StagedSample>,
+) -> Result<Option<AviCandidateSamples>, MuxError> {
+    let mut logical_chunk_offset = 0_u64;
+    let mut samples = Vec::with_capacity(parsed_samples.len());
+    let mut sample_sizes = Vec::with_capacity(parsed_samples.len());
+    for (chunk, sample) in chunks.iter().zip(parsed_samples.into_iter()) {
+        let sample_start = sample
+            .data_offset
+            .checked_sub(logical_chunk_offset)
+            .ok_or_else(|| {
+                invalid_avi(
+                    spec,
+                    &format!(
+                        "AVI MPEG-4 Part 2 stream {} produced one sample before its chunk start",
+                        stream_index
+                    ),
+                )
+            })?;
+        let sample_end = sample_start
+            .checked_add(u64::from(sample.data_size))
+            .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample end"))?;
+        if sample_end > u64::from(chunk.data_size) {
+            return Ok(None);
+        }
+        let data_offset = chunk
+            .data_offset
+            .checked_add(sample_start)
+            .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample offset"))?;
+        sample_sizes.push((sample.data_size, sample.duration));
+        samples.push(CandidateSample {
+            source_index,
+            data_offset,
+            data_size: sample.data_size,
+            duration: sample.duration,
+            composition_time_offset: sample.composition_time_offset,
+            is_sync_sample: sample.is_sync_sample,
+        });
+        logical_chunk_offset = logical_chunk_offset
+            .checked_add(u64::from(chunk.data_size))
+            .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 logical offset"))?;
+    }
+    Ok(Some((samples, sample_sizes)))
+}
+
+type AviCandidateSamples = (Vec<CandidateSample>, Vec<(u32, u32)>);
+
+fn trimmed_avi_mp4v_chunk_payload(
+    spec: &str,
+    stream_index: u32,
+    chunk: &AviChunkSpan,
+    frame: &[u8],
+    decoder_specific_info: &[u8],
+) -> Result<(u64, u32), MuxError> {
+    if decoder_specific_info.is_empty() || !frame.starts_with(decoder_specific_info) {
+        return Ok((chunk.data_offset, chunk.data_size));
+    }
+
+    let trimmed_prefix = u64::try_from(decoder_specific_info.len())
+        .map_err(|_| MuxError::LayoutOverflow("AVI MPEG-4 Part 2 decoder config size"))?;
+    let trimmed_prefix_u32 = u32::try_from(trimmed_prefix)
+        .map_err(|_| MuxError::LayoutOverflow("AVI MPEG-4 Part 2 decoder config size"))?;
+    let trimmed_size = chunk
+        .data_size
+        .checked_sub(trimmed_prefix_u32)
+        .ok_or_else(|| {
+            invalid_avi(
+                spec,
+                &format!(
+                    "AVI MPEG-4 Part 2 stream {} carried one chunk with only decoder configuration and no VOP payload",
+                    stream_index
+                ),
+            )
+        })?;
+    if trimmed_size == 0 {
+        return Err(invalid_avi(
+            spec,
+            &format!(
+                "AVI MPEG-4 Part 2 stream {} carried one zero-length VOP payload after stripping duplicated decoder configuration",
+                stream_index
+            ),
+        ));
+    }
+
+    let trimmed_offset = chunk
+        .data_offset
+        .checked_add(trimmed_prefix)
+        .ok_or(MuxError::LayoutOverflow("AVI MPEG-4 Part 2 sample offset"))?;
+    Ok((trimmed_offset, trimmed_size))
+}
+
+fn build_fallback_avi_mp4v_candidate_samples_sync(
+    file: &mut File,
+    spec: &str,
+    stream_index: u32,
+    source_index: usize,
+    sample_duration: u32,
+    decoder_specific_info: &[u8],
+    chunks: &[AviChunkSpan],
+) -> Result<AviCandidateSamples, MuxError> {
+    let mut samples = Vec::with_capacity(chunks.len());
+    let mut sample_sizes = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.data_size == 0 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI video stream {} carried one zero-length chunk",
+                    stream_index
+                ),
+            ));
+        }
+        let mut frame = vec![
+            0_u8;
+            usize::try_from(chunk.data_size)
+                .map_err(|_| MuxError::LayoutOverflow("AVI video chunk size"))?
+        ];
+        read_exact_at_sync(
+            file,
+            chunk.data_offset,
+            &mut frame,
+            spec,
+            "AVI video chunk is truncated",
+        )?;
+        let is_sync_sample = avi_mp4v_chunk_is_sync_sample(spec, stream_index, &frame)?;
+        let (data_offset, data_size) = trimmed_avi_mp4v_chunk_payload(
+            spec,
+            stream_index,
+            chunk,
+            &frame,
+            decoder_specific_info,
+        )?;
+        sample_sizes.push((data_size, sample_duration));
+        samples.push(CandidateSample {
+            source_index,
+            data_offset,
+            data_size,
+            duration: sample_duration,
+            composition_time_offset: 0,
+            is_sync_sample,
+        });
+    }
+    Ok((samples, sample_sizes))
+}
+
+#[cfg(feature = "async")]
+async fn build_fallback_avi_mp4v_candidate_samples_async(
+    file: &mut TokioFile,
+    spec: &str,
+    stream_index: u32,
+    source_index: usize,
+    sample_duration: u32,
+    decoder_specific_info: &[u8],
+    chunks: &[AviChunkSpan],
+) -> Result<AviCandidateSamples, MuxError> {
+    let mut samples = Vec::with_capacity(chunks.len());
+    let mut sample_sizes = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.data_size == 0 {
+            return Err(invalid_avi(
+                spec,
+                &format!(
+                    "AVI video stream {} carried one zero-length chunk",
+                    stream_index
+                ),
+            ));
+        }
+        let mut frame = vec![
+            0_u8;
+            usize::try_from(chunk.data_size)
+                .map_err(|_| MuxError::LayoutOverflow("AVI video chunk size"))?
+        ];
+        read_exact_at_async(
+            file,
+            chunk.data_offset,
+            &mut frame,
+            spec,
+            "AVI video chunk is truncated",
+        )
+        .await?;
+        let is_sync_sample = avi_mp4v_chunk_is_sync_sample(spec, stream_index, &frame)?;
+        let (data_offset, data_size) = trimmed_avi_mp4v_chunk_payload(
+            spec,
+            stream_index,
+            chunk,
+            &frame,
+            decoder_specific_info,
+        )?;
+        sample_sizes.push((data_size, sample_duration));
+        samples.push(CandidateSample {
+            source_index,
+            data_offset,
+            data_size,
+            duration: sample_duration,
+            composition_time_offset: 0,
+            is_sync_sample,
+        });
+    }
+    Ok((samples, sample_sizes))
 }
 
 fn finalize_avi_h264_track_sync(
@@ -1844,14 +1938,23 @@ fn finalize_avi_h264_track_sync(
     }
     for sample in &mut staged.samples {
         sample.duration = timing.sample_duration;
+        sample.composition_time_offset = 0;
     }
     let sample_entry_box = retune_carried_h264_sample_entry_box(
         &staged.sample_entry_box,
         timing.timescale,
+        Some(super::h264::authored_h264_media_duration(
+            staged
+                .samples
+                .iter()
+                .map(|sample| (sample.duration, sample.composition_time_offset)),
+        )?),
         staged
             .samples
             .iter()
             .map(|sample| (sample.data_size, sample.duration)),
+        true,
+        false,
     )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
@@ -1910,14 +2013,23 @@ async fn finalize_avi_h264_track_async(
     }
     for sample in &mut staged.samples {
         sample.duration = timing.sample_duration;
+        sample.composition_time_offset = 0;
     }
     let sample_entry_box = retune_carried_h264_sample_entry_box(
         &staged.sample_entry_box,
         timing.timescale,
+        Some(super::h264::authored_h264_media_duration(
+            staged
+                .samples
+                .iter()
+                .map(|sample| (sample.duration, sample.composition_time_offset)),
+        )?),
         staged
             .samples
             .iter()
             .map(|sample| (sample.data_size, sample.duration)),
+        true,
+        false,
     )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {

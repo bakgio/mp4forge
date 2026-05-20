@@ -3164,14 +3164,19 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"leva")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ludt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"avc1")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"avc3")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mime")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mp4a")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"dvbs")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"dvbt")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"text")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"tx3g")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mp4s")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"dvsC")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"divx")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"jpeg")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"png ")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"SVQ1")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"pasp")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"prft")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"samr")));
@@ -3179,6 +3184,7 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"sqcp")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sevc")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ssmv")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"QDM2")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"schm")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sbtt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sidx")));

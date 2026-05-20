@@ -258,6 +258,16 @@ pub fn write_test_eac3_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
 }
 
 #[cfg(feature = "mux")]
+pub fn write_test_eac3_file_with_dependent_substream(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&build_eac3_frame(payload));
+        bytes.extend_from_slice(&build_eac3_dependent_substream_frame(payload));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
 pub fn write_test_ac4_file(prefix: &str, frame_count: usize) -> PathBuf {
     let bytes = build_test_ac4_stream_bytes(frame_count);
     let unique = SystemTime::now()
@@ -533,6 +543,41 @@ pub fn write_test_ogg_flac_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathB
 }
 
 #[cfg(feature = "mux")]
+pub fn write_test_ogg_flac_split_header_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
+    let serial = 0x464C_4144_u32;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_ogg_page(serial, 0, 0x02, 0, &[b"fLaC".to_vec()]));
+    let mut streaminfo_packet = Vec::new();
+    streaminfo_packet.push(0x80);
+    streaminfo_packet.extend_from_slice(&34_u32.to_be_bytes()[1..]);
+    streaminfo_packet.extend_from_slice(&build_flac_streaminfo_block(
+        48_000,
+        2,
+        16,
+        u64::try_from(frame_payloads.len()).unwrap() * 1_024,
+    ));
+    bytes.extend_from_slice(&build_ogg_page(serial, 1, 0, 0, &[streaminfo_packet]));
+    let mut granule_position = 0_u64;
+    for (index, payload) in frame_payloads.iter().enumerate() {
+        let frame = build_test_flac_frame(payload);
+        granule_position += 1_024;
+        let header_type = if index + 1 == frame_payloads.len() {
+            0x04
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&build_ogg_page(
+            serial,
+            u32::try_from(index + 2).unwrap(),
+            header_type,
+            granule_position,
+            &[frame],
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
 pub fn write_test_ogg_flac_mapping_file(prefix: &str, frame_payloads: &[&[u8]]) -> PathBuf {
     let serial = 0x4F47_464C_u32;
     let mut bytes = Vec::new();
@@ -656,6 +701,160 @@ pub fn write_test_aiff_pcm_file(prefix: &str, frames: &[[i16; 2]]) -> PathBuf {
 #[cfg(feature = "mux")]
 pub fn write_test_aifc_pcm_file(prefix: &str, frames: &[[i16; 2]]) -> PathBuf {
     write_test_aiff_like_pcm_file(prefix, frames, Some(*b"twos"))
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aifc_float64_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    frames: &[&[f64]],
+) -> PathBuf {
+    write_test_aifc_float_file(prefix, sample_rate, channel_count, 64, *b"fl64", frames)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aifc_alaw_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    packets: &[&[u8]],
+) -> PathBuf {
+    write_test_aifc_companded_file(prefix, sample_rate, channel_count, *b"ALAW", 8, packets)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aifc_alaw_file_with_declared_bits(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    declared_bits_per_sample: u16,
+    packets: &[&[u8]],
+) -> PathBuf {
+    write_test_aifc_companded_file(
+        prefix,
+        sample_rate,
+        channel_count,
+        *b"ALAW",
+        declared_bits_per_sample,
+        packets,
+    )
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aifc_ulaw_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    packets: &[&[u8]],
+) -> PathBuf {
+    write_test_aifc_companded_file(prefix, sample_rate, channel_count, *b"ULAW", 8, packets)
+}
+
+#[cfg(feature = "mux")]
+pub fn write_test_aifc_ulaw_file_with_declared_bits(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    declared_bits_per_sample: u16,
+    packets: &[&[u8]],
+) -> PathBuf {
+    write_test_aifc_companded_file(
+        prefix,
+        sample_rate,
+        channel_count,
+        *b"ULAW",
+        declared_bits_per_sample,
+        packets,
+    )
+}
+
+#[cfg(feature = "mux")]
+fn write_test_aifc_companded_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    compression: [u8; 4],
+    declared_bits_per_sample: u16,
+    packets: &[&[u8]],
+) -> PathBuf {
+    let data = packets.iter().flat_map(|packet| packet.iter().copied()).collect::<Vec<_>>();
+    let sample_frames = u32::try_from(data.len() / usize::from(channel_count)).unwrap();
+
+    let mut comm_payload = Vec::new();
+    comm_payload.extend_from_slice(&channel_count.to_be_bytes());
+    comm_payload.extend_from_slice(&sample_frames.to_be_bytes());
+    comm_payload.extend_from_slice(&declared_bits_per_sample.to_be_bytes());
+    comm_payload.extend_from_slice(&encode_aiff_extended_sample_rate(sample_rate));
+    comm_payload.extend_from_slice(&compression);
+
+    let mut ssnd_payload = Vec::new();
+    ssnd_payload.extend_from_slice(&0_u32.to_be_bytes());
+    ssnd_payload.extend_from_slice(&0_u32.to_be_bytes());
+    ssnd_payload.extend_from_slice(&data);
+
+    let mut bytes = Vec::new();
+    let total_size = 4 + (8 + comm_payload.len()) + (8 + ssnd_payload.len());
+    bytes.extend_from_slice(b"FORM");
+    bytes.extend_from_slice(&u32::try_from(total_size).unwrap().to_be_bytes());
+    bytes.extend_from_slice(b"AIFC");
+    bytes.extend_from_slice(b"COMM");
+    bytes.extend_from_slice(&u32::try_from(comm_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&comm_payload);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&u32::try_from(ssnd_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&ssnd_payload);
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
+fn write_test_aifc_float_file(
+    prefix: &str,
+    sample_rate: u32,
+    channel_count: u16,
+    bits_per_sample: u16,
+    compression: [u8; 4],
+    frames: &[&[f64]],
+) -> PathBuf {
+    let bytes_per_sample = usize::from(bits_per_sample / 8);
+    let mut data =
+        Vec::with_capacity(frames.len() * usize::from(channel_count) * bytes_per_sample);
+    for frame in frames {
+        assert_eq!(frame.len(), usize::from(channel_count));
+        for &sample in *frame {
+            match bits_per_sample {
+                64 => data.extend_from_slice(&sample.to_be_bytes()),
+                32 => data.extend_from_slice(&(sample as f32).to_be_bytes()),
+                _ => unreachable!(),
+            }
+        }
+    }
+    let sample_frames = u32::try_from(frames.len()).unwrap();
+
+    let mut comm_payload = Vec::new();
+    comm_payload.extend_from_slice(&channel_count.to_be_bytes());
+    comm_payload.extend_from_slice(&sample_frames.to_be_bytes());
+    comm_payload.extend_from_slice(&bits_per_sample.to_be_bytes());
+    comm_payload.extend_from_slice(&encode_aiff_extended_sample_rate(sample_rate));
+    comm_payload.extend_from_slice(&compression);
+
+    let mut ssnd_payload = Vec::new();
+    ssnd_payload.extend_from_slice(&0_u32.to_be_bytes());
+    ssnd_payload.extend_from_slice(&0_u32.to_be_bytes());
+    ssnd_payload.extend_from_slice(&data);
+
+    let mut bytes = Vec::new();
+    let total_size = 4 + (8 + comm_payload.len()) + (8 + ssnd_payload.len());
+    bytes.extend_from_slice(b"FORM");
+    bytes.extend_from_slice(&u32::try_from(total_size).unwrap().to_be_bytes());
+    bytes.extend_from_slice(b"AIFC");
+    bytes.extend_from_slice(b"COMM");
+    bytes.extend_from_slice(&u32::try_from(comm_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&comm_payload);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&u32::try_from(ssnd_payload.len()).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&ssnd_payload);
+    write_temp_file(prefix, &bytes)
 }
 
 #[cfg(feature = "mux")]
@@ -4084,6 +4283,43 @@ fn build_eac3_frame(payload: &[u8]) -> Vec<u8> {
     frame[1] = 0x77;
     frame[2..2 + header_suffix.len()].copy_from_slice(&header_suffix);
     frame[6..6 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
+#[cfg(feature = "mux")]
+fn build_eac3_dependent_substream_frame(payload: &[u8]) -> Vec<u8> {
+    const FRAME_LENGTH: usize = 64;
+    let mut header_writer = BitWriter::new(Vec::new());
+    header_writer.write_bits(&[1_u8], 2).unwrap();
+    header_writer.write_bits(&[0_u8], 3).unwrap();
+    header_writer
+        .write_bits(
+            &u16::try_from((FRAME_LENGTH / 2) - 1).unwrap().to_be_bytes(),
+            11,
+        )
+        .unwrap();
+    header_writer.write_bits(&[0_u8], 2).unwrap();
+    header_writer.write_bits(&[3_u8], 2).unwrap();
+    header_writer.write_bits(&[2_u8], 3).unwrap();
+    header_writer.write_bits(&[1_u8], 1).unwrap();
+    header_writer.write_bits(&[16_u8], 5).unwrap();
+    header_writer.write_bits(&[0_u8], 5).unwrap();
+    header_writer.write_bits(&[0_u8], 1).unwrap();
+    header_writer.write_bits(&[1_u8], 1).unwrap();
+    header_writer.write_bits(&(1_u16 << 9).to_be_bytes(), 16).unwrap();
+    header_writer.write_bits(&[0_u8], 1).unwrap();
+    header_writer.write_bits(&[0_u8], 1).unwrap();
+    header_writer.write_bits(&[0_u8], 1).unwrap();
+    align_test_bit_writer(&mut header_writer);
+    let header_suffix = header_writer.into_inner().unwrap();
+    assert!(payload.len() <= FRAME_LENGTH - 2 - header_suffix.len());
+
+    let mut frame = vec![0_u8; FRAME_LENGTH];
+    frame[0] = 0x0B;
+    frame[1] = 0x77;
+    frame[2..2 + header_suffix.len()].copy_from_slice(&header_suffix);
+    let payload_offset = 2 + header_suffix.len();
+    frame[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
     frame
 }
 

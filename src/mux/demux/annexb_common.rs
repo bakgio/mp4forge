@@ -15,6 +15,7 @@ pub(in crate::mux) struct IndexedAnnexBTrack {
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
+#[derive(Clone)]
 pub(in crate::mux) struct AnnexBNal {
     pub(in crate::mux) source_offset: u64,
     pub(in crate::mux) bytes: Vec<u8>,

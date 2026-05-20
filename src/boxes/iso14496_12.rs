@@ -11685,6 +11685,86 @@ impl CodecBox for GenericMediaSampleEntry {
     ]);
 }
 
+/// Opaque timed-text sample entry used for legacy `text` and `tx3g` carriage.
+///
+/// The fixed sample-entry header is preserved, and the remaining payload bytes are carried
+/// opaquely because these legacy text entries store non-box inline data after the shared header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpaqueTextSampleEntry {
+    sample_entry: SampleEntry,
+    data: Vec<u8>,
+}
+
+impl Default for OpaqueTextSampleEntry {
+    fn default() -> Self {
+        Self {
+            sample_entry: SampleEntry {
+                box_type: FourCc::ANY,
+                data_reference_index: 0,
+            },
+            data: Vec::new(),
+        }
+    }
+}
+
+impl FieldHooks for OpaqueTextSampleEntry {}
+
+impl ImmutableBox for OpaqueTextSampleEntry {
+    fn box_type(&self) -> FourCc {
+        self.sample_entry.box_type
+    }
+}
+
+impl MutableBox for OpaqueTextSampleEntry {}
+
+impl AnyTypeBox for OpaqueTextSampleEntry {
+    fn set_box_type(&mut self, box_type: FourCc) {
+        self.sample_entry.box_type = box_type;
+    }
+}
+
+impl FieldValueRead for OpaqueTextSampleEntry {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "DataReferenceIndex" => Ok(FieldValue::Unsigned(u64::from(
+                self.sample_entry.data_reference_index,
+            ))),
+            "Data" => Ok(FieldValue::Bytes(self.data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for OpaqueTextSampleEntry {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("DataReferenceIndex", FieldValue::Unsigned(value)) => {
+                self.sample_entry.data_reference_index = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Data", FieldValue::Bytes(value)) => {
+                self.data = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for OpaqueTextSampleEntry {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Reserved0A", 0, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0B", 1, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0C", 2, with_bit_width(16), with_constant("0")),
+        codec_field!("DataReferenceIndex", 3, with_bit_width(16)),
+        codec_field!("Data", 4, with_bit_width(8), as_bytes()),
+    ]);
+}
+
 /// DVB subtitle decoder configuration carried by `dvsC` child boxes under `dvbs`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DvsC {
@@ -11996,6 +12076,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<EventMessageSampleEntry>(FourCc::from_bytes(*b"evte"));
     registry.register::<AlbumLoudnessInfo>(FourCc::from_bytes(*b"alou"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc1"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc3"));
     registry.register_contextual_any::<WaveAudioData>(
         FourCc::from_bytes(*b"enca"),
         is_quicktime_wave_audio_context,
@@ -12045,6 +12126,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sevc"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ssmv"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"alaw"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"MLAW"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b".mp3"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ulaw"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes([0x6D, 0x73, 0x00, 0x02]));
@@ -12060,6 +12142,10 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
         FourCc::from_bytes(*b"alac"),
         is_audio_sample_entry_child_context,
     );
+    registry.register_contextual_any::<OpaqueCodecSpecificData>(
+        FourCc::from_u32(0),
+        is_audio_sample_entry_child_context,
+    );
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"spex"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsc"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtse"));
@@ -12073,15 +12159,19 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<crate::boxes::dts::Udts>(FourCc::from_bytes(*b"udts"));
     registry.register::<crate::boxes::iamf::Iacb>(FourCc::from_bytes(*b"iacb"));
     registry.register_dynamic_any::<AudioSampleEntry>(matches_audio_sample_entry_context);
+    registry.register_any::<OpaqueTextSampleEntry>(FourCc::from_bytes(*b"text"));
+    registry.register_any::<OpaqueTextSampleEntry>(FourCc::from_bytes(*b"tx3g"));
     registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbs"));
     registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbt"));
     registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"mp4s"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"H263"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"DIV3"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"DIV4"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"divx"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"BGR3"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MJPG"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MPEG"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"SVQ1"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mjp2"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"PNG "));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apco"));
@@ -12095,6 +12185,20 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"s263"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"png "));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"uncv"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"QDM2"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"auxi"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"jp2h"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"ramf"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"cmpd"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"uncC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"dvcC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"dvvC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"lhvC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"chrm"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"vexu"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"hfov"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"clli"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"mdcv"));
     registry.register::<DvsC>(FourCc::from_bytes(*b"dvsC"));
     registry.register::<Pasp>(FourCc::from_bytes(*b"pasp"));
     registry.register::<Saio>(FourCc::from_bytes(*b"saio"));

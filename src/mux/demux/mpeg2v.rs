@@ -55,6 +55,7 @@ pub(in crate::mux) struct ParsedMpeg2VideoTrack {
     pub(in crate::mux) decoder_specific_info: Vec<u8>,
     pub(in crate::mux) object_type_indication: u8,
     pub(in crate::mux) pixel_aspect_ratio: Option<(u32, u32)>,
+    pub(in crate::mux) eof_terminated_trailing_sample: bool,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
@@ -192,6 +193,7 @@ where
     let mut sequence_start = None::<u64>;
     let mut first_picture_start = None::<u64>;
     let mut current_sample_start = None::<u64>;
+    let mut pending_sample_start = None::<u64>;
     let mut current_sync_sample = false;
 
     while offset < logical_size {
@@ -220,6 +222,7 @@ where
                     .ok_or(MuxError::LayoutOverflow("MPEG-2 video start-code offset"))?;
                 if start_code == SEQUENCE_START_CODE {
                     sequence_start.get_or_insert(start_offset);
+                    pending_sample_start = Some(start_offset);
                     continue;
                 }
                 if start_code == SEQUENCE_END_START_CODE {
@@ -235,6 +238,7 @@ where
                             is_sync_sample: current_sync_sample,
                         });
                     }
+                    pending_sample_start = None;
                     current_sync_sample = false;
                     continue;
                 }
@@ -249,22 +253,28 @@ where
                 )?;
                 let Some(sample_start) = current_sample_start else {
                     first_picture_start = Some(start_offset);
-                    current_sample_start = Some(sequence_start.unwrap_or(start_offset));
+                    current_sample_start = Some(
+                        pending_sample_start
+                            .take()
+                            .or(sequence_start)
+                            .unwrap_or(start_offset),
+                    );
                     current_sync_sample = is_sync_sample;
                     continue;
                 };
-                if start_offset <= sample_start {
+                let next_sample_start = pending_sample_start.take().unwrap_or(start_offset);
+                if next_sample_start <= sample_start {
                     continue;
                 }
                 samples.push(StagedSample {
                     data_offset: sample_start,
-                    data_size: u32::try_from(start_offset - sample_start)
+                    data_size: u32::try_from(next_sample_start - sample_start)
                         .map_err(|_| MuxError::LayoutOverflow("MPEG-2 video frame size"))?,
                     duration: 0,
                     composition_time_offset: 0,
                     is_sync_sample: current_sync_sample,
                 });
-                current_sample_start = Some(start_offset);
+                current_sample_start = Some(next_sample_start);
                 current_sync_sample = is_sync_sample;
             }
         }
@@ -300,6 +310,7 @@ async fn scan_mpeg2v_boundaries_file_async(
     let mut sequence_start = None::<u64>;
     let mut first_picture_start = None::<u64>;
     let mut current_sample_start = None::<u64>;
+    let mut pending_sample_start = None::<u64>;
     let mut current_sync_sample = false;
 
     while offset < logical_size {
@@ -335,6 +346,7 @@ async fn scan_mpeg2v_boundaries_file_async(
                     .ok_or(MuxError::LayoutOverflow("MPEG-2 video start-code offset"))?;
                 if start_code == SEQUENCE_START_CODE {
                     sequence_start.get_or_insert(start_offset);
+                    pending_sample_start = Some(start_offset);
                     continue;
                 }
                 if start_code == SEQUENCE_END_START_CODE {
@@ -350,6 +362,7 @@ async fn scan_mpeg2v_boundaries_file_async(
                             is_sync_sample: current_sync_sample,
                         });
                     }
+                    pending_sample_start = None;
                     current_sync_sample = false;
                     continue;
                 }
@@ -365,22 +378,28 @@ async fn scan_mpeg2v_boundaries_file_async(
                 .await?;
                 let Some(sample_start) = current_sample_start else {
                     first_picture_start = Some(start_offset);
-                    current_sample_start = Some(sequence_start.unwrap_or(start_offset));
+                    current_sample_start = Some(
+                        pending_sample_start
+                            .take()
+                            .or(sequence_start)
+                            .unwrap_or(start_offset),
+                    );
                     current_sync_sample = is_sync_sample;
                     continue;
                 };
-                if start_offset <= sample_start {
+                let next_sample_start = pending_sample_start.take().unwrap_or(start_offset);
+                if next_sample_start <= sample_start {
                     continue;
                 }
                 samples.push(StagedSample {
                     data_offset: sample_start,
-                    data_size: u32::try_from(start_offset - sample_start)
+                    data_size: u32::try_from(next_sample_start - sample_start)
                         .map_err(|_| MuxError::LayoutOverflow("MPEG-2 video frame size"))?,
                     duration: 0,
                     composition_time_offset: 0,
                     is_sync_sample: current_sync_sample,
                 });
-                current_sample_start = Some(start_offset);
+                current_sample_start = Some(next_sample_start);
                 current_sync_sample = is_sync_sample;
             }
         }
@@ -417,6 +436,7 @@ async fn scan_mpeg2v_boundaries_segmented_async(
     let mut sequence_start = None::<u64>;
     let mut first_picture_start = None::<u64>;
     let mut current_sample_start = None::<u64>;
+    let mut pending_sample_start = None::<u64>;
     let mut current_sync_sample = false;
 
     while offset < logical_size {
@@ -454,6 +474,7 @@ async fn scan_mpeg2v_boundaries_segmented_async(
                     .ok_or(MuxError::LayoutOverflow("MPEG-2 video start-code offset"))?;
                 if start_code == SEQUENCE_START_CODE {
                     sequence_start.get_or_insert(start_offset);
+                    pending_sample_start = Some(start_offset);
                     continue;
                 }
                 if start_code == SEQUENCE_END_START_CODE {
@@ -469,6 +490,7 @@ async fn scan_mpeg2v_boundaries_segmented_async(
                             is_sync_sample: current_sync_sample,
                         });
                     }
+                    pending_sample_start = None;
                     current_sync_sample = false;
                     continue;
                 }
@@ -485,22 +507,28 @@ async fn scan_mpeg2v_boundaries_segmented_async(
                 .await?;
                 let Some(sample_start) = current_sample_start else {
                     first_picture_start = Some(start_offset);
-                    current_sample_start = Some(sequence_start.unwrap_or(start_offset));
+                    current_sample_start = Some(
+                        pending_sample_start
+                            .take()
+                            .or(sequence_start)
+                            .unwrap_or(start_offset),
+                    );
                     current_sync_sample = is_sync_sample;
                     continue;
                 };
-                if start_offset <= sample_start {
+                let next_sample_start = pending_sample_start.take().unwrap_or(start_offset);
+                if next_sample_start <= sample_start {
                     continue;
                 }
                 samples.push(StagedSample {
                     data_offset: sample_start,
-                    data_size: u32::try_from(start_offset - sample_start)
+                    data_size: u32::try_from(next_sample_start - sample_start)
                         .map_err(|_| MuxError::LayoutOverflow("MPEG-2 video frame size"))?,
                     duration: 0,
                     composition_time_offset: 0,
                     is_sync_sample: current_sync_sample,
                 });
-                current_sample_start = Some(start_offset);
+                current_sample_start = Some(next_sample_start);
                 current_sync_sample = is_sync_sample;
             }
         }
@@ -561,6 +589,7 @@ where
     )?;
     let parsed_config = parse_mpeg2_decoder_specific_info(&decoder_specific_info, spec)?;
 
+    let eof_terminated_trailing_sample = scan.current_sample_start.is_some();
     let mut samples = scan.samples;
     if let Some(current_sample_start) = scan.current_sample_start {
         samples.push(StagedSample {
@@ -603,6 +632,7 @@ where
         object_type_indication: parsed_config.object_type_indication,
         sample_entry_box,
         pixel_aspect_ratio: parsed_config.pixel_aspect_ratio,
+        eof_terminated_trailing_sample,
         samples,
     })
 }
@@ -645,6 +675,7 @@ async fn finalize_mpeg2v_track_file_async(
     .await?;
     let parsed_config = parse_mpeg2_decoder_specific_info(&decoder_specific_info, spec)?;
 
+    let eof_terminated_trailing_sample = scan.current_sample_start.is_some();
     let mut samples = scan.samples;
     if let Some(current_sample_start) = scan.current_sample_start {
         samples.push(StagedSample {
@@ -687,6 +718,7 @@ async fn finalize_mpeg2v_track_file_async(
         object_type_indication: parsed_config.object_type_indication,
         sample_entry_box,
         pixel_aspect_ratio: parsed_config.pixel_aspect_ratio,
+        eof_terminated_trailing_sample,
         samples,
     })
 }
@@ -732,6 +764,7 @@ async fn finalize_mpeg2v_track_segmented_async(
     .await?;
     let parsed_config = parse_mpeg2_decoder_specific_info(&decoder_specific_info, spec)?;
 
+    let eof_terminated_trailing_sample = scan.current_sample_start.is_some();
     let mut samples = scan.samples;
     if let Some(current_sample_start) = scan.current_sample_start {
         samples.push(StagedSample {
@@ -774,6 +807,7 @@ async fn finalize_mpeg2v_track_segmented_async(
         object_type_indication: parsed_config.object_type_indication,
         sample_entry_box,
         pixel_aspect_ratio: parsed_config.pixel_aspect_ratio,
+        eof_terminated_trailing_sample,
         samples,
     })
 }
@@ -865,7 +899,9 @@ fn encode_mpeg2v_sample_entry_box(
     esds.normalize_descriptor_sizes_for_mux()
         .map_err(|_| MuxError::LayoutOverflow("MPEG-2 video esds"))?;
     let mut child_boxes = vec![super::super::mp4::encode_typed_box(&esds, &[])?];
-    if let Some((h_spacing, v_spacing)) = pixel_aspect_ratio {
+    if let Some((h_spacing, v_spacing)) = pixel_aspect_ratio
+        && !(h_spacing == 1 && v_spacing == 1)
+    {
         child_boxes.push(super::super::mp4::encode_typed_box(
             &Pasp {
                 h_spacing,

@@ -173,6 +173,200 @@ where
     build_duration_chunk_sample_counts_with_start_time(track_id, sample_durations, target_ticks, 0)
 }
 
+pub(crate) fn build_fragmented_duration_chunk_sample_counts_with_start_time<I>(
+    track_id: u32,
+    sample_durations: I,
+    fragment_target_ticks: u64,
+    segment_target_ticks: u64,
+    start_time_ticks: i64,
+) -> Result<(Vec<u32>, Vec<u32>), MuxError>
+where
+    I: IntoIterator<Item = u32>,
+{
+    if fragment_target_ticks == 0 || segment_target_ticks == 0 {
+        return Err(MuxError::InvalidChunkPlan {
+            track_id,
+            message: "fragment and segment duration targets must be greater than zero".to_string(),
+        });
+    }
+    let mut fragment_counts = Vec::new();
+    let mut reference_group_fragment_counts = Vec::new();
+    let mut current_fragment_sample_count = 0_u32;
+    let mut current_reference_group_fragment_count = 0_u32;
+    let mut current_segment_index = 0_i128;
+    let mut current_subsegment_index = 0_u64;
+    let mut sample_start_time = 0_u64;
+    let mut segment_start_time = 0_u64;
+    let start_time_ticks = i128::from(start_time_ticks);
+
+    for duration in sample_durations {
+        if current_fragment_sample_count != 0 {
+            let adjusted_sample_start_time = i128::from(sample_start_time)
+                .checked_add(start_time_ticks)
+                .ok_or(MuxError::LayoutOverflow("fragment adjusted start-time"))?;
+            let segment_index = if adjusted_sample_start_time < 0 {
+                0
+            } else {
+                adjusted_sample_start_time / i128::from(segment_target_ticks)
+            };
+            let started_new_segment = segment_index != current_segment_index;
+            if started_new_segment {
+                current_segment_index = segment_index;
+                current_subsegment_index = 0;
+                fragment_counts.push(current_fragment_sample_count);
+                current_fragment_sample_count = 0;
+                current_reference_group_fragment_count = current_reference_group_fragment_count
+                    .checked_add(1)
+                    .ok_or(MuxError::LayoutOverflow("fragment reference-group count"))?;
+                reference_group_fragment_counts.push(current_reference_group_fragment_count);
+                current_reference_group_fragment_count = 0;
+                segment_start_time = sample_start_time;
+            } else if fragment_target_ticks != segment_target_ticks {
+                let subsegment_index =
+                    (sample_start_time - segment_start_time) / fragment_target_ticks;
+                if subsegment_index != current_subsegment_index {
+                    current_subsegment_index = subsegment_index;
+                    fragment_counts.push(current_fragment_sample_count);
+                    current_fragment_sample_count = 0;
+                    current_reference_group_fragment_count = current_reference_group_fragment_count
+                        .checked_add(1)
+                        .ok_or(MuxError::LayoutOverflow("fragment reference-group count"))?;
+                }
+            }
+        }
+
+        current_fragment_sample_count = current_fragment_sample_count
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("fragment sample count"))?;
+        sample_start_time = sample_start_time
+            .checked_add(u64::from(duration))
+            .ok_or(MuxError::LayoutOverflow("fragment duration"))?;
+    }
+
+    if current_fragment_sample_count != 0 {
+        fragment_counts.push(current_fragment_sample_count);
+        current_reference_group_fragment_count = current_reference_group_fragment_count
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("fragment reference-group count"))?;
+    }
+    if current_reference_group_fragment_count != 0 {
+        reference_group_fragment_counts.push(current_reference_group_fragment_count);
+    }
+    if fragment_counts.is_empty() || reference_group_fragment_counts.is_empty() {
+        return Err(MuxError::InvalidChunkPlan {
+            track_id,
+            message: "no fragment boundaries were produced".to_string(),
+        });
+    }
+    Ok((fragment_counts, reference_group_fragment_counts))
+}
+
+pub(crate) fn build_sync_aligned_fragmented_duration_chunk_sample_counts<I>(
+    track_id: u32,
+    samples: I,
+    fragment_target_ticks: u64,
+    segment_target_ticks: u64,
+    start_time_ticks: i64,
+) -> Result<(Vec<u32>, Vec<u32>), MuxError>
+where
+    I: IntoIterator<Item = (u32, i64, bool)>,
+{
+    if fragment_target_ticks == 0 || segment_target_ticks == 0 {
+        return Err(MuxError::InvalidChunkPlan {
+            track_id,
+            message: "fragment and segment duration targets must be greater than zero".to_string(),
+        });
+    }
+
+    let mut fragment_counts = Vec::new();
+    let mut reference_group_fragment_counts = Vec::new();
+    let mut current_fragment_sample_count = 0_u32;
+    let mut current_reference_group_fragment_count = 0_u32;
+    let mut decode_start_time = 0_i128;
+    let start_time_ticks = i128::from(start_time_ticks);
+    let fragment_target_ticks = i128::from(fragment_target_ticks);
+    let segment_target_ticks = i128::from(segment_target_ticks);
+    let mut current_segment_index = 0_i128;
+    let mut current_subsegment_index = 0_i128;
+    let mut segment_start_time = 0_i128;
+    let mut segment_started = false;
+
+    for (duration_ticks, composition_offset_ticks, is_sync_sample) in samples {
+        let presentation_start_time = decode_start_time
+            .checked_add(i128::from(composition_offset_ticks))
+            .and_then(|value| value.checked_add(start_time_ticks))
+            .ok_or(MuxError::LayoutOverflow("fragment presentation start"))?;
+
+        if !segment_started {
+            current_segment_index = if presentation_start_time < 0 {
+                0
+            } else {
+                presentation_start_time / segment_target_ticks
+            };
+            current_subsegment_index = 0;
+            segment_start_time = presentation_start_time;
+            segment_started = true;
+        } else if current_fragment_sample_count != 0 && is_sync_sample {
+            let segment_index = if presentation_start_time < 0 {
+                0
+            } else {
+                presentation_start_time / segment_target_ticks
+            };
+            let started_new_segment = segment_index != current_segment_index;
+            if started_new_segment {
+                current_segment_index = segment_index;
+                current_subsegment_index = 0;
+                fragment_counts.push(current_fragment_sample_count);
+                current_fragment_sample_count = 0;
+                current_reference_group_fragment_count = current_reference_group_fragment_count
+                    .checked_add(1)
+                    .ok_or(MuxError::LayoutOverflow("fragment reference-group count"))?;
+                reference_group_fragment_counts.push(current_reference_group_fragment_count);
+                current_reference_group_fragment_count = 0;
+                segment_start_time = presentation_start_time;
+            } else if fragment_target_ticks != segment_target_ticks {
+                let subsegment_index = if presentation_start_time < segment_start_time {
+                    0
+                } else {
+                    (presentation_start_time - segment_start_time) / fragment_target_ticks
+                };
+                if subsegment_index != current_subsegment_index {
+                    current_subsegment_index = subsegment_index;
+                    fragment_counts.push(current_fragment_sample_count);
+                    current_fragment_sample_count = 0;
+                    current_reference_group_fragment_count = current_reference_group_fragment_count
+                        .checked_add(1)
+                        .ok_or(MuxError::LayoutOverflow("fragment reference-group count"))?;
+                }
+            }
+        }
+
+        current_fragment_sample_count = current_fragment_sample_count
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("fragment sample count"))?;
+        decode_start_time = decode_start_time
+            .checked_add(i128::from(duration_ticks))
+            .ok_or(MuxError::LayoutOverflow("fragment duration"))?;
+    }
+
+    if current_fragment_sample_count != 0 {
+        fragment_counts.push(current_fragment_sample_count);
+        current_reference_group_fragment_count = current_reference_group_fragment_count
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("fragment reference-group count"))?;
+    }
+    if current_reference_group_fragment_count != 0 {
+        reference_group_fragment_counts.push(current_reference_group_fragment_count);
+    }
+    if fragment_counts.is_empty() || reference_group_fragment_counts.is_empty() {
+        return Err(MuxError::InvalidChunkPlan {
+            track_id,
+            message: "no fragment boundaries were produced".to_string(),
+        });
+    }
+    Ok((fragment_counts, reference_group_fragment_counts))
+}
+
 pub(crate) fn build_capped_duration_chunk_sample_counts<I>(
     track_id: u32,
     sample_durations: I,
@@ -461,5 +655,70 @@ mod tests {
             plan.duration_boundary_after_sample(7, 2),
             Some(MuxDurationBoundaryKind::Fragment)
         );
+    }
+
+    #[test]
+    fn fragmented_duration_chunk_counts_emit_fragment_and_segment_groups() {
+        let durations = vec![1_536_u32; 375];
+        let (fragment_counts, reference_group_fragment_counts) =
+            build_fragmented_duration_chunk_sample_counts_with_start_time(
+                7, durations, 240_000, 288_000, 0,
+            )
+            .unwrap();
+
+        assert_eq!(&fragment_counts[..4], &[157, 31, 157, 30]);
+        assert_eq!(&reference_group_fragment_counts[..2], &[2, 2]);
+        assert_eq!(fragment_counts.iter().copied().sum::<u32>(), 375);
+        assert_eq!(
+            reference_group_fragment_counts.iter().copied().sum::<u32>() as usize,
+            fragment_counts.len()
+        );
+    }
+
+    #[test]
+    fn sync_aligned_fragmented_duration_chunk_counts_wait_for_sync_boundaries() {
+        let samples = std::iter::repeat_n((2_048_u32, 0_i64, false), 144)
+            .enumerate()
+            .map(|(index, (duration, composition_offset, _))| {
+                (duration, composition_offset, index % 24 == 0)
+            });
+        let (fragment_counts, reference_group_fragment_counts) =
+            build_sync_aligned_fragmented_duration_chunk_sample_counts(
+                7, samples, 240_000, 288_000, 0,
+            )
+            .unwrap();
+
+        assert_eq!(fragment_counts, vec![120, 24]);
+        assert_eq!(reference_group_fragment_counts, vec![2]);
+    }
+
+    #[test]
+    fn sync_aligned_fragmented_duration_chunk_counts_honor_negative_start_time() {
+        let samples = std::iter::repeat_n((1_024_u32, 0_i64, false), 300)
+            .enumerate()
+            .map(|(index, (duration, composition_offset, _))| {
+                (duration, composition_offset, index % 25 == 0)
+            });
+        let (fragment_counts, reference_group_fragment_counts) =
+            build_sync_aligned_fragmented_duration_chunk_sample_counts(
+                7, samples, 240_000, 288_000, -3_072,
+            )
+            .unwrap();
+
+        assert_eq!(fragment_counts, vec![250, 50]);
+        assert_eq!(reference_group_fragment_counts, vec![2]);
+    }
+
+    #[test]
+    fn fragmented_duration_chunk_counts_honor_negative_start_time_for_segment_rollover() {
+        let durations = std::iter::repeat_n(1_024_u32, 303);
+        let (fragment_counts, reference_group_fragment_counts) =
+            build_fragmented_duration_chunk_sample_counts_with_start_time(
+                7, durations, 220_500, 264_600, -2_048,
+            )
+            .unwrap();
+
+        assert_eq!(&fragment_counts[..3], &[216, 45, 42]);
+        assert_eq!(&reference_group_fragment_counts[..2], &[2, 1]);
     }
 }

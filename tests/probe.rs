@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::Cursor;
 
+use miniz_oxide::deflate::compress_to_vec_zlib;
 use mp4forge::boxes::AnyTypeBox;
 use mp4forge::boxes::av1::AV1CodecConfiguration;
 use mp4forge::boxes::avs3::Av3c;
@@ -167,6 +168,18 @@ fn probe_summarizes_movie_tracks_samples_and_codecs() {
 
     let idr_frames = find_idr_frames(&mut reader, video).unwrap();
     assert_eq!(idr_frames, vec![0]);
+}
+
+#[test]
+fn probe_detects_tracks_in_compressed_movie_metadata() {
+    let file = compress_movie_metadata(&build_wvtt_movie_file());
+    let mut reader = Cursor::new(file);
+
+    let info = probe_codec_detailed(&mut reader).unwrap();
+
+    assert_eq!(info.timescale, 1_000);
+    assert_eq!(info.tracks.len(), 1);
+    assert_eq!(info.tracks[0].summary.codec_family, TrackCodecFamily::WebVtt);
 }
 
 #[test]
@@ -1624,6 +1637,16 @@ fn detect_aac_profile_matches_expected_cases() {
             Some(AacProfileInfo {
                 object_type_indication: 0x40,
                 audio_object_type: 29,
+            }),
+        ),
+        (
+            aac_profile_esds(
+                0x40,
+                &[0x13, 0x10, 0x56, 0xe5, 0x98, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02],
+            ),
+            Some(AacProfileInfo {
+                object_type_indication: 0x40,
+                audio_object_type: 5,
             }),
         ),
         (
@@ -3526,4 +3549,41 @@ fn encode_raw_box(box_type: FourCc, payload: &[u8]) -> Vec<u8> {
     let mut bytes = info.encode();
     bytes.extend_from_slice(payload);
     bytes
+}
+
+fn compress_movie_metadata(file: &[u8]) -> Vec<u8> {
+    let mut cursor = Cursor::new(file);
+    let mut ftyp_box = None::<Vec<u8>>;
+    let mut moov_box = None::<Vec<u8>>;
+    let mut trailing_boxes = Vec::<u8>::new();
+
+    while usize::try_from(cursor.position()).unwrap() < file.len() {
+        let info = BoxInfo::read(&mut cursor).unwrap();
+        let start = usize::try_from(info.offset()).unwrap();
+        let end = usize::try_from(info.offset() + info.size()).unwrap();
+        match info.box_type() {
+            value if value == fourcc("ftyp") => ftyp_box = Some(file[start..end].to_vec()),
+            value if value == fourcc("moov") => moov_box = Some(file[start..end].to_vec()),
+            _ => trailing_boxes.extend_from_slice(&file[start..end]),
+        }
+        info.seek_to_end(&mut cursor).unwrap();
+    }
+
+    let moov_box = moov_box.unwrap();
+    let compressed_moov = compress_to_vec_zlib(&moov_box, 6);
+    let dcom = encode_raw_box(fourcc("dcom"), b"zlib");
+    let mut cmvd_payload = Vec::with_capacity(4 + compressed_moov.len());
+    cmvd_payload.extend_from_slice(&(moov_box.len() as u32).to_be_bytes());
+    cmvd_payload.extend_from_slice(&compressed_moov);
+    let cmvd = encode_raw_box(fourcc("cmvd"), &cmvd_payload);
+    let cmov = encode_raw_box(fourcc("cmov"), &[dcom, cmvd].concat());
+    let moov = encode_raw_box(fourcc("moov"), &cmov);
+
+    let mut output = Vec::new();
+    if let Some(ftyp_box) = ftyp_box {
+        output.extend_from_slice(&ftyp_box);
+    }
+    output.extend_from_slice(&moov);
+    output.extend_from_slice(&trailing_boxes);
+    output
 }

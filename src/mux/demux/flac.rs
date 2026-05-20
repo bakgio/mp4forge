@@ -22,6 +22,7 @@ use super::ogg_common::read_ogg_page_header_async;
 use super::ogg_common::{OggPacketBuilder, read_ogg_page_header_sync};
 
 const FLAC_ENTRY: FourCc = FourCc::from_bytes(*b"fLaC");
+const OGG_FLAC_PACKET_CLOCK_TIMESCALE: u32 = 1_000;
 const FLAC_SCAN_CHUNK_SIZE: usize = 64 * 1024;
 const FLAC_BLOCK_SIZE_TABLE: [u32; 16] = [
     0, 192, 576, 1_152, 2_304, 4_608, 0, 0, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768,
@@ -38,7 +39,7 @@ pub(in crate::mux) struct ParsedFlacTrack {
 
 pub(in crate::mux) struct ParsedOggFlacTrack {
     pub(in crate::mux) segmented_source: SegmentedMuxSourceSpec,
-    pub(in crate::mux) sample_rate: u32,
+    pub(in crate::mux) media_timescale: u32,
     pub(in crate::mux) sample_entry_box: Vec<u8>,
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
@@ -50,6 +51,7 @@ struct ParsedFlacMetadataBlock {
     block_data: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct ParsedFlacStreamInfo {
     sample_rate: u32,
     channel_count: u16,
@@ -63,12 +65,18 @@ struct ParsedFlacFrameHeader {
 
 struct OggFlacHeaderState {
     header_bytes: Vec<u8>,
-    extra_header_packets_remaining: u16,
+    mode: OggFlacHeaderMode,
 }
 
 struct ParsedOggFlacHeaderPacket<'a> {
     native_header_bytes: &'a [u8],
-    extra_header_packets_remaining: u16,
+    mode: OggFlacHeaderMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OggFlacHeaderMode {
+    NativeSplit,
+    MappingExtraPacketsRemaining(u16),
 }
 
 pub(in crate::mux) fn scan_flac_file_sync(
@@ -322,6 +330,8 @@ pub(in crate::mux) fn scan_ogg_flac_file_sync(
     let mut logical_size = 0_u64;
     let mut transformed_segments = Vec::new();
     let mut samples = Vec::new();
+    let mut audio_packet_count = 0_u64;
+    let mut started_media_packets = false;
     while offset < file_size {
         let page = read_ogg_page_header_sync(&mut file, offset, spec)?;
         if packet_builder.is_empty() && page.header_type & 0x01 != 0 {
@@ -345,50 +355,62 @@ pub(in crate::mux) fn scan_ogg_flac_file_sync(
             if packet.total_size == 0 {
                 continue;
             }
-            if sample_entry_box.is_none() {
-                let packet_bytes = read_spans_sync(
+            let needs_packet_bytes = sample_entry_box.is_none()
+                || header_state
+                    .as_ref()
+                    .is_some_and(OggFlacHeaderState::awaiting_mapping_packets)
+                || !started_media_packets;
+            let mut packet_bytes = None::<Vec<u8>>;
+            if needs_packet_bytes {
+                packet_bytes = Some(read_spans_sync(
                     &mut file,
                     &packet.spans,
                     packet.total_size,
                     spec,
                     "Ogg FLAC identification packet is truncated",
-                )?;
+                )?);
+            }
+            if sample_entry_box.is_none()
+                || header_state
+                    .as_ref()
+                    .is_some_and(OggFlacHeaderState::awaiting_mapping_packets)
+            {
+                let packet_bytes = packet_bytes.as_deref().unwrap();
                 if let Some(state) = &mut header_state {
-                    state.append_extra_packet(&packet_bytes);
+                    state.append_extra_packet(packet_bytes);
                 } else {
-                    header_state = Some(parse_ogg_flac_header_start(&packet_bytes, spec)?);
+                    header_state = Some(parse_ogg_flac_header_start(packet_bytes, spec)?);
+                }
+                if sample_entry_box.is_none() {
+                    let header_bytes = &header_state.as_ref().unwrap().header_bytes;
+                    if let Some(parsed_stream_info) =
+                        try_parse_ogg_flac_stream_info_from_header_prefix(header_bytes, spec)?
+                    {
+                        stream_info = Some(parsed_stream_info.clone());
+                        sample_entry_box = Some(build_ogg_flac_sample_entry_box(
+                            parsed_stream_info.channel_count,
+                            parsed_stream_info.bits_per_sample,
+                            None,
+                        )?);
+                    }
+                }
+                if sample_entry_box.is_none() {
+                    continue;
+                }
+                if !started_media_packets && !ogg_flac_packet_should_stage_as_media(packet_bytes) {
+                    continue;
                 }
                 if header_state
                     .as_ref()
-                    .is_some_and(|state| state.extra_header_packets_remaining == 0)
+                    .is_some_and(|state| state.is_complete() && !state.awaiting_mapping_packets())
                 {
-                    let state = header_state.take().unwrap();
-                    let (metadata_blocks, parsed_stream_info) =
-                        parse_ogg_flac_header_packet(&state.header_bytes, spec)?;
-                    sample_entry_box = Some(build_flac_sample_entry_box(
-                        parsed_stream_info.sample_rate,
-                        parsed_stream_info.channel_count,
-                        parsed_stream_info.bits_per_sample,
-                        &metadata_blocks,
-                        None,
-                    )?);
-                    stream_info = Some(parsed_stream_info);
+                    header_state = None;
                 }
+            } else if !started_media_packets
+                && !ogg_flac_packet_should_stage_as_media(packet_bytes.as_deref().unwrap())
+            {
                 continue;
             }
-            let packet_bytes = read_spans_sync(
-                &mut file,
-                &packet.spans,
-                packet.total_size,
-                spec,
-                "Ogg FLAC frame packet is truncated",
-            )?;
-            let parsed_header = parse_flac_frame_packet(
-                &packet_bytes,
-                spec,
-                packet.spans.first().map_or(0, |span| span.source_offset),
-                stream_info.as_ref().unwrap(),
-            )?;
             let data_offset = logical_size;
             for span in &packet.spans {
                 transformed_segments.push(SegmentedMuxSourceSegment {
@@ -405,10 +427,12 @@ pub(in crate::mux) fn scan_ogg_flac_file_sync(
             samples.push(StagedSample {
                 data_offset,
                 data_size: packet.total_size,
-                duration: parsed_header.block_size,
+                duration: 1,
                 composition_time_offset: 0,
                 is_sync_sample: true,
             });
+            audio_packet_count += 1;
+            started_media_packets = true;
         }
     }
     if !packet_builder.is_empty() {
@@ -419,7 +443,7 @@ pub(in crate::mux) fn scan_ogg_flac_file_sync(
     }
     if header_state
         .as_ref()
-        .is_some_and(|state| state.extra_header_packets_remaining != 0)
+        .is_some_and(OggFlacHeaderState::awaiting_mapping_packets)
     {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -427,7 +451,7 @@ pub(in crate::mux) fn scan_ogg_flac_file_sync(
                 .to_string(),
         });
     }
-    let stream_info = stream_info.ok_or_else(|| MuxError::UnsupportedTrackImport {
+    stream_info.ok_or_else(|| MuxError::UnsupportedTrackImport {
         spec: spec.to_string(),
         message: "Ogg FLAC input did not contain an identification packet".to_string(),
     })?;
@@ -435,19 +459,20 @@ pub(in crate::mux) fn scan_ogg_flac_file_sync(
         spec: spec.to_string(),
         message: "Ogg FLAC input did not yield any FLAC metadata blocks".to_string(),
     })?;
-    if samples.is_empty() {
+    if audio_packet_count == 0 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
             message: "Ogg FLAC input did not contain any audio packets after headers".to_string(),
         });
     }
+    samples.last_mut().unwrap().duration = 0;
     Ok(ParsedOggFlacTrack {
         segmented_source: SegmentedMuxSourceSpec {
             path: path.to_path_buf(),
             segments: transformed_segments,
             total_size: logical_size,
         },
-        sample_rate: stream_info.sample_rate,
+        media_timescale: OGG_FLAC_PACKET_CLOCK_TIMESCALE,
         sample_entry_box,
         samples,
     })
@@ -468,6 +493,8 @@ pub(in crate::mux) async fn scan_ogg_flac_file_async(
     let mut logical_size = 0_u64;
     let mut transformed_segments = Vec::new();
     let mut samples = Vec::new();
+    let mut audio_packet_count = 0_u64;
+    let mut started_media_packets = false;
     while offset < file_size {
         let page = read_ogg_page_header_async(&mut file, offset, spec).await?;
         if packet_builder.is_empty() && page.header_type & 0x01 != 0 {
@@ -491,52 +518,65 @@ pub(in crate::mux) async fn scan_ogg_flac_file_async(
             if packet.total_size == 0 {
                 continue;
             }
-            if sample_entry_box.is_none() {
-                let packet_bytes = read_spans_async(
-                    &mut file,
-                    &packet.spans,
-                    packet.total_size,
-                    spec,
-                    "Ogg FLAC identification packet is truncated",
-                )
-                .await?;
+            let needs_packet_bytes = sample_entry_box.is_none()
+                || header_state
+                    .as_ref()
+                    .is_some_and(OggFlacHeaderState::awaiting_mapping_packets)
+                || !started_media_packets;
+            let mut packet_bytes = None::<Vec<u8>>;
+            if needs_packet_bytes {
+                packet_bytes = Some(
+                    read_spans_async(
+                        &mut file,
+                        &packet.spans,
+                        packet.total_size,
+                        spec,
+                        "Ogg FLAC identification packet is truncated",
+                    )
+                    .await?,
+                );
+            }
+            if sample_entry_box.is_none()
+                || header_state
+                    .as_ref()
+                    .is_some_and(OggFlacHeaderState::awaiting_mapping_packets)
+            {
+                let packet_bytes = packet_bytes.as_deref().unwrap();
                 if let Some(state) = &mut header_state {
-                    state.append_extra_packet(&packet_bytes);
+                    state.append_extra_packet(packet_bytes);
                 } else {
-                    header_state = Some(parse_ogg_flac_header_start(&packet_bytes, spec)?);
+                    header_state = Some(parse_ogg_flac_header_start(packet_bytes, spec)?);
+                }
+                if sample_entry_box.is_none() {
+                    let header_bytes = &header_state.as_ref().unwrap().header_bytes;
+                    if let Some(parsed_stream_info) =
+                        try_parse_ogg_flac_stream_info_from_header_prefix(header_bytes, spec)?
+                    {
+                        stream_info = Some(parsed_stream_info.clone());
+                        sample_entry_box = Some(build_ogg_flac_sample_entry_box(
+                            parsed_stream_info.channel_count,
+                            parsed_stream_info.bits_per_sample,
+                            None,
+                        )?);
+                    }
+                }
+                if sample_entry_box.is_none() {
+                    continue;
+                }
+                if !started_media_packets && !ogg_flac_packet_should_stage_as_media(packet_bytes) {
+                    continue;
                 }
                 if header_state
                     .as_ref()
-                    .is_some_and(|state| state.extra_header_packets_remaining == 0)
+                    .is_some_and(|state| state.is_complete() && !state.awaiting_mapping_packets())
                 {
-                    let state = header_state.take().unwrap();
-                    let (metadata_blocks, parsed_stream_info) =
-                        parse_ogg_flac_header_packet(&state.header_bytes, spec)?;
-                    sample_entry_box = Some(build_flac_sample_entry_box(
-                        parsed_stream_info.sample_rate,
-                        parsed_stream_info.channel_count,
-                        parsed_stream_info.bits_per_sample,
-                        &metadata_blocks,
-                        None,
-                    )?);
-                    stream_info = Some(parsed_stream_info);
+                    header_state = None;
                 }
+            } else if !started_media_packets
+                && !ogg_flac_packet_should_stage_as_media(packet_bytes.as_deref().unwrap())
+            {
                 continue;
             }
-            let packet_bytes = read_spans_async(
-                &mut file,
-                &packet.spans,
-                packet.total_size,
-                spec,
-                "Ogg FLAC frame packet is truncated",
-            )
-            .await?;
-            let parsed_header = parse_flac_frame_packet(
-                &packet_bytes,
-                spec,
-                packet.spans.first().map_or(0, |span| span.source_offset),
-                stream_info.as_ref().unwrap(),
-            )?;
             let data_offset = logical_size;
             for span in &packet.spans {
                 transformed_segments.push(SegmentedMuxSourceSegment {
@@ -553,10 +593,12 @@ pub(in crate::mux) async fn scan_ogg_flac_file_async(
             samples.push(StagedSample {
                 data_offset,
                 data_size: packet.total_size,
-                duration: parsed_header.block_size,
+                duration: 1,
                 composition_time_offset: 0,
                 is_sync_sample: true,
             });
+            audio_packet_count += 1;
+            started_media_packets = true;
         }
     }
     if !packet_builder.is_empty() {
@@ -567,7 +609,7 @@ pub(in crate::mux) async fn scan_ogg_flac_file_async(
     }
     if header_state
         .as_ref()
-        .is_some_and(|state| state.extra_header_packets_remaining != 0)
+        .is_some_and(OggFlacHeaderState::awaiting_mapping_packets)
     {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -575,7 +617,7 @@ pub(in crate::mux) async fn scan_ogg_flac_file_async(
                 .to_string(),
         });
     }
-    let stream_info = stream_info.ok_or_else(|| MuxError::UnsupportedTrackImport {
+    stream_info.ok_or_else(|| MuxError::UnsupportedTrackImport {
         spec: spec.to_string(),
         message: "Ogg FLAC input did not contain an identification packet".to_string(),
     })?;
@@ -583,19 +625,20 @@ pub(in crate::mux) async fn scan_ogg_flac_file_async(
         spec: spec.to_string(),
         message: "Ogg FLAC input did not yield any FLAC metadata blocks".to_string(),
     })?;
-    if samples.is_empty() {
+    if audio_packet_count == 0 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
             message: "Ogg FLAC input did not contain any audio packets after headers".to_string(),
         });
     }
+    samples.last_mut().unwrap().duration = 0;
     Ok(ParsedOggFlacTrack {
         segmented_source: SegmentedMuxSourceSpec {
             path: path.to_path_buf(),
             segments: transformed_segments,
             total_size: logical_size,
         },
-        sample_rate: stream_info.sample_rate,
+        media_timescale: OGG_FLAC_PACKET_CLOCK_TIMESCALE,
         sample_entry_box,
         samples,
     })
@@ -612,7 +655,7 @@ fn build_flac_sample_entry_box(
     dfla.metadata_blocks = minimal_flac_sample_entry_metadata_blocks(metadata_blocks, sample_rate)?;
     let mut dfla_box = super::super::mp4::encode_typed_box(&dfla, &[])?;
     // The typed `dfLa` model stays strict about the final-block bit, but the flat authored sample
-    // entry preserves the retained one-block payload shape that the comparison target writes.
+    // entry preserves the retained one-block payload shape used by the fixture.
     if let Some(first_metadata_block) = dfla_box.get_mut(12) {
         *first_metadata_block &= 0x7F;
     } else {
@@ -625,6 +668,24 @@ fn build_flac_sample_entry_box(
     build_generic_audio_sample_entry_box(
         FLAC_ENTRY,
         sample_rate,
+        channel_count,
+        sample_size,
+        &child_boxes,
+    )
+}
+
+fn build_ogg_flac_sample_entry_box(
+    channel_count: u16,
+    sample_size: u16,
+    btrt: Option<crate::boxes::iso14496_12::Btrt>,
+) -> Result<Vec<u8>, MuxError> {
+    let mut child_boxes = vec![super::super::mp4::encode_typed_box(&DfLa::default(), &[])?];
+    if let Some(btrt) = btrt {
+        child_boxes.push(super::super::mp4::encode_typed_box(&btrt, &[])?);
+    }
+    build_generic_audio_sample_entry_box(
+        FLAC_ENTRY,
+        OGG_FLAC_PACKET_CLOCK_TIMESCALE,
         channel_count,
         sample_size,
         &child_boxes,
@@ -899,7 +960,25 @@ fn minimal_flac_sample_entry_metadata_blocks(
 impl OggFlacHeaderState {
     fn append_extra_packet(&mut self, packet: &[u8]) {
         self.header_bytes.extend_from_slice(packet);
-        self.extra_header_packets_remaining -= 1;
+        if let OggFlacHeaderMode::MappingExtraPacketsRemaining(remaining) = &mut self.mode {
+            *remaining = remaining.saturating_sub(1);
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self.mode {
+            OggFlacHeaderMode::NativeSplit => {
+                ogg_flac_native_header_is_complete(&self.header_bytes)
+            }
+            OggFlacHeaderMode::MappingExtraPacketsRemaining(remaining) => remaining == 0,
+        }
+    }
+
+    fn awaiting_mapping_packets(&self) -> bool {
+        matches!(
+            self.mode,
+            OggFlacHeaderMode::MappingExtraPacketsRemaining(remaining) if remaining != 0
+        )
     }
 }
 
@@ -907,78 +986,90 @@ fn parse_ogg_flac_header_start(packet: &[u8], spec: &str) -> Result<OggFlacHeade
     let parsed = normalize_ogg_flac_header_packet(packet, spec)?;
     Ok(OggFlacHeaderState {
         header_bytes: parsed.native_header_bytes.to_vec(),
-        extra_header_packets_remaining: parsed.extra_header_packets_remaining,
+        mode: parsed.mode,
     })
 }
 
-fn parse_ogg_flac_header_packet(
+fn try_parse_ogg_flac_stream_info_from_header_prefix(
     packet: &[u8],
     spec: &str,
-) -> Result<(Vec<ParsedFlacMetadataBlock>, ParsedFlacStreamInfo), MuxError> {
+) -> Result<Option<ParsedFlacStreamInfo>, MuxError> {
     if !packet.starts_with(b"fLaC") {
+        return Ok(None);
+    }
+    if packet.len() < 8 {
+        return Ok(None);
+    }
+    let header = &packet[4..8];
+    let block_type = header[0] & 0x7F;
+    if block_type != 0 {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
-            message: "Ogg FLAC header payload did not start with the native `fLaC` stream marker"
+            message: "Ogg FLAC header prefix did not begin with a STREAMINFO metadata block"
                 .to_string(),
         });
     }
+    let length =
+        (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
+    let end = 8usize
+        .checked_add(usize::try_from(length).unwrap())
+        .ok_or(MuxError::LayoutOverflow("Ogg FLAC STREAMINFO prefix size"))?;
+    if end > packet.len() {
+        return Ok(None);
+    }
+    Ok(Some(parse_flac_stream_info(&packet[8..end], spec)?))
+}
+
+fn parse_ogg_flac_standalone_metadata_block_type(packet: &[u8]) -> Option<u8> {
+    if packet.len() < 4 {
+        return None;
+    }
+    let length =
+        (u32::from(packet[1]) << 16) | (u32::from(packet[2]) << 8) | u32::from(packet[3]);
+    let expected_len = 4usize.checked_add(usize::try_from(length).ok()?)?;
+    (packet.len() == expected_len).then_some(packet[0] & 0x7F)
+}
+
+fn ogg_flac_packet_should_stage_as_media(packet: &[u8]) -> bool {
+    if packet.starts_with(b"fLaC") {
+        return false;
+    }
+    if packet.len() >= 13 && packet[0] == 0x7F && &packet[1..5] == b"FLAC" {
+        return false;
+    }
+    match parse_ogg_flac_standalone_metadata_block_type(packet) {
+        Some(0 | 4) => false,
+        Some(_) | None => true,
+    }
+}
+
+fn ogg_flac_native_header_is_complete(packet: &[u8]) -> bool {
+    if !packet.starts_with(b"fLaC") {
+        return false;
+    }
     let mut offset = 4usize;
-    let mut metadata_blocks = Vec::new();
-    let mut stream_info = None::<ParsedFlacStreamInfo>;
     loop {
         if packet.len().saturating_sub(offset) < 4 {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "Ogg FLAC metadata block header is truncated".to_string(),
-            });
+            return false;
         }
         let header = &packet[offset..offset + 4];
         let last_metadata_block_flag = header[0] & 0x80 != 0;
-        let block_type = header[0] & 0x7F;
         let length =
             (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
-        offset = offset
-            .checked_add(4)
-            .ok_or(MuxError::LayoutOverflow("Ogg FLAC metadata offset"))?;
-        let end = offset
-            .checked_add(usize::try_from(length).unwrap())
-            .ok_or(MuxError::LayoutOverflow("Ogg FLAC metadata size"))?;
+        let Some(block_offset) = offset.checked_add(4) else {
+            return false;
+        };
+        let Some(end) = block_offset.checked_add(usize::try_from(length).unwrap()) else {
+            return false;
+        };
         if end > packet.len() {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: format!(
-                    "Ogg FLAC metadata block type {block_type} overruns the identification packet"
-                ),
-            });
+            return false;
         }
-        let block_data = packet[offset..end].to_vec();
-        if block_type == 0 {
-            stream_info = Some(parse_flac_stream_info(&block_data, spec)?);
-        }
-        metadata_blocks.push(ParsedFlacMetadataBlock {
-            block_type,
-            length,
-            block_data,
-        });
         offset = end;
         if last_metadata_block_flag {
-            break;
+            return offset == packet.len();
         }
     }
-    if offset != packet.len() {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message:
-                "Ogg FLAC identification packet carried unexpected bytes after the metadata blocks"
-                    .to_string(),
-        });
-    }
-    let stream_info = stream_info.ok_or_else(|| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: "Ogg FLAC identification packet did not contain a STREAMINFO metadata block"
-            .to_string(),
-    })?;
-    Ok((metadata_blocks, stream_info))
 }
 
 fn normalize_ogg_flac_header_packet<'a>(
@@ -988,7 +1079,7 @@ fn normalize_ogg_flac_header_packet<'a>(
     if packet.starts_with(b"fLaC") {
         return Ok(ParsedOggFlacHeaderPacket {
             native_header_bytes: packet,
-            extra_header_packets_remaining: 0,
+            mode: OggFlacHeaderMode::NativeSplit,
         });
     }
     if packet.len() >= 13 && packet[0] == 0x7F && &packet[1..5] == b"FLAC" {
@@ -1014,7 +1105,7 @@ fn normalize_ogg_flac_header_packet<'a>(
         if native_packet.starts_with(b"fLaC") {
             return Ok(ParsedOggFlacHeaderPacket {
                 native_header_bytes: native_packet,
-                extra_header_packets_remaining: header_packet_count,
+                mode: OggFlacHeaderMode::MappingExtraPacketsRemaining(header_packet_count),
             });
         }
     }

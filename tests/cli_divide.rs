@@ -1,5 +1,4 @@
 #![cfg(feature = "mux")]
-
 #![allow(clippy::field_reassign_with_default)]
 
 mod support;

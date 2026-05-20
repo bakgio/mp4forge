@@ -79,7 +79,6 @@ impl QcpCodecKind {
 #[derive(Clone, Copy, Debug)]
 struct ParsedQcpFormat {
     codec_kind: QcpCodecKind,
-    decoder_version: u8,
     sample_rate: u32,
     block_size: u32,
     packet_size: u32,
@@ -385,12 +384,6 @@ fn parse_qcp_format_payload(payload: &[u8], spec: &str) -> Result<ParsedQcpForma
     let guid =
         <[u8; 16]>::try_from(&payload[2..18]).map_err(|_| MuxError::LayoutOverflow("QCP GUID"))?;
     let codec_kind = parse_qcp_codec_kind(guid, spec)?;
-    let decoder_version = u8::try_from(u16::from_le_bytes([payload[18], payload[19]])).map_err(
-        |_| MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: "QCP fmt chunk declared a codec version that does not fit in the MP4 decoder-version field".to_string(),
-        },
-    )?;
     let packet_size = u32::from(u16::from_le_bytes([payload[102], payload[103]]));
     let block_size = u32::from(u16::from_le_bytes([payload[104], payload[105]]));
     let sample_rate = u32::from(u16::from_le_bytes([payload[106], payload[107]]));
@@ -426,7 +419,6 @@ fn parse_qcp_format_payload(payload: &[u8], spec: &str) -> Result<ParsedQcpForma
     }
     Ok(ParsedQcpFormat {
         codec_kind,
-        decoder_version,
         sample_rate,
         block_size,
         packet_size,
@@ -626,7 +618,7 @@ fn build_qcp_sample_entry_box(format: ParsedQcpFormat) -> Result<Vec<u8>, MuxErr
         QcpCodecKind::Qcelp => super::super::mp4::encode_typed_box(
             &Dqcp {
                 vendor: 0,
-                decoder_version: format.decoder_version,
+                decoder_version: 0,
                 frames_per_sample: 1,
             },
             &[],
@@ -634,7 +626,7 @@ fn build_qcp_sample_entry_box(format: ParsedQcpFormat) -> Result<Vec<u8>, MuxErr
         QcpCodecKind::Evrc => super::super::mp4::encode_typed_box(
             &Devc {
                 vendor: 0,
-                decoder_version: format.decoder_version,
+                decoder_version: 0,
                 frames_per_sample: 1,
             },
             &[],
@@ -642,7 +634,7 @@ fn build_qcp_sample_entry_box(format: ParsedQcpFormat) -> Result<Vec<u8>, MuxErr
         QcpCodecKind::Smv => super::super::mp4::encode_typed_box(
             &Dsmv {
                 vendor: 0,
-                decoder_version: format.decoder_version,
+                decoder_version: 0,
                 frames_per_sample: 1,
             },
             &[],

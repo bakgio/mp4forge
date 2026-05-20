@@ -11,7 +11,10 @@ use crate::boxes::iso23001_5::PcmC;
 use super::super::MuxError;
 #[cfg(feature = "async")]
 use super::super::import::read_exact_at_async;
-use super::super::import::{build_generic_audio_sample_entry_box, read_exact_at_sync};
+use super::super::import::{
+    SegmentedMuxSourceSegment, SegmentedMuxSourceSegmentData, SegmentedMuxSourceSpec,
+    build_generic_audio_sample_entry_box, read_exact_at_sync,
+};
 
 const FORM: &[u8; 4] = b"FORM";
 const AIFF: &[u8; 4] = b"AIFF";
@@ -27,8 +30,13 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const AIFC_COMPRESSION_NONE: FourCc = FourCc::from_bytes(*b"NONE");
 const AIFC_COMPRESSION_TWOS: FourCc = FourCc::from_bytes(*b"twos");
+const AIFC_COMPRESSION_ALAW: FourCc = FourCc::from_bytes(*b"ALAW");
+const AIFC_COMPRESSION_ULAW: FourCc = FourCc::from_bytes(*b"ULAW");
+const AIFC_COMPRESSION_FL32: FourCc = FourCc::from_bytes(*b"fl32");
+const AIFC_COMPRESSION_FL64: FourCc = FourCc::from_bytes(*b"fl64");
 const SAMPLE_ENTRY_IPCM: FourCc = FourCc::from_bytes(*b"ipcm");
 const SAMPLE_ENTRY_FPCM: FourCc = FourCc::from_bytes(*b"fpcm");
+const AIFC_FLOAT_VENDOR_CODE: [u8; 4] = *b"GPAC";
 const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
 ];
@@ -43,6 +51,7 @@ pub(in crate::mux) struct ParsedPcmTrack {
     pub(in crate::mux) data_offset: u64,
     pub(in crate::mux) frame_size: u32,
     pub(in crate::mux) frame_count: u32,
+    pub(in crate::mux) transformed_source: Option<SegmentedMuxSourceSpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +62,12 @@ pub(in crate::mux) enum PcmContainerKind {
 }
 
 #[derive(Clone, Copy)]
+enum CompandedPcmKind {
+    Alaw,
+    Ulaw,
+}
+
+#[derive(Clone, Copy)]
 struct ParsedPcmFormat {
     sample_entry_type: FourCc,
     sample_rate: u32,
@@ -60,6 +75,7 @@ struct ParsedPcmFormat {
     bits_per_sample: u16,
     block_align: u16,
     is_little_endian: bool,
+    companded_kind: Option<CompandedPcmKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -74,7 +90,7 @@ pub(in crate::mux) fn scan_pcm_file_sync(
 ) -> Result<ParsedPcmTrack, MuxError> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
-    parse_pcm_stream_sync(&mut file, file_size, spec)
+    parse_pcm_stream_sync(path, &mut file, file_size, spec)
 }
 
 #[cfg(feature = "async")]
@@ -84,10 +100,11 @@ pub(in crate::mux) async fn scan_pcm_file_async(
 ) -> Result<ParsedPcmTrack, MuxError> {
     let mut file = TokioFile::open(path).await?;
     let file_size = file.metadata().await?.len();
-    parse_pcm_stream_async(&mut file, file_size, spec).await
+    parse_pcm_stream_async(path, &mut file, file_size, spec).await
 }
 
 fn parse_pcm_stream_sync(
+    path: &Path,
     file: &mut File,
     file_size: u64,
     spec: &str,
@@ -109,7 +126,9 @@ fn parse_pcm_stream_sync(
     if &header[..4] == RIFF && &header[8..12] == WAVE {
         validate_riff_wave_header(&header, file_size, spec)?;
         let (format, data_offset, data_size) = parse_wave_chunks_sync(file, file_size, spec)?;
-        return finalize_pcm_track(
+        return finalize_pcm_track_sync(
+            path,
+            file,
             PcmContainerKind::Wave,
             format,
             data_offset,
@@ -123,7 +142,9 @@ fn parse_pcm_stream_sync(
         let is_aifc = &header[8..12] == AIFC;
         let (common, data_offset, data_size) =
             parse_aiff_chunks_sync(file, file_size, is_aifc, spec)?;
-        return finalize_pcm_track(
+        return finalize_pcm_track_sync(
+            path,
+            file,
             if is_aifc {
                 PcmContainerKind::Aifc
             } else {
@@ -144,6 +165,7 @@ fn parse_pcm_stream_sync(
 
 #[cfg(feature = "async")]
 async fn parse_pcm_stream_async(
+    path: &Path,
     file: &mut TokioFile,
     file_size: u64,
     spec: &str,
@@ -167,21 +189,26 @@ async fn parse_pcm_stream_async(
         validate_riff_wave_header(&header, file_size, spec)?;
         let (format, data_offset, data_size) =
             parse_wave_chunks_async(file, file_size, spec).await?;
-        return finalize_pcm_track(
+        return finalize_pcm_track_async(
+            path,
+            file,
             PcmContainerKind::Wave,
             format,
             data_offset,
             data_size,
             None,
             spec,
-        );
+        )
+        .await;
     }
     if &header[..4] == FORM && (&header[8..12] == AIFF || &header[8..12] == AIFC) {
         validate_aiff_form_header(&header, file_size, spec)?;
         let is_aifc = &header[8..12] == AIFC;
         let (common, data_offset, data_size) =
             parse_aiff_chunks_async(file, file_size, is_aifc, spec).await?;
-        return finalize_pcm_track(
+        return finalize_pcm_track_async(
+            path,
+            file,
             if is_aifc {
                 PcmContainerKind::Aifc
             } else {
@@ -192,7 +219,8 @@ async fn parse_pcm_stream_async(
             data_size,
             Some(common.declared_sample_frames),
             spec,
-        );
+        )
+        .await;
     }
     Err(MuxError::UnsupportedTrackImport {
         spec: spec.to_string(),
@@ -525,6 +553,7 @@ fn parse_pcm_format(
         bits_per_sample,
         block_align,
         is_little_endian: true,
+        companded_kind: None,
     })
 }
 
@@ -557,6 +586,7 @@ fn parse_float_format(
         bits_per_sample,
         block_align,
         is_little_endian: true,
+        companded_kind: None,
     })
 }
 
@@ -933,11 +963,38 @@ fn parse_aiff_common_chunk_bytes(
                 block_align,
                 spec,
             )?,
+            AIFC_COMPRESSION_FL32 | AIFC_COMPRESSION_FL64 => {
+                parse_float_format_without_stride(
+                    bits_per_sample,
+                    channel_count,
+                    sample_rate,
+                    block_align,
+                    spec,
+                )?
+            }
+            AIFC_COMPRESSION_ALAW => {
+                parse_companded_aifc_format(
+                    channel_count,
+                    sample_rate,
+                    bits_per_sample,
+                    CompandedPcmKind::Alaw,
+                    spec,
+                )?
+            }
+            AIFC_COMPRESSION_ULAW => {
+                parse_companded_aifc_format(
+                    channel_count,
+                    sample_rate,
+                    bits_per_sample,
+                    CompandedPcmKind::Ulaw,
+                    spec,
+                )?
+            }
             compression => {
                 return Err(MuxError::UnsupportedTrackImport {
                     spec: spec.to_string(),
                     message: format!(
-                        "unsupported AIFC compression type `{compression}`; only `NONE` and `twos` are supported"
+                        "unsupported AIFC compression type `{compression}`; only `NONE`, `twos`, `fl32`, `fl64`, `ALAW`, and `ULAW` are supported"
                     ),
                 });
             }
@@ -1096,10 +1153,71 @@ fn parse_pcm_format_without_stride(
         bits_per_sample,
         block_align,
         is_little_endian: false,
+        companded_kind: None,
     })
 }
 
-fn finalize_pcm_track(
+fn parse_float_format_without_stride(
+    bits_per_sample: u16,
+    channel_count: u16,
+    sample_rate: u32,
+    block_align: u16,
+    spec: &str,
+) -> Result<ParsedPcmFormat, MuxError> {
+    if !matches!(bits_per_sample, 32 | 64) {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!("unsupported floating-point PCM sample size {bits_per_sample}"),
+        });
+    }
+    Ok(ParsedPcmFormat {
+        sample_entry_type: SAMPLE_ENTRY_FPCM,
+        sample_rate,
+        channel_count,
+        bits_per_sample,
+        block_align,
+        is_little_endian: true,
+        companded_kind: None,
+    })
+}
+
+fn parse_companded_aifc_format(
+    channel_count: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    companded_kind: CompandedPcmKind,
+    spec: &str,
+) -> Result<ParsedPcmFormat, MuxError> {
+    if !matches!(bits_per_sample, 8 | 16) {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!(
+                "unsupported AIFC companded sample size {bits_per_sample}; only 8-bit and 16-bit declared sample sizes are supported on the companded PCM path"
+            ),
+        });
+    }
+    let block_align = match bits_per_sample {
+        8 => channel_count,
+        16 => channel_count
+            .checked_mul(2)
+            .ok_or(MuxError::LayoutOverflow("AIFC companded block alignment"))?,
+        _ => unreachable!(),
+    };
+    Ok(ParsedPcmFormat {
+        sample_entry_type: SAMPLE_ENTRY_IPCM,
+        sample_rate,
+        channel_count,
+        bits_per_sample: 16,
+        block_align,
+        is_little_endian: true,
+        companded_kind: Some(companded_kind),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_pcm_track_sync(
+    path: &Path,
+    file: &mut File,
     container_kind: PcmContainerKind,
     format: ParsedPcmFormat,
     data_offset: u64,
@@ -1129,7 +1247,7 @@ fn finalize_pcm_track(
         });
     }
     if let Some(declared_sample_frames) = declared_sample_frames
-        && declared_sample_frames != frame_count
+        && !declared_pcm_sample_frames_match(&format, declared_sample_frames, frame_count)
     {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -1138,7 +1256,23 @@ fn finalize_pcm_track(
             ),
         });
     }
-    let sample_entry_box = build_wave_sample_entry_box(&format)?;
+    let transformed_source = build_companded_aifc_transformed_source_sync(
+        file,
+        path,
+        data_offset,
+        data_size,
+        format,
+        spec,
+    )?;
+    let (data_offset, frame_size) = if transformed_source.is_some() {
+        let frame_size = u32::from(format.channel_count)
+            .checked_mul(2)
+            .ok_or(MuxError::LayoutOverflow("companded PCM output frame size"))?;
+        (0, frame_size)
+    } else {
+        (data_offset, frame_size)
+    };
+    let sample_entry_box = build_pcm_container_sample_entry_box(container_kind, &format)?;
     Ok(ParsedPcmTrack {
         container_kind,
         sample_rate: format.sample_rate,
@@ -1146,7 +1280,224 @@ fn finalize_pcm_track(
         data_offset,
         frame_size,
         frame_count,
+        transformed_source,
     })
+}
+
+#[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_pcm_track_async(
+    path: &Path,
+    file: &mut TokioFile,
+    container_kind: PcmContainerKind,
+    format: ParsedPcmFormat,
+    data_offset: u64,
+    data_size: u32,
+    declared_sample_frames: Option<u32>,
+    spec: &str,
+) -> Result<ParsedPcmTrack, MuxError> {
+    if data_size == 0 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "PCM input did not contain any audio payload in its media-data chunk"
+                .to_string(),
+        });
+    }
+    if !data_size.is_multiple_of(u32::from(format.block_align)) {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "PCM media-data chunk size is not a whole number of PCM frames".to_string(),
+        });
+    }
+    let frame_size = u32::from(format.block_align);
+    let frame_count = data_size / frame_size;
+    if frame_count == 0 {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: "PCM input did not contain a complete PCM frame".to_string(),
+        });
+    }
+    if let Some(declared_sample_frames) = declared_sample_frames
+        && !declared_pcm_sample_frames_match(&format, declared_sample_frames, frame_count)
+    {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!(
+                "PCM container declared {declared_sample_frames} sample frames but the media-data chunk encoded {frame_count}"
+            ),
+        });
+    }
+    let transformed_source = build_companded_aifc_transformed_source_async(
+        file,
+        path,
+        data_offset,
+        data_size,
+        format,
+        spec,
+    )
+    .await?;
+    let (data_offset, frame_size) = if transformed_source.is_some() {
+        let frame_size = u32::from(format.channel_count)
+            .checked_mul(2)
+            .ok_or(MuxError::LayoutOverflow("companded PCM output frame size"))?;
+        (0, frame_size)
+    } else {
+        (data_offset, frame_size)
+    };
+    let sample_entry_box = build_pcm_container_sample_entry_box(container_kind, &format)?;
+    Ok(ParsedPcmTrack {
+        container_kind,
+        sample_rate: format.sample_rate,
+        sample_entry_box,
+        data_offset,
+        frame_size,
+        frame_count,
+        transformed_source,
+    })
+}
+
+fn declared_pcm_sample_frames_match(
+    format: &ParsedPcmFormat,
+    declared_sample_frames: u32,
+    frame_count: u32,
+) -> bool {
+    if declared_sample_frames == frame_count {
+        return true;
+    }
+    let Some(_) = format.companded_kind else {
+        return false;
+    };
+    if format.channel_count == 0 {
+        return false;
+    }
+    let bytes_per_channel = u32::from(format.block_align) / u32::from(format.channel_count);
+    bytes_per_channel > 1
+        && frame_count
+            .checked_mul(bytes_per_channel)
+            .is_some_and(|packed_frame_count| packed_frame_count == declared_sample_frames)
+}
+
+fn build_companded_aifc_transformed_source_sync(
+    file: &mut File,
+    path: &Path,
+    data_offset: u64,
+    data_size: u32,
+    format: ParsedPcmFormat,
+    spec: &str,
+) -> Result<Option<SegmentedMuxSourceSpec>, MuxError> {
+    let Some(companded_kind) = format.companded_kind else {
+        return Ok(None);
+    };
+    if format.block_align != format.channel_count {
+        return Ok(None);
+    }
+    let mut encoded = vec![
+        0_u8;
+        usize::try_from(data_size)
+            .map_err(|_| MuxError::LayoutOverflow("companded PCM input size"))?
+    ];
+    read_exact_at_sync(
+        file,
+        data_offset,
+        &mut encoded,
+        spec,
+        "PCM input is truncated while reading companded AIFC payload",
+    )?;
+    Ok(Some(build_inline_companded_pcm_source(
+        path,
+        &encoded,
+        companded_kind,
+    )?))
+}
+
+#[cfg(feature = "async")]
+async fn build_companded_aifc_transformed_source_async(
+    file: &mut TokioFile,
+    path: &Path,
+    data_offset: u64,
+    data_size: u32,
+    format: ParsedPcmFormat,
+    spec: &str,
+) -> Result<Option<SegmentedMuxSourceSpec>, MuxError> {
+    let Some(companded_kind) = format.companded_kind else {
+        return Ok(None);
+    };
+    if format.block_align != format.channel_count {
+        return Ok(None);
+    }
+    let mut encoded = vec![
+        0_u8;
+        usize::try_from(data_size)
+            .map_err(|_| MuxError::LayoutOverflow("companded PCM input size"))?
+    ];
+    read_exact_at_async(
+        file,
+        data_offset,
+        &mut encoded,
+        spec,
+        "PCM input is truncated while reading companded AIFC payload",
+    )
+    .await?;
+    Ok(Some(build_inline_companded_pcm_source(
+        path,
+        &encoded,
+        companded_kind,
+    )?))
+}
+
+fn build_inline_companded_pcm_source(
+    path: &Path,
+    encoded: &[u8],
+    companded_kind: CompandedPcmKind,
+) -> Result<SegmentedMuxSourceSpec, MuxError> {
+    let decoded = decode_companded_pcm_payload(encoded, companded_kind);
+    let total_size = u64::try_from(decoded.len())
+        .map_err(|_| MuxError::LayoutOverflow("companded PCM output size"))?;
+    Ok(SegmentedMuxSourceSpec {
+        path: path.to_path_buf(),
+        segments: vec![SegmentedMuxSourceSegment {
+            logical_offset: 0,
+            data: SegmentedMuxSourceSegmentData::Bytes(decoded),
+        }],
+        total_size,
+    })
+}
+
+fn decode_companded_pcm_payload(encoded: &[u8], companded_kind: CompandedPcmKind) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(encoded.len().saturating_mul(2));
+    for &value in encoded {
+        let sample = match companded_kind {
+            CompandedPcmKind::Alaw => decode_alaw_pcm_sample(value),
+            CompandedPcmKind::Ulaw => decode_ulaw_pcm_sample(value),
+        };
+        decoded.extend_from_slice(&sample.to_le_bytes());
+    }
+    decoded
+}
+
+fn decode_alaw_pcm_sample(value: u8) -> i16 {
+    let value = value ^ 0x55;
+    let mut sample = i16::from(value & 0x0F) << 4;
+    let segment = i16::from((value & 0x70) >> 4);
+    sample += 8;
+    if segment != 0 {
+        sample += 0x100;
+    }
+    if segment > 1 {
+        sample <<= u32::try_from(segment - 1).unwrap();
+    }
+    if value & 0x80 == 0 { -sample } else { sample }
+}
+
+fn decode_ulaw_pcm_sample(value: u8) -> i16 {
+    let value = !value;
+    let mut sample = (i16::from(value & 0x0F) << 3) + 0x84;
+    sample <<= u32::from((value & 0x70) >> 4);
+    if value & 0x80 != 0 {
+        0x84 - sample
+    } else {
+        sample - 0x84
+    }
 }
 
 fn build_wave_sample_entry_box(format: &ParsedPcmFormat) -> Result<Vec<u8>, MuxError> {
@@ -1157,6 +1508,20 @@ fn build_wave_sample_entry_box(format: &ParsedPcmFormat) -> Result<Vec<u8>, MuxE
         format.bits_per_sample,
         format.is_little_endian,
     )
+}
+
+fn build_pcm_container_sample_entry_box(
+    container_kind: PcmContainerKind,
+    format: &ParsedPcmFormat,
+) -> Result<Vec<u8>, MuxError> {
+    let sample_entry_box = build_wave_sample_entry_box(format)?;
+    if container_kind == PcmContainerKind::Aifc && format.sample_entry_type == SAMPLE_ENTRY_FPCM {
+        return super::super::mp4::replace_audio_sample_entry_vendor_code(
+            &sample_entry_box,
+            AIFC_FLOAT_VENDOR_CODE,
+        );
+    }
+    Ok(sample_entry_box)
 }
 
 pub(in crate::mux) fn build_pcm_sample_entry_box(
@@ -1185,14 +1550,26 @@ pub(in crate::mux) fn build_pcm_sample_entry_box(
 }
 
 fn build_pcm_channel_layout_box(channel_count: u16) -> Result<Option<Vec<u8>>, MuxError> {
-    let defined_layout = match channel_count {
-        1 => 1_u8,
-        2 => 2_u8,
+    let payload = match channel_count {
+        1 => {
+            let mut payload = vec![0_u8; 14];
+            payload[4] = 1;
+            payload[5] = 1;
+            payload
+        }
+        2 => {
+            let mut payload = vec![0_u8; 14];
+            payload[4] = 1;
+            payload[5] = 2;
+            payload
+        }
+        4 => {
+            let mut payload = vec![0_u8; 10];
+            payload[4] = 1;
+            payload
+        }
         _ => return Ok(None),
     };
-    let mut payload = vec![0_u8; 14];
-    payload[4] = 1;
-    payload[5] = defined_layout;
     Ok(Some(super::super::mp4::encode_typed_box(
         &Chnl { data: payload },
         &[],

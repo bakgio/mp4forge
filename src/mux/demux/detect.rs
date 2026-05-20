@@ -119,11 +119,11 @@ pub(in crate::mux) fn detect_path_track_kind_from_prefix(prefix: &[u8]) -> Detec
     if looks_like_h263_prefix(prefix) {
         return DetectedPathTrackKind::Raw(MuxRawCodec::H263);
     }
-    if looks_like_mpeg2v_prefix(prefix) {
-        return DetectedPathTrackKind::Raw(MuxRawCodec::Mpeg2v);
-    }
     if looks_like_mp4v_prefix(prefix) {
         return DetectedPathTrackKind::Raw(MuxRawCodec::Mp4v);
+    }
+    if looks_like_mpeg2v_prefix(prefix) {
+        return DetectedPathTrackKind::Raw(MuxRawCodec::Mpeg2v);
     }
     if let Some(kind) = detect_annex_b_video_prefix(prefix) {
         return kind;
@@ -595,6 +595,22 @@ mod tests {
         assert_eq!(
             detect_container_path_kind_from_path_and_prefix(Path::new("demo.ghix"), b"<MPD"),
             Some(DetectedContainerPathKind::Ghi)
+        );
+    }
+
+    #[test]
+    fn ambiguous_mpeg4_part2_prefix_prefers_mp4v_detection() {
+        let prefix = [
+            0x00, 0x00, 0x01, 0xB0, 0x01, 0x00, 0x00, 0x01, 0xB5, 0x89, 0x13, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00, 0xC4, 0x8D, 0x88, 0x00,
+            0xCD, 0x0A, 0x04, 0x1E, 0x14, 0x43, 0x00, 0x00, 0x01, 0xB2, 0x4C, 0x61,
+            0x76, 0x63, 0x36, 0x31, 0x2E, 0x32, 0x2E, 0x31, 0x30, 0x30, 0x00, 0x00,
+            0x01, 0xB3, 0x00, 0x10, 0x07, 0x00, 0x00, 0x01, 0xB6, 0x10, 0x60, 0xB1,
+            0x82, 0x99, 0xB7, 0xF1,
+        ];
+        assert_eq!(
+            detect_path_track_kind_from_prefix(&prefix),
+            DetectedPathTrackKind::Raw(MuxRawCodec::Mp4v)
         );
     }
 }
