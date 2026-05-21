@@ -238,7 +238,9 @@ pub(in crate::mux) fn scan_ac4_segmented_sync(
             first_is_sync_sample
         } else {
             read_ac4_frame_sync_flag(
-                &read_ac4_frame_payload_segmented_sync(file, segments, total_size, offset, frame, spec)?,
+                &read_ac4_frame_payload_segmented_sync(
+                    file, segments, total_size, offset, frame, spec,
+                )?,
                 spec,
             )?
         };
@@ -354,8 +356,10 @@ pub(in crate::mux) async fn scan_ac4_segmented_async(
             first_is_sync_sample
         } else {
             read_ac4_frame_sync_flag(
-                &read_ac4_frame_payload_segmented_async(file, segments, total_size, offset, frame, spec)
-                    .await?,
+                &read_ac4_frame_payload_segmented_async(
+                    file, segments, total_size, offset, frame, spec,
+                )
+                .await?,
                 spec,
             )?
         };
@@ -851,7 +855,9 @@ fn parse_ac4_stream(frame_payload: &[u8], spec: &str) -> Result<ParsedAc4Stream,
             .find(|presentation| presentation.group_index == *group_index)
             .ok_or_else(|| MuxError::UnsupportedTrackImport {
                 spec: spec.to_string(),
-                message: format!("AC-4 substream group {group_index} is not referenced by any presentation"),
+                message: format!(
+                    "AC-4 substream group {group_index} is not referenced by any presentation"
+                ),
             })?;
         let group_frame_rate_factor = match group_presentation.frame_rate_multiply_info {
             0 => 1,
@@ -875,9 +881,10 @@ fn parse_ac4_stream(frame_payload: &[u8], spec: &str) -> Result<ParsedAc4Stream,
                 .and_then(|position| parsed_groups.get(position))
         })
         .map(|group| {
-            group.substreams.iter().fold(0_u32, |mask, substream| {
-                mask | substream.channel_mask
-            })
+            group
+                .substreams
+                .iter()
+                .fold(0_u32, |mask, substream| mask | substream.channel_mask)
         })
         .unwrap_or(0);
     for presentation in &mut presentations {
@@ -891,9 +898,7 @@ fn parse_ac4_stream(frame_payload: &[u8], spec: &str) -> Result<ParsedAc4Stream,
                     presentation.group_index
                 ),
             })?;
-        presentation.group = Some(
-            parsed_groups[group_position].clone(),
-        );
+        presentation.group = Some(parsed_groups[group_position].clone());
         populate_ac4_presentation_channels(presentation);
         normalize_ac4_presentation_for_dsi(presentation);
     }
@@ -1110,8 +1115,7 @@ fn normalize_ac4_presentation_for_dsi(presentation: &mut ParsedAc4Presentation) 
         presentation.presentation_channel_mask,
         presentation.presentation_channel_mode,
     );
-    if presentation.top_channel_pairs == 0 && (presentation.presentation_channel_mask & 0x80) != 0
-    {
+    if presentation.top_channel_pairs == 0 && (presentation.presentation_channel_mask & 0x80) != 0 {
         presentation.top_channel_pairs = 1;
     }
     if uses_stereo_fallback {
@@ -1979,5 +1983,4 @@ mod tests {
             "{parsed:#?}"
         );
     }
-
 }

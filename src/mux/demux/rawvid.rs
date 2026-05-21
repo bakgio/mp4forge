@@ -1,7 +1,10 @@
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 #[cfg(feature = "async")]
-use tokio::fs;
+use tokio::fs::{self, File};
+#[cfg(feature = "async")]
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader as AsyncBufReader};
 
 use super::super::import::StagedSample;
 use super::super::{MuxError, MuxRawVideoParams, MuxRawVideoPixelFormat};
@@ -15,12 +18,23 @@ pub(in crate::mux) struct ParsedRawVideoTrack {
     pub(in crate::mux) samples: Vec<StagedSample>,
 }
 
+struct ParsedY4mHeader {
+    width: u16,
+    height: u16,
+    timescale: u32,
+    frame_duration: u32,
+    frame_size: u64,
+    sample_entry_box: Vec<u8>,
+}
+
 pub(in crate::mux) fn scan_y4m_file_sync(
     path: &Path,
     spec: &str,
 ) -> Result<ParsedRawVideoTrack, MuxError> {
-    let bytes = std::fs::read(path)?;
-    parse_y4m_bytes(spec, &bytes)
+    let file_size = std::fs::metadata(path)?.len();
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    parse_y4m_reader_sync(spec, &mut reader, file_size)
 }
 
 #[cfg(feature = "async")]
@@ -28,8 +42,10 @@ pub(in crate::mux) async fn scan_y4m_file_async(
     path: &Path,
     spec: &str,
 ) -> Result<ParsedRawVideoTrack, MuxError> {
-    let bytes = fs::read(path).await?;
-    parse_y4m_bytes(spec, &bytes)
+    let file_size = fs::metadata(path).await?.len();
+    let file = File::open(path).await?;
+    let mut reader = AsyncBufReader::new(file);
+    parse_y4m_reader_async(spec, &mut reader, file_size).await
 }
 
 pub(in crate::mux) fn scan_raw_video_file_sync(
@@ -51,13 +67,170 @@ pub(in crate::mux) async fn scan_raw_video_file_async(
     parse_raw_video_size(spec, file_size, params)
 }
 
-fn parse_y4m_bytes(spec: &str, bytes: &[u8]) -> Result<ParsedRawVideoTrack, MuxError> {
-    let header_end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| invalid_y4m(spec, "Y4M input did not terminate its stream header line"))?;
-    let header = std::str::from_utf8(&bytes[..header_end])
+fn parse_y4m_reader_sync<R>(
+    spec: &str,
+    reader: &mut R,
+    file_size: u64,
+) -> Result<ParsedRawVideoTrack, MuxError>
+where
+    R: BufRead + Seek,
+{
+    let mut header_bytes = Vec::new();
+    if reader.read_until(b'\n', &mut header_bytes)? == 0 {
+        return Err(invalid_y4m(
+            spec,
+            "Y4M input did not terminate its stream header line",
+        ));
+    }
+    let header =
+        std::str::from_utf8(header_bytes.strip_suffix(b"\n").ok_or_else(|| {
+            invalid_y4m(spec, "Y4M input did not terminate its stream header line")
+        })?)
         .map_err(|_| invalid_y4m(spec, "Y4M stream header is not valid UTF-8 text"))?;
+    let parsed_header = parse_y4m_stream_header(spec, header)?;
+    let mut physical_offset = u64::try_from(header_bytes.len())
+        .map_err(|_| MuxError::LayoutOverflow("Y4M header length"))?;
+    let mut retained_sample_offset = 0_u64;
+    let mut samples = Vec::new();
+    while physical_offset < file_size {
+        let mut frame_header = Vec::new();
+        if reader.read_until(b'\n', &mut frame_header)? == 0 {
+            break;
+        }
+        let frame_header = std::str::from_utf8(
+            frame_header
+                .strip_suffix(b"\n")
+                .ok_or_else(|| invalid_y4m(spec, "Y4M frame header is truncated"))?,
+        )
+        .map_err(|_| invalid_y4m(spec, "Y4M frame header is not valid UTF-8 text"))?;
+        if !frame_header.starts_with("FRAME") {
+            return Err(invalid_y4m(
+                spec,
+                "Y4M payload did not begin its frame headers with the FRAME marker",
+            ));
+        }
+        physical_offset = physical_offset
+            .checked_add(u64::try_from(frame_header.len() + 1).unwrap())
+            .ok_or(MuxError::LayoutOverflow("Y4M frame header range"))?;
+        if physical_offset
+            .checked_add(parsed_header.frame_size)
+            .is_none_or(|frame_end| frame_end > file_size)
+        {
+            return Err(invalid_y4m(
+                spec,
+                "Y4M frame payload overruns the input length",
+            ));
+        }
+        samples.push(StagedSample {
+            data_offset: retained_sample_offset,
+            data_size: u32::try_from(parsed_header.frame_size).map_err(|_| {
+                MuxError::LayoutOverflow("Y4M frame size exceeds MP4 sample limits")
+            })?,
+            duration: parsed_header.frame_duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        retained_sample_offset = retained_sample_offset
+            .checked_add(parsed_header.frame_size)
+            .ok_or(MuxError::LayoutOverflow("Y4M retained sample offset"))?;
+        physical_offset = physical_offset
+            .checked_add(parsed_header.frame_size)
+            .ok_or(MuxError::LayoutOverflow("Y4M frame payload range"))?;
+        reader.seek(SeekFrom::Start(physical_offset))?;
+    }
+    finalize_y4m_track(
+        spec,
+        parsed_header.width,
+        parsed_header.height,
+        parsed_header.timescale,
+        parsed_header.sample_entry_box,
+        samples,
+    )
+}
+
+#[cfg(feature = "async")]
+async fn parse_y4m_reader_async<R>(
+    spec: &str,
+    reader: &mut R,
+    file_size: u64,
+) -> Result<ParsedRawVideoTrack, MuxError>
+where
+    R: tokio::io::AsyncBufRead + tokio::io::AsyncSeek + Unpin,
+{
+    let mut header_bytes = Vec::new();
+    if reader.read_until(b'\n', &mut header_bytes).await? == 0 {
+        return Err(invalid_y4m(
+            spec,
+            "Y4M input did not terminate its stream header line",
+        ));
+    }
+    let header =
+        std::str::from_utf8(header_bytes.strip_suffix(b"\n").ok_or_else(|| {
+            invalid_y4m(spec, "Y4M input did not terminate its stream header line")
+        })?)
+        .map_err(|_| invalid_y4m(spec, "Y4M stream header is not valid UTF-8 text"))?;
+    let parsed_header = parse_y4m_stream_header(spec, header)?;
+    let mut physical_offset = u64::try_from(header_bytes.len())
+        .map_err(|_| MuxError::LayoutOverflow("Y4M header length"))?;
+    let mut retained_sample_offset = 0_u64;
+    let mut samples = Vec::new();
+    while physical_offset < file_size {
+        let mut frame_header = Vec::new();
+        if reader.read_until(b'\n', &mut frame_header).await? == 0 {
+            break;
+        }
+        let frame_header = std::str::from_utf8(
+            frame_header
+                .strip_suffix(b"\n")
+                .ok_or_else(|| invalid_y4m(spec, "Y4M frame header is truncated"))?,
+        )
+        .map_err(|_| invalid_y4m(spec, "Y4M frame header is not valid UTF-8 text"))?;
+        if !frame_header.starts_with("FRAME") {
+            return Err(invalid_y4m(
+                spec,
+                "Y4M payload did not begin its frame headers with the FRAME marker",
+            ));
+        }
+        physical_offset = physical_offset
+            .checked_add(u64::try_from(frame_header.len() + 1).unwrap())
+            .ok_or(MuxError::LayoutOverflow("Y4M frame header range"))?;
+        if physical_offset
+            .checked_add(parsed_header.frame_size)
+            .is_none_or(|frame_end| frame_end > file_size)
+        {
+            return Err(invalid_y4m(
+                spec,
+                "Y4M frame payload overruns the input length",
+            ));
+        }
+        samples.push(StagedSample {
+            data_offset: retained_sample_offset,
+            data_size: u32::try_from(parsed_header.frame_size).map_err(|_| {
+                MuxError::LayoutOverflow("Y4M frame size exceeds MP4 sample limits")
+            })?,
+            duration: parsed_header.frame_duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        retained_sample_offset = retained_sample_offset
+            .checked_add(parsed_header.frame_size)
+            .ok_or(MuxError::LayoutOverflow("Y4M retained sample offset"))?;
+        physical_offset = physical_offset
+            .checked_add(parsed_header.frame_size)
+            .ok_or(MuxError::LayoutOverflow("Y4M frame payload range"))?;
+        reader.seek(SeekFrom::Start(physical_offset)).await?;
+    }
+    finalize_y4m_track(
+        spec,
+        parsed_header.width,
+        parsed_header.height,
+        parsed_header.timescale,
+        parsed_header.sample_entry_box,
+        samples,
+    )
+}
+
+fn parse_y4m_stream_header(spec: &str, header: &str) -> Result<ParsedY4mHeader, MuxError> {
     if !header.starts_with("YUV4MPEG2 ") {
         return Err(invalid_y4m(
             spec,
@@ -151,8 +324,6 @@ fn parse_y4m_bytes(spec: &str, bytes: &[u8]) -> Result<ParsedRawVideoTrack, MuxE
     let layout = layout.unwrap_or(UncvPixelLayout::Yuv420p8);
     validate_y4m_dimensions(spec, width, height, layout)?;
     let frame_size = y4m_frame_size(width, height, layout)?;
-    let frame_size_u32 = u32::try_from(frame_size)
-        .map_err(|_| MuxError::LayoutOverflow("Y4M frame size exceeds MP4 sample limits"))?;
     let width_u16 = u16::try_from(width)
         .map_err(|_| invalid_y4m(spec, "Y4M width does not fit in an MP4 visual sample entry"))?;
     let height_u16 = u16::try_from(height).map_err(|_| {
@@ -162,56 +333,6 @@ fn parse_y4m_bytes(spec: &str, bytes: &[u8]) -> Result<ParsedRawVideoTrack, MuxE
         )
     })?;
 
-    let mut offset = header_end + 1;
-    let mut retained_sample_offset = 0_u64;
-    let mut samples = Vec::new();
-    while offset < bytes.len() {
-        let frame_header_end = bytes[offset..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|position| offset + position)
-            .ok_or_else(|| invalid_y4m(spec, "Y4M frame header is truncated"))?;
-        let frame_header = std::str::from_utf8(&bytes[offset..frame_header_end])
-            .map_err(|_| invalid_y4m(spec, "Y4M frame header is not valid UTF-8 text"))?;
-        if !frame_header.starts_with("FRAME") {
-            return Err(invalid_y4m(
-                spec,
-                "Y4M payload did not begin its frame headers with the FRAME marker",
-            ));
-        }
-        let payload_offset = frame_header_end + 1;
-        let payload_end = payload_offset
-            .checked_add(usize::try_from(frame_size).unwrap())
-            .ok_or(MuxError::LayoutOverflow("Y4M frame payload range"))?;
-        if payload_end > bytes.len() {
-            return Err(invalid_y4m(
-                spec,
-                "Y4M frame payload overruns the input length",
-            ));
-        }
-        // The retained Y4M raw-video path advances the byte-reference cursor by frame size only,
-        // so the authored samples stay aligned to contiguous file offsets rather than the
-        // post-FRAME payload offsets.
-        samples.push(StagedSample {
-            data_offset: retained_sample_offset,
-            data_size: frame_size_u32,
-            duration: fps_den,
-            composition_time_offset: 0,
-            is_sync_sample: true,
-        });
-        retained_sample_offset = retained_sample_offset
-            .checked_add(frame_size)
-            .ok_or(MuxError::LayoutOverflow("Y4M retained sample offset"))?;
-        offset = payload_end;
-    }
-
-    if samples.is_empty() {
-        return Err(invalid_y4m(
-            spec,
-            "Y4M input did not carry any FRAME payloads",
-        ));
-    }
-
     let sample_entry_box = build_uncv_sample_entry_box(
         width_u16,
         height_u16,
@@ -219,10 +340,34 @@ fn parse_y4m_bytes(spec: &str, bytes: &[u8]) -> Result<ParsedRawVideoTrack, MuxE
         true,
         matches!(layout, UncvPixelLayout::Yuv420p8),
     )?;
-    Ok(ParsedRawVideoTrack {
+    Ok(ParsedY4mHeader {
         width: width_u16,
         height: height_u16,
         timescale: fps_num,
+        frame_duration: fps_den,
+        frame_size,
+        sample_entry_box,
+    })
+}
+
+fn finalize_y4m_track(
+    spec: &str,
+    width: u16,
+    height: u16,
+    timescale: u32,
+    sample_entry_box: Vec<u8>,
+    samples: Vec<StagedSample>,
+) -> Result<ParsedRawVideoTrack, MuxError> {
+    if samples.is_empty() {
+        return Err(invalid_y4m(
+            spec,
+            "Y4M input did not carry any FRAME payloads",
+        ));
+    }
+    Ok(ParsedRawVideoTrack {
+        width,
+        height,
+        timescale,
         sample_entry_box,
         samples,
     })

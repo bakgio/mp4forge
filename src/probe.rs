@@ -26,9 +26,7 @@ use crate::boxes::iso23001_5::PcmC;
 use crate::boxes::opus::DOps;
 use crate::boxes::vp::VpCodecConfiguration;
 use crate::codec::{CodecBox, CodecError, ImmutableBox, unmarshal};
-use crate::extract::{
-    ExtractError, ExtractedBox, extract_boxes, extract_boxes_with_payload,
-};
+use crate::extract::{ExtractError, ExtractedBox, extract_boxes, extract_boxes_with_payload};
 #[cfg(feature = "async")]
 use crate::extract::{extract_boxes_async, extract_boxes_with_payload_async};
 use crate::header::HeaderError;
@@ -1330,15 +1328,13 @@ where
     let Some(moov_box_bytes) = extract_root_box_bytes_sync(reader, MOOV)? else {
         return Ok(None);
     };
-    let Some(decoded_moov_box_bytes) =
-        decode_compressed_movie_moov_box_bytes(&moov_box_bytes)?
+    let Some(decoded_moov_box_bytes) = decode_compressed_movie_moov_box_bytes(&moov_box_bytes)?
     else {
         return Ok(None);
     };
 
-    let mut root_bytes = Vec::with_capacity(
-        ftyp_bytes.as_ref().map_or(0, Vec::len) + decoded_moov_box_bytes.len(),
-    );
+    let mut root_bytes =
+        Vec::with_capacity(ftyp_bytes.as_ref().map_or(0, Vec::len) + decoded_moov_box_bytes.len());
     if let Some(ftyp_box_bytes) = ftyp_bytes {
         root_bytes.extend_from_slice(&ftyp_box_bytes);
     }
@@ -1404,7 +1400,10 @@ fn decode_compressed_movie_moov_box_bytes(
     Ok(Some(decompressed))
 }
 
-fn extract_root_box_bytes_sync<R>(reader: &mut R, box_type: FourCc) -> Result<Option<Vec<u8>>, ProbeError>
+fn extract_root_box_bytes_sync<R>(
+    reader: &mut R,
+    box_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError>
 where
     R: Read + Seek,
 {
@@ -1441,7 +1440,10 @@ where
     Ok(bytes)
 }
 
-fn find_child_box_bytes_sync(parent_box_bytes: &[u8], child_type: FourCc) -> Result<Option<Vec<u8>>, ProbeError> {
+fn find_child_box_bytes_sync(
+    parent_box_bytes: &[u8],
+    child_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError> {
     let mut cursor = Cursor::new(parent_box_bytes);
     let parent_info = BoxInfo::read(&mut cursor)?;
     let parent_end = parent_info.offset() + parent_info.size();
@@ -1449,11 +1451,14 @@ fn find_child_box_bytes_sync(parent_box_bytes: &[u8], child_type: FourCc) -> Res
     while next_offset < parent_end {
         Seek::seek(&mut cursor, SeekFrom::Start(next_offset))?;
         let child_info = BoxInfo::read(&mut cursor)?;
-        let child_start = usize::try_from(child_info.offset()).map_err(|_| ProbeError::NumericOverflow {
-            field_name: "child box start",
-        })?;
-        let child_end = usize::try_from(child_info.offset() + child_info.size()).map_err(|_| ProbeError::NumericOverflow {
-            field_name: "child box end",
+        let child_start =
+            usize::try_from(child_info.offset()).map_err(|_| ProbeError::NumericOverflow {
+                field_name: "child box start",
+            })?;
+        let child_end = usize::try_from(child_info.offset() + child_info.size()).map_err(|_| {
+            ProbeError::NumericOverflow {
+                field_name: "child box end",
+            }
         })?;
         if child_end > parent_box_bytes.len() {
             return Err(ProbeError::Io(io::Error::new(
@@ -1478,9 +1483,10 @@ fn find_child_box_payload_bytes_sync(
     };
     let mut cursor = Cursor::new(child_box_bytes.as_slice());
     let child_info = BoxInfo::read(&mut cursor)?;
-    let payload_start = usize::try_from(child_info.header_size()).map_err(|_| ProbeError::NumericOverflow {
-        field_name: "child box payload start",
-    })?;
+    let payload_start =
+        usize::try_from(child_info.header_size()).map_err(|_| ProbeError::NumericOverflow {
+            field_name: "child box payload start",
+        })?;
     if payload_start > child_box_bytes.len() {
         return Err(ProbeError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2159,9 +2165,7 @@ fn detect_aac_sync_extension_info(
             continue;
         }
 
-        let mut bit_offset = sync_bit
-            .saturating_add(11)
-            .saturating_add(ext_aot_bits);
+        let mut bit_offset = sync_bit.saturating_add(11).saturating_add(ext_aot_bits);
         let sbr = read_bits_from_slice(specific_info, bit_offset, 1)?;
         bit_offset = bit_offset.saturating_add(1);
         if sbr == 0 {
@@ -2258,8 +2262,8 @@ fn get_audio_object_type_from_slice(data: &[u8], bit_offset: usize) -> Option<(u
         return Some((audio_object_type, 5));
     }
 
-    let extended = u8::try_from(read_bits_from_slice(data, bit_offset.saturating_add(5), 6)?)
-        .ok()?;
+    let extended =
+        u8::try_from(read_bits_from_slice(data, bit_offset.saturating_add(5), 6)?).ok()?;
     Some((extended.saturating_add(32), 11))
 }
 
@@ -2543,8 +2547,8 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
     ];
     let audio_sample_entries = [
         MP4A, DOT_MP3, ALAW, MLAW, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, ULAW, AC_3, EC_3,
-        AC_4, ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2,
-        MHM1, MHM2, IPCM, FPCM, ENCA,
+        AC_4, ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2, MHM1,
+        MHM2, IPCM, FPCM, ENCA,
     ];
     let mut paths = vec![
         BoxPath::from([TKHD]),

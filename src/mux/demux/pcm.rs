@@ -963,33 +963,27 @@ fn parse_aiff_common_chunk_bytes(
                 block_align,
                 spec,
             )?,
-            AIFC_COMPRESSION_FL32 | AIFC_COMPRESSION_FL64 => {
-                parse_float_format_without_stride(
-                    bits_per_sample,
-                    channel_count,
-                    sample_rate,
-                    block_align,
-                    spec,
-                )?
-            }
-            AIFC_COMPRESSION_ALAW => {
-                parse_companded_aifc_format(
-                    channel_count,
-                    sample_rate,
-                    bits_per_sample,
-                    CompandedPcmKind::Alaw,
-                    spec,
-                )?
-            }
-            AIFC_COMPRESSION_ULAW => {
-                parse_companded_aifc_format(
-                    channel_count,
-                    sample_rate,
-                    bits_per_sample,
-                    CompandedPcmKind::Ulaw,
-                    spec,
-                )?
-            }
+            AIFC_COMPRESSION_FL32 | AIFC_COMPRESSION_FL64 => parse_float_format_without_stride(
+                bits_per_sample,
+                channel_count,
+                sample_rate,
+                block_align,
+                spec,
+            )?,
+            AIFC_COMPRESSION_ALAW => parse_companded_aifc_format(
+                channel_count,
+                sample_rate,
+                bits_per_sample,
+                CompandedPcmKind::Alaw,
+                spec,
+            )?,
+            AIFC_COMPRESSION_ULAW => parse_companded_aifc_format(
+                channel_count,
+                sample_rate,
+                bits_per_sample,
+                CompandedPcmKind::Ulaw,
+                spec,
+            )?,
             compression => {
                 return Err(MuxError::UnsupportedTrackImport {
                     spec: spec.to_string(),

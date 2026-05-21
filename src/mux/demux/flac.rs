@@ -1009,8 +1009,7 @@ fn try_parse_ogg_flac_stream_info_from_header_prefix(
                 .to_string(),
         });
     }
-    let length =
-        (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
+    let length = (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
     let end = 8usize
         .checked_add(usize::try_from(length).unwrap())
         .ok_or(MuxError::LayoutOverflow("Ogg FLAC STREAMINFO prefix size"))?;
@@ -1024,8 +1023,7 @@ fn parse_ogg_flac_standalone_metadata_block_type(packet: &[u8]) -> Option<u8> {
     if packet.len() < 4 {
         return None;
     }
-    let length =
-        (u32::from(packet[1]) << 16) | (u32::from(packet[2]) << 8) | u32::from(packet[3]);
+    let length = (u32::from(packet[1]) << 16) | (u32::from(packet[2]) << 8) | u32::from(packet[3]);
     let expected_len = 4usize.checked_add(usize::try_from(length).ok()?)?;
     (packet.len() == expected_len).then_some(packet[0] & 0x7F)
 }

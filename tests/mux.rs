@@ -62,22 +62,21 @@ use support::{
     fixture_path, fourcc, temp_output_dir, write_single_track_mp4_input, write_temp_file,
     write_temp_file_with_extension, write_test_ac3_44100_file, write_test_ac3_file,
     write_test_ac4_file, write_test_adts_file, write_test_aifc_alaw_file,
-    write_test_aifc_alaw_file_with_declared_bits,
-    write_test_aifc_float64_file, write_test_aifc_pcm_file, write_test_aifc_ulaw_file,
-    write_test_aiff_pcm_file,
-    write_test_amr_file, write_test_amr_wb_file, write_test_av1_annex_b_file,
-    write_test_av1_ivf_file, write_test_av1_obu_file, write_test_avi_ac3_file,
-    write_test_avi_alaw_file, write_test_avi_audio_tag_file, write_test_avi_avc1_file,
-    write_test_avi_extensible_alaw_file, write_test_avi_extensible_float_file,
-    write_test_avi_extensible_mulaw_file, write_test_avi_extensible_pcm_file,
-    write_test_avi_h263_file, write_test_avi_h264_file, write_test_avi_jpeg_file,
-    write_test_avi_mp3_file, write_test_avi_mp4v_file, write_test_avi_mulaw_file,
-    write_test_avi_pcm_file, write_test_avi_png_file, write_test_avi_raw_bgr_file,
-    write_test_avi_video_tag_file, write_test_caf_alac_file,
+    write_test_aifc_alaw_file_with_declared_bits, write_test_aifc_float64_file,
+    write_test_aifc_pcm_file, write_test_aifc_ulaw_file,
+    write_test_aifc_ulaw_file_with_declared_bits, write_test_aiff_pcm_file, write_test_amr_file,
+    write_test_amr_wb_file, write_test_av1_annex_b_file, write_test_av1_ivf_file,
+    write_test_av1_obu_file, write_test_avi_ac3_file, write_test_avi_alaw_file,
+    write_test_avi_audio_tag_file, write_test_avi_avc1_file, write_test_avi_extensible_alaw_file,
+    write_test_avi_extensible_float_file, write_test_avi_extensible_mulaw_file,
+    write_test_avi_extensible_pcm_file, write_test_avi_h263_file, write_test_avi_h264_file,
+    write_test_avi_jpeg_file, write_test_avi_mp3_file, write_test_avi_mp4v_file,
+    write_test_avi_mulaw_file, write_test_avi_pcm_file, write_test_avi_png_file,
+    write_test_avi_raw_bgr_file, write_test_avi_video_tag_file, write_test_caf_alac_file,
     write_test_caf_alac_variable_packet_file, write_test_dts_14bit_big_endian_file,
     write_test_dts_14bit_little_endian_file, write_test_dts_file,
-    write_test_dts_little_endian_file, write_test_eac3_file, write_test_flac_file,
-    write_test_eac3_file_with_dependent_substream,
+    write_test_dts_little_endian_file, write_test_eac3_file,
+    write_test_eac3_file_with_dependent_substream, write_test_flac_file,
     write_test_flac_file_with_frames, write_test_flac_file_with_frames_and_block_size,
     write_test_h263_file, write_test_h264_annexb_file, write_test_h265_annexb_file,
     write_test_h265_annexb_file_with_timing, write_test_iamf_file, write_test_jpeg_file,
@@ -104,7 +103,6 @@ use support::{
     write_test_transport_stream_mp3_file, write_test_transport_stream_mp4v_file,
     write_test_transport_stream_mpeg2v_file, write_test_transport_stream_truehd_file,
     write_test_transport_stream_vvc_file, write_test_truehd_file, write_test_usac_latm_file,
-    write_test_aifc_ulaw_file_with_declared_bits,
     write_test_vobsub_files, write_test_vp8_ivf_file, write_test_vp9_ivf_file,
     write_test_vp10_ivf_file, write_test_wave_pcm_file, write_test_wrapped_dts_file,
     write_test_wrapped_dts_file_with_tail,
@@ -6304,11 +6302,11 @@ fn mux_to_path_fragmented_imported_dtsc_preserves_existing_ddts() {
 fn mux_to_path_fragmented_imported_flac_preserves_dfla_and_strips_btrt() {
     let mut expected_dfla = DfLa::default();
     expected_dfla.metadata_blocks = vec![FlacMetadataBlock {
-            last_metadata_block_flag: true,
-            block_type: 0,
-            length: 34,
-            block_data: vec![0; 34],
-        }];
+        last_metadata_block_flag: true,
+        block_type: 0,
+        length: 34,
+        block_data: vec![0; 34],
+    }];
     let input = build_imported_track_input_file(
         "mux-fragment-imported-flac-preserve-dfla",
         &MuxFileConfig::new(48_000)
@@ -6982,7 +6980,12 @@ fn mux_to_path_flat_single_sample_h264_plus_aac_omits_video_lead_in_boxes() {
     );
     let video_elst = extract_boxes::<Elst>(
         &output_bytes,
-        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("edts"), fourcc("elst")]),
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("edts"),
+            fourcc("elst"),
+        ]),
     );
     let video_btrt = extract_boxes::<Btrt>(
         &output_bytes,
@@ -7033,7 +7036,12 @@ fn mux_to_path_flat_single_sample_h264_multi_audio_omits_video_lead_in_boxes() {
     );
     let video_elst = extract_boxes::<Elst>(
         &output_bytes,
-        BoxPath::from([fourcc("moov"), fourcc("trak"), fourcc("edts"), fourcc("elst")]),
+        BoxPath::from([
+            fourcc("moov"),
+            fourcc("trak"),
+            fourcc("edts"),
+            fourcc("elst"),
+        ]),
     );
     let video_btrt = extract_boxes::<Btrt>(
         &output_bytes,
@@ -12674,10 +12682,8 @@ fn mux_to_path_imports_raw_eac3_inputs() {
 
 #[test]
 fn mux_to_path_imports_raw_eac3_inputs_with_dependent_substreams() {
-    let eac3_input = write_test_eac3_file_with_dependent_substream(
-        "mux-raw-eac3-dependent-input",
-        &[b"ec3"],
-    );
+    let eac3_input =
+        write_test_eac3_file_with_dependent_substream("mux-raw-eac3-dependent-input", &[b"ec3"]);
     let expected = fs::read(&eac3_input).unwrap();
     let output_path = write_temp_file("mux-raw-eac3-dependent-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::path(eac3_input)]);

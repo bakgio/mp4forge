@@ -778,7 +778,10 @@ fn write_test_aifc_companded_file(
     declared_bits_per_sample: u16,
     packets: &[&[u8]],
 ) -> PathBuf {
-    let data = packets.iter().flat_map(|packet| packet.iter().copied()).collect::<Vec<_>>();
+    let data = packets
+        .iter()
+        .flat_map(|packet| packet.iter().copied())
+        .collect::<Vec<_>>();
     let sample_frames = u32::try_from(data.len() / usize::from(channel_count)).unwrap();
 
     let mut comm_payload = Vec::new();
@@ -817,8 +820,7 @@ fn write_test_aifc_float_file(
     frames: &[&[f64]],
 ) -> PathBuf {
     let bytes_per_sample = usize::from(bits_per_sample / 8);
-    let mut data =
-        Vec::with_capacity(frames.len() * usize::from(channel_count) * bytes_per_sample);
+    let mut data = Vec::with_capacity(frames.len() * usize::from(channel_count) * bytes_per_sample);
     for frame in frames {
         assert_eq!(frame.len(), usize::from(channel_count));
         for &sample in *frame {
@@ -4306,7 +4308,9 @@ fn build_eac3_dependent_substream_frame(payload: &[u8]) -> Vec<u8> {
     header_writer.write_bits(&[0_u8], 5).unwrap();
     header_writer.write_bits(&[0_u8], 1).unwrap();
     header_writer.write_bits(&[1_u8], 1).unwrap();
-    header_writer.write_bits(&(1_u16 << 9).to_be_bytes(), 16).unwrap();
+    header_writer
+        .write_bits(&(1_u16 << 9).to_be_bytes(), 16)
+        .unwrap();
     header_writer.write_bits(&[0_u8], 1).unwrap();
     header_writer.write_bits(&[0_u8], 1).unwrap();
     header_writer.write_bits(&[0_u8], 1).unwrap();

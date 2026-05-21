@@ -591,7 +591,9 @@ fn stage_h264_nal(state: &mut H264StageState, nal: AnnexBNal) -> Result<(), MuxE
                         && state
                             .current_access_unit_info
                             .as_ref()
-                            .is_some_and(|current| h264_starts_new_access_unit(current, &access_unit_info))
+                            .is_some_and(|current| {
+                                h264_starts_new_access_unit(current, &access_unit_info)
+                            })
                     {
                         state.finish_current_sample();
                     }
@@ -605,8 +607,7 @@ fn stage_h264_nal(state: &mut H264StageState, nal: AnnexBNal) -> Result<(), MuxE
                         state.prev_poc_lsb = parsed_poc.poc_lsb;
                         state.prev_poc_msb = parsed_poc.poc_msb;
                     }
-                } else if h264_first_mb_in_slice(&nal.bytes, "h264")? == 0
-                    && state.current_has_vcl
+                } else if h264_first_mb_in_slice(&nal.bytes, "h264")? == 0 && state.current_has_vcl
                 {
                     state.finish_current_sample();
                 }
@@ -645,7 +646,9 @@ fn stage_h264_nal_segmented(state: &mut H264StageState, nal: AnnexBNal) -> Resul
                         && state
                             .current_access_unit_info
                             .as_ref()
-                            .is_some_and(|current| h264_starts_new_access_unit(current, &access_unit_info))
+                            .is_some_and(|current| {
+                                h264_starts_new_access_unit(current, &access_unit_info)
+                            })
                     {
                         state.finish_current_sample();
                     }
@@ -659,8 +662,7 @@ fn stage_h264_nal_segmented(state: &mut H264StageState, nal: AnnexBNal) -> Resul
                         state.prev_poc_lsb = parsed_poc.poc_lsb;
                         state.prev_poc_msb = parsed_poc.poc_msb;
                     }
-                } else if h264_first_mb_in_slice(&nal.bytes, "h264")? == 0
-                    && state.current_has_vcl
+                } else if h264_first_mb_in_slice(&nal.bytes, "h264")? == 0 && state.current_has_vcl
                 {
                     state.finish_current_sample();
                 }
@@ -1676,14 +1678,8 @@ fn parse_h264_access_unit_info(
     let mut delta_pic_order_cnt_bottom = 0;
     let mut poc = None;
     if sps_info.pic_order_cnt_type == 0 {
-        let parsed_poc = parse_h264_slice_poc(
-            nal,
-            sps_info,
-            pps_info,
-            prev_poc_lsb,
-            prev_poc_msb,
-            spec,
-        )?;
+        let parsed_poc =
+            parse_h264_slice_poc(nal, sps_info, pps_info, prev_poc_lsb, prev_poc_msb, spec)?;
         pic_order_cnt_lsb = Some(parsed_poc.poc_lsb);
         if pps_info.bottom_field_pic_order_in_frame_present_flag && !field_pic_flag {
             let rbsp = nal_to_rbsp(&nal[1..]);

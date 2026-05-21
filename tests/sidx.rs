@@ -13,6 +13,8 @@ use mp4forge::boxes::iso14496_12::{
 };
 use mp4forge::codec::{ImmutableBox, MutableBox};
 use mp4forge::extract::{extract_box, extract_box_as};
+#[cfg(feature = "async")]
+use mp4forge::sidx::analyze_top_level_sidx_update_async;
 use mp4forge::sidx::{
     SidxAnalysisError, SidxPlanError, SidxRewriteError, TopLevelSidxPlanAction,
     TopLevelSidxPlanOptions, analyze_top_level_sidx_update, analyze_top_level_sidx_update_bytes,
@@ -297,6 +299,19 @@ fn plan_top_level_sidx_update_builds_insert_plan_with_default_values() {
     );
     assert_eq!(plan.entries[1].start_offset, styps[1].offset());
     assert!(plan.encoded_box_size >= 44);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_analyze_top_level_sidx_update_matches_sync_bytes_for_interleaved_fixture() {
+    let input = fs::read(fixture_path("sample_fragmented.mp4")).unwrap();
+
+    let async_analysis = analyze_top_level_sidx_update_async(&mut Cursor::new(&input))
+        .await
+        .unwrap();
+    let sync_analysis = analyze_top_level_sidx_update_bytes(&input).unwrap();
+
+    assert_eq!(async_analysis, sync_analysis);
 }
 
 #[cfg(feature = "async")]

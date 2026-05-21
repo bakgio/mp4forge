@@ -13,13 +13,17 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "async")]
+use std::pin::Pin;
+#[cfg(feature = "async")]
+use std::task::{Context, Poll};
 
 use aes::Aes128;
 use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
 #[cfg(feature = "async")]
 use tokio::fs as tokio_fs;
 #[cfg(feature = "async")]
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 
 use crate::BoxInfo;
 use crate::FourCc;
@@ -1848,8 +1852,10 @@ where
         DecryptInputLayout::FragmentedFile | DecryptInputLayout::MediaSegment => {
             let fragments_info_bytes = if layout == DecryptInputLayout::MediaSegment {
                 reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 0, Some(1));
-                let fragments_info_bytes =
-                    resolve_stream_fragments_info_bytes(fragments_info_reader.take(), options)?;
+                let fragments_info_bytes = resolve_stream_fragments_info_init_bytes(
+                    fragments_info_reader.take(),
+                    options,
+                )?;
                 reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 1, Some(1));
                 Some(fragments_info_bytes)
             } else {
@@ -1903,7 +1909,7 @@ where
         DecryptInputLayout::FragmentedFile | DecryptInputLayout::MediaSegment => {
             let fragments_info_bytes = if layout == DecryptInputLayout::MediaSegment {
                 reporter.report(DecryptProgressPhase::OpenFragmentsInfo, 0, Some(1));
-                let fragments_info_bytes = resolve_async_stream_fragments_info_bytes(
+                let fragments_info_bytes = resolve_async_stream_fragments_info_init_bytes(
                     fragments_info_reader.take(),
                     options,
                 )
@@ -1940,6 +1946,49 @@ where
     };
 
     Ok(SyncStreamDecryptPlan { execution })
+}
+
+struct SyncReadSeekAdapter<'a> {
+    inner: &'a mut dyn SyncReadSeek,
+}
+
+impl Read for SyncReadSeekAdapter<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.inner, buf)
+    }
+}
+
+impl Seek for SyncReadSeekAdapter<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.inner, pos)
+    }
+}
+
+#[cfg(feature = "async")]
+struct AsyncReadSeekAdapter<'a> {
+    inner: &'a mut dyn AsyncReadSeek,
+}
+
+#[cfg(feature = "async")]
+impl AsyncRead for AsyncReadSeekAdapter<'_> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "async")]
+impl AsyncSeek for AsyncReadSeekAdapter<'_> {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        Pin::new(&mut *self.inner).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut *self.inner).poll_complete(cx)
+    }
 }
 
 fn execute_sync_stream_decrypt_plan<R, W>(
@@ -1985,7 +2034,7 @@ where
     }
 }
 
-fn resolve_stream_fragments_info_bytes(
+fn resolve_stream_fragments_info_init_bytes(
     fragments_info_reader: Option<&mut dyn SyncReadSeek>,
     options: &DecryptOptions,
 ) -> Result<Vec<u8>, DecryptError> {
@@ -1995,11 +2044,13 @@ fn resolve_stream_fragments_info_bytes(
     let Some(reader) = fragments_info_reader else {
         return Err(DecryptError::MissingFragmentsInfo);
     };
-    read_all_bytes_from_reader(reader)
+    let mut adapter = SyncReadSeekAdapter { inner: reader };
+    let root_boxes = read_root_box_infos_from_reader(&mut adapter)?;
+    collect_common_encryption_init_segment_bytes_from_reader(&mut adapter, &root_boxes)
 }
 
 #[cfg(feature = "async")]
-async fn resolve_async_stream_fragments_info_bytes(
+async fn resolve_async_stream_fragments_info_init_bytes(
     fragments_info_reader: Option<&mut dyn AsyncReadSeek>,
     options: &DecryptOptions,
 ) -> Result<Vec<u8>, DecryptError> {
@@ -2009,7 +2060,9 @@ async fn resolve_async_stream_fragments_info_bytes(
     let Some(reader) = fragments_info_reader else {
         return Err(DecryptError::MissingFragmentsInfo);
     };
-    read_all_bytes_from_async_reader(reader).await
+    let mut adapter = AsyncReadSeekAdapter { inner: reader };
+    let root_boxes = read_root_box_infos_from_async_reader(&mut adapter).await?;
+    collect_common_encryption_init_segment_bytes_from_async_reader(&mut adapter, &root_boxes).await
 }
 
 fn build_common_encryption_init_stream_plan<R>(
@@ -3749,27 +3802,6 @@ where
                 "failed to read movie sample bytes from the source reader at offset {absolute_offset}: {error}"
             ))
         })
-}
-
-fn read_all_bytes_from_reader<R>(reader: &mut R) -> Result<Vec<u8>, DecryptError>
-where
-    R: Read + Seek + ?Sized,
-{
-    reader.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-#[cfg(feature = "async")]
-async fn read_all_bytes_from_async_reader<R>(reader: &mut R) -> Result<Vec<u8>, DecryptError>
-where
-    R: AsyncReadSeek + ?Sized,
-{
-    reader.seek(SeekFrom::Start(0)).await?;
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    Ok(bytes)
 }
 
 fn read_box_bytes_from_reader<R>(reader: &mut R, info: BoxInfo) -> Result<Vec<u8>, DecryptError>
@@ -11942,13 +11974,98 @@ mod tests {
     mod test_support;
 
     use crate::boxes::iso14496_12::StscEntry;
+    use std::cmp;
     use std::fs;
     use std::io::Cursor;
+    #[cfg(feature = "async")]
+    use std::pin::Pin;
+    #[cfg(feature = "async")]
+    use std::task::{Context, Poll};
 
     use test_support::{
         build_oma_dcf_broader_movie_fixture, common_encryption_fragment_fixture,
         common_encryption_multi_track_fixture,
     };
+    #[cfg(feature = "async")]
+    use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+
+    struct LimitedReadCursor {
+        inner: Cursor<Vec<u8>>,
+        readable_limit: u64,
+    }
+
+    impl LimitedReadCursor {
+        fn with_unreadable_trailing_box(init_bytes: &[u8]) -> Self {
+            let trailing_box = [
+                0_u8, 0, 0, 16, b'f', b'r', b'e', b'e', 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            let mut bytes = init_bytes.to_vec();
+            bytes.extend_from_slice(&trailing_box);
+            Self {
+                inner: Cursor::new(bytes),
+                readable_limit: u64::try_from(init_bytes.len() + 8).unwrap(),
+            }
+        }
+    }
+
+    impl Read for LimitedReadCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let position = self.inner.position();
+            if position >= self.readable_limit {
+                return Err(std::io::Error::other(
+                    "attempted to read unreadable trailing fragments-info bytes",
+                ));
+            }
+            let remaining = usize::try_from(self.readable_limit - position).unwrap();
+            let allowed = cmp::min(buf.len(), remaining);
+            std::io::Read::read(&mut self.inner, &mut buf[..allowed])
+        }
+    }
+
+    impl Seek for LimitedReadCursor {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.inner, pos)
+        }
+    }
+
+    #[cfg(feature = "async")]
+    impl AsyncRead for LimitedReadCursor {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let position = self.inner.position();
+            if position >= self.readable_limit && buf.remaining() > 0 {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "attempted to read unreadable trailing fragments-info bytes",
+                )));
+            }
+            let remaining = usize::try_from(self.readable_limit.saturating_sub(position)).unwrap();
+            let allowed = cmp::min(buf.remaining(), remaining);
+            let filled_before = buf.filled().len();
+            let mut scratch = vec![0_u8; allowed];
+            let read = std::io::Read::read(&mut self.inner, &mut scratch)?;
+            buf.put_slice(&scratch[..read]);
+            debug_assert_eq!(buf.filled().len(), filled_before + read);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "async")]
+    impl AsyncSeek for LimitedReadCursor {
+        fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+            std::io::Seek::seek(&mut self.inner, position)?;
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(self.inner.position()))
+        }
+    }
 
     fn decrypt_stream_to_bytes(
         input: &[u8],
@@ -11961,6 +12078,24 @@ mod tests {
         let fragments_info_reader = fragments_info_reader
             .as_mut()
             .map(|reader| reader as &mut dyn SyncReadSeek);
+        let mut reporter = ProgressReporter::new(None::<fn(DecryptProgress)>);
+        decrypt_sync_stream_with_optional_progress(
+            &mut input_reader,
+            &mut output_writer,
+            fragments_info_reader,
+            options,
+            &mut reporter,
+        )?;
+        Ok(output_writer.into_inner())
+    }
+
+    fn decrypt_stream_to_bytes_with_fragments_reader(
+        input: &[u8],
+        options: &DecryptOptions,
+        fragments_info_reader: Option<&mut dyn SyncReadSeek>,
+    ) -> Result<Vec<u8>, DecryptError> {
+        let mut input_reader = Cursor::new(input);
+        let mut output_writer = Cursor::new(Vec::new());
         let mut reporter = ProgressReporter::new(None::<fn(DecryptProgress)>);
         decrypt_sync_stream_with_optional_progress(
             &mut input_reader,
@@ -12017,6 +12152,26 @@ mod tests {
         )
         .await?;
         Ok(output.into_inner())
+    }
+
+    #[cfg(feature = "async")]
+    async fn decrypt_stream_to_bytes_with_fragments_reader_async(
+        input: &[u8],
+        options: &DecryptOptions,
+        fragments_info_reader: Option<&mut dyn AsyncReadSeek>,
+    ) -> Result<Vec<u8>, DecryptError> {
+        let mut input_reader = Cursor::new(input.to_vec());
+        let mut output_writer = Cursor::new(Vec::new());
+        let mut reporter = ProgressReporter::new(None::<fn(DecryptProgress)>);
+        decrypt_async_stream_with_optional_progress(
+            &mut input_reader,
+            &mut output_writer,
+            fragments_info_reader,
+            options,
+            &mut reporter,
+        )
+        .await?;
+        Ok(output_writer.into_inner())
     }
 
     #[test]
@@ -12134,6 +12289,24 @@ mod tests {
         assert_eq!(output, expected);
     }
 
+    #[test]
+    fn sync_stream_core_only_reads_init_boxes_from_seekable_fragments_info_reader() {
+        let fixture = common_encryption_fragment_fixture("cenc-single", "video");
+        let encrypted = fs::read(&fixture.encrypted_segment_path).unwrap();
+        let expected = fs::read(&fixture.clear_segment_path).unwrap();
+        let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+        let mut fragments_reader = LimitedReadCursor::with_unreadable_trailing_box(&fragments_info);
+
+        let output = decrypt_stream_to_bytes_with_fragments_reader(
+            &encrypted,
+            &DecryptOptions::new().with_key(fixture.keys[0]),
+            Some(&mut fragments_reader),
+        )
+        .unwrap();
+
+        assert_eq!(output, expected);
+    }
+
     #[cfg(feature = "async")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_stream_core_decrypts_retained_standalone_fragment_from_non_seekable_input() {
@@ -12146,6 +12319,26 @@ mod tests {
             &encrypted,
             &DecryptOptions::new().with_key(fixture.keys[0]),
             Some(&fragments_info),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, expected);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_stream_core_only_reads_init_boxes_from_seekable_fragments_info_reader() {
+        let fixture = common_encryption_fragment_fixture("cenc-single", "video");
+        let encrypted = fs::read(&fixture.encrypted_segment_path).unwrap();
+        let expected = fs::read(&fixture.clear_segment_path).unwrap();
+        let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+        let mut fragments_reader = LimitedReadCursor::with_unreadable_trailing_box(&fragments_info);
+
+        let output = decrypt_stream_to_bytes_with_fragments_reader_async(
+            &encrypted,
+            &DecryptOptions::new().with_key(fixture.keys[0]),
+            Some(&mut fragments_reader),
         )
         .await
         .unwrap();

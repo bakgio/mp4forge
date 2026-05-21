@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "async")]
 use tokio::fs as tokio_fs;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
 
 use super::super::import::{
     CandidateSample, SegmentedMuxSourceSegment, SegmentedMuxSourceSegmentData,
@@ -66,6 +69,18 @@ struct XmlTag {
     closing: bool,
 }
 
+#[derive(Default)]
+struct NhmlParserState {
+    source_specs: BTreeMap<usize, ParsedNhmlSourceSpec>,
+    tracks: Vec<TrackCandidate>,
+    pending_source: Option<PendingSource>,
+    pending_track: Option<TrackCandidate>,
+    packet_tracks: BTreeMap<u32, ParsedTrackDescriptor>,
+    packet_samples: BTreeMap<u32, Vec<(usize, CandidateSample)>>,
+    root_kind: Option<DetectedNhmlSidecarKind>,
+    saw_root: bool,
+}
+
 /// Detects whether one path/prefix pair looks like one supported NHML/NHNT-like sidecar.
 pub(in crate::mux) fn detect_nhml_sidecar_kind(
     path: &Path,
@@ -92,8 +107,25 @@ pub(in crate::mux) fn parse_nhml_source_sync(
     path: &Path,
     kind: DetectedNhmlSidecarKind,
 ) -> Result<ParsedNhmlSource, MuxError> {
-    let bytes = fs::read(path)?;
-    parse_nhml_source_bytes(path, kind, &bytes)
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut first_line = true;
+    let mut state = NhmlParserState::default();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let rendered = if first_line {
+            first_line = false;
+            line.strip_prefix('\u{FEFF}').unwrap_or(&line)
+        } else {
+            &line
+        };
+        state.push_line(path, kind, rendered)?;
+    }
+    state.finish(path, kind)
 }
 
 #[cfg(feature = "async")]
@@ -101,95 +133,100 @@ pub(in crate::mux) async fn parse_nhml_source_async(
     path: &Path,
     kind: DetectedNhmlSidecarKind,
 ) -> Result<ParsedNhmlSource, MuxError> {
-    let bytes = tokio_fs::read(path).await?;
-    parse_nhml_source_bytes(path, kind, &bytes)
+    let file = tokio_fs::File::open(path).await?;
+    let mut reader = AsyncBufReader::new(file);
+    let mut line = String::new();
+    let mut first_line = true;
+    let mut state = NhmlParserState::default();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        let rendered = if first_line {
+            first_line = false;
+            line.strip_prefix('\u{FEFF}').unwrap_or(&line)
+        } else {
+            &line
+        };
+        state.push_line(path, kind, rendered)?;
+    }
+    state.finish(path, kind)
 }
 
-fn parse_nhml_source_bytes(
-    path: &Path,
-    expected_kind: DetectedNhmlSidecarKind,
-    bytes: &[u8],
-) -> Result<ParsedNhmlSource, MuxError> {
-    let mut text = std::str::from_utf8(bytes)
-        .map_err(|_| invalid_sidecar(path, "sidecar bytes are not valid UTF-8"))?;
-    if let Some(stripped) = text.strip_prefix('\u{FEFF}') {
-        text = stripped;
-    }
-    let mut source_specs = BTreeMap::<usize, ParsedNhmlSourceSpec>::new();
-    let mut tracks = Vec::<TrackCandidate>::new();
-    let mut pending_source = None::<PendingSource>;
-    let mut pending_track = None::<TrackCandidate>;
-    let mut packet_tracks = BTreeMap::<u32, ParsedTrackDescriptor>::new();
-    let mut packet_samples = BTreeMap::<u32, Vec<(usize, CandidateSample)>>::new();
-    let mut root_kind = None::<DetectedNhmlSidecarKind>;
-    let mut saw_root = false;
-    for raw_line in text.lines() {
+impl NhmlParserState {
+    fn push_line(
+        &mut self,
+        path: &Path,
+        expected_kind: DetectedNhmlSidecarKind,
+        raw_line: &str,
+    ) -> Result<(), MuxError> {
         let Some(tag) =
             parse_xml_tag(raw_line).map_err(|message| invalid_sidecar(path, &message))?
         else {
-            continue;
+            return Ok(());
         };
         let name = tag.name.as_str();
         if tag.closing {
             if name.eq_ignore_ascii_case("source") {
-                let Some(source) = pending_source.take() else {
+                let Some(source) = self.pending_source.take() else {
                     return Err(invalid_sidecar(
                         path,
                         "encountered `</source>` without `<source>`",
                     ));
                 };
-                insert_source_spec(path, &mut source_specs, source)?;
-                continue;
+                insert_source_spec(path, &mut self.source_specs, source)?;
+                return Ok(());
             }
             if name.eq_ignore_ascii_case("track") {
-                let Some(track) = pending_track.take() else {
+                let Some(track) = self.pending_track.take() else {
                     return Err(invalid_sidecar(
                         path,
                         "encountered `</track>` without `<track>`",
                     ));
                 };
-                tracks.push(track);
-                continue;
+                self.tracks.push(track);
+                return Ok(());
             }
-            continue;
+            return Ok(());
         }
 
         if name.eq_ignore_ascii_case("nhml") || name.eq_ignore_ascii_case("nhmlstream") {
-            root_kind = Some(DetectedNhmlSidecarKind::Nhml);
-            saw_root = true;
-            continue;
+            self.root_kind = Some(DetectedNhmlSidecarKind::Nhml);
+            self.saw_root = true;
+            return Ok(());
         }
         if name.eq_ignore_ascii_case("nhnt") || name.eq_ignore_ascii_case("nhntstream") {
-            root_kind = Some(DetectedNhmlSidecarKind::Nhnt);
-            saw_root = true;
-            continue;
+            self.root_kind = Some(DetectedNhmlSidecarKind::Nhnt);
+            self.saw_root = true;
+            return Ok(());
         }
-        if !saw_root {
+        if !self.saw_root {
             return Err(invalid_sidecar(path, "missing NHML/NHNT root element"));
         }
 
         if name.eq_ignore_ascii_case("source") {
             let source = parse_source_tag(path, &tag.attrs)?;
             if tag.self_closing {
-                insert_source_spec(path, &mut source_specs, source)?;
-            } else if pending_source.replace(source).is_some() {
+                insert_source_spec(path, &mut self.source_specs, source)?;
+            } else if self.pending_source.replace(source).is_some() {
                 return Err(invalid_sidecar(
                     path,
                     "encountered nested `<source>` elements",
                 ));
             }
-            continue;
+            return Ok(());
         }
 
         if name.eq_ignore_ascii_case("segment") {
-            let Some(source) = pending_source.as_mut() else {
+            let Some(source) = self.pending_source.as_mut() else {
                 return Err(invalid_sidecar(
                     path,
                     "encountered `<segment>` outside `<source>`",
                 ));
             };
             source.segments.push(parse_segment_tag(path, &tag.attrs)?);
-            continue;
+            return Ok(());
         }
 
         match expected_kind {
@@ -198,87 +235,94 @@ fn parse_nhml_source_bytes(
                     let descriptor = parse_track_descriptor(path, &tag.attrs)?;
                     let track = track_from_descriptor(descriptor, Vec::new());
                     if tag.self_closing {
-                        tracks.push(track);
-                    } else if pending_track.replace(track).is_some() {
+                        self.tracks.push(track);
+                    } else if self.pending_track.replace(track).is_some() {
                         return Err(invalid_sidecar(
                             path,
                             "encountered nested `<track>` elements",
                         ));
                     }
-                    continue;
+                    return Ok(());
                 }
                 if name.eq_ignore_ascii_case("sample") {
-                    let Some(track) = pending_track.as_mut() else {
+                    let Some(track) = self.pending_track.as_mut() else {
                         return Err(invalid_sidecar(
                             path,
                             "encountered `<sample>` outside `<track>`",
                         ));
                     };
                     track.samples.push(parse_sample_tag(path, &tag.attrs)?);
-                    continue;
+                    return Ok(());
                 }
             }
             DetectedNhmlSidecarKind::Nhnt => {
                 if name.eq_ignore_ascii_case("track") {
                     let descriptor = parse_track_descriptor(path, &tag.attrs)?;
-                    packet_tracks.insert(descriptor.track_id, descriptor);
-                    continue;
+                    self.packet_tracks.insert(descriptor.track_id, descriptor);
+                    return Ok(());
                 }
                 if name.eq_ignore_ascii_case("packet") || name.eq_ignore_ascii_case("nhntsample") {
                     let (track_id, packet_index, sample) = parse_packet_tag(path, &tag.attrs)?;
-                    packet_samples
+                    self.packet_samples
                         .entry(track_id)
                         .or_default()
                         .push((packet_index, sample));
-                    continue;
+                    return Ok(());
                 }
             }
         }
+        Ok(())
     }
 
-    let Some(actual_kind) = root_kind else {
-        return Err(invalid_sidecar(path, "missing NHML/NHNT root element"));
-    };
-    if actual_kind != expected_kind {
-        return Err(invalid_sidecar(
-            path,
-            "sidecar root does not match the detected sidecar kind",
-        ));
-    }
-    if pending_source.is_some() {
-        return Err(invalid_sidecar(path, "unterminated `<source>` element"));
-    }
-    if pending_track.is_some() {
-        return Err(invalid_sidecar(path, "unterminated `<track>` element"));
-    }
-
-    if expected_kind == DetectedNhmlSidecarKind::Nhnt {
-        for (track_id, descriptor) in packet_tracks {
-            let Some(mut samples) = packet_samples.remove(&track_id) else {
-                return Err(invalid_sidecar(
-                    path,
-                    &format!("NHNT track {track_id} does not carry any packet entries"),
-                ));
-            };
-            samples.sort_by_key(|(packet_index, _)| *packet_index);
-            let samples = samples.into_iter().map(|(_, sample)| sample).collect();
-            tracks.push(track_from_descriptor(descriptor, samples));
-        }
-        if !packet_samples.is_empty() {
-            let missing_track_id = *packet_samples.keys().next().unwrap();
+    fn finish(
+        mut self,
+        path: &Path,
+        expected_kind: DetectedNhmlSidecarKind,
+    ) -> Result<ParsedNhmlSource, MuxError> {
+        let Some(actual_kind) = self.root_kind else {
+            return Err(invalid_sidecar(path, "missing NHML/NHNT root element"));
+        };
+        if actual_kind != expected_kind {
             return Err(invalid_sidecar(
                 path,
-                &format!(
-                    "NHNT packet track {missing_track_id} is missing the required `<track ... />` metadata entry"
-                ),
+                "sidecar root does not match the detected sidecar kind",
             ));
         }
-    }
+        if self.pending_source.is_some() {
+            return Err(invalid_sidecar(path, "unterminated `<source>` element"));
+        }
+        if self.pending_track.is_some() {
+            return Err(invalid_sidecar(path, "unterminated `<track>` element"));
+        }
 
-    Ok(ParsedNhmlSource {
-        source_specs,
-        tracks,
-    })
+        if expected_kind == DetectedNhmlSidecarKind::Nhnt {
+            for (track_id, descriptor) in self.packet_tracks {
+                let Some(mut samples) = self.packet_samples.remove(&track_id) else {
+                    return Err(invalid_sidecar(
+                        path,
+                        &format!("NHNT track {track_id} does not carry any packet entries"),
+                    ));
+                };
+                samples.sort_by_key(|(packet_index, _)| *packet_index);
+                let samples = samples.into_iter().map(|(_, sample)| sample).collect();
+                self.tracks.push(track_from_descriptor(descriptor, samples));
+            }
+            if !self.packet_samples.is_empty() {
+                let missing_track_id = *self.packet_samples.keys().next().unwrap();
+                return Err(invalid_sidecar(
+                    path,
+                    &format!(
+                        "NHNT packet track {missing_track_id} is missing the required `<track ... />` metadata entry"
+                    ),
+                ));
+            }
+        }
+
+        Ok(ParsedNhmlSource {
+            source_specs: self.source_specs,
+            tracks: self.tracks,
+        })
+    }
 }
 
 fn parse_source_tag(

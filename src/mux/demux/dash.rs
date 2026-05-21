@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "async")]
 use tokio::fs as tokio_fs;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
 
 use super::super::MuxError;
 use super::super::import::{
@@ -113,12 +116,33 @@ enum DashXmlEvent {
     Text(String),
 }
 
+enum DashXmlEventPoll {
+    Event(DashXmlEvent),
+    NeedMore,
+    End,
+}
+
 #[derive(Clone, Copy)]
 enum PendingBaseUrlTarget {
     Global,
     Period,
     Adaptation,
     Representation,
+}
+
+#[derive(Default)]
+struct DashManifestBuilder {
+    saw_root: bool,
+    period_open: bool,
+    current_period_plans: Vec<DashRepresentationPlan>,
+    periods: Vec<ParsedDashPeriodPlan>,
+    current_period_start_millis: u64,
+    global_base_url: Option<String>,
+    period_base_url: Option<String>,
+    adaptation_base_url: Option<String>,
+    adaptation_defaults: Option<PendingRepresentationDefaults>,
+    representation: Option<PendingRepresentation>,
+    pending_base_url: Option<(PendingBaseUrlTarget, String)>,
 }
 
 pub(in crate::mux) fn looks_like_dash_manifest_path(path: &Path, prefix: &[u8]) -> bool {
@@ -137,8 +161,9 @@ pub(in crate::mux) fn looks_like_dash_manifest_path(path: &Path, prefix: &[u8]) 
 }
 
 pub(in crate::mux) fn parse_dash_source_sync(path: &Path) -> Result<ParsedDashSource, MuxError> {
-    let bytes = fs::read(path)?;
-    let manifest = parse_dash_source_bytes(path, &bytes)?;
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let manifest = parse_dash_source_reader_sync(path, &mut reader)?;
     let mut periods = Vec::with_capacity(manifest.periods.len());
     for period in manifest.periods {
         let mut representation_sources = Vec::with_capacity(period.representations.len());
@@ -157,8 +182,9 @@ pub(in crate::mux) fn parse_dash_source_sync(path: &Path) -> Result<ParsedDashSo
 pub(in crate::mux) async fn parse_dash_source_async(
     path: &Path,
 ) -> Result<ParsedDashSource, MuxError> {
-    let bytes = tokio_fs::read(path).await?;
-    let manifest = parse_dash_source_bytes(path, &bytes)?;
+    let file = tokio_fs::File::open(path).await?;
+    let mut reader = AsyncBufReader::new(file);
+    let manifest = parse_dash_source_reader_async(path, &mut reader).await?;
     let mut periods = Vec::with_capacity(manifest.periods.len());
     for period in manifest.periods {
         let mut representation_sources = Vec::with_capacity(period.representations.len());
@@ -173,195 +199,274 @@ pub(in crate::mux) async fn parse_dash_source_async(
     Ok(ParsedDashSource { periods })
 }
 
-fn parse_dash_source_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedDashManifest, MuxError> {
-    let mut text = std::str::from_utf8(bytes)
-        .map_err(|_| invalid_dash_manifest(path, "manifest bytes are not valid UTF-8"))?;
-    if let Some(stripped) = text.strip_prefix('\u{FEFF}') {
-        text = stripped;
-    }
-    let mut saw_root = false;
-    let mut period_open = false;
-    let mut current_period_plans = Vec::new();
-    let mut periods = Vec::new();
-    let mut current_period_start_millis = 0_u64;
-    let mut global_base_url = None::<String>;
-    let mut period_base_url = None::<String>;
-    let mut adaptation_base_url = None::<String>;
-    let mut adaptation_defaults = None::<PendingRepresentationDefaults>;
-    let mut representation = None::<PendingRepresentation>;
-    let mut pending_base_url = None::<(PendingBaseUrlTarget, String)>;
+fn parse_dash_source_reader_sync<R>(
+    path: &Path,
+    reader: &mut R,
+) -> Result<ParsedDashManifest, MuxError>
+where
+    R: BufRead,
+{
+    let mut builder = DashManifestBuilder::default();
+    let mut buffer = String::new();
+    let mut line = String::new();
     let mut cursor = 0usize;
-    while let Some(event) = next_xml_event(text, &mut cursor)
+    let mut first_line = true;
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|_| invalid_dash_manifest(path, "manifest bytes are not valid UTF-8"))?;
+        let eof = bytes_read == 0;
+        if !line.is_empty() {
+            let rendered = if first_line {
+                first_line = false;
+                line.strip_prefix('\u{FEFF}').unwrap_or(&line)
+            } else {
+                &line
+            };
+            buffer.push_str(rendered);
+        }
+        consume_dash_buffer(path, &mut builder, &mut buffer, &mut cursor, eof)?;
+        if eof {
+            break;
+        }
+    }
+    builder.finish(path)
+}
+
+#[cfg(feature = "async")]
+async fn parse_dash_source_reader_async<R>(
+    path: &Path,
+    reader: &mut R,
+) -> Result<ParsedDashManifest, MuxError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut builder = DashManifestBuilder::default();
+    let mut buffer = String::new();
+    let mut line = String::new();
+    let mut cursor = 0usize;
+    let mut first_line = true;
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|_| invalid_dash_manifest(path, "manifest bytes are not valid UTF-8"))?;
+        let eof = bytes_read == 0;
+        if !line.is_empty() {
+            let rendered = if first_line {
+                first_line = false;
+                line.strip_prefix('\u{FEFF}').unwrap_or(&line)
+            } else {
+                &line
+            };
+            buffer.push_str(rendered);
+        }
+        consume_dash_buffer(path, &mut builder, &mut buffer, &mut cursor, eof)?;
+        if eof {
+            break;
+        }
+    }
+    builder.finish(path)
+}
+
+fn consume_dash_buffer(
+    path: &Path,
+    builder: &mut DashManifestBuilder,
+    buffer: &mut String,
+    cursor: &mut usize,
+    eof: bool,
+) -> Result<(), MuxError> {
+    while let DashXmlEventPoll::Event(event) = poll_next_xml_event(buffer, cursor, eof)
         .map_err(|message| invalid_dash_manifest(path, &message))?
     {
+        builder.push_event(path, event)?;
+    }
+    if *cursor == buffer.len() {
+        buffer.clear();
+        *cursor = 0;
+    } else if *cursor > 8_192 || eof {
+        buffer.drain(..*cursor);
+        *cursor = 0;
+    }
+    Ok(())
+}
+
+impl DashManifestBuilder {
+    fn push_event(&mut self, path: &Path, event: DashXmlEvent) -> Result<(), MuxError> {
         let DashXmlEvent::Tag(tag) = event else {
             if let DashXmlEvent::Text(value) = event
-                && let Some((_, pending_text)) = pending_base_url.as_mut()
+                && let Some((_, pending_text)) = self.pending_base_url.as_mut()
             {
                 pending_text.push_str(&value);
             }
-            continue;
+            return Ok(());
         };
         let name = tag.name.as_str();
         if tag.closing {
             if name.eq_ignore_ascii_case("BaseURL") {
-                if let Some((target, value)) = pending_base_url.take() {
+                if let Some((target, value)) = self.pending_base_url.take() {
                     let value = value.trim().to_string();
                     match target {
-                        PendingBaseUrlTarget::Global => global_base_url = Some(value),
-                        PendingBaseUrlTarget::Period => period_base_url = Some(value),
-                        PendingBaseUrlTarget::Adaptation => adaptation_base_url = Some(value),
+                        PendingBaseUrlTarget::Global => self.global_base_url = Some(value),
+                        PendingBaseUrlTarget::Period => self.period_base_url = Some(value),
+                        PendingBaseUrlTarget::Adaptation => self.adaptation_base_url = Some(value),
                         PendingBaseUrlTarget::Representation => {
-                            if let Some(pending) = representation.as_mut() {
+                            if let Some(pending) = self.representation.as_mut() {
                                 pending.base_url = Some(value);
                             }
                         }
                     }
                 }
-                continue;
+                return Ok(());
             }
             if name.eq_ignore_ascii_case("Representation") {
-                let Some(pending) = representation.take() else {
+                let Some(pending) = self.representation.take() else {
                     return Err(invalid_dash_manifest(
                         path,
                         "encountered `</Representation>` without `<Representation>`",
                     ));
                 };
-                current_period_plans.push(build_representation_plan(
+                self.current_period_plans.push(build_representation_plan(
                     path,
-                    &global_base_url,
-                    &period_base_url,
-                    &adaptation_base_url,
+                    &self.global_base_url,
+                    &self.period_base_url,
+                    &self.adaptation_base_url,
                     pending,
                 )?);
-                continue;
+                return Ok(());
             }
             if name.eq_ignore_ascii_case("AdaptationSet") {
-                adaptation_base_url = None;
-                adaptation_defaults = None;
-                continue;
+                self.adaptation_base_url = None;
+                self.adaptation_defaults = None;
+                return Ok(());
             }
             if name.eq_ignore_ascii_case("Period") {
-                if !current_period_plans.is_empty() {
-                    periods.push(ParsedDashPeriodPlan {
-                        start_millis: current_period_start_millis,
-                        representations: std::mem::take(&mut current_period_plans),
+                if !self.current_period_plans.is_empty() {
+                    self.periods.push(ParsedDashPeriodPlan {
+                        start_millis: self.current_period_start_millis,
+                        representations: std::mem::take(&mut self.current_period_plans),
                     });
                 }
-                period_base_url = None;
-                adaptation_base_url = None;
-                adaptation_defaults = None;
-                current_period_start_millis = 0;
-                period_open = false;
-                continue;
+                self.period_base_url = None;
+                self.adaptation_base_url = None;
+                self.adaptation_defaults = None;
+                self.current_period_start_millis = 0;
+                self.period_open = false;
+                return Ok(());
             }
-            continue;
+            return Ok(());
         }
 
         if name.eq_ignore_ascii_case("BaseURL") {
-            let target = if representation.is_some() {
+            let target = if self.representation.is_some() {
                 PendingBaseUrlTarget::Representation
-            } else if adaptation_defaults.is_some() {
+            } else if self.adaptation_defaults.is_some() {
                 PendingBaseUrlTarget::Adaptation
-            } else if period_open {
+            } else if self.period_open {
                 PendingBaseUrlTarget::Period
             } else {
                 PendingBaseUrlTarget::Global
             };
             if tag.self_closing {
                 match target {
-                    PendingBaseUrlTarget::Global => global_base_url = Some(String::new()),
-                    PendingBaseUrlTarget::Period => period_base_url = Some(String::new()),
-                    PendingBaseUrlTarget::Adaptation => adaptation_base_url = Some(String::new()),
+                    PendingBaseUrlTarget::Global => self.global_base_url = Some(String::new()),
+                    PendingBaseUrlTarget::Period => self.period_base_url = Some(String::new()),
+                    PendingBaseUrlTarget::Adaptation => {
+                        self.adaptation_base_url = Some(String::new())
+                    }
                     PendingBaseUrlTarget::Representation => {
-                        if let Some(pending) = representation.as_mut() {
+                        if let Some(pending) = self.representation.as_mut() {
                             pending.base_url = Some(String::new());
                         }
                     }
                 }
             } else {
-                pending_base_url = Some((target, String::new()));
+                self.pending_base_url = Some((target, String::new()));
             }
-            continue;
+            return Ok(());
         }
 
         if name.eq_ignore_ascii_case("MPD") {
-            saw_root = true;
-            continue;
+            self.saw_root = true;
+            return Ok(());
         }
-        if !saw_root {
+        if !self.saw_root {
             if name.eq_ignore_ascii_case("Period") {
-                saw_root = true;
+                self.saw_root = true;
             } else {
                 return Err(invalid_dash_manifest(path, "missing MPD root element"));
             }
         }
         if name.eq_ignore_ascii_case("Period") {
-            if period_open && !current_period_plans.is_empty() {
-                periods.push(ParsedDashPeriodPlan {
-                    start_millis: current_period_start_millis,
-                    representations: std::mem::take(&mut current_period_plans),
+            if self.period_open && !self.current_period_plans.is_empty() {
+                self.periods.push(ParsedDashPeriodPlan {
+                    start_millis: self.current_period_start_millis,
+                    representations: std::mem::take(&mut self.current_period_plans),
                 });
             }
-            period_base_url = None;
-            period_open = true;
-            adaptation_base_url = None;
-            adaptation_defaults = None;
-            current_period_start_millis = attrs_optional_string(path, &tag.attrs, "start")?
+            self.period_base_url = None;
+            self.period_open = true;
+            self.adaptation_base_url = None;
+            self.adaptation_defaults = None;
+            self.current_period_start_millis = attrs_optional_string(path, &tag.attrs, "start")?
                 .map(|value| parse_dash_duration_millis(path, &value))
                 .transpose()?
                 .unwrap_or(0);
-            continue;
+            return Ok(());
         }
         if name.eq_ignore_ascii_case("AdaptationSet") {
-            if !period_open {
+            if !self.period_open {
                 return Err(invalid_dash_manifest(
                     path,
                     "encountered `<AdaptationSet>` outside `<Period>`",
                 ));
             }
-            adaptation_defaults = Some(PendingRepresentationDefaults::default());
-            continue;
+            self.adaptation_defaults = Some(PendingRepresentationDefaults::default());
+            return Ok(());
         }
         if name.eq_ignore_ascii_case("Representation") {
-            if !period_open {
+            if !self.period_open {
                 return Err(invalid_dash_manifest(
                     path,
                     "encountered `<Representation>` outside `<Period>`",
                 ));
             }
-            if representation.is_some() {
+            if self.representation.is_some() {
                 return Err(invalid_dash_manifest(
                     path,
                     "nested `<Representation>` elements are not supported",
                 ));
             }
-            let mut pending = PendingRepresentation::from_defaults(adaptation_defaults.as_ref());
+            let mut pending =
+                PendingRepresentation::from_defaults(self.adaptation_defaults.as_ref());
             pending.representation_id = attrs_optional_string(path, &tag.attrs, "id")?;
             pending.bandwidth = attrs_optional_usize(path, &tag.attrs, "bandwidth")?;
-            representation = Some(pending);
+            self.representation = Some(pending);
             if tag.self_closing {
-                let pending = representation.take().unwrap();
-                current_period_plans.push(build_representation_plan(
+                let pending = self.representation.take().unwrap();
+                self.current_period_plans.push(build_representation_plan(
                     path,
-                    &global_base_url,
-                    &period_base_url,
-                    &adaptation_base_url,
+                    &self.global_base_url,
+                    &self.period_base_url,
+                    &self.adaptation_base_url,
                     pending,
                 )?);
             }
-            continue;
+            return Ok(());
         }
-        let Some(mut pending) = representation
+        let Some(mut pending) = self
+            .representation
             .as_mut()
             .map(PendingDashTarget::Representation)
             .or_else(|| {
-                adaptation_defaults
+                self.adaptation_defaults
                     .as_mut()
                     .map(PendingDashTarget::AdaptationDefaults)
             })
         else {
-            continue;
+            return Ok(());
         };
         if name.eq_ignore_ascii_case("SegmentTemplate") {
             pending.set_template_initialization(attrs_optional_string(
@@ -373,7 +478,7 @@ fn parse_dash_source_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedDashManife
             pending.set_template_start_number(
                 attrs_optional_usize(path, &tag.attrs, "startNumber")?.unwrap_or(1),
             );
-            continue;
+            return Ok(());
         }
         if name.eq_ignore_ascii_case("S") {
             let duration = attrs_optional_u64(path, &tag.attrs, "d")?;
@@ -404,11 +509,11 @@ fn parse_dash_source_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedDashManife
                     pending.set_template_next_time(None);
                 }
             }
-            continue;
+            return Ok(());
         }
         if name.eq_ignore_ascii_case("Initialization") {
             pending.set_list_initialization(attrs_optional_string(path, &tag.attrs, "sourceURL")?);
-            continue;
+            return Ok(());
         }
         if name.eq_ignore_ascii_case("SegmentURL") {
             let Some(media) = attrs_optional_string(path, &tag.attrs, "media")? else {
@@ -419,42 +524,48 @@ fn parse_dash_source_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedDashManife
             };
             pending.push_list_media(media);
         }
+        Ok(())
     }
 
-    if !saw_root {
-        return Err(invalid_dash_manifest(path, "missing MPD root element"));
+    fn finish(mut self, path: &Path) -> Result<ParsedDashManifest, MuxError> {
+        if !self.saw_root {
+            return Err(invalid_dash_manifest(path, "missing MPD root element"));
+        }
+        if let Some(pending) = self.representation.take() {
+            self.current_period_plans.push(build_representation_plan(
+                path,
+                &self.global_base_url,
+                &self.period_base_url,
+                &self.adaptation_base_url,
+                pending,
+            )?);
+        }
+        if !self.current_period_plans.is_empty() {
+            self.periods.push(ParsedDashPeriodPlan {
+                start_millis: self.current_period_start_millis,
+                representations: self.current_period_plans,
+            });
+        }
+        if self.periods.is_empty() {
+            return Err(invalid_dash_manifest(
+                path,
+                "MPD did not describe any local representation-backed sources",
+            ));
+        }
+        if self
+            .periods
+            .iter()
+            .any(|period| period.representations.is_empty())
+        {
+            return Err(invalid_dash_manifest(
+                path,
+                "one MPD Period did not describe any local representation-backed sources",
+            ));
+        }
+        Ok(ParsedDashManifest {
+            periods: self.periods,
+        })
     }
-    if let Some(pending) = representation.take() {
-        current_period_plans.push(build_representation_plan(
-            path,
-            &global_base_url,
-            &period_base_url,
-            &adaptation_base_url,
-            pending,
-        )?);
-    }
-    if !current_period_plans.is_empty() {
-        periods.push(ParsedDashPeriodPlan {
-            start_millis: current_period_start_millis,
-            representations: current_period_plans,
-        });
-    }
-    if periods.is_empty() {
-        return Err(invalid_dash_manifest(
-            path,
-            "MPD did not describe any local representation-backed sources",
-        ));
-    }
-    if periods
-        .iter()
-        .any(|period| period.representations.is_empty())
-    {
-        return Err(invalid_dash_manifest(
-            path,
-            "one MPD Period did not describe any local representation-backed sources",
-        ));
-    }
-    Ok(ParsedDashManifest { periods })
 }
 
 fn parse_dash_duration_millis(path: &Path, value: &str) -> Result<u64, MuxError> {
@@ -1146,38 +1257,69 @@ fn resolve_dash_local_file_uri(uri: &str) -> Option<PathBuf> {
     }
 }
 
-fn next_xml_event(input: &str, cursor: &mut usize) -> Result<Option<DashXmlEvent>, String> {
+fn poll_next_xml_event(
+    input: &str,
+    cursor: &mut usize,
+    eof: bool,
+) -> Result<DashXmlEventPoll, String> {
     while *cursor < input.len() {
         let rest = &input[*cursor..];
         if rest.starts_with("<?") {
             let Some(end) = rest.find("?>") else {
-                return Err("unterminated XML declaration in DASH manifest".to_string());
+                return if eof {
+                    Err("unterminated XML declaration in DASH manifest".to_string())
+                } else {
+                    Ok(DashXmlEventPoll::NeedMore)
+                };
             };
             *cursor += end + 2;
             continue;
         }
         if rest.starts_with("<!--") {
             let Some(end) = rest.find("-->") else {
-                return Err("unterminated XML comment in DASH manifest".to_string());
+                return if eof {
+                    Err("unterminated XML comment in DASH manifest".to_string())
+                } else {
+                    Ok(DashXmlEventPoll::NeedMore)
+                };
             };
             *cursor += end + 3;
             continue;
         }
         if rest.starts_with('<') {
-            let tag_end = find_xml_tag_end(rest)?;
+            let tag_end = match find_xml_tag_end(rest) {
+                Ok(tag_end) => tag_end,
+                Err(message) => {
+                    return if eof {
+                        Err(message)
+                    } else {
+                        Ok(DashXmlEventPoll::NeedMore)
+                    };
+                }
+            };
             let tag = parse_xml_tag(&rest[..=tag_end])?;
             *cursor += tag_end + 1;
-            return Ok(Some(DashXmlEvent::Tag(tag)));
+            return Ok(DashXmlEventPoll::Event(DashXmlEvent::Tag(tag)));
         }
-        let next_tag = rest.find('<').unwrap_or(rest.len());
+        let Some(next_tag) = rest.find('<') else {
+            if eof {
+                let text = xml_unescape_attr(rest)?;
+                *cursor = input.len();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                return Ok(DashXmlEventPoll::Event(DashXmlEvent::Text(text)));
+            }
+            return Ok(DashXmlEventPoll::NeedMore);
+        };
         let text = xml_unescape_attr(&rest[..next_tag])?;
         *cursor += next_tag;
         if text.trim().is_empty() {
             continue;
         }
-        return Ok(Some(DashXmlEvent::Text(text)));
+        return Ok(DashXmlEventPoll::Event(DashXmlEvent::Text(text)));
     }
-    Ok(None)
+    Ok(DashXmlEventPoll::End)
 }
 
 fn find_xml_tag_end(text: &str) -> Result<usize, String> {

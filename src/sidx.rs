@@ -18,6 +18,8 @@ use crate::boxes::iso14496_12::{
 };
 use crate::codec::{CodecBox, CodecError, ImmutableBox, MutableBox, marshal, unmarshal};
 use crate::extract::{ExtractError, extract_box_as, extract_boxes};
+#[cfg(feature = "async")]
+use crate::extract::{extract_box_as_async, extract_boxes_async};
 use crate::header::{BoxInfo, HeaderError, LARGE_HEADER_SIZE, SMALL_HEADER_SIZE};
 use crate::walk::BoxPath;
 #[cfg(feature = "async")]
@@ -826,8 +828,59 @@ pub async fn analyze_top_level_sidx_update_async<R>(
 where
     R: AsyncReadSeek,
 {
-    let input = read_all_bytes_async(reader).await?;
-    analyze_top_level_sidx_update_bytes(&input)
+    let root_boxes = scan_root_boxes_async(reader).await?;
+    let has_fragment_markers = root_boxes
+        .iter()
+        .any(|info| matches!(info.box_type(), MOOF | STYP | SIDX));
+
+    let moov = root_boxes
+        .iter()
+        .find(|info| info.box_type() == MOOV)
+        .copied()
+        .ok_or(SidxAnalysisError::MissingMovieBox)?;
+
+    let has_mvex = !extract_boxes_async(reader, Some(&moov), &[BoxPath::from([MVEX])])
+        .await?
+        .is_empty();
+    if !has_fragment_markers && !has_mvex {
+        return Err(SidxAnalysisError::NotFragmented);
+    }
+    if !has_mvex {
+        return Err(SidxAnalysisError::MissingMovieExtendsBox);
+    }
+
+    let init = analyze_init_segment_async(reader, &moov).await?;
+    let (segments, existing_top_level_sidxs) =
+        group_media_segments_async(reader, &root_boxes).await?;
+    if segments.is_empty() {
+        return Err(SidxAnalysisError::MissingMediaSegments);
+    }
+
+    let mut analyzed_segments = Vec::with_capacity(segments.len());
+    for (segment_index, segment) in segments.iter().enumerate() {
+        analyzed_segments.push(
+            analyze_segment_async(
+                reader,
+                segment_index + 1,
+                segment,
+                init.timing_track.track_id,
+                &init.trex,
+            )
+            .await?,
+        );
+    }
+
+    Ok(TopLevelSidxUpdateAnalysis {
+        timing_track: init.timing_track,
+        placement: TopLevelSidxPlacement {
+            insertion_box: segments[0].first_box,
+            existing_top_level_sidxs: existing_top_level_sidxs
+                .into_iter()
+                .map(|entry| entry.public)
+                .collect(),
+        },
+        segments: analyzed_segments,
+    })
 }
 
 /// Builds a deterministic top-level `sidx` refresh plan from analyzed file data.
@@ -1101,6 +1154,24 @@ where
     Ok(boxes)
 }
 
+#[cfg(feature = "async")]
+async fn scan_root_boxes_async<R>(reader: &mut R) -> Result<Vec<BoxInfo>, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let end = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(0)).await?;
+
+    let mut boxes = Vec::new();
+    while reader.stream_position().await? < end {
+        let info = BoxInfo::read_async(reader).await?;
+        boxes.push(info);
+        info.seek_to_end_async(reader).await?;
+    }
+
+    Ok(boxes)
+}
+
 fn analyze_init_segment<R>(
     reader: &mut R,
     moov: &BoxInfo,
@@ -1128,6 +1199,45 @@ where
 
     let timing_track = select_timing_track(&tracks)?;
     let trex = extract_box_as::<_, Trex>(reader, Some(&mvex), BoxPath::from([TREX]))?
+        .into_iter()
+        .find(|entry| entry.track_id == timing_track.track_id)
+        .ok_or(SidxAnalysisError::MissingTrackExtends {
+            track_id: timing_track.track_id,
+        })?;
+
+    Ok(InitAnalysis { timing_track, trex })
+}
+
+#[cfg(feature = "async")]
+async fn analyze_init_segment_async<R>(
+    reader: &mut R,
+    moov: &BoxInfo,
+) -> Result<InitAnalysis, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let mvex = require_single_child_info_async(reader, moov, MVEX).await?;
+    let traks = extract_boxes_async(reader, Some(moov), &[BoxPath::from([TRAK])]).await?;
+    if traks.is_empty() {
+        return Err(SidxAnalysisError::MissingTracks);
+    }
+
+    let mut tracks = Vec::with_capacity(traks.len());
+    for trak in traks {
+        let tkhd = require_single_child_as_async::<_, Tkhd>(reader, &trak, TKHD).await?;
+        let mdhd =
+            require_single_nested_child_as_async::<_, Mdhd>(reader, &trak, MDIA, MDHD).await?;
+        let handler_type = extract_optional_handler_type_async(reader, &trak).await?;
+        tracks.push(InitTrackInfo {
+            track_id: tkhd.track_id,
+            handler_type,
+            timescale: mdhd.timescale,
+        });
+    }
+
+    let timing_track = select_timing_track(&tracks)?;
+    let trex = extract_box_as_async::<_, Trex>(reader, Some(&mvex), BoxPath::from([TREX]))
+        .await?
         .into_iter()
         .find(|entry| entry.track_id == timing_track.track_id)
         .ok_or(SidxAnalysisError::MissingTrackExtends {
@@ -1176,6 +1286,32 @@ where
     }
 }
 
+#[cfg(feature = "async")]
+async fn extract_optional_handler_type_async<R>(
+    reader: &mut R,
+    trak: &BoxInfo,
+) -> Result<Option<FourCc>, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let handlers = extract_box_as_async::<_, crate::boxes::iso14496_12::Hdlr>(
+        reader,
+        Some(trak),
+        BoxPath::from([MDIA, HDLR]),
+    )
+    .await?;
+    match handlers.len() {
+        0 => Ok(None),
+        1 => Ok(Some(handlers[0].handler_type)),
+        count => Err(SidxAnalysisError::UnexpectedChildCount {
+            parent_box_type: trak.box_type(),
+            parent_offset: trak.offset(),
+            child_box_type: HDLR,
+            count,
+        }),
+    }
+}
+
 fn require_single_child_info<R>(
     reader: &mut R,
     parent: &BoxInfo,
@@ -1185,6 +1321,33 @@ where
     R: Read + Seek,
 {
     let infos = extract_boxes(reader, Some(parent), &[BoxPath::from([child_box_type])])?;
+    match infos.len() {
+        0 => Err(SidxAnalysisError::MissingRequiredChild {
+            parent_box_type: parent.box_type(),
+            parent_offset: parent.offset(),
+            child_box_type,
+        }),
+        1 => Ok(infos[0]),
+        count => Err(SidxAnalysisError::UnexpectedChildCount {
+            parent_box_type: parent.box_type(),
+            parent_offset: parent.offset(),
+            child_box_type,
+            count,
+        }),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn require_single_child_info_async<R>(
+    reader: &mut R,
+    parent: &BoxInfo,
+    child_box_type: FourCc,
+) -> Result<BoxInfo, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let infos =
+        extract_boxes_async(reader, Some(parent), &[BoxPath::from([child_box_type])]).await?;
     match infos.len() {
         0 => Err(SidxAnalysisError::MissingRequiredChild {
             parent_box_type: parent.box_type(),
@@ -1211,6 +1374,34 @@ where
     B: CodecBox + Clone + 'static,
 {
     let boxes = extract_box_as::<_, B>(reader, Some(parent), BoxPath::from([child_box_type]))?;
+    match boxes.len() {
+        0 => Err(SidxAnalysisError::MissingRequiredChild {
+            parent_box_type: parent.box_type(),
+            parent_offset: parent.offset(),
+            child_box_type,
+        }),
+        1 => Ok(boxes.into_iter().next().unwrap()),
+        count => Err(SidxAnalysisError::UnexpectedChildCount {
+            parent_box_type: parent.box_type(),
+            parent_offset: parent.offset(),
+            child_box_type,
+            count,
+        }),
+    }
+}
+
+#[cfg(feature = "async")]
+async fn require_single_child_as_async<R, B>(
+    reader: &mut R,
+    parent: &BoxInfo,
+    child_box_type: FourCc,
+) -> Result<B, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+    B: CodecBox + Clone + 'static,
+{
+    let boxes =
+        extract_box_as_async::<_, B>(reader, Some(parent), BoxPath::from([child_box_type])).await?;
     match boxes.len() {
         0 => Err(SidxAnalysisError::MissingRequiredChild {
             parent_box_type: parent.box_type(),
@@ -1258,6 +1449,39 @@ where
     }
 }
 
+#[cfg(feature = "async")]
+async fn require_single_nested_child_as_async<R, B>(
+    reader: &mut R,
+    parent: &BoxInfo,
+    intermediate_box_type: FourCc,
+    child_box_type: FourCc,
+) -> Result<B, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+    B: CodecBox + Clone + 'static,
+{
+    let boxes = extract_box_as_async::<_, B>(
+        reader,
+        Some(parent),
+        BoxPath::from([intermediate_box_type, child_box_type]),
+    )
+    .await?;
+    match boxes.len() {
+        0 => Err(SidxAnalysisError::MissingRequiredChild {
+            parent_box_type: parent.box_type(),
+            parent_offset: parent.offset(),
+            child_box_type,
+        }),
+        1 => Ok(boxes.into_iter().next().unwrap()),
+        count => Err(SidxAnalysisError::UnexpectedChildCount {
+            parent_box_type: parent.box_type(),
+            parent_offset: parent.offset(),
+            child_box_type,
+            count,
+        }),
+    }
+}
+
 fn group_media_segments<R>(
     reader: &mut R,
     root_boxes: &[BoxInfo],
@@ -1288,6 +1512,78 @@ where
                     && segments.last().is_some_and(is_pending_styp_prelude_segment)
                 {
                     let decoded = read_payload_as::<_, Sidx>(reader, info)?;
+                    let internal = analyze_existing_top_level_sidx(info, &decoded)?;
+                    existing_top_level_sidxs.push(internal);
+                    segments.pop();
+                } else if previous_box_type == Some(MDAT) {
+                    start_segment(&mut segments, *info);
+                    let segment = segments.last_mut().unwrap();
+                    segment.segment_sidx_count = 1;
+                    add_segment_size(segment, info.size(), "media segment size")?;
+                } else if let Some(segment) = segments.last_mut() {
+                    if segment.segment_sidx_count == 0 {
+                        add_segment_size(segment, info.size(), "media segment size")?;
+                    }
+                    segment.segment_sidx_count += 1;
+                }
+            }
+            EMSG | MOOF => {
+                if should_start_segment(info.offset(), segments.len(), &existing_top_level_sidxs) {
+                    start_segment(&mut segments, *info);
+                }
+
+                if let Some(segment) = segments.last_mut() {
+                    add_segment_size(segment, info.size(), "media segment size")?;
+                    if info.box_type() == MOOF {
+                        segment.moofs.push(*info);
+                    }
+                }
+            }
+            MDAT => {
+                if let Some(segment) = segments.last_mut() {
+                    add_segment_size(segment, info.size(), "media segment size")?;
+                }
+            }
+            _ => {}
+        }
+
+        previous_box_type = Some(info.box_type());
+    }
+
+    Ok((segments, existing_top_level_sidxs))
+}
+
+#[cfg(feature = "async")]
+async fn group_media_segments_async<R>(
+    reader: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<(Vec<SegmentAccumulator>, Vec<ExistingTopLevelSidxInternal>), SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let mut segments = Vec::new();
+    let mut existing_top_level_sidxs = Vec::new();
+    let mut previous_box_type = None;
+
+    for info in root_boxes {
+        match info.box_type() {
+            STYP => {
+                start_segment(&mut segments, *info);
+                add_segment_size(
+                    segments.last_mut().unwrap(),
+                    info.size(),
+                    "media segment size",
+                )?;
+            }
+            SIDX => {
+                if segments.is_empty() && previous_box_type != Some(MDAT) {
+                    let decoded = read_payload_as_async::<_, Sidx>(reader, info).await?;
+                    let internal = analyze_existing_top_level_sidx(info, &decoded)?;
+                    existing_top_level_sidxs.push(internal);
+                } else if previous_box_type == Some(STYP)
+                    && segments.last().is_some_and(is_pending_styp_prelude_segment)
+                {
+                    let decoded = read_payload_as_async::<_, Sidx>(reader, info).await?;
                     let internal = analyze_existing_top_level_sidx(info, &decoded)?;
                     existing_top_level_sidxs.push(internal);
                     segments.pop();
@@ -1512,6 +1808,109 @@ where
     })
 }
 
+#[cfg(feature = "async")]
+async fn analyze_segment_async<R>(
+    reader: &mut R,
+    segment_index: usize,
+    segment: &SegmentAccumulator,
+    timing_track_id: u32,
+    trex: &Trex,
+) -> Result<SidxMediaSegment, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+{
+    let first_moof =
+        segment
+            .moofs
+            .first()
+            .copied()
+            .ok_or(SidxAnalysisError::SegmentWithoutMovieFragment {
+                segment_index,
+                segment_offset: segment.first_box.offset(),
+            })?;
+
+    let mut base_decode_time = 0_u64;
+    let mut first_composition_time_offset = 0_i64;
+    let mut duration = 0_u64;
+    let mut timing_fragment_count = 0_usize;
+    let mut matched_any_fragment = false;
+
+    for (fragment_index, moof) in segment.moofs.iter().enumerate() {
+        let trafs = extract_boxes_async(reader, Some(moof), &[BoxPath::from([TRAF])]).await?;
+        let mut matched_timing_fragment = false;
+
+        for traf in trafs {
+            let tfhd = require_single_child_as_async::<_, Tfhd>(reader, &traf, TFHD).await?;
+            if tfhd.track_id != timing_track_id {
+                continue;
+            }
+
+            let tfdt = require_single_child_as_async::<_, Tfdt>(reader, &traf, TFDT)
+                .await
+                .map_err(|error| match error {
+                    SidxAnalysisError::MissingRequiredChild { .. } => {
+                        SidxAnalysisError::MissingTrackFragmentDecodeTime {
+                            segment_index,
+                            moof_offset: moof.offset(),
+                            track_id: timing_track_id,
+                        }
+                    }
+                    other => other,
+                })?;
+            let truns =
+                extract_box_as_async::<_, Trun>(reader, Some(&traf), BoxPath::from([TRUN])).await?;
+
+            if !matched_timing_fragment {
+                timing_fragment_count += 1;
+                matched_timing_fragment = true;
+            }
+            matched_any_fragment = true;
+
+            if fragment_index == 0 {
+                base_decode_time = tfdt.base_media_decode_time();
+            }
+
+            for (trun_index, trun) in truns.iter().enumerate() {
+                validate_trun_sample_count(trun, moof, timing_track_id)?;
+
+                if fragment_index == 0 && trun_index == 0 && trun.sample_count > 0 {
+                    first_composition_time_offset = effective_first_composition_time_offset(trun)?;
+                }
+
+                duration = checked_add(
+                    duration,
+                    effective_trun_duration(trun, &tfhd, trex),
+                    "segment duration",
+                )?;
+            }
+        }
+    }
+
+    if !matched_any_fragment {
+        return Err(SidxAnalysisError::MissingTimingTrackFragments {
+            segment_index,
+            track_id: timing_track_id,
+        });
+    }
+
+    let presentation_time = base_decode_time
+        .checked_add_signed(first_composition_time_offset)
+        .ok_or(SidxAnalysisError::NumericOverflow {
+            field_name: "segment presentation time",
+        })?;
+
+    Ok(SidxMediaSegment {
+        first_box: segment.first_box,
+        first_moof_offset: first_moof.offset(),
+        moof_count: segment.moofs.len(),
+        timing_fragment_count,
+        presentation_time,
+        base_decode_time,
+        duration,
+        size: segment.size,
+    })
+}
+
 fn validate_trun_sample_count(
     trun: &Trun,
     moof: &BoxInfo,
@@ -1590,6 +1989,29 @@ where
     Ok(decoded)
 }
 
+#[cfg(feature = "async")]
+async fn read_payload_as_async<R, B>(reader: &mut R, info: &BoxInfo) -> Result<B, SidxAnalysisError>
+where
+    R: AsyncReadSeek,
+    B: CodecBox + Default,
+{
+    info.seek_to_payload_async(reader).await?;
+    let payload_size = info.payload_size()?;
+    let mut payload = usize::try_from(payload_size)
+        .map(Vec::with_capacity)
+        .unwrap_or_else(|_| Vec::new());
+    let mut limited = (&mut *reader).take(payload_size);
+    let copied = limited.read_to_end(&mut payload).await? as u64;
+    if copied != payload_size {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
+
+    let mut payload_reader = Cursor::new(payload);
+    let mut decoded = B::default();
+    unmarshal(&mut payload_reader, payload_size, &mut decoded, None)?;
+    Ok(decoded)
+}
+
 fn add_segment_size(
     segment: &mut SegmentAccumulator,
     size: u64,
@@ -1602,18 +2024,6 @@ fn add_segment_size(
 fn checked_add(lhs: u64, rhs: u64, field_name: &'static str) -> Result<u64, SidxAnalysisError> {
     lhs.checked_add(rhs)
         .ok_or(SidxAnalysisError::NumericOverflow { field_name })
-}
-
-#[cfg(feature = "async")]
-async fn read_all_bytes_async<R>(reader: &mut R) -> Result<Vec<u8>, SidxAnalysisError>
-where
-    R: AsyncReadSeek,
-{
-    reader.seek(SeekFrom::Start(0)).await?;
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    reader.seek(SeekFrom::Start(0)).await?;
-    Ok(bytes)
 }
 
 fn encoded_payload_size(sidx: &Sidx) -> Result<u64, CodecError> {

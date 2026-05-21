@@ -35,15 +35,14 @@ pub(in crate::mux) fn scan_vp9_file_sync(
         "IVF VP9 sample payload is truncated",
     )?;
     annotate_vp9_sync_samples_sync(path, spec, &mut indexed.samples)?;
-    let sample_entry_box =
-        build_vp9_sample_entry_box(
-            indexed.width,
-            indexed.height,
-            &first_sample,
-            &indexed.samples,
-            indexed.timescale,
-            spec,
-        )?;
+    let sample_entry_box = build_vp9_sample_entry_box(
+        indexed.width,
+        indexed.height,
+        &first_sample,
+        &indexed.samples,
+        indexed.timescale,
+        spec,
+    )?;
     Ok(ParsedIvfTrack {
         width: indexed.width,
         height: indexed.height,
@@ -67,15 +66,14 @@ pub(in crate::mux) async fn scan_vp9_file_async(
     )
     .await?;
     annotate_vp9_sync_samples_async(path, spec, &mut indexed.samples).await?;
-    let sample_entry_box =
-        build_vp9_sample_entry_box(
-            indexed.width,
-            indexed.height,
-            &first_sample,
-            &indexed.samples,
-            indexed.timescale,
-            spec,
-        )?;
+    let sample_entry_box = build_vp9_sample_entry_box(
+        indexed.width,
+        indexed.height,
+        &first_sample,
+        &indexed.samples,
+        indexed.timescale,
+        spec,
+    )?;
     Ok(ParsedIvfTrack {
         width: indexed.width,
         height: indexed.height,
@@ -258,24 +256,29 @@ fn parse_vp9_config(
         Some(value) => value,
         None => return Ok(default_vp9_config(profile)),
     };
-    let (video_full_range_flag, chroma_subsampling, colour_primaries, transfer_characteristics, matrix_coefficients) =
-        if color_space == 7 {
-            if profile == 1 || profile == 3 {
-                let _reserved_zero = bits.read_bit().unwrap_or(false);
-            }
-            (1_u8, 3_u8, 1_u8, 13_u8, 0_u8)
+    let (
+        video_full_range_flag,
+        chroma_subsampling,
+        colour_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+    ) = if color_space == 7 {
+        if profile == 1 || profile == 3 {
+            let _reserved_zero = bits.read_bit().unwrap_or(false);
+        }
+        (1_u8, 3_u8, 1_u8, 13_u8, 0_u8)
+    } else {
+        let video_full_range_flag = u8::from(bits.read_bit().unwrap_or(false));
+        let chroma_subsampling = if profile != 1 && profile != 3 {
+            0_u8
         } else {
-            let video_full_range_flag = u8::from(bits.read_bit().unwrap_or(false));
-            let chroma_subsampling = if profile != 1 && profile != 3 {
-                0_u8
-            } else {
-                let subsampling_x = u8::from(bits.read_bit().unwrap_or(false));
-                let subsampling_y = u8::from(bits.read_bit().unwrap_or(false));
-                let _reserved_zero = bits.read_bit().unwrap_or(false);
-                ((subsampling_x << 1) | subsampling_y) + 1
-            };
-            (video_full_range_flag, chroma_subsampling, 5_u8, 5_u8, 6_u8)
+            let subsampling_x = u8::from(bits.read_bit().unwrap_or(false));
+            let subsampling_y = u8::from(bits.read_bit().unwrap_or(false));
+            let _reserved_zero = bits.read_bit().unwrap_or(false);
+            ((subsampling_x << 1) | subsampling_y) + 1
         };
+        (video_full_range_flag, chroma_subsampling, 5_u8, 5_u8, 6_u8)
+    };
 
     let parsed_width = match bits.read_bits_u16(16) {
         Some(value) => value.saturating_add(1),

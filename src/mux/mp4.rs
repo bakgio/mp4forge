@@ -16,9 +16,9 @@ use crate::boxes::AnyTypeBox;
 use crate::boxes::etsi_ts_102_366::Dec3;
 use crate::boxes::iso14496_12::{
     AudioSampleEntry, Btrt, Co64, Ctts, CttsEntry, Dinf, Dref, Edts, Elst, ElstEntry, Ftyp, Hdlr,
-    Mdhd, Mdia, Mehd, Meta, Mfhd, Minf, Moof, Moov, Mvex, Mvhd, Nmhd, Pasp, Sbgp, SbgpEntry, Sgpd,
-    SampleEntry, Sidx, SidxReference, Smhd, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stss, Stsz, Stts,
-    SttsEntry, TFHD_DEFAULT_BASE_IS_MOOF, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
+    Mdhd, Mdia, Mehd, Meta, Mfhd, Minf, Moof, Moov, Mvex, Mvhd, Nmhd, Pasp, SampleEntry, Sbgp,
+    SbgpEntry, Sgpd, Sidx, SidxReference, Smhd, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stss,
+    Stsz, Stts, SttsEntry, TFHD_DEFAULT_BASE_IS_MOOF, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
     TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
     TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT, TRUN_DATA_OFFSET_PRESENT,
     TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
@@ -36,7 +36,9 @@ use crate::probe::{detect_aac_effective_sample_rate, detect_aac_profile};
 
 #[cfg(feature = "async")]
 use super::copy_planned_payloads_async;
-use super::{MuxError, MuxFileConfig, MuxPlan, MuxTrackConfig, MuxTrackKind, copy_planned_payloads};
+use super::{
+    MuxError, MuxFileConfig, MuxPlan, MuxTrackConfig, MuxTrackKind, copy_planned_payloads,
+};
 
 const IDENTITY_MATRIX: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 const VMHD_DEFAULT_FLAGS: u32 = 0x0000_0001;
@@ -1184,7 +1186,10 @@ fn infer_auto_flat_ftyp_profile(tracks: &[PreparedTrack<'_>]) -> (FourCc, u32, V
         .iter()
         .any(|track| sample_entry_matches(track.sample_entry_box, &[b"vvc1", b"vvi1"]));
     let has_avc = tracks.iter().any(|track| {
-        sample_entry_matches(track.sample_entry_box, &[b"avc1", b"avc2", b"avc3", b"avc4"])
+        sample_entry_matches(
+            track.sample_entry_box,
+            &[b"avc1", b"avc2", b"avc3", b"avc4"],
+        )
     });
     let has_h263 = tracks
         .iter()
@@ -1333,7 +1338,9 @@ fn mp4a_sample_entry_oti_matches(
     sample_entry_esds_oti_matches(sample_entry_box, &[b"mp4a"], object_type_indication)
 }
 
-fn sample_entry_mp4a_object_type_indication(sample_entry_box: &[u8]) -> Result<Option<u8>, MuxError> {
+fn sample_entry_mp4a_object_type_indication(
+    sample_entry_box: &[u8],
+) -> Result<Option<u8>, MuxError> {
     if !sample_entry_matches(sample_entry_box, &[b"mp4a"]) {
         return Ok(None);
     }
@@ -1723,7 +1730,9 @@ fn build_flat_iods_bytes(
         .any(|track| mp4a_sample_entry_oti_matches(track.sample_entry_box, 0xE1).unwrap_or(false));
     let first_mp4a_oti = tracks
         .iter()
-        .find_map(|track| sample_entry_mp4a_object_type_indication(track.sample_entry_box).transpose())
+        .find_map(|track| {
+            sample_entry_mp4a_object_type_indication(track.sample_entry_box).transpose()
+        })
         .transpose()?;
     let first_mp4a_audio_profile_level_indication = tracks
         .iter()
@@ -1974,7 +1983,11 @@ fn build_flat_iods_bytes(
         } else if has_avc {
             0x7f
         } else if has_mpeg2_mp4v {
-            if imported_authority_tracks { 0xfe } else { 0x0c }
+            if imported_authority_tracks {
+                0xfe
+            } else {
+                0x0c
+            }
         } else if let Some(profile_level_indication) = first_mp4v_profile_level {
             profile_level_indication
         } else if first_mp4v_oti == Some(0x6a) {
@@ -3683,8 +3696,7 @@ fn sample_entry_box_type(sample_entry_box: &[u8]) -> Result<FourCc, MuxError> {
 
 fn encoded_box_type(box_bytes: &[u8]) -> Result<FourCc, MuxError> {
     let mut cursor = Cursor::new(box_bytes);
-    let info =
-        BoxInfo::read(&mut cursor).map_err(|_| MuxError::LayoutOverflow("box header"))?;
+    let info = BoxInfo::read(&mut cursor).map_err(|_| MuxError::LayoutOverflow("box header"))?;
     Ok(info.box_type())
 }
 
@@ -4054,7 +4066,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.visual_profile_level_indication, 0x7f);
     }
@@ -4076,9 +4090,11 @@ mod tests {
         };
         let file_config = MuxFileConfig::new(1_000).with_auto_flat_profile(true);
 
-        assert!(build_flat_iods_bytes(&file_config, &[track])
-            .expect("flat iods")
-            .is_none());
+        assert!(
+            build_flat_iods_bytes(&file_config, &[track])
+                .expect("flat iods")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4096,14 +4112,12 @@ mod tests {
         let mut esds = Esds::default();
         esds.descriptors = vec![Descriptor {
             tag: crate::boxes::iso14496_14::DECODER_CONFIG_DESCRIPTOR_TAG,
-            decoder_config_descriptor: Some(
-                crate::boxes::iso14496_14::DecoderConfigDescriptor {
-                    object_type_indication: 0xDD,
-                    stream_type: 5,
-                    reserved: true,
-                    ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
-                },
-            ),
+            decoder_config_descriptor: Some(crate::boxes::iso14496_14::DecoderConfigDescriptor {
+                object_type_indication: 0xDD,
+                stream_type: 5,
+                reserved: true,
+                ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
+            }),
             ..Descriptor::default()
         }];
         let sample_entry_box =
@@ -4125,9 +4139,11 @@ mod tests {
         };
         let file_config = MuxFileConfig::new(48_000).with_auto_flat_profile(true);
 
-        assert!(build_flat_iods_bytes(&file_config, &[track])
-            .expect("flat iods")
-            .is_none());
+        assert!(
+            build_flat_iods_bytes(&file_config, &[track])
+                .expect("flat iods")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4145,14 +4161,12 @@ mod tests {
         let mut esds = Esds::default();
         esds.descriptors = vec![Descriptor {
             tag: crate::boxes::iso14496_14::DECODER_CONFIG_DESCRIPTOR_TAG,
-            decoder_config_descriptor: Some(
-                crate::boxes::iso14496_14::DecoderConfigDescriptor {
-                    object_type_indication: 0xE1,
-                    stream_type: 5,
-                    reserved: true,
-                    ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
-                },
-            ),
+            decoder_config_descriptor: Some(crate::boxes::iso14496_14::DecoderConfigDescriptor {
+                object_type_indication: 0xE1,
+                stream_type: 5,
+                reserved: true,
+                ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
+            }),
             ..Descriptor::default()
         }];
         let sample_entry_box =
@@ -4176,9 +4190,11 @@ mod tests {
             .with_auto_flat_profile(true)
             .with_allow_audio_only_iods(true);
 
-        assert!(build_flat_iods_bytes(&file_config, &[track])
-            .expect("flat iods")
-            .is_none());
+        assert!(
+            build_flat_iods_bytes(&file_config, &[track])
+                .expect("flat iods")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4212,9 +4228,11 @@ mod tests {
             .with_auto_flat_profile(true)
             .with_allow_audio_only_iods(true);
 
-        assert!(build_flat_iods_bytes(&file_config, &[track])
-            .expect("flat iods")
-            .is_none());
+        assert!(
+            build_flat_iods_bytes(&file_config, &[track])
+                .expect("flat iods")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4249,9 +4267,11 @@ mod tests {
             .with_auto_flat_profile(true)
             .with_allow_audio_only_iods(true);
 
-        assert!(build_flat_iods_bytes(&file_config, &[track])
-            .expect("flat iods")
-            .is_none());
+        assert!(
+            build_flat_iods_bytes(&file_config, &[track])
+                .expect("flat iods")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4287,7 +4307,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
         assert_eq!(descriptor.audio_profile_level_indication, 0xfe);
         assert_eq!(descriptor.visual_profile_level_indication, 0xff);
     }
@@ -4321,9 +4343,11 @@ mod tests {
         };
         let file_config = MuxFileConfig::new(16_000).with_auto_flat_profile(true);
 
-        assert!(build_flat_udta_bytes(&file_config, &[track])
-            .expect("flat udta")
-            .is_some());
+        assert!(
+            build_flat_udta_bytes(&file_config, &[track])
+                .expect("flat udta")
+                .is_some()
+        );
     }
 
     #[test]
@@ -4380,7 +4404,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.audio_profile_level_indication, 0x2c);
     }
@@ -4439,7 +4465,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.audio_profile_level_indication, 0x0f);
     }
@@ -4498,7 +4526,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.audio_profile_level_indication, 0x28);
     }
@@ -4518,14 +4548,12 @@ mod tests {
         let mut esds = Esds::default();
         esds.descriptors = vec![Descriptor {
             tag: crate::boxes::iso14496_14::DECODER_CONFIG_DESCRIPTOR_TAG,
-            decoder_config_descriptor: Some(
-                crate::boxes::iso14496_14::DecoderConfigDescriptor {
-                    object_type_indication: 0x6b,
-                    stream_type: 5,
-                    reserved: true,
-                    ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
-                },
-            ),
+            decoder_config_descriptor: Some(crate::boxes::iso14496_14::DecoderConfigDescriptor {
+                object_type_indication: 0x6b,
+                stream_type: 5,
+                reserved: true,
+                ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
+            }),
             ..Descriptor::default()
         }];
         let sample_entry_box =
@@ -4553,7 +4581,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.audio_profile_level_indication, 0xfe);
     }
@@ -4593,7 +4623,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.audio_profile_level_indication, 0x0e);
     }
@@ -4603,14 +4635,12 @@ mod tests {
         let mut esds = Esds::default();
         esds.descriptors = vec![Descriptor {
             tag: crate::boxes::iso14496_14::DECODER_CONFIG_DESCRIPTOR_TAG,
-            decoder_config_descriptor: Some(
-                crate::boxes::iso14496_14::DecoderConfigDescriptor {
-                    object_type_indication: 0x60,
-                    stream_type: 4,
-                    reserved: true,
-                    ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
-                },
-            ),
+            decoder_config_descriptor: Some(crate::boxes::iso14496_14::DecoderConfigDescriptor {
+                object_type_indication: 0x60,
+                stream_type: 4,
+                reserved: true,
+                ..crate::boxes::iso14496_14::DecoderConfigDescriptor::default()
+            }),
             ..Descriptor::default()
         }];
         let sample_entry_box = encode_typed_box(
@@ -4646,7 +4676,9 @@ mod tests {
             .expect("flat iods")
             .expect("present iods");
         let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
-        let descriptor = iods.initial_object_descriptor().expect("initial descriptor");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
 
         assert_eq!(descriptor.visual_profile_level_indication, 0xfe);
     }
@@ -4818,8 +4850,8 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_mehd_duration_floors_imported_audio_authority_duration_when_movie_timescale_differs(
-    ) {
+    fn fragmented_mehd_duration_floors_imported_audio_authority_duration_when_movie_timescale_differs()
+     {
         let sample_entry_box =
             encode_raw_box(FourCc::from_bytes(*b"mp4a"), &[]).expect("mp4a sample entry");
         let config = MuxTrackConfig::new_audio(1, 10, sample_entry_box.clone())
@@ -4852,8 +4884,8 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_mehd_duration_preserves_imported_audio_authority_media_duration_at_same_timescale(
-    ) {
+    fn fragmented_mehd_duration_preserves_imported_audio_authority_media_duration_at_same_timescale()
+     {
         let sample_entry_box =
             encode_raw_box(FourCc::from_bytes(*b"mp4a"), &[]).expect("mp4a sample entry");
         let config = MuxTrackConfig::new_audio(1, 44_100, sample_entry_box.clone())
@@ -4880,15 +4912,14 @@ mod tests {
             flat_timing_override: Some(&override_value),
         };
 
-        let duration =
-            fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 3_072);
     }
 
     #[test]
-    fn fragmented_mehd_duration_uses_imported_audio_sample_span_when_authority_media_duration_is_one_tick_larger(
-    ) {
+    fn fragmented_mehd_duration_uses_imported_audio_sample_span_when_authority_media_duration_is_one_tick_larger()
+     {
         let sample_entry_box =
             encode_raw_box(FourCc::from_bytes(*b"mp4a"), &[]).expect("mp4a sample entry");
         let config = MuxTrackConfig::new_audio(1, 44_100, sample_entry_box.clone())
@@ -4915,15 +4946,14 @@ mod tests {
             flat_timing_override: Some(&override_value),
         };
 
-        let duration =
-            fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 3_071);
     }
 
     #[test]
-    fn fragmented_mehd_duration_scales_imported_audio_authority_media_duration_when_movie_timescale_differs(
-    ) {
+    fn fragmented_mehd_duration_scales_imported_audio_authority_media_duration_when_movie_timescale_differs()
+     {
         let sample_entry_box =
             encode_raw_box(FourCc::from_bytes(*b"mp4a"), &[]).expect("mp4a sample entry");
         let config = MuxTrackConfig::new_audio(1, 10, sample_entry_box.clone())
@@ -4975,8 +5005,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 2_047);
     }
@@ -5001,8 +5030,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 1_744);
     }
@@ -5028,8 +5056,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(48_000, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(48_000, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 4_607);
     }
@@ -5054,8 +5081,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(48_000, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(48_000, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 3_072);
     }
@@ -5078,11 +5104,9 @@ mod tests {
             ec3_substreams: vec![crate::boxes::etsi_ts_102_366::Ec3Substream::default()],
             reserved: Vec::new(),
         };
-        let sample_entry_box = encode_typed_box(
-            &sample_entry,
-            &encode_typed_box(&dec3, &[]).expect("dec3"),
-        )
-        .expect("ec-3 sample entry");
+        let sample_entry_box =
+            encode_typed_box(&sample_entry, &encode_typed_box(&dec3, &[]).expect("dec3"))
+                .expect("ec-3 sample entry");
         let config = MuxTrackConfig::new_audio(1, 44_100, sample_entry_box.clone());
         let track = PreparedTrack {
             config: &config,
@@ -5100,8 +5124,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 4_608);
     }
@@ -5124,11 +5147,9 @@ mod tests {
             ec3_substreams: vec![crate::boxes::etsi_ts_102_366::Ec3Substream::default()],
             reserved: Vec::new(),
         };
-        let sample_entry_box = encode_typed_box(
-            &sample_entry,
-            &encode_typed_box(&dec3, &[]).expect("dec3"),
-        )
-        .expect("ec-3 sample entry");
+        let sample_entry_box =
+            encode_typed_box(&sample_entry, &encode_typed_box(&dec3, &[]).expect("dec3"))
+                .expect("ec-3 sample entry");
         let config = MuxTrackConfig::new_audio(1, 48_000, sample_entry_box.clone());
         let track = PreparedTrack {
             config: &config,
@@ -5146,8 +5167,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(48_000, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(48_000, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 4_608);
     }
@@ -5185,11 +5205,9 @@ mod tests {
             sample_rate: 44_100 << 16,
             ..AudioSampleEntry::default()
         };
-        let sample_entry_box = encode_typed_box(
-            &sample_entry,
-            &encode_typed_box(&esds, &[]).expect("esds"),
-        )
-        .expect("mp4a sample entry");
+        let sample_entry_box =
+            encode_typed_box(&sample_entry, &encode_typed_box(&esds, &[]).expect("esds"))
+                .expect("mp4a sample entry");
         let config = MuxTrackConfig::new_audio(1, 44_100, sample_entry_box.clone());
         let track = PreparedTrack {
             config: &config,
@@ -5206,8 +5224,7 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let duration =
-            fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
+        let duration = fragmented_mehd_duration(44_100, &track).expect("fragmented mehd duration");
 
         assert_eq!(duration, 2_048);
     }
@@ -5245,11 +5262,9 @@ mod tests {
             sample_rate: 44_100 << 16,
             ..AudioSampleEntry::default()
         };
-        let sample_entry_box = encode_typed_box(
-            &sample_entry,
-            &encode_typed_box(&esds, &[]).expect("esds"),
-        )
-        .expect("mp4a sample entry");
+        let sample_entry_box =
+            encode_typed_box(&sample_entry, &encode_typed_box(&esds, &[]).expect("esds"))
+                .expect("mp4a sample entry");
 
         let sample_rate =
             fragmented_mp4a_sample_entry_sample_rate(&sample_entry_box).expect("sample rate");

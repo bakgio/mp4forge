@@ -146,8 +146,9 @@ pub(in crate::mux) fn scan_eac3_file_sync(
             }
             let mut next_frame = vec![
                 0_u8;
-                usize::try_from(next_syncframe_header.frame_size)
-                    .map_err(|_| MuxError::LayoutOverflow("E-AC-3 frame size"))?
+                usize::try_from(next_syncframe_header.frame_size).map_err(
+                    |_| MuxError::LayoutOverflow("E-AC-3 frame size")
+                )?
             ];
             read_exact_at_sync(
                 &mut file,
@@ -308,8 +309,9 @@ pub(in crate::mux) fn scan_eac3_segmented_sync(
             }
             let mut next_frame = vec![
                 0_u8;
-                usize::try_from(next_syncframe_header.frame_size)
-                    .map_err(|_| MuxError::LayoutOverflow("E-AC-3 frame size"))?
+                usize::try_from(next_syncframe_header.frame_size).map_err(
+                    |_| MuxError::LayoutOverflow("E-AC-3 frame size")
+                )?
             ];
             read_segmented_bytes_sync(
                 file,
@@ -468,8 +470,9 @@ pub(in crate::mux) async fn scan_eac3_file_async(
             }
             let mut next_frame = vec![
                 0_u8;
-                usize::try_from(next_syncframe_header.frame_size)
-                    .map_err(|_| MuxError::LayoutOverflow("E-AC-3 frame size"))?
+                usize::try_from(next_syncframe_header.frame_size).map_err(
+                    |_| MuxError::LayoutOverflow("E-AC-3 frame size")
+                )?
             ];
             read_exact_at_async(
                 &mut file,
@@ -635,8 +638,9 @@ pub(in crate::mux) async fn scan_eac3_segmented_async(
             }
             let mut next_frame = vec![
                 0_u8;
-                usize::try_from(next_syncframe_header.frame_size)
-                    .map_err(|_| MuxError::LayoutOverflow("E-AC-3 frame size"))?
+                usize::try_from(next_syncframe_header.frame_size).map_err(
+                    |_| MuxError::LayoutOverflow("E-AC-3 frame size")
+                )?
             ];
             read_segmented_bytes_async(
                 file,
@@ -763,17 +767,16 @@ fn merge_eac3_dependent_substream(
             message: "E-AC-3 dependent substream changed decoder timing mid-stream".to_string(),
         });
     }
-    primary.num_dep_sub = primary
-        .num_dep_sub
-        .max(
-            dependent_substream_id
-                .checked_add(1)
-                .ok_or(MuxError::LayoutOverflow("E-AC-3 dependent substream id"))?,
-        );
+    primary.num_dep_sub = primary.num_dep_sub.max(
+        dependent_substream_id
+            .checked_add(1)
+            .ok_or(MuxError::LayoutOverflow("E-AC-3 dependent substream id"))?,
+    );
     primary.chan_loc |= dependent.chan_loc;
     primary.atmos_ec3_ext |= dependent.atmos_ec3_ext;
-    primary.complexity_index_type =
-        primary.complexity_index_type.max(dependent.complexity_index_type);
+    primary.complexity_index_type = primary
+        .complexity_index_type
+        .max(dependent.complexity_index_type);
     Ok(())
 }
 
@@ -920,8 +923,12 @@ fn parse_eac3_additional_config(
         }
     }
     if strmtyp == 0x1 && read_bit_labeled(&mut reader, spec, "E-AC-3 chanmape")? {
-        decoder_config.chan_loc =
-            eac3_chanmap_to_chan_loc(read_bits_u16_labeled(&mut reader, 16, spec, "E-AC-3 chanmap")?);
+        decoder_config.chan_loc = eac3_chanmap_to_chan_loc(read_bits_u16_labeled(
+            &mut reader,
+            16,
+            spec,
+            "E-AC-3 chanmap",
+        )?);
     }
 
     if read_bit_labeled(&mut reader, spec, "E-AC-3 mix metadata")? {

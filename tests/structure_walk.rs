@@ -474,8 +474,8 @@ async fn async_walk_structure_stops_audio_sample_entry_children_before_zero_tail
         visited: &mut visited,
     };
     walk_structure_async(&mut Cursor::new(file), visitor)
-    .await
-    .unwrap();
+        .await
+        .unwrap();
 
     assert_eq!(
         visited,

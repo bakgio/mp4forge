@@ -179,7 +179,10 @@ fn probe_detects_tracks_in_compressed_movie_metadata() {
 
     assert_eq!(info.timescale, 1_000);
     assert_eq!(info.tracks.len(), 1);
-    assert_eq!(info.tracks[0].summary.codec_family, TrackCodecFamily::WebVtt);
+    assert_eq!(
+        info.tracks[0].summary.codec_family,
+        TrackCodecFamily::WebVtt
+    );
 }
 
 #[test]
@@ -1642,7 +1645,9 @@ fn detect_aac_profile_matches_expected_cases() {
         (
             aac_profile_esds(
                 0x40,
-                &[0x13, 0x10, 0x56, 0xe5, 0x98, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02],
+                &[
+                    0x13, 0x10, 0x56, 0xe5, 0x98, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
+                ],
             ),
             Some(AacProfileInfo {
                 object_type_indication: 0x40,

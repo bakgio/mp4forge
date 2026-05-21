@@ -1053,7 +1053,9 @@ fn finalize_avi_companded_track(
     if sample_entry_type == SAMPLE_ENTRY_MLAW {
         child_boxes.push(super::super::mp4::encode_typed_box(
             &build_btrt_from_sample_sizes(
-                samples.iter().map(|sample| (sample.data_size, sample.duration)),
+                samples
+                    .iter()
+                    .map(|sample| (sample.data_size, sample.duration)),
                 audio_format.sample_rate,
             )?,
             &[],

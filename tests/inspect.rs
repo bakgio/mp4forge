@@ -10,7 +10,7 @@ use mp4forge::mux::inspect::{
     inspect_direct_ingest_path, write_packet_report, write_report,
 };
 
-use support::{write_temp_file_with_extension, write_test_ogg_opus_file};
+use support::{write_temp_file_with_extension, write_test_ogg_opus_file, write_test_vobsub_files};
 
 fn sample_report(
     source_index: usize,
@@ -1145,6 +1145,20 @@ async fn inspect_direct_ingest_packets_async_matches_sync_for_real_ogg_opus_trac
 
     let sync_report = inspect_direct_ingest_packets(&input).unwrap();
     let async_report = mp4forge::mux::inspect::inspect_direct_ingest_packets_async(&input)
+        .await
+        .unwrap();
+
+    assert_eq!(async_report, sync_report);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspect_direct_ingest_path_async_matches_sync_for_vobsub_sidecars() {
+    let (_idx_input, sub_input) =
+        write_test_vobsub_files("inspect-vobsub-async-input", &[1_000], &[b"\xDE\xAD"]);
+
+    let sync_report = inspect_direct_ingest_path(&sub_input).unwrap();
+    let async_report = mp4forge::mux::inspect::inspect_direct_ingest_path_async(&sub_input)
         .await
         .unwrap();
 

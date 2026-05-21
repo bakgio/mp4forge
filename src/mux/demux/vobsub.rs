@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "async")]
 use tokio::fs::File as TokioFile;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader as TokioBufReader};
 
 use super::super::MuxError;
 use super::super::MuxTrackKind;
@@ -208,6 +211,16 @@ struct VobSubTrackBuildContext<'a> {
     palette: &'a [[u8; 4]; 16],
 }
 
+#[derive(Default)]
+struct VobSubIndexBuilder {
+    width: Option<u16>,
+    height: Option<u16>,
+    palette: Option<[[u8; 4]; 16]>,
+    languages: BTreeMap<u8, VobSubTrack>,
+    current_track: Option<u8>,
+    delays_ms: BTreeMap<u8, i64>,
+}
+
 pub(in crate::mux) fn scan_vobsub_source_sync(
     path: &Path,
     spec: &str,
@@ -224,8 +237,8 @@ pub(in crate::mux) async fn scan_vobsub_source_async(
     path: &Path,
     spec: &str,
 ) -> Result<Vec<CompositeTrackCandidate>, MuxError> {
-    let (idx_path, sub_path) = resolve_vobsub_paths(path, spec)?;
-    let index = parse_vobsub_index(&idx_path, spec)?;
+    let (idx_path, sub_path) = resolve_vobsub_paths_async(path, spec).await?;
+    let index = parse_vobsub_index_async(&idx_path, spec).await?;
     let mut file = TokioFile::open(&sub_path).await?;
     let file_size = file.metadata().await?.len();
     build_vobsub_tracks_async(&mut file, file_size, &sub_path, spec, index).await
@@ -274,8 +287,70 @@ fn resolve_vobsub_paths(path: &Path, spec: &str) -> Result<(PathBuf, PathBuf), M
     }
 }
 
+#[cfg(feature = "async")]
+async fn resolve_vobsub_paths_async(
+    path: &Path,
+    spec: &str,
+) -> Result<(PathBuf, PathBuf), MuxError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(MuxError::Io)?.join(path)
+    };
+    let extension = absolute
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("idx") => {
+            ensure_vobsub_idx_signature_async(&absolute, spec).await?;
+            let sub_path = absolute.with_extension("sub");
+            let sub_exists = tokio::fs::metadata(&sub_path)
+                .await
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false);
+            if !sub_exists {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: format!(
+                        "VobSub index input `{}` is missing its sibling `.sub` media file",
+                        absolute.display()
+                    ),
+                });
+            }
+            Ok((absolute, sub_path))
+        }
+        Some("sub") => {
+            let idx_path = absolute.with_extension("idx");
+            ensure_vobsub_idx_signature_async(&idx_path, spec).await?;
+            Ok((idx_path, absolute))
+        }
+        _ => Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message:
+                "VobSub direct ingest expects one `.idx` path or one `.sub` path with a sibling `.idx` file"
+                    .to_string(),
+        }),
+    }
+}
+
 fn ensure_vobsub_idx_signature(path: &Path, spec: &str) -> Result<(), MuxError> {
-    let prefix = fs::read(path).map_err(MuxError::Io)?;
+    let prefix = read_vobsub_prefix_sync(path)?;
+    if !looks_like_vobsub_prefix(&prefix) {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: spec.to_string(),
+            message: format!(
+                "`{}` is not a VobSub index file with the expected `# VobSub` signature",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn ensure_vobsub_idx_signature_async(path: &Path, spec: &str) -> Result<(), MuxError> {
+    let prefix = read_vobsub_prefix_async(path).await?;
     if !looks_like_vobsub_prefix(&prefix) {
         return Err(MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
@@ -289,21 +364,122 @@ fn ensure_vobsub_idx_signature(path: &Path, spec: &str) -> Result<(), MuxError> 
 }
 
 fn parse_vobsub_index(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> {
-    let bytes = fs::read(path)?;
-    let text = String::from_utf8(bytes).map_err(|_| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: "VobSub index files must be valid UTF-8 or ASCII text".to_string(),
-    })?;
-    let mut width = None::<u16>;
-    let mut height = None::<u16>;
-    let mut palette = None::<[[u8; 4]; 16]>;
-    let mut languages = BTreeMap::<u8, VobSubTrack>::new();
-    let mut current_track = None::<u8>;
-    let mut delays_ms = BTreeMap::<u8, i64>::new();
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    parse_vobsub_index_reader(&mut reader, path, spec)
+}
 
-    for (line_index, raw_line) in text.lines().enumerate() {
+#[cfg(feature = "async")]
+async fn parse_vobsub_index_async(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> {
+    let file = TokioFile::open(path).await?;
+    let mut reader = TokioBufReader::new(file);
+    parse_vobsub_index_reader_async(&mut reader, path, spec).await
+}
+
+fn read_vobsub_prefix_sync(path: &Path) -> Result<Vec<u8>, MuxError> {
+    let mut file = File::open(path)?;
+    let mut prefix = vec![0_u8; VOBSUB_PREFIX.len()];
+    let mut total = 0;
+    while total < prefix.len() {
+        let read = file.read(&mut prefix[total..])?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+    }
+    prefix.truncate(total);
+    Ok(prefix)
+}
+
+#[cfg(feature = "async")]
+async fn read_vobsub_prefix_async(path: &Path) -> Result<Vec<u8>, MuxError> {
+    let mut file = TokioFile::open(path).await?;
+    let mut prefix = vec![0_u8; VOBSUB_PREFIX.len()];
+    let mut total = 0;
+    while total < prefix.len() {
+        let read = file.read(&mut prefix[total..]).await?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+    }
+    prefix.truncate(total);
+    Ok(prefix)
+}
+
+fn parse_vobsub_index_reader<R>(
+    reader: &mut R,
+    path: &Path,
+    spec: &str,
+) -> Result<VobSubIndex, MuxError>
+where
+    R: BufRead,
+{
+    let mut builder = VobSubIndexBuilder::default();
+    let mut line = String::new();
+    let mut line_number = 0_usize;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                line_number += 1;
+                builder.push_line(&line, spec, path, line_number)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: "VobSub index files must be valid UTF-8 or ASCII text".to_string(),
+                });
+            }
+            Err(error) => return Err(MuxError::Io(error)),
+        }
+    }
+    builder.finish(spec, path)
+}
+
+#[cfg(feature = "async")]
+async fn parse_vobsub_index_reader_async<R>(
+    reader: &mut R,
+    path: &Path,
+    spec: &str,
+) -> Result<VobSubIndex, MuxError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut builder = VobSubIndexBuilder::default();
+    let mut line = String::new();
+    let mut line_number = 0_usize;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                line_number += 1;
+                builder.push_line(&line, spec, path, line_number)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: spec.to_string(),
+                    message: "VobSub index files must be valid UTF-8 or ASCII text".to_string(),
+                });
+            }
+            Err(error) => return Err(MuxError::Io(error)),
+        }
+    }
+    builder.finish(spec, path)
+}
+
+impl VobSubIndexBuilder {
+    fn push_line(
+        &mut self,
+        raw_line: &str,
+        spec: &str,
+        path: &Path,
+        line_number: usize,
+    ) -> Result<(), MuxError> {
         let line = raw_line.trim();
-        if line_index == 0 {
+        if line_number == 1 {
             if !line.contains("VobSub index file, v") {
                 return Err(MuxError::UnsupportedTrackImport {
                     spec: spec.to_string(),
@@ -312,32 +488,32 @@ fn parse_vobsub_index(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> 
                             .to_string(),
                 });
             }
-            continue;
+            return Ok(());
         }
         if line.is_empty() || line.starts_with('#') {
-            continue;
+            return Ok(());
         }
         let Some((entry, value)) = line.split_once(':') else {
-            continue;
+            return Ok(());
         };
         let entry = entry.trim();
         let value = value.trim();
         if value.is_empty() {
-            continue;
+            return Ok(());
         }
         match entry.to_ascii_lowercase().as_str() {
             "size" => {
                 let (parsed_width, parsed_height) =
-                    parse_vobsub_size(value, spec, path, line_index + 1)?;
-                width = Some(parsed_width);
-                height = Some(parsed_height);
+                    parse_vobsub_size(value, spec, path, line_number)?;
+                self.width = Some(parsed_width);
+                self.height = Some(parsed_height);
             }
             "palette" => {
-                palette = Some(parse_vobsub_palette(value, spec, path, line_index + 1)?);
+                self.palette = Some(parse_vobsub_palette(value, spec, path, line_number)?);
             }
             "id" => {
-                let (track_index, language) = parse_vobsub_id(value, spec, path, line_index + 1)?;
-                languages.insert(
+                let (track_index, language) = parse_vobsub_id(value, spec, path, line_number)?;
+                self.languages.insert(
                     track_index,
                     VobSubTrack {
                         index: track_index,
@@ -345,27 +521,27 @@ fn parse_vobsub_index(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> 
                         positions: Vec::new(),
                     },
                 );
-                delays_ms.insert(track_index, 0);
-                current_track = Some(track_index);
+                self.delays_ms.insert(track_index, 0);
+                self.current_track = Some(track_index);
             }
             "delay" => {
-                let Some(track_index) = current_track else {
-                    continue;
+                let Some(track_index) = self.current_track else {
+                    return Ok(());
                 };
-                let delay = parse_vobsub_timestamp_ms(value, spec, path, line_index + 1)?;
-                let entry = delays_ms.entry(track_index).or_default();
+                let delay = parse_vobsub_timestamp_ms(value, spec, path, line_number)?;
+                let entry = self.delays_ms.entry(track_index).or_default();
                 *entry = entry
                     .checked_add(delay)
                     .ok_or(MuxError::LayoutOverflow("VobSub delay accumulation"))?;
             }
             "timestamp" => {
-                let Some(track_index) = current_track else {
-                    continue;
+                let Some(track_index) = self.current_track else {
+                    return Ok(());
                 };
                 let (start_ms, filepos) =
-                    parse_vobsub_timestamp_entry(value, spec, path, line_index + 1)?;
-                let delay_ms = *delays_ms.get(&track_index).unwrap_or(&0);
-                let track = languages.get_mut(&track_index).unwrap();
+                    parse_vobsub_timestamp_entry(value, spec, path, line_number)?;
+                let delay_ms = *self.delays_ms.get(&track_index).unwrap_or(&0);
+                let track = self.languages.get_mut(&track_index).unwrap();
                 let mut adjusted_start_ms = start_ms
                     .checked_add(delay_ms)
                     .ok_or(MuxError::LayoutOverflow("VobSub timestamp adjustment"))?;
@@ -376,7 +552,7 @@ fn parse_vobsub_index(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> 
                         .map_err(|_| MuxError::LayoutOverflow("VobSub timestamp normalization"))?;
                     if adjusted_start_ms < previous_ms {
                         let correction = previous_ms - adjusted_start_ms;
-                        let entry = delays_ms.entry(track_index).or_default();
+                        let entry = self.delays_ms.entry(track_index).or_default();
                         *entry = entry
                             .checked_add(correction)
                             .ok_or(MuxError::LayoutOverflow("VobSub delay correction"))?;
@@ -388,7 +564,7 @@ fn parse_vobsub_index(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> 
                         spec: spec.to_string(),
                         message: format!(
                             "VobSub timestamp on line {} resolved to a negative media time",
-                            line_index + 1
+                            line_number
                         ),
                     });
                 }
@@ -400,50 +576,56 @@ fn parse_vobsub_index(path: &Path, spec: &str) -> Result<VobSubIndex, MuxError> 
             }
             _ => {}
         }
+        Ok(())
     }
 
-    let width = width.ok_or_else(|| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!(
-            "VobSub index file `{}` is missing one `size:` declaration",
-            path.display()
-        ),
-    })?;
-    let height = height.ok_or_else(|| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!(
-            "VobSub index file `{}` is missing one `size:` declaration",
-            path.display()
-        ),
-    })?;
-    let palette = palette.ok_or_else(|| MuxError::UnsupportedTrackImport {
-        spec: spec.to_string(),
-        message: format!(
-            "VobSub index file `{}` is missing one 16-color `palette:` declaration",
-            path.display()
-        ),
-    })?;
-
-    let tracks = languages
-        .into_values()
-        .filter(|track| !track.positions.is_empty())
-        .collect::<Vec<_>>();
-    if tracks.is_empty() {
-        return Err(MuxError::UnsupportedTrackImport {
+    fn finish(self, spec: &str, path: &Path) -> Result<VobSubIndex, MuxError> {
+        let width = self.width.ok_or_else(|| MuxError::UnsupportedTrackImport {
             spec: spec.to_string(),
             message: format!(
-                "VobSub index file `{}` did not declare any subtitle positions",
+                "VobSub index file `{}` is missing one `size:` declaration",
                 path.display()
             ),
-        });
+        })?;
+        let height = self
+            .height
+            .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "VobSub index file `{}` is missing one `size:` declaration",
+                    path.display()
+                ),
+            })?;
+        let palette = self
+            .palette
+            .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "VobSub index file `{}` is missing one 16-color `palette:` declaration",
+                    path.display()
+                ),
+            })?;
+        let tracks = self
+            .languages
+            .into_values()
+            .filter(|track| !track.positions.is_empty())
+            .collect::<Vec<_>>();
+        if tracks.is_empty() {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: spec.to_string(),
+                message: format!(
+                    "VobSub index file `{}` did not declare any subtitle positions",
+                    path.display()
+                ),
+            });
+        }
+        Ok(VobSubIndex {
+            width,
+            height,
+            palette,
+            tracks,
+        })
     }
-
-    Ok(VobSubIndex {
-        width,
-        height,
-        palette,
-        tracks,
-    })
 }
 
 fn parse_vobsub_size(

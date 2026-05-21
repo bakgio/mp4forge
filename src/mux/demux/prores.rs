@@ -1,7 +1,11 @@
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[cfg(feature = "async")]
-use tokio::fs;
+use tokio::fs::File as TokioFile;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::FourCc;
 
@@ -40,8 +44,9 @@ pub(in crate::mux) fn scan_prores_file_sync(
     path: &Path,
     spec: &str,
 ) -> Result<ParsedProresTrack, MuxError> {
-    let bytes = std::fs::read(path)?;
-    parse_prores_bytes(path, spec, &bytes)
+    let mut file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    parse_prores_file_sync(path, spec, &mut file, file_size)
 }
 
 #[cfg(feature = "async")]
@@ -49,58 +54,61 @@ pub(in crate::mux) async fn scan_prores_file_async(
     path: &Path,
     spec: &str,
 ) -> Result<ParsedProresTrack, MuxError> {
-    let bytes = fs::read(path).await?;
-    parse_prores_bytes(path, spec, &bytes)
+    let mut file = TokioFile::open(path).await?;
+    let file_size = file.metadata().await?.len();
+    parse_prores_file_async(path, spec, &mut file, file_size).await
 }
 
-fn parse_prores_bytes(
+fn parse_prores_file_sync(
     path: &Path,
     spec: &str,
-    bytes: &[u8],
+    file: &mut File,
+    file_size: u64,
 ) -> Result<ParsedProresTrack, MuxError> {
-    if bytes.len() < 28 {
+    if file_size < 28 {
         return Err(invalid_prores(
             spec,
             "ProRes input is truncated before the first frame header",
         ));
     }
 
-    let mut offset = 0_usize;
+    let mut offset = 0_u64;
     let mut samples = Vec::new();
     let mut config = None::<ProresTrackConfig>;
-    while offset < bytes.len() {
-        let remaining = bytes.len() - offset;
+    let mut header = [0_u8; 28];
+    while offset < file_size {
+        let remaining = file_size - offset;
         if remaining < 28 {
             return Err(invalid_prores(
                 spec,
                 "ProRes input is truncated before one complete frame header",
             ));
         }
-        let frame_size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        let frame_size_usize = usize::try_from(frame_size)
-            .map_err(|_| MuxError::LayoutOverflow("ProRes frame size"))?;
-        if frame_size_usize < 28 {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut header)?;
+        let frame_size = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        if frame_size < 28 {
             return Err(invalid_prores(
                 spec,
                 "ProRes frame declared a size smaller than the required header",
             ));
         }
         let frame_end = offset
-            .checked_add(frame_size_usize)
+            .checked_add(u64::from(frame_size))
             .ok_or(MuxError::LayoutOverflow("ProRes frame range"))?;
-        if frame_end > bytes.len() {
+        if frame_end > file_size {
             return Err(invalid_prores(
                 spec,
                 "ProRes frame overruns the input length",
             ));
         }
-        if &bytes[offset + 4..offset + 8] != b"icpf" {
+        if &header[4..8] != b"icpf" {
             return Err(invalid_prores(
                 spec,
                 "ProRes frame did not carry the required `icpf` identifier",
             ));
         }
-        let parsed = parse_prores_frame_header(path, spec, &bytes[offset..frame_end])?;
+        let parsed = parse_prores_frame_header(path, spec, &header, frame_size)?;
         if let Some(previous) = config {
             if previous != parsed {
                 return Err(invalid_prores(
@@ -112,8 +120,7 @@ fn parse_prores_bytes(
             config = Some(parsed);
         }
         samples.push(StagedSample {
-            data_offset: u64::try_from(offset)
-                .map_err(|_| MuxError::LayoutOverflow("ProRes frame offset"))?,
+            data_offset: offset,
             data_size: frame_size,
             duration: parsed.duration,
             composition_time_offset: 0,
@@ -148,39 +155,134 @@ fn parse_prores_bytes(
     })
 }
 
+#[cfg(feature = "async")]
+async fn parse_prores_file_async(
+    path: &Path,
+    spec: &str,
+    file: &mut TokioFile,
+    file_size: u64,
+) -> Result<ParsedProresTrack, MuxError> {
+    if file_size < 28 {
+        return Err(invalid_prores(
+            spec,
+            "ProRes input is truncated before the first frame header",
+        ));
+    }
+
+    let mut offset = 0_u64;
+    let mut samples = Vec::new();
+    let mut config = None::<ProresTrackConfig>;
+    let mut header = [0_u8; 28];
+    while offset < file_size {
+        let remaining = file_size - offset;
+        if remaining < 28 {
+            return Err(invalid_prores(
+                spec,
+                "ProRes input is truncated before one complete frame header",
+            ));
+        }
+        file.seek(SeekFrom::Start(offset)).await?;
+        file.read_exact(&mut header).await?;
+        let frame_size = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        if frame_size < 28 {
+            return Err(invalid_prores(
+                spec,
+                "ProRes frame declared a size smaller than the required header",
+            ));
+        }
+        let frame_end = offset
+            .checked_add(u64::from(frame_size))
+            .ok_or(MuxError::LayoutOverflow("ProRes frame range"))?;
+        if frame_end > file_size {
+            return Err(invalid_prores(
+                spec,
+                "ProRes frame overruns the input length",
+            ));
+        }
+        if &header[4..8] != b"icpf" {
+            return Err(invalid_prores(
+                spec,
+                "ProRes frame did not carry the required `icpf` identifier",
+            ));
+        }
+        let parsed = parse_prores_frame_header(path, spec, &header, frame_size)?;
+        if let Some(previous) = config {
+            if previous != parsed {
+                return Err(invalid_prores(
+                    spec,
+                    "ProRes input changed its frame configuration mid-stream",
+                ));
+            }
+        } else {
+            config = Some(parsed);
+        }
+        samples.push(StagedSample {
+            data_offset: offset,
+            data_size: frame_size,
+            duration: parsed.duration,
+            composition_time_offset: 0,
+            is_sync_sample: true,
+        });
+        offset = frame_end;
+    }
+
+    let config =
+        config.ok_or_else(|| invalid_prores(spec, "ProRes input did not carry any frames"))?;
+    if let Some(last_sample) = samples.last_mut() {
+        last_sample.duration = 0;
+    }
+    let sample_entry_box = build_prores_sample_entry_box(
+        config.sample_entry_type,
+        config.width,
+        config.height,
+        prores_compressor_name(config.sample_entry_type),
+        config.colour_primaries,
+        config.transfer_characteristics,
+        config.matrix_coefficients,
+    )?;
+    Ok(ParsedProresTrack {
+        width: config.width,
+        height: config.height,
+        media_timescale: config.timescale,
+        sample_entry_box,
+        samples,
+    })
+}
+
 fn parse_prores_frame_header(
     path: &Path,
     spec: &str,
-    frame: &[u8],
+    header: &[u8; 28],
+    frame_size: u32,
 ) -> Result<ProresTrackConfig, MuxError> {
-    let frame_header_size = usize::from(u16::from_be_bytes(frame[8..10].try_into().unwrap()));
+    let frame_header_size = usize::from(u16::from_be_bytes(header[8..10].try_into().unwrap()));
     if frame_header_size < 20 {
         return Err(invalid_prores(
             spec,
             "ProRes frame header declared a size smaller than the required 20-byte core layout",
         ));
     }
-    if 8 + frame_header_size > frame.len() {
+    if 8 + frame_header_size > usize::try_from(frame_size).unwrap() {
         return Err(invalid_prores(
             spec,
             "ProRes frame header overruns the declared frame size",
         ));
     }
 
-    let width = u16::from_be_bytes(frame[16..18].try_into().unwrap());
-    let height = u16::from_be_bytes(frame[18..20].try_into().unwrap());
+    let width = u16::from_be_bytes(header[16..18].try_into().unwrap());
+    let height = u16::from_be_bytes(header[18..20].try_into().unwrap());
     if width == 0 || height == 0 {
         return Err(invalid_prores(
             spec,
             "ProRes frame header declared zero width or zero height",
         ));
     }
-    let chroma_format = frame[20] >> 6;
-    let framerate_code = frame[21] & 0x0F;
+    let chroma_format = header[20] >> 6;
+    let framerate_code = header[21] & 0x0F;
     let (timescale, duration) = prores_frame_rate(framerate_code);
-    let colour_primaries = normalize_prores_colour_component(frame[22]);
-    let transfer_characteristics = normalize_prores_colour_component(frame[23]);
-    let matrix_coefficients = normalize_prores_colour_component(frame[24]);
+    let colour_primaries = normalize_prores_colour_component(header[22]);
+    let transfer_characteristics = normalize_prores_colour_component(header[23]);
+    let matrix_coefficients = normalize_prores_colour_component(header[24]);
     let sample_entry_type = prores_sample_entry_type(path, chroma_format);
     Ok(ProresTrackConfig {
         sample_entry_type,
