@@ -2,12 +2,18 @@
 
 use std::io::{Cursor, Read};
 
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::BoxRegistry;
 use crate::codec::{
     CodecBox, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead, FieldValueWrite,
-    ImmutableBox, MutableBox, read_exact_vec_untrusted,
+    ImmutableBox, MutableBox, ReadSeek, read_exact_array_untrusted, read_exact_vec_untrusted,
 };
+#[cfg(feature = "async")]
+use crate::codec::{CodecFuture, read_exact_array_untrusted_async};
 use crate::{FourCc, codec_field};
+#[cfg(feature = "async")]
+use tokio::io::AsyncReadExt;
 
 /// Descriptor tag used by the elementary-stream descriptor record.
 pub const ES_DESCRIPTOR_TAG: u8 = 0x03;
@@ -84,7 +90,10 @@ fn escape_display_char(value: char) -> char {
     }
 }
 
-fn read_u8(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u8, FieldValueError> {
+fn read_u8<R: Read + ?Sized>(
+    reader: &mut R,
+    field_name: &'static str,
+) -> Result<u8, FieldValueError> {
     let mut buf = [0_u8; 1];
     reader
         .read_exact(&mut buf)
@@ -92,7 +101,10 @@ fn read_u8(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u8, F
     Ok(buf[0])
 }
 
-fn read_u16(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u16, FieldValueError> {
+fn read_u16<R: Read + ?Sized>(
+    reader: &mut R,
+    field_name: &'static str,
+) -> Result<u16, FieldValueError> {
     let mut buf = [0_u8; 2];
     reader
         .read_exact(&mut buf)
@@ -100,7 +112,10 @@ fn read_u16(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u16,
     Ok(u16::from_be_bytes(buf))
 }
 
-fn read_u24(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u32, FieldValueError> {
+fn read_u24<R: Read + ?Sized>(
+    reader: &mut R,
+    field_name: &'static str,
+) -> Result<u32, FieldValueError> {
     let mut buf = [0_u8; 3];
     reader
         .read_exact(&mut buf)
@@ -108,7 +123,10 @@ fn read_u24(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u32,
     Ok((u32::from(buf[0]) << 16) | (u32::from(buf[1]) << 8) | u32::from(buf[2]))
 }
 
-fn read_u32(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u32, FieldValueError> {
+fn read_u32<R: Read + ?Sized>(
+    reader: &mut R,
+    field_name: &'static str,
+) -> Result<u32, FieldValueError> {
     let mut buf = [0_u8; 4];
     reader
         .read_exact(&mut buf)
@@ -116,8 +134,8 @@ fn read_u32(reader: &mut Cursor<&[u8]>, field_name: &'static str) -> Result<u32,
     Ok(u32::from_be_bytes(buf))
 }
 
-fn read_exact_bytes(
-    reader: &mut Cursor<&[u8]>,
+fn read_exact_bytes<R: Read + ?Sized>(
+    reader: &mut R,
     len: usize,
     field_name: &'static str,
 ) -> Result<Vec<u8>, FieldValueError> {
@@ -125,8 +143,8 @@ fn read_exact_bytes(
         .map_err(|_| invalid_value(field_name, "descriptor payload is truncated"))
 }
 
-fn read_uvarint(
-    reader: &mut Cursor<&[u8]>,
+fn read_uvarint<R: Read + ?Sized>(
+    reader: &mut R,
     field_name: &'static str,
 ) -> Result<u32, FieldValueError> {
     let mut value = 0_u64;
@@ -140,6 +158,364 @@ fn read_uvarint(
             return Ok(value as u32);
         }
     }
+}
+
+#[cfg(feature = "async")]
+async fn read_u8_async<R>(reader: &mut R, field_name: &'static str) -> Result<u8, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut buf = [0_u8; 1];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|_| invalid_value(field_name, "descriptor stream is truncated"))?;
+    Ok(buf[0])
+}
+
+#[cfg(feature = "async")]
+async fn read_u16_async<R>(reader: &mut R, field_name: &'static str) -> Result<u16, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut buf = [0_u8; 2];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|_| invalid_value(field_name, "descriptor stream is truncated"))?;
+    Ok(u16::from_be_bytes(buf))
+}
+
+#[cfg(feature = "async")]
+async fn read_u24_async<R>(reader: &mut R, field_name: &'static str) -> Result<u32, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut buf = [0_u8; 3];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|_| invalid_value(field_name, "descriptor stream is truncated"))?;
+    Ok((u32::from(buf[0]) << 16) | (u32::from(buf[1]) << 8) | u32::from(buf[2]))
+}
+
+#[cfg(feature = "async")]
+async fn read_u32_async<R>(reader: &mut R, field_name: &'static str) -> Result<u32, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut buf = [0_u8; 4];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|_| invalid_value(field_name, "descriptor stream is truncated"))?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+#[cfg(feature = "async")]
+async fn read_exact_bytes_async<R>(
+    reader: &mut R,
+    len: usize,
+    field_name: &'static str,
+) -> Result<Vec<u8>, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut data = Vec::with_capacity(len.min(64 * 1024));
+    let mut chunk = [0_u8; 4096];
+    let mut remaining = len;
+    while remaining != 0 {
+        let to_read = remaining.min(chunk.len());
+        reader
+            .read_exact(&mut chunk[..to_read])
+            .await
+            .map_err(|_| invalid_value(field_name, "descriptor payload is truncated"))?;
+        data.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
+    Ok(data)
+}
+
+#[cfg(feature = "async")]
+async fn read_uvarint_async<R>(
+    reader: &mut R,
+    field_name: &'static str,
+) -> Result<u32, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut value = 0_u64;
+    loop {
+        let octet = read_u8_async(reader, field_name).await?;
+        value = (value << 7) | u64::from(octet & 0x7f);
+        if value > u64::from(u32::MAX) {
+            return Err(invalid_value(field_name, "value does not fit in u32"));
+        }
+        if octet & 0x80 == 0 {
+            return Ok(value as u32);
+        }
+    }
+}
+
+fn parse_descriptor_stream_from_reader<R: Read + ?Sized>(
+    field_name: &'static str,
+    reader: &mut R,
+    payload_size: usize,
+) -> Result<Vec<Descriptor>, FieldValueError> {
+    let mut limited = reader.take(payload_size as u64);
+    let mut descriptors = Vec::new();
+
+    while limited.limit() != 0 {
+        let tag = read_u8(&mut limited, field_name)?;
+        let size = read_uvarint(&mut limited, "Size")?;
+
+        let mut descriptor = Descriptor {
+            tag,
+            size,
+            ..Descriptor::default()
+        };
+
+        match tag {
+            MP4_OBJECT_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                parse_object_descriptor_payload("ObjectDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            MP4_INITIAL_OBJECT_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                parse_initial_object_descriptor_payload("InitialObjectDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            ES_DESCRIPTOR_TAG => {
+                descriptor.es_descriptor = Some(parse_es_descriptor("ESDescriptor", &mut limited)?);
+            }
+            DECODER_CONFIG_DESCRIPTOR_TAG => {
+                descriptor.decoder_config_descriptor = Some(parse_decoder_config_descriptor(
+                    "DecoderConfigDescriptor",
+                    &mut limited,
+                )?);
+            }
+            ES_ID_INC_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                parse_es_id_inc_descriptor_payload("EsIdIncDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            ES_ID_REF_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                parse_es_id_ref_descriptor_payload("EsIdRefDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            IPMP_DESCRIPTOR_POINTER_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                parse_ipmp_descriptor_pointer_payload("IpmpDescriptorPointer", &data)?;
+                descriptor.data = data;
+            }
+            IPMP_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                parse_ipmp_descriptor_payload("IpmpDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            _ => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes(&mut limited, data_len, field_name)?;
+                descriptor.data = data;
+            }
+        }
+
+        descriptors.push(descriptor);
+    }
+
+    Ok(descriptors)
+}
+
+#[cfg(feature = "async")]
+async fn parse_es_descriptor_async<R>(
+    field_name: &'static str,
+    reader: &mut R,
+) -> Result<EsDescriptor, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let es_id = read_u16_async(reader, field_name).await?;
+    let packed = read_u8_async(reader, field_name).await?;
+    let stream_dependence_flag = packed & 0x80 != 0;
+    let url_flag = packed & 0x40 != 0;
+    let ocr_stream_flag = packed & 0x20 != 0;
+    let stream_priority = packed & 0x1f;
+
+    let depends_on_es_id = if stream_dependence_flag {
+        read_u16_async(reader, field_name).await?
+    } else {
+        0
+    };
+    let (url_length, url_string) = if url_flag {
+        let url_length = read_u8_async(reader, field_name).await?;
+        let url_string =
+            read_exact_bytes_async(reader, usize::from(url_length), field_name).await?;
+        (url_length, url_string)
+    } else {
+        (0, Vec::new())
+    };
+    let ocr_es_id = if ocr_stream_flag {
+        read_u16_async(reader, field_name).await?
+    } else {
+        0
+    };
+
+    Ok(EsDescriptor {
+        es_id,
+        stream_dependence_flag,
+        url_flag,
+        ocr_stream_flag,
+        stream_priority,
+        depends_on_es_id,
+        url_length,
+        url_string,
+        ocr_es_id,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn parse_decoder_config_descriptor_async<R>(
+    field_name: &'static str,
+    reader: &mut R,
+) -> Result<DecoderConfigDescriptor, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let object_type_indication = read_u8_async(reader, field_name).await?;
+    let packed = read_u8_async(reader, field_name).await?;
+    let stream_type = packed >> 2;
+    let up_stream = packed & 0x02 != 0;
+    let reserved = packed & 0x01 != 0;
+    let buffer_size_db = read_u24_async(reader, field_name).await?;
+    let max_bitrate = read_u32_async(reader, field_name).await?;
+    let avg_bitrate = read_u32_async(reader, field_name).await?;
+
+    Ok(DecoderConfigDescriptor {
+        object_type_indication,
+        stream_type,
+        up_stream,
+        reserved,
+        buffer_size_db,
+        max_bitrate,
+        avg_bitrate,
+    })
+}
+
+#[cfg(feature = "async")]
+async fn parse_descriptor_stream_from_reader_async<R>(
+    field_name: &'static str,
+    reader: &mut R,
+    payload_size: usize,
+) -> Result<Vec<Descriptor>, FieldValueError>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut limited = reader.take(payload_size as u64);
+    let mut descriptors = Vec::new();
+
+    while limited.limit() != 0 {
+        let tag = read_u8_async(&mut limited, field_name).await?;
+        let size = read_uvarint_async(&mut limited, "Size").await?;
+        let mut descriptor = Descriptor {
+            tag,
+            size,
+            ..Descriptor::default()
+        };
+
+        match tag {
+            MP4_OBJECT_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                parse_object_descriptor_payload("ObjectDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            MP4_INITIAL_OBJECT_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                parse_initial_object_descriptor_payload("InitialObjectDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            ES_DESCRIPTOR_TAG => {
+                descriptor.es_descriptor =
+                    Some(parse_es_descriptor_async("ESDescriptor", &mut limited).await?);
+            }
+            DECODER_CONFIG_DESCRIPTOR_TAG => {
+                descriptor.decoder_config_descriptor = Some(
+                    parse_decoder_config_descriptor_async("DecoderConfigDescriptor", &mut limited)
+                        .await?,
+                );
+            }
+            ES_ID_INC_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                parse_es_id_inc_descriptor_payload("EsIdIncDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            ES_ID_REF_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                parse_es_id_ref_descriptor_payload("EsIdRefDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            IPMP_DESCRIPTOR_POINTER_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                parse_ipmp_descriptor_pointer_payload("IpmpDescriptorPointer", &data)?;
+                descriptor.data = data;
+            }
+            IPMP_DESCRIPTOR_TAG => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                parse_ipmp_descriptor_payload("IpmpDescriptor", &data)?;
+                descriptor.data = data;
+            }
+            _ => {
+                let data_len = usize::try_from(size).map_err(|_| {
+                    invalid_value(field_name, "descriptor size does not fit in usize")
+                })?;
+                let data = read_exact_bytes_async(&mut limited, data_len, field_name).await?;
+                descriptor.data = data;
+            }
+        }
+
+        descriptors.push(descriptor);
+    }
+
+    Ok(descriptors)
 }
 
 fn write_u16(buffer: &mut Vec<u8>, value: u16) {
@@ -444,9 +820,9 @@ fn encode_command_payload(command: &DescriptorCommand) -> Result<(u8, Vec<u8>), 
     }
 }
 
-fn parse_es_descriptor(
+fn parse_es_descriptor<R: Read + ?Sized>(
     field_name: &'static str,
-    reader: &mut Cursor<&[u8]>,
+    reader: &mut R,
 ) -> Result<EsDescriptor, FieldValueError> {
     let es_id = read_u16(reader, field_name)?;
     let packed = read_u8(reader, field_name)?;
@@ -486,9 +862,9 @@ fn parse_es_descriptor(
     })
 }
 
-fn parse_decoder_config_descriptor(
+fn parse_decoder_config_descriptor<R: Read + ?Sized>(
     field_name: &'static str,
-    reader: &mut Cursor<&[u8]>,
+    reader: &mut R,
 ) -> Result<DecoderConfigDescriptor, FieldValueError> {
     let object_type_indication = read_u8(reader, field_name)?;
     let packed = read_u8(reader, field_name)?;
@@ -1189,6 +1565,73 @@ impl CodecBox for Esds {
         codec_field!("Descriptors", 2, with_bit_width(8), as_bytes()),
     ]);
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, crate::codec::CodecError> {
+        if payload_size < 4 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+        let header =
+            read_exact_array_untrusted::<4, _>(reader).map_err(crate::codec::CodecError::Io)?;
+        let version = header[0];
+        if version != 0 {
+            return Err(crate::codec::CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        self.full_box = FullBoxState {
+            version,
+            flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+        };
+        self.descriptors = parse_descriptor_stream_from_reader(
+            "Descriptors",
+            reader,
+            usize::try_from(payload_size - 4)
+                .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+        )?;
+        Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, crate::codec::CodecError>> {
+        Box::pin(async move {
+            if payload_size < 4 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let header = read_exact_array_untrusted_async::<4, _>(reader)
+                .await
+                .map_err(crate::codec::CodecError::Io)?;
+            let version = header[0];
+            if version != 0 {
+                return Err(crate::codec::CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            self.full_box = FullBoxState {
+                version,
+                flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+            };
+            self.descriptors = parse_descriptor_stream_from_reader_async(
+                "Descriptors",
+                reader,
+                usize::try_from(payload_size - 4)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+            )
+            .await?;
+            Ok(Some(payload_size))
+        })
+    }
 }
 
 /// Initial-object descriptor box carried under `moov`.
@@ -1290,6 +1733,93 @@ impl CodecBox for Iods {
         codec_field!("Descriptor", 2, with_bit_width(8), as_bytes()),
     ]);
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, crate::codec::CodecError> {
+        if payload_size < 4 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+        let header =
+            read_exact_array_untrusted::<4, _>(reader).map_err(crate::codec::CodecError::Io)?;
+        let version = header[0];
+        if version != 0 {
+            return Err(crate::codec::CodecError::UnsupportedVersion {
+                box_type: self.box_type(),
+                version,
+            });
+        }
+
+        let descriptors = parse_descriptor_stream_from_reader(
+            "Descriptor",
+            reader,
+            usize::try_from(payload_size - 4)
+                .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+        )?;
+        self.descriptor = match descriptors.len() {
+            0 => None,
+            1 => Some(descriptors.into_iter().next().unwrap()),
+            _ => {
+                return Err(
+                    invalid_value("Descriptor", "iods may carry at most one descriptor").into(),
+                );
+            }
+        };
+        self.full_box = FullBoxState {
+            version,
+            flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+        };
+        Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, crate::codec::CodecError>> {
+        Box::pin(async move {
+            if payload_size < 4 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let header = read_exact_array_untrusted_async::<4, _>(reader)
+                .await
+                .map_err(crate::codec::CodecError::Io)?;
+            let version = header[0];
+            if version != 0 {
+                return Err(crate::codec::CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let descriptors = parse_descriptor_stream_from_reader_async(
+                "Descriptor",
+                reader,
+                usize::try_from(payload_size - 4)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+            )
+            .await?;
+            self.descriptor = match descriptors.len() {
+                0 => None,
+                1 => Some(descriptors.into_iter().next().unwrap()),
+                _ => {
+                    return Err(invalid_value(
+                        "Descriptor",
+                        "iods may carry at most one descriptor",
+                    )
+                    .into());
+                }
+            };
+            self.full_box = FullBoxState {
+                version,
+                flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+            };
+            Ok(Some(payload_size))
+        })
+    }
 }
 
 /// One tag-sized record within the `esds` descriptor stream.

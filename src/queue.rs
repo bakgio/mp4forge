@@ -121,7 +121,6 @@ impl RawOffsetQueue {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn head(&self) -> u64 {
         self.head
     }

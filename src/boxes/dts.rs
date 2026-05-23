@@ -4,13 +4,15 @@ use std::io::{Cursor, Write};
 
 #[cfg(feature = "async")]
 use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
+#[cfg(feature = "async")]
+use crate::bitio::AsyncBitReader;
 use crate::bitio::{BitReader, BitWriter};
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek,
 };
-#[cfg(feature = "async")]
-use crate::codec::{CodecFuture, read_exact_vec_untrusted_async};
 use crate::{FourCc, codec_field};
 
 fn missing_field(field_name: &'static str) -> FieldValueError {
@@ -47,6 +49,21 @@ fn read_bits_u8(
     _field_name: &'static str,
 ) -> Result<u8, CodecError> {
     Ok(reader.read_bits(width)?[0])
+}
+
+#[cfg(feature = "async")]
+async fn read_bits_u8_async<R>(
+    reader: &mut AsyncBitReader<R>,
+    width: usize,
+    field_name: &'static str,
+) -> Result<u8, CodecError>
+where
+    R: crate::async_io::AsyncRead + Unpin,
+{
+    let bits = reader.read_bits(width).await?;
+    bits.first()
+        .copied()
+        .ok_or_else(|| invalid_value(field_name, "bit field did not yield any bytes").into())
 }
 
 /// DTS core-specific configuration box carried by DTS sample entries.
@@ -269,6 +286,41 @@ impl CodecBox for Ddts {
         let _ = bit_reader.read_bits(6)?;
         Ok(Some(20))
     }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size != 20 {
+                return Err(invalid_value("Ddts", "payload size must be exactly 20 bytes").into());
+            }
+            let mut fixed = [0u8; 20];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut fixed).await?;
+            self.sampling_frequency = u32::from_be_bytes(fixed[0..4].try_into().unwrap());
+            self.max_bitrate = u32::from_be_bytes(fixed[4..8].try_into().unwrap());
+            self.avg_bitrate = u32::from_be_bytes(fixed[8..12].try_into().unwrap());
+            self.sample_depth = fixed[12];
+            let mut bit_reader = BitReader::new(Cursor::new(&fixed[13..20]));
+            self.frame_duration = read_bits_u8(&mut bit_reader, 2, "FrameDuration")?;
+            self.stream_construction = read_bits_u8(&mut bit_reader, 5, "StreamConstruction")?;
+            self.core_lfe_present = bit_reader.read_bit()?;
+            self.core_layout = read_bits_u8(&mut bit_reader, 6, "CoreLayout")?;
+            self.core_size = u16::from_be_bytes({
+                let bits = bit_reader.read_bits(14)?;
+                [bits[0], bits[1]]
+            }) & 0x3fff;
+            self.stereo_downmix = bit_reader.read_bit()?;
+            self.representation_type = read_bits_u8(&mut bit_reader, 3, "RepresentationType")?;
+            self.channel_layout = u16::from_be_bytes(bit_reader.read_bits(16)?.try_into().unwrap());
+            self.multi_asset_flag = bit_reader.read_bit()?;
+            self.lbr_duration_mod = bit_reader.read_bit()?;
+            let _ = bit_reader.read_bits(6)?;
+            Ok(Some(20))
+        })
+    }
 }
 
 /// DTS-UHD-specific configuration box carried by DTS sample entries.
@@ -462,16 +514,29 @@ impl CodecBox for Udts {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload = read_exact_vec_untrusted(
-            reader,
-            usize::try_from(payload_size).map_err(|_| {
-                invalid_value("Udts", "payload size exceeds the supported in-memory range")
-            })?,
-        )?;
-        if payload.len() < 6 {
-            return Err(invalid_value("Udts", "payload size must be at least 6 bytes").into());
+        if payload_size < 8 {
+            return Err(invalid_value("Udts", "payload size must be at least 8 bytes").into());
         }
-        let mut bit_reader = BitReader::new(Cursor::new(payload.as_slice()));
+        let total_len = usize::try_from(payload_size).map_err(|_| {
+            invalid_value("Udts", "payload size exceeds the supported in-memory range")
+        })?;
+        let mut prefix = [0_u8; 2];
+        reader.read_exact(&mut prefix)?;
+        let mut prefix_reader = BitReader::new(Cursor::new(prefix.as_slice()));
+        let _decoder_profile_code = read_bits_u8(&mut prefix_reader, 6, "DecoderProfileCode")?;
+        let _frame_duration_code = read_bits_u8(&mut prefix_reader, 2, "FrameDurationCode")?;
+        let _max_payload_code = read_bits_u8(&mut prefix_reader, 3, "MaxPayloadCode")?;
+        let num_presentations_code = read_bits_u8(&mut prefix_reader, 5, "NumPresentationsCode")?;
+        let header_len = (58usize + usize::from(num_presentations_code) + 1).div_ceil(8);
+        if total_len < header_len {
+            return Err(
+                invalid_value("Udts", "payload is truncated before the header completes").into(),
+            );
+        }
+        let mut header_bytes = vec![0_u8; header_len];
+        header_bytes[..2].copy_from_slice(&prefix);
+        reader.read_exact(&mut header_bytes[2..])?;
+        let mut bit_reader = BitReader::new(Cursor::new(header_bytes.as_slice()));
         self.decoder_profile_code = read_bits_u8(&mut bit_reader, 6, "DecoderProfileCode")?;
         self.frame_duration_code = read_bits_u8(&mut bit_reader, 2, "FrameDurationCode")?;
         self.max_payload_code = read_bits_u8(&mut bit_reader, 3, "MaxPayloadCode")?;
@@ -486,19 +551,22 @@ impl CodecBox for Udts {
         for _ in 0..=self.num_presentations_code {
             self.id_tag_present.push(bit_reader.read_bit()?);
         }
-        let mut consumed = (58usize + self.id_tag_present.len()).div_ceil(8);
+        let consumed = header_len;
         let presentation_id_len = self.id_tag_present.iter().filter(|flag| **flag).count() * 16;
-        if payload.len().saturating_sub(consumed) < presentation_id_len {
+        if total_len.saturating_sub(consumed) < presentation_id_len {
             return Err(invalid_value(
                 "PresentationIdTagData",
                 "payload is truncated before the declared ID-tag data",
             )
             .into());
         }
-        self.presentation_id_tag_data = payload[consumed..consumed + presentation_id_len].to_vec();
-        consumed += presentation_id_len;
+        self.presentation_id_tag_data = vec![0_u8; presentation_id_len];
+        reader.read_exact(&mut self.presentation_id_tag_data)?;
+        let consumed = consumed + presentation_id_len;
         if self.expansion_box_present {
-            self.expansion_box_data = payload[consumed..].to_vec();
+            let expansion_len = total_len.saturating_sub(consumed);
+            self.expansion_box_data = vec![0_u8; expansion_len];
+            reader.read_exact(&mut self.expansion_box_data)?;
         } else {
             self.expansion_box_data.clear();
         }
@@ -525,16 +593,75 @@ impl CodecBox for Udts {
         payload_size: u64,
     ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
         Box::pin(async move {
-            let payload = read_exact_vec_untrusted_async(
-                reader,
-                usize::try_from(payload_size).map_err(|_| {
-                    invalid_value("Udts", "payload size exceeds the supported in-memory range")
-                })?,
-            )
-            .await?;
-            let mut cursor = Cursor::new(payload);
-            let read = self.custom_unmarshal(&mut cursor, payload_size)?;
-            Ok(read)
+            if payload_size < 8 {
+                return Err(invalid_value("Udts", "payload size must be at least 8 bytes").into());
+            }
+            let total_len = usize::try_from(payload_size).map_err(|_| {
+                invalid_value("Udts", "payload size exceeds the supported in-memory range")
+            })?;
+            let mut prefix = [0_u8; 2];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut prefix).await?;
+            let mut prefix_reader = AsyncBitReader::new(Cursor::new(prefix.to_vec()));
+            let _decoder_profile_code =
+                read_bits_u8_async(&mut prefix_reader, 6, "DecoderProfileCode").await?;
+            let _frame_duration_code =
+                read_bits_u8_async(&mut prefix_reader, 2, "FrameDurationCode").await?;
+            let _max_payload_code =
+                read_bits_u8_async(&mut prefix_reader, 3, "MaxPayloadCode").await?;
+            let num_presentations_code =
+                read_bits_u8_async(&mut prefix_reader, 5, "NumPresentationsCode").await?;
+            let header_len = (58usize + usize::from(num_presentations_code) + 1).div_ceil(8);
+            if total_len < header_len {
+                return Err(invalid_value(
+                    "Udts",
+                    "payload is truncated before the header completes",
+                )
+                .into());
+            }
+            let mut header_bytes = vec![0_u8; header_len];
+            header_bytes[..2].copy_from_slice(&prefix);
+            tokio::io::AsyncReadExt::read_exact(reader, &mut header_bytes[2..]).await?;
+            let mut bit_reader = AsyncBitReader::new(Cursor::new(header_bytes));
+            self.decoder_profile_code =
+                read_bits_u8_async(&mut bit_reader, 6, "DecoderProfileCode").await?;
+            self.frame_duration_code =
+                read_bits_u8_async(&mut bit_reader, 2, "FrameDurationCode").await?;
+            self.max_payload_code =
+                read_bits_u8_async(&mut bit_reader, 3, "MaxPayloadCode").await?;
+            self.num_presentations_code =
+                read_bits_u8_async(&mut bit_reader, 5, "NumPresentationsCode").await?;
+            self.channel_mask =
+                u32::from_be_bytes(bit_reader.read_bits(32).await?.try_into().unwrap());
+            self.base_sampling_frequency_code = bit_reader.read_bit().await?;
+            self.sample_rate_mod = read_bits_u8_async(&mut bit_reader, 2, "SampleRateMod").await?;
+            self.representation_type =
+                read_bits_u8_async(&mut bit_reader, 3, "RepresentationType").await?;
+            self.stream_index = read_bits_u8_async(&mut bit_reader, 3, "StreamIndex").await?;
+            self.expansion_box_present = bit_reader.read_bit().await?;
+            self.id_tag_present.clear();
+            for _ in 0..=self.num_presentations_code {
+                self.id_tag_present.push(bit_reader.read_bit().await?);
+            }
+            let consumed = header_len;
+            let presentation_id_len = self.id_tag_present.iter().filter(|flag| **flag).count() * 16;
+            if total_len.saturating_sub(consumed) < presentation_id_len {
+                return Err(invalid_value(
+                    "PresentationIdTagData",
+                    "payload is truncated before the declared ID-tag data",
+                )
+                .into());
+            }
+            self.presentation_id_tag_data = vec![0_u8; presentation_id_len];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut self.presentation_id_tag_data).await?;
+            let consumed = consumed + presentation_id_len;
+            if self.expansion_box_present {
+                let expansion_len = total_len.saturating_sub(consumed);
+                self.expansion_box_data = vec![0_u8; expansion_len];
+                tokio::io::AsyncReadExt::read_exact(reader, &mut self.expansion_box_data).await?;
+            } else {
+                self.expansion_box_data.clear();
+            }
+            Ok(Some(payload_size))
         })
     }
 }

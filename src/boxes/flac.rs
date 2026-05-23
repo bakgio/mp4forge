@@ -3,11 +3,18 @@
 use std::io::Write;
 
 use super::iso14496_12::AudioSampleEntry;
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::BoxRegistry;
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_array_untrusted,
+    read_exact_vec_untrusted,
 };
+#[cfg(feature = "async")]
+use crate::codec::{read_exact_array_untrusted_async, read_exact_vec_untrusted_async};
 use crate::{FourCc, codec_field};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -182,6 +189,131 @@ fn decode_metadata_blocks(
     Ok(blocks)
 }
 
+fn decode_metadata_blocks_from_reader(
+    field_name: &'static str,
+    reader: &mut dyn ReadSeek,
+    payload_size: u64,
+) -> Result<Vec<FlacMetadataBlock>, FieldValueError> {
+    let mut remaining = payload_size;
+    let mut blocks = Vec::new();
+
+    while remaining != 0 {
+        if remaining < 4 {
+            return Err(invalid_value(
+                field_name,
+                "metadata block header is truncated",
+            ));
+        }
+
+        let header = read_exact_array_untrusted::<4, _>(reader)
+            .map_err(|_| invalid_value(field_name, "metadata block header is truncated"))?;
+        remaining -= 4;
+
+        let last_metadata_block_flag = (header[0] & 0x80) != 0;
+        let block_type = header[0] & 0x7f;
+        let length = read_u24(&header, 1);
+        let block_len = usize::try_from(length).map_err(|_| {
+            invalid_value(field_name, "metadata block length does not fit in usize")
+        })?;
+        if remaining < u64::from(length) {
+            return Err(invalid_value(
+                field_name,
+                "metadata block payload is truncated",
+            ));
+        }
+
+        let block_data = read_exact_vec_untrusted(reader, block_len)
+            .map_err(|_| invalid_value(field_name, "metadata block payload is truncated"))?;
+        remaining -= u64::from(length);
+
+        if last_metadata_block_flag && remaining != 0 {
+            return Err(invalid_value(
+                field_name,
+                "last metadata block flag must only appear on the final block",
+            ));
+        }
+
+        blocks.push(FlacMetadataBlock {
+            last_metadata_block_flag,
+            block_type,
+            length,
+            block_data,
+        });
+    }
+
+    if let Some(last_block) = blocks.last_mut()
+        && !last_block.last_metadata_block_flag
+    {
+        last_block.last_metadata_block_flag = true;
+    }
+
+    Ok(blocks)
+}
+
+#[cfg(feature = "async")]
+async fn decode_metadata_blocks_from_reader_async(
+    field_name: &'static str,
+    reader: &mut dyn AsyncReadSeek,
+    payload_size: u64,
+) -> Result<Vec<FlacMetadataBlock>, FieldValueError> {
+    let mut remaining = payload_size;
+    let mut blocks = Vec::new();
+
+    while remaining != 0 {
+        if remaining < 4 {
+            return Err(invalid_value(
+                field_name,
+                "metadata block header is truncated",
+            ));
+        }
+
+        let header = read_exact_array_untrusted_async::<4, _>(reader)
+            .await
+            .map_err(|_| invalid_value(field_name, "metadata block header is truncated"))?;
+        remaining -= 4;
+
+        let last_metadata_block_flag = (header[0] & 0x80) != 0;
+        let block_type = header[0] & 0x7f;
+        let length = read_u24(&header, 1);
+        let block_len = usize::try_from(length).map_err(|_| {
+            invalid_value(field_name, "metadata block length does not fit in usize")
+        })?;
+        if remaining < u64::from(length) {
+            return Err(invalid_value(
+                field_name,
+                "metadata block payload is truncated",
+            ));
+        }
+
+        let block_data = read_exact_vec_untrusted_async(reader, block_len)
+            .await
+            .map_err(|_| invalid_value(field_name, "metadata block payload is truncated"))?;
+        remaining -= u64::from(length);
+
+        if last_metadata_block_flag && remaining != 0 {
+            return Err(invalid_value(
+                field_name,
+                "last metadata block flag must only appear on the final block",
+            ));
+        }
+
+        blocks.push(FlacMetadataBlock {
+            last_metadata_block_flag,
+            block_type,
+            length,
+            block_data,
+        });
+    }
+
+    if let Some(last_block) = blocks.last_mut()
+        && !last_block.last_metadata_block_flag
+    {
+        last_block.last_metadata_block_flag = true;
+    }
+
+    Ok(blocks)
+}
+
 /// One FLAC metadata block carried by `dfLa`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlacMetadataBlock {
@@ -306,10 +438,10 @@ impl CodecBox for DfLa {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let payload = read_exact_vec_untrusted(reader, payload_size as usize)?;
-        let version = payload[0];
+        let header = read_exact_array_untrusted::<4, _>(reader)?;
+        let version = header[0];
         let flags =
-            (u32::from(payload[1]) << 16) | (u32::from(payload[2]) << 8) | u32::from(payload[3]);
+            (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
         if version != 0 {
             return Err(invalid_value("Version", "unsupported version").into());
         }
@@ -318,8 +450,42 @@ impl CodecBox for DfLa {
         }
 
         self.full_box = FullBoxState { version, flags };
-        self.metadata_blocks = decode_metadata_blocks("MetadataBlocks", &payload[4..])?;
+        self.metadata_blocks =
+            decode_metadata_blocks_from_reader("MetadataBlocks", reader, payload_size - 4)?;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 4 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let header = read_exact_array_untrusted_async::<4, _>(reader).await?;
+            let version = header[0];
+            let flags =
+                (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
+            if version != 0 {
+                return Err(invalid_value("Version", "unsupported version").into());
+            }
+            if flags != 0 {
+                return Err(invalid_value("Flags", "unsupported flags").into());
+            }
+
+            self.full_box = FullBoxState { version, flags };
+            self.metadata_blocks = decode_metadata_blocks_from_reader_async(
+                "MetadataBlocks",
+                reader,
+                payload_size - 4,
+            )
+            .await?;
+            Ok(Some(payload_size))
+        })
     }
 }
 

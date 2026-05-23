@@ -66,6 +66,9 @@ where
 {
     let layout = build_container_layout(file_config, track_configs, plan)?;
     writer.write_all(&layout.ftyp_bytes)?;
+    if !layout.leading_bytes.is_empty() {
+        writer.write_all(&layout.leading_bytes)?;
+    }
     writer.write_all(&layout.moov_bytes)?;
     writer.write_all(&layout.mdat_header)?;
     copy_planned_payloads(sources, writer, plan)?;
@@ -109,6 +112,9 @@ where
 {
     let layout = build_container_layout(file_config, track_configs, plan)?;
     writer.write_all(&layout.ftyp_bytes).await?;
+    if !layout.leading_bytes.is_empty() {
+        writer.write_all(&layout.leading_bytes).await?;
+    }
     writer.write_all(&layout.moov_bytes).await?;
     writer.write_all(&layout.mdat_header).await?;
     copy_planned_payloads_async(sources, writer, plan).await?;
@@ -193,6 +199,7 @@ where
 
 struct ContainerLayout {
     ftyp_bytes: Vec<u8>,
+    leading_bytes: Vec<u8>,
     moov_bytes: Vec<u8>,
     mdat_header: Vec<u8>,
     trailing_bytes: Vec<u8>,
@@ -258,30 +265,39 @@ fn build_container_layout(
 
     let prepared_tracks = prepare_tracks(file_config, track_configs, plan)?;
     let ftyp_bytes = build_ftyp_bytes(file_config, &prepared_tracks)?;
+    let leading_bytes = file_config.preserved_flat_prefix_bytes().to_vec();
+    let ftyp_size =
+        u64::try_from(ftyp_bytes.len()).map_err(|_| MuxError::LayoutOverflow("ftyp size"))?;
+    let leading_bytes_size = u64::try_from(leading_bytes.len())
+        .map_err(|_| MuxError::LayoutOverflow("leading box size"))?;
+    let moov_start = ftyp_size
+        .checked_add(leading_bytes_size)
+        .ok_or(MuxError::LayoutOverflow("moov start"))?;
     let mdat_header = encode_header_only(
         FourCc::from_bytes(*b"mdat"),
         plan.total_payload_size(),
         "mdat header",
     )?;
+    let mdat_header_size =
+        u64::try_from(mdat_header.len()).map_err(|_| MuxError::LayoutOverflow("mdat header"))?;
     let provisional_moov = build_moov_bytes(
         file_config,
         &prepared_tracks,
-        u64::try_from(ftyp_bytes.len()).map_err(|_| MuxError::LayoutOverflow("ftyp size"))?,
-        u64::try_from(mdat_header.len()).map_err(|_| MuxError::LayoutOverflow("mdat header"))?,
+        moov_start,
+        mdat_header_size,
         0,
     )?;
     let moov_size =
         u64::try_from(provisional_moov.len()).map_err(|_| MuxError::LayoutOverflow("moov size"))?;
-    let mdat_data_start = u64::try_from(ftyp_bytes.len())
-        .map_err(|_| MuxError::LayoutOverflow("ftyp size"))?
+    let mdat_data_start = moov_start
         .checked_add(moov_size)
-        .and_then(|offset| offset.checked_add(u64::try_from(mdat_header.len()).ok()?))
+        .and_then(|offset| offset.checked_add(mdat_header_size))
         .ok_or(MuxError::LayoutOverflow("mdat data start"))?;
     let moov_bytes = build_moov_bytes(
         file_config,
         &prepared_tracks,
-        u64::try_from(ftyp_bytes.len()).map_err(|_| MuxError::LayoutOverflow("ftyp size"))?,
-        u64::try_from(mdat_header.len()).map_err(|_| MuxError::LayoutOverflow("mdat header"))?,
+        moov_start,
+        mdat_header_size,
         mdat_data_start,
     )?;
     let trailing_bytes = if file_config.auto_flat_profile() || file_config.keep_flat_free_box() {
@@ -298,6 +314,7 @@ fn build_container_layout(
 
     Ok(ContainerLayout {
         ftyp_bytes,
+        leading_bytes,
         moov_bytes,
         mdat_header,
         trailing_bytes,
@@ -1714,6 +1731,9 @@ fn build_flat_iods_bytes(
     file_config: &MuxFileConfig,
     tracks: &[PreparedTrack<'_>],
 ) -> Result<Option<Vec<u8>>, MuxError> {
+    if let Some(preserved_iods_bytes) = file_config.preserved_flat_iods_bytes() {
+        return Ok(Some(preserved_iods_bytes.to_vec()));
+    }
     if !file_config.auto_flat_profile() {
         return Ok(None);
     }
@@ -1976,6 +1996,8 @@ fn build_flat_iods_bytes(
             || (has_avc && !has_audio && imported_authority_tracks)
         {
             0xfe
+        } else if has_avc && has_mp4a && imported_authority_tracks {
+            0xff
         } else if has_avc && has_mp4a {
             0x7f
         } else if has_avc && has_non_mp4a_audio {
@@ -2035,6 +2057,9 @@ fn build_flat_udta_bytes(
     file_config: &MuxFileConfig,
     tracks: &[PreparedTrack<'_>],
 ) -> Result<Option<Vec<u8>>, MuxError> {
+    if let Some(preserved_udta_bytes) = file_config.preserved_flat_udta_bytes() {
+        return Ok(Some(preserved_udta_bytes.to_vec()));
+    }
     if !file_config.auto_flat_profile() {
         return Ok(None);
     }
@@ -2166,8 +2191,14 @@ fn build_mvhd(
     mvhd.matrix = IDENTITY_MATRIX;
     mvhd.next_track_id = next_track_id;
     if let Some(auto_flat_creation_time) = auto_flat_creation_time {
-        mvhd.creation_time_v0 = auto_flat_creation_time;
-        mvhd.modification_time_v0 = auto_flat_creation_time;
+        let modification_time = file_config
+            .flat_source_movie_modification_time()
+            .unwrap_or(u64::from(auto_flat_creation_time));
+        apply_flat_movie_header_times(
+            &mut mvhd,
+            file_config.flat_source_movie_creation_time(),
+            modification_time,
+        )?;
     }
     Ok(mvhd)
 }
@@ -2248,10 +2279,21 @@ fn build_tkhd(
     let mut tkhd =
         build_tkhd_with_movie_timescale(track, flat_movie_header_timescale(file_config))?;
     if let Some(auto_flat_creation_time) = auto_flat_creation_time {
+        let modification_time = if track.config.kind() == MuxTrackKind::Video
+            && track_uses_imported_authority_headers(track)
+        {
+            track
+                .config
+                .flat_source_track_modification_time()
+                .filter(|modification_time| *modification_time != 0)
+                .unwrap_or(u64::from(auto_flat_creation_time))
+        } else {
+            u64::from(auto_flat_creation_time)
+        };
         apply_flat_track_header_times(
             &mut tkhd,
             track.config.flat_source_track_creation_time(),
-            u64::from(auto_flat_creation_time),
+            modification_time,
         )?;
     }
     Ok(tkhd)
@@ -2336,10 +2378,20 @@ fn build_mdhd(
 ) -> Result<Mdhd, MuxError> {
     let mut mdhd = build_mdhd_base(track)?;
     if let Some(auto_flat_creation_time) = auto_flat_creation_time {
+        let modification_time = if track.config.kind() == MuxTrackKind::Video
+            && track_uses_imported_authority_headers(track)
+        {
+            track
+                .config
+                .flat_source_media_modification_time()
+                .unwrap_or(u64::from(auto_flat_creation_time))
+        } else {
+            u64::from(auto_flat_creation_time)
+        };
         apply_flat_media_header_times(
             &mut mdhd,
             track.config.flat_source_media_creation_time(),
-            u64::from(auto_flat_creation_time),
+            modification_time,
         )?;
     }
     Ok(mdhd)
@@ -2363,6 +2415,28 @@ fn apply_flat_track_header_times(
             .map_err(|_| MuxError::LayoutOverflow("tkhd creation time"))?;
         tkhd.modification_time_v0 = u32::try_from(modification_time)
             .map_err(|_| MuxError::LayoutOverflow("tkhd modification time"))?;
+    }
+    Ok(())
+}
+
+fn apply_flat_movie_header_times(
+    mvhd: &mut Mvhd,
+    source_creation_time: Option<u64>,
+    modification_time: u64,
+) -> Result<(), MuxError> {
+    let creation_time = source_creation_time.unwrap_or(modification_time);
+    if mvhd.version() == 1
+        || creation_time > u64::from(u32::MAX)
+        || modification_time > u64::from(u32::MAX)
+    {
+        mvhd.set_version(1);
+        mvhd.creation_time_v1 = creation_time;
+        mvhd.modification_time_v1 = modification_time;
+    } else {
+        mvhd.creation_time_v0 = u32::try_from(creation_time)
+            .map_err(|_| MuxError::LayoutOverflow("mvhd creation time"))?;
+        mvhd.modification_time_v0 = u32::try_from(modification_time)
+            .map_err(|_| MuxError::LayoutOverflow("mvhd modification time"))?;
     }
     Ok(())
 }
@@ -3490,9 +3564,13 @@ pub(crate) fn fragmented_visual_tkhd_dimensions_fixed_16_16(
     if pasp.h_spacing == 0 || pasp.v_spacing == 0 || (pasp.h_spacing == 1 && pasp.v_spacing == 1) {
         return Ok(None);
     }
-    let width_fixed_16_16 =
-        (u128::from(sample_entry.width) * u128::from(pasp.h_spacing) * u128::from(1_u32 << 16))
-            / u128::from(pasp.v_spacing);
+    let numerator =
+        u128::from(sample_entry.width) * u128::from(pasp.h_spacing) * u128::from(1_u32 << 16);
+    let divisor = u128::from(pasp.v_spacing);
+    let width_fixed_16_16 = numerator
+        .saturating_add(divisor / 2)
+        .checked_div(divisor)
+        .unwrap_or(0);
     Ok(Some((
         u32::try_from(width_fixed_16_16)
             .map_err(|_| MuxError::LayoutOverflow("fragmented visual tkhd width"))?,
@@ -3926,6 +4004,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boxes::iso14496_12::AVCDecoderConfiguration;
     use crate::mux::FlatTimingOverride;
     use crate::mux::StscRunEncodingMode;
 
@@ -4071,6 +4150,65 @@ mod tests {
             .expect("initial descriptor");
 
         assert_eq!(descriptor.visual_profile_level_indication, 0x7f);
+    }
+
+    #[test]
+    fn build_flat_iods_bytes_uses_unknown_visual_profile_for_imported_authority_avc_mp4a_tracks() {
+        let video_sample_entry_box = test_visual_sample_entry_box(FourCc::from_bytes(*b"avc1"));
+        let video_config =
+            MuxTrackConfig::new_video(1, 1_000, 640, 360, video_sample_entry_box.clone())
+                .with_flat_source_track_creation_time(Some(1))
+                .with_flat_source_media_creation_time(Some(1));
+        let video_track = PreparedTrack {
+            config: &video_config,
+            sample_entry_box: &video_sample_entry_box,
+            samples: vec![test_prepared_sample(0, 1_000, true)],
+            chunk_sample_counts: vec![1],
+            fragmented_reference_group_fragment_counts: None,
+            media_duration: 1_000,
+            presentation_duration_media: 1_000,
+            edit_media_time: None,
+            flat_timing_override: None,
+        };
+        let audio_sample_entry_box = encode_typed_box(
+            &AudioSampleEntry {
+                sample_entry: SampleEntry {
+                    box_type: FourCc::from_bytes(*b"mp4a"),
+                    data_reference_index: 1,
+                },
+                channel_count: 2,
+                sample_size: 16,
+                sample_rate: 48_000 << 16,
+                ..AudioSampleEntry::default()
+            },
+            &[],
+        )
+        .expect("mp4a sample entry");
+        let audio_config = MuxTrackConfig::new_audio(2, 48_000, audio_sample_entry_box.clone())
+            .with_flat_source_track_creation_time(Some(1))
+            .with_flat_source_media_creation_time(Some(1));
+        let audio_track = PreparedTrack {
+            config: &audio_config,
+            sample_entry_box: &audio_sample_entry_box,
+            samples: vec![test_prepared_sample(0, 1_024, true)],
+            chunk_sample_counts: vec![1],
+            fragmented_reference_group_fragment_counts: None,
+            media_duration: 1_024,
+            presentation_duration_media: 1_024,
+            edit_media_time: None,
+            flat_timing_override: None,
+        };
+        let file_config = MuxFileConfig::new(1_000).with_auto_flat_profile(true);
+
+        let iods_bytes = build_flat_iods_bytes(&file_config, &[video_track, audio_track])
+            .expect("flat iods")
+            .expect("present iods");
+        let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
+
+        assert_eq!(descriptor.visual_profile_level_indication, 0xff);
     }
 
     #[test]
@@ -4681,6 +4819,138 @@ mod tests {
             .expect("initial descriptor");
 
         assert_eq!(descriptor.visual_profile_level_indication, 0xfe);
+    }
+
+    #[test]
+    fn fragmented_visual_tkhd_dimensions_fixed_16_16_preserves_non_square_pasp_width() {
+        let avcc = encode_typed_box(
+            &AVCDecoderConfiguration {
+                configuration_version: 1,
+                profile: 100,
+                profile_compatibility: 0,
+                level: 31,
+                length_size_minus_one: 3,
+                ..AVCDecoderConfiguration::default()
+            },
+            &[],
+        )
+        .expect("avcc");
+        let pasp = encode_typed_box(
+            &Pasp {
+                h_spacing: 8,
+                v_spacing: 9,
+            },
+            &[],
+        )
+        .expect("pasp");
+        let sample_entry = encode_typed_box(
+            &VisualSampleEntry {
+                sample_entry: SampleEntry {
+                    box_type: FourCc::from_bytes(*b"avc1"),
+                    data_reference_index: 1,
+                },
+                width: 706,
+                height: 472,
+                ..VisualSampleEntry::default()
+            },
+            &[avcc, pasp].concat(),
+        )
+        .expect("sample entry");
+
+        let dimensions =
+            fragmented_visual_tkhd_dimensions_fixed_16_16(&sample_entry).expect("dimensions");
+
+        assert_eq!(dimensions, Some((41_127_481, 30_932_992)));
+    }
+
+    #[test]
+    fn build_mdhd_preserves_imported_authority_video_media_modification_time() {
+        let sample_entry_box = test_visual_sample_entry_box(FourCc::from_bytes(*b"avc1"));
+        let config = MuxTrackConfig::new_video(1, 1_000, 640, 360, sample_entry_box.clone())
+            .with_flat_source_track_creation_time(Some(0))
+            .with_flat_source_media_creation_time(Some(0))
+            .with_flat_source_media_modification_time(Some(0));
+        let track = PreparedTrack {
+            config: &config,
+            sample_entry_box: &sample_entry_box,
+            samples: vec![test_prepared_sample(0, 1_000, true)],
+            chunk_sample_counts: vec![1],
+            fragmented_reference_group_fragment_counts: None,
+            media_duration: 1_000,
+            presentation_duration_media: 1_000,
+            edit_media_time: None,
+            flat_timing_override: None,
+        };
+
+        let mdhd = build_mdhd(&track, Some(123)).expect("mdhd");
+
+        assert_eq!(mdhd.creation_time(), 0);
+        assert_eq!(mdhd.modification_time(), 0);
+    }
+
+    #[test]
+    fn build_tkhd_uses_generated_modification_time_for_imported_authority_video_when_source_value_is_zero()
+     {
+        let sample_entry_box = test_visual_sample_entry_box(FourCc::from_bytes(*b"avc1"));
+        let config = MuxTrackConfig::new_video(1, 1_000, 640, 360, sample_entry_box.clone())
+            .with_flat_source_track_creation_time(Some(0))
+            .with_flat_source_track_modification_time(Some(0))
+            .with_flat_source_media_creation_time(Some(0));
+        let track = PreparedTrack {
+            config: &config,
+            sample_entry_box: &sample_entry_box,
+            samples: vec![test_prepared_sample(0, 1_000, true)],
+            chunk_sample_counts: vec![1],
+            fragmented_reference_group_fragment_counts: None,
+            media_duration: 1_000,
+            presentation_duration_media: 1_000,
+            edit_media_time: None,
+            flat_timing_override: None,
+        };
+        let file_config = MuxFileConfig::new(1_000).with_auto_flat_profile(true);
+
+        let tkhd = build_tkhd(&file_config, &track, Some(123)).expect("tkhd");
+
+        assert_eq!(tkhd.creation_time(), 0);
+        assert_eq!(tkhd.modification_time(), 123);
+    }
+
+    #[test]
+    fn build_mdhd_keeps_generated_media_modification_time_for_imported_authority_audio() {
+        let sample_entry_box = encode_typed_box(
+            &AudioSampleEntry {
+                sample_entry: SampleEntry {
+                    box_type: FourCc::from_bytes(*b"mp4a"),
+                    data_reference_index: 1,
+                },
+                channel_count: 2,
+                sample_size: 16,
+                sample_rate: 48_000 << 16,
+                ..AudioSampleEntry::default()
+            },
+            &[],
+        )
+        .expect("mp4a sample entry");
+        let config = MuxTrackConfig::new_audio(1, 48_000, sample_entry_box.clone())
+            .with_flat_source_track_creation_time(Some(0))
+            .with_flat_source_media_creation_time(Some(0))
+            .with_flat_source_media_modification_time(Some(0));
+        let track = PreparedTrack {
+            config: &config,
+            sample_entry_box: &sample_entry_box,
+            samples: vec![test_prepared_sample(0, 1_024, true)],
+            chunk_sample_counts: vec![1],
+            fragmented_reference_group_fragment_counts: None,
+            media_duration: 1_024,
+            presentation_duration_media: 1_024,
+            edit_media_time: None,
+            flat_timing_override: None,
+        };
+
+        let mdhd = build_mdhd(&track, Some(123)).expect("mdhd");
+
+        assert_eq!(mdhd.creation_time(), 0);
+        assert_eq!(mdhd.modification_time(), 123);
     }
 
     #[test]

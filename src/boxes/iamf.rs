@@ -4,12 +4,12 @@ use std::io::Write;
 
 #[cfg(feature = "async")]
 use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek,
 };
-#[cfg(feature = "async")]
-use crate::codec::{CodecFuture, read_exact_vec_untrusted_async};
 use crate::{FourCc, codec_field};
 
 fn missing_field(field_name: &'static str) -> FieldValueError {
@@ -234,7 +234,8 @@ impl CodecBox for Iacb {
             )
             .into());
         }
-        self.config_obus = read_exact_vec_untrusted(reader, config_len)?;
+        self.config_obus.resize(config_len, 0);
+        reader.read_exact(&mut self.config_obus)?;
         Ok(Some(total))
     }
 
@@ -291,7 +292,8 @@ impl CodecBox for Iacb {
                 )
                 .into());
             }
-            self.config_obus = read_exact_vec_untrusted_async(reader, config_len).await?;
+            self.config_obus.resize(config_len, 0);
+            tokio::io::AsyncReadExt::read_exact(reader, &mut self.config_obus).await?;
             Ok(Some(total))
         })
     }

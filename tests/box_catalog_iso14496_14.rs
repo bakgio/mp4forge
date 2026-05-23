@@ -13,6 +13,8 @@ use mp4forge::boxes::iso14496_14::{
     parse_descriptor_commands,
 };
 use mp4forge::codec::{CodecBox, MutableBox, marshal, unmarshal, unmarshal_any};
+#[cfg(feature = "async")]
+use mp4forge::codec::{marshal_async, unmarshal_any_async, unmarshal_async};
 use mp4forge::stringify::stringify;
 
 fn assert_box_roundtrip<T>(src: T, payload: &[u8], expected: &str)
@@ -132,6 +134,142 @@ fn descriptor_catalog_roundtrips() {
         ],
         "Version=0 Flags=0x000000 Descriptors=[{Tag=ESDescr Size=19088743 ESID=4660 StreamDependenceFlag=true UrlFlag=false OcrStreamFlag=true StreamPriority=3 DependsOnESID=9029 OCRESID=13398}, {Tag=ESDescr Size=19088743 ESID=4660 StreamDependenceFlag=false UrlFlag=true OcrStreamFlag=false StreamPriority=3 URLLength=0xb URLString=\"http://hoge\"}, {Tag=DecoderConfigDescr Size=19088743 ObjectTypeIndication=0x12 StreamType=21 UpStream=true Reserved=false BufferSizeDB=1193046 MaxBitrate=305419896 AvgBitrate=591751049}, {Tag=DecSpecificInfo Size=3 Data=[0x11, 0x22, 0x33]}, {Tag=SLConfigDescr Size=5 Data=[0x11, 0x22, 0x33, 0x44, 0x55]}]",
     );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_descriptor_catalog_roundtrips() {
+    let mut esds = Esds::default();
+    esds.set_version(0);
+    esds.descriptors = vec![
+        Descriptor {
+            tag: ES_DESCRIPTOR_TAG,
+            size: 0x1234567,
+            es_descriptor: Some(EsDescriptor {
+                es_id: 0x1234,
+                stream_dependence_flag: true,
+                ocr_stream_flag: true,
+                stream_priority: 0x03,
+                depends_on_es_id: 0x2345,
+                ocr_es_id: 0x3456,
+                ..EsDescriptor::default()
+            }),
+            ..Descriptor::default()
+        },
+        Descriptor {
+            tag: DECODER_CONFIG_DESCRIPTOR_TAG,
+            size: 0x1234567,
+            decoder_config_descriptor: Some(DecoderConfigDescriptor {
+                object_type_indication: 0x12,
+                stream_type: 0x15,
+                up_stream: true,
+                reserved: false,
+                buffer_size_db: 0x123456,
+                max_bitrate: 0x12345678,
+                avg_bitrate: 0x23456789,
+            }),
+            ..Descriptor::default()
+        },
+        Descriptor {
+            tag: DECODER_SPECIFIC_INFO_TAG,
+            size: 0x03,
+            data: vec![0x11, 0x22, 0x33],
+            ..Descriptor::default()
+        },
+    ];
+
+    let expected_esds = vec![
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x89, 0x8d, 0x8a, 0x67, 0x12, 0x34, 0xa3, 0x23, 0x45, 0x34,
+        0x56, 0x04, 0x89, 0x8d, 0x8a, 0x67, 0x12, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x78,
+        0x23, 0x45, 0x67, 0x89, 0x05, 0x03, 0x11, 0x22, 0x33,
+    ];
+
+    let mut esds_writer = Cursor::new(Vec::new());
+    let written = marshal_async(&mut esds_writer, &esds, None).await.unwrap();
+    assert_eq!(written, expected_esds.len() as u64);
+    assert_eq!(esds_writer.into_inner(), expected_esds);
+
+    let mut esds_reader = Cursor::new(expected_esds.clone());
+    let mut decoded_esds = Esds::default();
+    let read = unmarshal_async(
+        &mut esds_reader,
+        expected_esds.len() as u64,
+        &mut decoded_esds,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read, expected_esds.len() as u64);
+    assert_eq!(decoded_esds, esds);
+
+    let registry = default_registry();
+    let mut any_esds_reader = Cursor::new(expected_esds);
+    let (any_esds_box, any_esds_read) = unmarshal_any_async(
+        &mut any_esds_reader,
+        39,
+        FourCc::from_bytes(*b"esds"),
+        &registry,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(any_esds_read, 39);
+    assert_eq!(any_esds_box.as_any().downcast_ref::<Esds>().unwrap(), &esds);
+
+    let mut iods = Iods::default();
+    iods.set_version(0);
+    iods.descriptor = Some(
+        Descriptor::from_initial_object_descriptor(InitialObjectDescriptor {
+            object_descriptor_id: 18,
+            include_inline_profile_level_flag: true,
+            od_profile_level_indication: 0x11,
+            scene_profile_level_indication: 0x22,
+            audio_profile_level_indication: 0x33,
+            visual_profile_level_indication: 0x44,
+            graphics_profile_level_indication: 0x55,
+            sub_descriptors: vec![Descriptor::from_es_id_inc_descriptor(EsIdIncDescriptor {
+                track_id: 2,
+            })],
+            ..InitialObjectDescriptor::default()
+        })
+        .unwrap(),
+    );
+
+    let expected_iods = vec![
+        0x00, 0x00, 0x00, 0x00, 0x10, 0x0d, 0x04, 0x9f, 0x11, 0x22, 0x33, 0x44, 0x55, 0x0e, 0x04,
+        0x00, 0x00, 0x00, 0x02,
+    ];
+
+    let mut iods_writer = Cursor::new(Vec::new());
+    let written = marshal_async(&mut iods_writer, &iods, None).await.unwrap();
+    assert_eq!(written, expected_iods.len() as u64);
+    assert_eq!(iods_writer.into_inner(), expected_iods);
+
+    let mut iods_reader = Cursor::new(expected_iods.clone());
+    let mut decoded_iods = Iods::default();
+    let read = unmarshal_async(
+        &mut iods_reader,
+        expected_iods.len() as u64,
+        &mut decoded_iods,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read, expected_iods.len() as u64);
+    assert_eq!(decoded_iods, iods);
+
+    let mut any_iods_reader = Cursor::new(expected_iods);
+    let (any_iods_box, any_iods_read) = unmarshal_any_async(
+        &mut any_iods_reader,
+        19,
+        FourCc::from_bytes(*b"iods"),
+        &registry,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(any_iods_read, 19);
+    assert_eq!(any_iods_box.as_any().downcast_ref::<Iods>().unwrap(), &iods);
 }
 
 #[test]

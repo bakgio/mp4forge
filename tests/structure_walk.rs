@@ -531,7 +531,31 @@ async fn async_walk_structure_ignores_truncated_trailing_root_box_after_valid_bo
     let file = [moov, truncated_mdat].concat();
 
     let mut visited = Vec::new();
-    let visitor = AsyncTrackingVisitor {
+    struct AsyncCollectVisitor<'a> {
+        visited: &'a mut Vec<BoxPath>,
+    }
+
+    impl AsyncWalkVisitor<Cursor<Vec<u8>>> for AsyncCollectVisitor<'_> {
+        type Future<'a>
+            = AsyncWalkFuture<'a>
+        where
+            Self: 'a;
+
+        fn visit<'a, 'r>(
+            &'a mut self,
+            handle: &'a mut AsyncCursorWalkHandle<'r>,
+        ) -> Self::Future<'a>
+        where
+            'r: 'a,
+        {
+            Box::pin(async move {
+                self.visited.push(handle.path().clone());
+                Ok(WalkControl::Continue)
+            })
+        }
+    }
+
+    let visitor = AsyncCollectVisitor {
         visited: &mut visited,
     };
 

@@ -8,16 +8,16 @@ use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 #[cfg(feature = "async")]
-use std::io::Cursor;
-#[cfg(feature = "async")]
 use std::pin::Pin;
 
 #[cfg(feature = "async")]
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::FourCc;
 #[cfg(feature = "async")]
 use crate::async_io::{AsyncReadSeek, AsyncWriteSeek};
+#[cfg(feature = "async")]
+use crate::bitio::{AsyncBitReader, AsyncBitWriter};
 use crate::bitio::{BitReader, BitWriter};
 use crate::boxes::{BoxLookupContext, BoxRegistry};
 
@@ -57,6 +57,15 @@ where
     Ok(data)
 }
 
+pub(crate) fn read_exact_array_untrusted<const N: usize, R>(reader: &mut R) -> io::Result<[u8; N]>
+where
+    R: Read + ?Sized,
+{
+    let mut data = [0_u8; N];
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
 #[cfg(feature = "async")]
 pub(crate) async fn read_exact_vec_untrusted_async<R>(
     reader: &mut R,
@@ -77,8 +86,20 @@ where
     Ok(data)
 }
 
+#[cfg(feature = "async")]
+pub(crate) async fn read_exact_array_untrusted_async<const N: usize, R>(
+    reader: &mut R,
+) -> io::Result<[u8; N]>
+where
+    R: AsyncReadSeek + ?Sized,
+{
+    let mut data = [0_u8; N];
+    reader.read_exact(&mut data).await?;
+    Ok(data)
+}
+
 /// Box-specific overrides used by the generic descriptor codec.
-pub trait FieldHooks {
+pub trait FieldHooks: Sync {
     /// Returns a dynamic bit width for `name` when the descriptor requests one.
     fn field_size(&self, _name: &'static str) -> Option<u32> {
         None
@@ -770,7 +791,7 @@ pub trait FieldValueWrite {
 }
 
 /// Compile-time descriptor contract for a concrete box type.
-pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite {
+pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite + Send {
     /// Static descriptor table for the box payload.
     const FIELD_TABLE: FieldTable;
     /// Supported versions for the box type. An empty slice means any version is accepted.
@@ -820,7 +841,7 @@ pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite {
 }
 
 /// Object-safe view of the descriptor-backed box surface.
-pub trait CodecDescription: MutableBox + FieldValueRead + FieldValueWrite {
+pub trait CodecDescription: MutableBox + FieldValueRead + FieldValueWrite + Send {
     /// Returns the runtime field table for the box.
     fn field_table(&self) -> FieldTable;
 
@@ -1255,11 +1276,25 @@ where
     if let Some(written) = src.custom_marshal_async(writer).await? {
         return Ok(written);
     }
+    if let Some(written) = try_sync_custom_marshal_fallback_async(writer, src).await? {
+        return Ok(written);
+    }
+    let fields = src
+        .field_table()
+        .resolve_active(src, erase_sync_hooks(hooks))?;
+    let mut encoder = AsyncEncoder::new(writer, src.box_type());
+    for field in fields {
+        encoder.encode_field(src, field).await?;
+    }
 
-    let mut payload = Vec::new();
-    let written = marshal_codec(&mut payload, src, erase_sync_hooks(hooks))?;
-    writer.write_all(&payload).await?;
-    Ok(written)
+    if !encoder.written_bits.is_multiple_of(8) {
+        return Err(CodecError::InvalidBoxAlignment {
+            box_type: src.box_type(),
+            bit_count: encoder.written_bits,
+        });
+    }
+
+    Ok(encoder.written_bits / 8)
 }
 
 #[cfg(feature = "async")]
@@ -1274,11 +1309,40 @@ where
     if let Some(written) = src.custom_marshal_async(writer).await? {
         return Ok(written);
     }
+    if let Some(written) = try_sync_custom_marshal_fallback_async(writer, src).await? {
+        return Ok(written);
+    }
+    let fields = src.field_table().resolve_active(src, hooks)?;
+    let mut encoder = AsyncEncoder::new(writer, src.box_type());
+    for field in fields {
+        encoder.encode_field(src, field).await?;
+    }
 
-    let mut payload = Vec::new();
-    let written = marshal_codec(&mut payload, src, hooks)?;
-    writer.write_all(&payload).await?;
-    Ok(written)
+    if !encoder.written_bits.is_multiple_of(8) {
+        return Err(CodecError::InvalidBoxAlignment {
+            box_type: src.box_type(),
+            bit_count: encoder.written_bits,
+        });
+    }
+
+    Ok(encoder.written_bits / 8)
+}
+
+#[cfg(feature = "async")]
+async fn try_sync_custom_marshal_fallback_async<W>(
+    writer: &mut W,
+    src: &dyn CodecDescription,
+) -> Result<Option<u64>, CodecError>
+where
+    W: AsyncWriteSeek,
+{
+    let mut bytes = Vec::new();
+    let Some(written) = src.custom_marshal(&mut bytes)? else {
+        return Ok(None);
+    };
+    use tokio::io::AsyncWriteExt;
+    writer.write_all(&bytes).await?;
+    Ok(Some(written))
 }
 
 /// Decodes a concrete box payload from `reader`.
@@ -1420,17 +1484,10 @@ pub async fn unmarshal_any_with_context_async<R>(
 where
     R: AsyncReadSeek,
 {
-    let payload = read_exact_vec_untrusted_async(
-        reader,
-        usize::try_from(payload_size).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-    )
-    .await?;
-
     let mut boxed = registry
         .new_box_with_context(box_type, context)
         .ok_or(CodecError::UnknownBoxType { box_type })?;
-    let mut payload_reader = Cursor::new(payload);
-    let read = unmarshal_dyn(&mut payload_reader, payload_size, boxed.as_mut(), hooks)?;
+    let read = unmarshal_dyn_async(reader, payload_size, boxed.as_mut(), hooks).await?;
     Ok((boxed, read))
 }
 
@@ -1491,50 +1548,20 @@ where
         Ok(read)
     } else {
         reader.seek(SeekFrom::Start(start)).await?;
-        let payload = read_exact_vec_untrusted_async(
-            reader,
-            usize::try_from(payload_size)
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-        )
-        .await?;
-        let mut payload_reader = Cursor::new(payload);
-        let result = if let Some(read) = dst.custom_unmarshal(&mut payload_reader, payload_size)? {
-            Ok(read)
-        } else {
-            let mut decoder = Decoder::new(&mut payload_reader, payload_size, dst.box_type());
-            decoder
-                .decode_box(dst, erase_sync_hooks(hooks))
-                .map(|read_bits| read_bits / 8)
-        };
-
-        let consumed = Seek::stream_position(&mut payload_reader)?;
+        let mut decoder = AsyncDecoder::new(reader, payload_size, dst.box_type());
+        let result = decoder
+            .decode_box(dst, erase_sync_hooks(hooks))
+            .await
+            .map(|read_bits| read_bits / 8);
         match result {
-            Ok(read_bytes) => {
-                let next = start.checked_add(consumed).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "async payload offset overflowed u64",
-                    )
-                })?;
-                reader.seek(SeekFrom::Start(next)).await?;
-                Ok(read_bytes)
-            }
+            Ok(read_bytes) => Ok(read_bytes),
             Err(error @ CodecError::UnsupportedVersion { .. }) => {
                 reader.seek(SeekFrom::Start(start)).await?;
                 dst.set_version(original_version);
                 dst.set_flags(original_flags);
                 Err(error)
             }
-            Err(error) => {
-                let next = start.checked_add(consumed).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "async payload offset overflowed u64",
-                    )
-                })?;
-                reader.seek(SeekFrom::Start(next)).await?;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     };
 
@@ -1569,53 +1596,21 @@ where
     let result = if let Some(read) = dst.custom_unmarshal_async(reader, payload_size).await? {
         Ok(read)
     } else {
-        // The first async codec landing keeps the existing descriptor logic intact by decoding from
-        // an in-memory cursor after the async pre-decode hook has inspected the payload.
         reader.seek(SeekFrom::Start(start)).await?;
-        let payload = read_exact_vec_untrusted_async(
-            reader,
-            usize::try_from(payload_size)
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-        )
-        .await?;
-        let mut payload_reader = Cursor::new(payload);
-        let result = if let Some(read) = dst.custom_unmarshal(&mut payload_reader, payload_size)? {
-            Ok(read)
-        } else {
-            let mut decoder = Decoder::new(&mut payload_reader, payload_size, dst.box_type());
-            decoder
-                .decode_box(dst, hooks)
-                .map(|read_bits| read_bits / 8)
-        };
-
-        let consumed = Seek::stream_position(&mut payload_reader)?;
+        let mut decoder = AsyncDecoder::new(reader, payload_size, dst.box_type());
+        let result = decoder
+            .decode_box(dst, hooks)
+            .await
+            .map(|read_bits| read_bits / 8);
         match result {
-            Ok(read_bytes) => {
-                let next = start.checked_add(consumed).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "async payload offset overflowed u64",
-                    )
-                })?;
-                reader.seek(SeekFrom::Start(next)).await?;
-                Ok(read_bytes)
-            }
+            Ok(read_bytes) => Ok(read_bytes),
             Err(error @ CodecError::UnsupportedVersion { .. }) => {
                 reader.seek(SeekFrom::Start(start)).await?;
                 dst.set_version(original_version);
                 dst.set_flags(original_flags);
                 Err(error)
             }
-            Err(error) => {
-                let next = start.checked_add(consumed).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "async payload offset overflowed u64",
-                    )
-                })?;
-                reader.seek(SeekFrom::Start(next)).await?;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     };
 
@@ -1907,6 +1902,297 @@ impl<W: Write> Encoder<W> {
             self.write_bytes(&[octet])?;
         }
         self.write_bytes(&[(value as u8) & 0x7f])?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async")]
+struct AsyncEncoder<'a, W> {
+    writer: AsyncBitWriter<&'a mut W>,
+    written_bits: u64,
+}
+
+#[cfg(feature = "async")]
+impl<'a, W: AsyncWriteSeek> AsyncEncoder<'a, W> {
+    fn new(writer: &'a mut W, _box_type: FourCc) -> Self {
+        Self {
+            writer: AsyncBitWriter::new(writer),
+            written_bits: 0,
+        }
+    }
+
+    async fn encode_field(
+        &mut self,
+        src: &dyn CodecDescription,
+        field: ResolvedField<'_>,
+    ) -> Result<(), CodecError> {
+        if let Some(value) = constant_field_value(field)? {
+            return Box::pin(self.encode_value(field, value)).await;
+        }
+
+        match field.descriptor.role {
+            FieldRole::Version => {
+                let bit_width = require_bit_width(field)?;
+                self.write_unsigned(field.name(), u64::from(src.version()), bit_width)
+                    .await?;
+            }
+            FieldRole::Flags => {
+                let bit_width = require_bit_width(field)?;
+                self.write_unsigned(field.name(), u64::from(src.flags()), bit_width)
+                    .await?;
+            }
+            FieldRole::Data => {
+                let value = src.field_value(field.name())?;
+                self.encode_value(field, value).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn encode_value(
+        &mut self,
+        field: ResolvedField<'_>,
+        value: FieldValue,
+    ) -> Result<(), CodecError> {
+        match field.descriptor.kind {
+            FieldKind::Unsigned => {
+                if field.descriptor.varint {
+                    let value = expect_unsigned(field.name(), &value)?;
+                    self.write_uvarint(field.name(), value).await?;
+                    return Ok(());
+                }
+
+                let width = require_bit_width(field)?;
+                match value {
+                    FieldValue::Unsigned(value) => {
+                        self.require_scalar_length(field)?;
+                        self.write_unsigned(field.name(), value, width).await?;
+                    }
+                    FieldValue::UnsignedArray(values) => {
+                        self.require_length(field, values.len())?;
+                        for value in values {
+                            self.write_unsigned(field.name(), value, width).await?;
+                        }
+                    }
+                    other => {
+                        return Err(FieldValueError::UnexpectedType {
+                            field_name: field.name(),
+                            expected: "unsigned integer",
+                            actual: other.kind_name(),
+                        }
+                        .into());
+                    }
+                }
+            }
+            FieldKind::Signed => {
+                let width = require_bit_width(field)?;
+                match value {
+                    FieldValue::Signed(value) => {
+                        self.require_scalar_length(field)?;
+                        self.write_signed(field.name(), value, width).await?;
+                    }
+                    FieldValue::SignedArray(values) => {
+                        self.require_length(field, values.len())?;
+                        for value in values {
+                            self.write_signed(field.name(), value, width).await?;
+                        }
+                    }
+                    other => {
+                        return Err(FieldValueError::UnexpectedType {
+                            field_name: field.name(),
+                            expected: "signed integer",
+                            actual: other.kind_name(),
+                        }
+                        .into());
+                    }
+                }
+            }
+            FieldKind::Boolean => {
+                let width = require_bit_width(field)?;
+                match value {
+                    FieldValue::Boolean(value) => {
+                        self.require_scalar_length(field)?;
+                        self.write_boolean(field.name(), value, width).await?;
+                    }
+                    FieldValue::BooleanArray(values) => {
+                        self.require_length(field, values.len())?;
+                        for value in values {
+                            self.write_boolean(field.name(), value, width).await?;
+                        }
+                    }
+                    other => {
+                        return Err(FieldValueError::UnexpectedType {
+                            field_name: field.name(),
+                            expected: "boolean",
+                            actual: other.kind_name(),
+                        }
+                        .into());
+                    }
+                }
+            }
+            FieldKind::Bytes => {
+                let width = require_bit_width(field)?;
+                if width != 8 {
+                    return Err(CodecError::InvalidBitWidth {
+                        field_name: field.name(),
+                        bit_width: width,
+                    });
+                }
+
+                let bytes = expect_bytes(field.name(), &value)?;
+                self.require_length(field, bytes.len())?;
+                self.write_bytes(bytes).await?;
+            }
+            FieldKind::String(mode) => {
+                let string = expect_string(field.name(), &value)?;
+                self.write_string(field, string, mode).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn require_scalar_length(&self, field: ResolvedField<'_>) -> Result<(), CodecError> {
+        match field.length {
+            ResolvedFieldLength::Unbounded | ResolvedFieldLength::Fixed(1) => Ok(()),
+            ResolvedFieldLength::Fixed(expected) => Err(CodecError::InvalidLength {
+                field_name: field.name(),
+                expected: expected as usize,
+                actual: 1,
+            }),
+        }
+    }
+
+    fn require_length(
+        &self,
+        field: ResolvedField<'_>,
+        actual_len: usize,
+    ) -> Result<(), CodecError> {
+        if let ResolvedFieldLength::Fixed(expected) = field.length
+            && actual_len != expected as usize
+        {
+            return Err(CodecError::InvalidLength {
+                field_name: field.name(),
+                expected: expected as usize,
+                actual: actual_len,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn write_unsigned(
+        &mut self,
+        field_name: &'static str,
+        value: u64,
+        bit_width: u32,
+    ) -> Result<(), CodecError> {
+        validate_unsigned_width(field_name, value, bit_width)?;
+        self.writer
+            .write_bits(&value.to_be_bytes(), bit_width as usize)
+            .await?;
+        self.written_bits += u64::from(bit_width);
+        Ok(())
+    }
+
+    async fn write_signed(
+        &mut self,
+        field_name: &'static str,
+        value: i64,
+        bit_width: u32,
+    ) -> Result<(), CodecError> {
+        let encoded = encode_signed(field_name, value, bit_width)?;
+        self.writer
+            .write_bits(&encoded.to_be_bytes(), bit_width as usize)
+            .await?;
+        self.written_bits += u64::from(bit_width);
+        Ok(())
+    }
+
+    async fn write_boolean(
+        &mut self,
+        field_name: &'static str,
+        value: bool,
+        bit_width: u32,
+    ) -> Result<(), CodecError> {
+        validate_width(field_name, bit_width)?;
+        let bits = if value {
+            if bit_width == 64 {
+                u64::MAX
+            } else {
+                (1_u64 << bit_width) - 1
+            }
+        } else {
+            0
+        };
+
+        self.writer
+            .write_bits(&bits.to_be_bytes(), bit_width as usize)
+            .await?;
+        self.written_bits += u64::from(bit_width);
+        Ok(())
+    }
+
+    async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        for byte in bytes {
+            self.writer.write_bits(&[*byte], 8).await?;
+            self.written_bits += 8;
+        }
+        Ok(())
+    }
+
+    async fn write_string(
+        &mut self,
+        field: ResolvedField<'_>,
+        value: &str,
+        mode: StringFieldMode,
+    ) -> Result<(), CodecError> {
+        match (mode, field.length) {
+            (StringFieldMode::RawBox, ResolvedFieldLength::Fixed(expected)) => {
+                if value.len() != expected as usize {
+                    return Err(CodecError::InvalidLength {
+                        field_name: field.name(),
+                        expected: expected as usize,
+                        actual: value.len(),
+                    });
+                }
+            }
+            (StringFieldMode::RawBox, ResolvedFieldLength::Unbounded) => {}
+            (_, ResolvedFieldLength::Unbounded) => {}
+            (_, ResolvedFieldLength::Fixed(expected)) => {
+                let actual = value.len() + 1;
+                if actual != expected as usize {
+                    return Err(CodecError::InvalidLength {
+                        field_name: field.name(),
+                        expected: expected as usize,
+                        actual,
+                    });
+                }
+            }
+        }
+
+        self.write_bytes(value.as_bytes()).await?;
+        if !matches!(mode, StringFieldMode::RawBox) {
+            self.write_bytes(&[0]).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_uvarint(
+        &mut self,
+        field_name: &'static str,
+        value: u64,
+    ) -> Result<(), CodecError> {
+        if value > 0x0fff_ffff {
+            return Err(CodecError::VarintOverflow { field_name, value });
+        }
+
+        for shift in [21_u32, 14, 7] {
+            let octet = (((value >> shift) as u8) & 0x7f) | 0x80;
+            self.write_bytes(&[octet]).await?;
+        }
+        self.write_bytes(&[(value as u8) & 0x7f]).await?;
         Ok(())
     }
 }
@@ -2353,6 +2639,479 @@ impl<'a, R: Read + Seek> Decoder<'a, R> {
         let mut value = 0_u64;
         loop {
             let octet = self.reader.read_bits(8)?;
+            self.read_bits += 8;
+
+            value = (value << 7) | u64::from(octet[0] & 0x7f);
+            if octet[0] & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn remaining_bits(&self) -> u64 {
+        self.payload_size
+            .saturating_mul(8)
+            .saturating_sub(self.read_bits)
+    }
+}
+
+#[cfg(feature = "async")]
+struct AsyncDecoder<'a, R> {
+    reader: AsyncBitReader<&'a mut R>,
+    box_type: FourCc,
+    payload_size: u64,
+    read_bits: u64,
+}
+
+#[cfg(feature = "async")]
+impl<'a, R: AsyncReadSeek> AsyncDecoder<'a, R> {
+    fn new(reader: &'a mut R, payload_size: u64, box_type: FourCc) -> Self {
+        Self {
+            reader: AsyncBitReader::new(reader),
+            box_type,
+            payload_size,
+            read_bits: 0,
+        }
+    }
+
+    async fn decode_box(
+        &mut self,
+        dst: &mut dyn CodecDescription,
+        hooks: Option<&dyn FieldHooks>,
+    ) -> Result<u64, CodecError> {
+        for descriptor in dst.field_table().ordered() {
+            if let Some(field) = descriptor.resolve(dst, hooks)? {
+                self.decode_field(dst, field, hooks).await?;
+            }
+        }
+
+        if !self.read_bits.is_multiple_of(8) {
+            return Err(CodecError::InvalidBoxAlignment {
+                box_type: self.box_type,
+                bit_count: self.read_bits,
+            });
+        }
+
+        if self.read_bits > self.payload_size.saturating_mul(8) {
+            return Err(CodecError::Overrun {
+                box_type: self.box_type,
+                payload_size: self.payload_size,
+                bit_count: self.read_bits,
+            });
+        }
+
+        Ok(self.read_bits)
+    }
+
+    async fn decode_field(
+        &mut self,
+        dst: &mut dyn CodecDescription,
+        field: ResolvedField<'_>,
+        hooks: Option<&dyn FieldHooks>,
+    ) -> Result<(), CodecError> {
+        if let Some(constant) = field.descriptor.constant {
+            self.verify_constant(field, constant).await?;
+            return Ok(());
+        }
+
+        match field.descriptor.role {
+            FieldRole::Version => {
+                let bit_width = require_bit_width(field)?;
+                let version = self.read_unsigned(field.name(), bit_width).await?;
+                let version = u8::try_from(version).map_err(|_| CodecError::NumericOverflow {
+                    field_name: field.name(),
+                    bit_width,
+                })?;
+                dst.set_version(version);
+                if !CodecDescription::is_supported_version(dst, version) {
+                    return Err(CodecError::UnsupportedVersion {
+                        box_type: dst.box_type(),
+                        version,
+                    });
+                }
+            }
+            FieldRole::Flags => {
+                let bit_width = require_bit_width(field)?;
+                let flags = self.read_unsigned(field.name(), bit_width).await?;
+                let flags = u32::try_from(flags).map_err(|_| CodecError::NumericOverflow {
+                    field_name: field.name(),
+                    bit_width,
+                })?;
+                dst.set_flags(flags);
+            }
+            FieldRole::Data => {
+                let value = self.read_value(field, select_hooks(dst, hooks)).await?;
+                dst.set_field_value(field.name(), value)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn read_value(
+        &mut self,
+        field: ResolvedField<'_>,
+        hooks: &dyn FieldHooks,
+    ) -> Result<FieldValue, CodecError> {
+        match field.descriptor.kind {
+            FieldKind::Unsigned => {
+                if field.descriptor.varint {
+                    return Ok(FieldValue::Unsigned(self.read_uvarint(field.name()).await?));
+                }
+
+                let width = require_bit_width(field)?;
+                if field_is_scalar(field) {
+                    Ok(FieldValue::Unsigned(
+                        self.read_unsigned(field.name(), width).await?,
+                    ))
+                } else {
+                    let count = self.element_count(field, width)?;
+                    let mut values = Vec::with_capacity(untrusted_prealloc_hint(count));
+                    for _ in 0..count {
+                        values.push(self.read_unsigned(field.name(), width).await?);
+                    }
+                    Ok(FieldValue::UnsignedArray(values))
+                }
+            }
+            FieldKind::Signed => {
+                let width = require_bit_width(field)?;
+                if field_is_scalar(field) {
+                    Ok(FieldValue::Signed(
+                        self.read_signed(field.name(), width).await?,
+                    ))
+                } else {
+                    let count = self.element_count(field, width)?;
+                    let mut values = Vec::with_capacity(untrusted_prealloc_hint(count));
+                    for _ in 0..count {
+                        values.push(self.read_signed(field.name(), width).await?);
+                    }
+                    Ok(FieldValue::SignedArray(values))
+                }
+            }
+            FieldKind::Boolean => {
+                let width = require_bit_width(field)?;
+                if field_is_scalar(field) {
+                    Ok(FieldValue::Boolean(
+                        self.read_boolean(field.name(), width).await?,
+                    ))
+                } else {
+                    let count = self.element_count(field, width)?;
+                    let mut values = Vec::with_capacity(untrusted_prealloc_hint(count));
+                    for _ in 0..count {
+                        values.push(self.read_boolean(field.name(), width).await?);
+                    }
+                    Ok(FieldValue::BooleanArray(values))
+                }
+            }
+            FieldKind::Bytes => {
+                let width = require_bit_width(field)?;
+                if width != 8 {
+                    return Err(CodecError::InvalidBitWidth {
+                        field_name: field.name(),
+                        bit_width: width,
+                    });
+                }
+                let count = self.element_count(field, width)?;
+                Ok(FieldValue::Bytes(self.read_exact_bytes(count).await?))
+            }
+            FieldKind::String(mode) => Ok(FieldValue::String(
+                self.read_string(field, mode, hooks).await?,
+            )),
+        }
+    }
+
+    async fn verify_constant(
+        &mut self,
+        field: ResolvedField<'_>,
+        constant: &'static str,
+    ) -> Result<(), CodecError> {
+        match field.descriptor.kind {
+            FieldKind::Unsigned => {
+                if field.descriptor.varint {
+                    let value = self.read_uvarint(field.name()).await?;
+                    let expected = parse_unsigned_constant(field.name(), constant)?;
+                    if value != expected {
+                        return Err(CodecError::ConstantMismatch {
+                            field_name: field.name(),
+                            constant,
+                        });
+                    }
+                } else {
+                    let bit_width = require_bit_width(field)?;
+                    let value = self.read_unsigned(field.name(), bit_width).await?;
+                    let expected = parse_unsigned_constant(field.name(), constant)?;
+                    if value != expected {
+                        return Err(CodecError::ConstantMismatch {
+                            field_name: field.name(),
+                            constant,
+                        });
+                    }
+                }
+            }
+            FieldKind::Signed => {
+                let bit_width = require_bit_width(field)?;
+                let value = self.read_signed(field.name(), bit_width).await?;
+                let expected = parse_signed_constant(field.name(), constant)?;
+                if value != expected {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: field.name(),
+                        constant,
+                    });
+                }
+            }
+            FieldKind::Boolean => {
+                let bit_width = require_bit_width(field)?;
+                let value = self.read_boolean(field.name(), bit_width).await?;
+                let expected = parse_unsigned_constant(field.name(), constant)? != 0;
+                if value != expected {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: field.name(),
+                        constant,
+                    });
+                }
+            }
+            FieldKind::Bytes | FieldKind::String(_) => {
+                return Err(CodecError::InvalidConstant {
+                    field_name: field.name(),
+                    constant,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn element_count(&self, field: ResolvedField<'_>, bit_width: u32) -> Result<usize, CodecError> {
+        match field.length {
+            ResolvedFieldLength::Fixed(length) => Ok(length as usize),
+            ResolvedFieldLength::Unbounded => {
+                let remaining_bits = self.remaining_bits();
+                if !remaining_bits.is_multiple_of(u64::from(bit_width)) {
+                    return Err(CodecError::InvalidUnboundedLength {
+                        field_name: field.name(),
+                        bit_width,
+                        remaining_bits,
+                    });
+                }
+                Ok((remaining_bits / u64::from(bit_width)) as usize)
+            }
+        }
+    }
+
+    async fn read_unsigned(
+        &mut self,
+        field_name: &'static str,
+        bit_width: u32,
+    ) -> Result<u64, CodecError> {
+        validate_width(field_name, bit_width)?;
+        let data = self.reader.read_bits(bit_width as usize).await?;
+        self.read_bits += u64::from(bit_width);
+
+        let mut value = 0_u64;
+        for byte in data {
+            value = (value << 8) | u64::from(byte);
+        }
+        Ok(value)
+    }
+
+    async fn read_signed(
+        &mut self,
+        field_name: &'static str,
+        bit_width: u32,
+    ) -> Result<i64, CodecError> {
+        let value = self.read_unsigned(field_name, bit_width).await?;
+        if bit_width == 64 {
+            return Ok(value as i64);
+        }
+
+        let sign_mask = 1_u64 << (bit_width - 1);
+        if value & sign_mask == 0 {
+            return Ok(value as i64);
+        }
+
+        let extended = value | (!0_u64 << bit_width);
+        Ok(extended as i64)
+    }
+
+    async fn read_boolean(
+        &mut self,
+        field_name: &'static str,
+        bit_width: u32,
+    ) -> Result<bool, CodecError> {
+        Ok(self.read_unsigned(field_name, bit_width).await? != 0)
+    }
+
+    async fn read_exact_bytes(&mut self, count: usize) -> Result<Vec<u8>, CodecError> {
+        let mut data = Vec::with_capacity(untrusted_prealloc_hint(count));
+        let mut chunk = [0_u8; 4096];
+        let mut remaining = count;
+        while remaining != 0 {
+            let to_read = remaining.min(chunk.len());
+            self.reader.read_exact(&mut chunk[..to_read]).await?;
+            data.extend_from_slice(&chunk[..to_read]);
+            remaining -= to_read;
+        }
+        self.read_bits += (count as u64) * 8;
+        Ok(data)
+    }
+
+    async fn read_string(
+        &mut self,
+        field: ResolvedField<'_>,
+        mode: StringFieldMode,
+        hooks: &dyn FieldHooks,
+    ) -> Result<String, CodecError> {
+        let width = require_bit_width(field)?;
+        if width != 8 {
+            return Err(CodecError::InvalidBitWidth {
+                field_name: field.name(),
+                bit_width: width,
+            });
+        }
+
+        let bytes = match mode {
+            StringFieldMode::RawBox => {
+                let count = match field.length {
+                    ResolvedFieldLength::Fixed(length) => length as usize,
+                    ResolvedFieldLength::Unbounded => {
+                        let remaining_bits = self.remaining_bits();
+                        if !remaining_bits.is_multiple_of(8) {
+                            return Err(CodecError::InvalidUnboundedLength {
+                                field_name: field.name(),
+                                bit_width: 8,
+                                remaining_bits,
+                            });
+                        }
+                        (remaining_bits / 8) as usize
+                    }
+                };
+                self.read_exact_bytes(count).await?
+            }
+            StringFieldMode::NullTerminated => {
+                self.read_c_string(field.name(), string_budget(field.length), hooks)
+                    .await?
+            }
+            StringFieldMode::PascalCompatible => {
+                if let Some(string) = self
+                    .try_read_pascal_string(field.name(), string_budget(field.length), hooks)
+                    .await?
+                {
+                    string.into_bytes()
+                } else {
+                    self.read_c_string(field.name(), string_budget(field.length), hooks)
+                        .await?
+                }
+            }
+        };
+
+        String::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8 {
+            field_name: field.name(),
+        })
+    }
+
+    async fn read_c_string(
+        &mut self,
+        field_name: &'static str,
+        budget: Option<usize>,
+        hooks: &dyn FieldHooks,
+    ) -> Result<Vec<u8>, CodecError> {
+        let mut bytes = Vec::new();
+        let mut terminated = false;
+
+        loop {
+            if self.remaining_bits() == 0 {
+                break;
+            }
+
+            if let Some(limit) = budget
+                && bytes.len() >= limit
+            {
+                break;
+            }
+
+            let octet = self.reader.read_bits(8).await?;
+            self.read_bits += 8;
+            if octet[0] == 0 {
+                terminated = true;
+                break;
+            }
+
+            bytes.push(octet[0]);
+        }
+
+        if budget.is_none()
+            && terminated
+            && hooks
+                .consume_remaining_bytes_after_string(field_name)
+                .unwrap_or(false)
+        {
+            while self.remaining_bits() >= 8 {
+                self.reader.read_bits(8).await?;
+                self.read_bits += 8;
+            }
+        }
+
+        Ok(bytes)
+    }
+
+    async fn try_read_pascal_string(
+        &mut self,
+        field_name: &'static str,
+        budget: Option<usize>,
+        hooks: &dyn FieldHooks,
+    ) -> Result<Option<String>, CodecError> {
+        let remaining_bytes = self.remaining_bits() / 8;
+        if remaining_bytes < 2 {
+            return Ok(None);
+        }
+
+        if let Some(limit) = budget
+            && limit < 2
+        {
+            return Ok(None);
+        }
+
+        let start = self.reader.stream_position().await?;
+
+        let mut length = [0_u8; 1];
+        self.reader.read_exact(&mut length).await?;
+        let payload_len = length[0] as usize;
+
+        if let Some(limit) = budget
+            && payload_len + 1 > limit
+        {
+            self.reader.seek(SeekFrom::Start(start)).await?;
+            return Ok(None);
+        }
+
+        if payload_len as u64 > remaining_bytes - 1 {
+            self.reader.seek(SeekFrom::Start(start)).await?;
+            return Ok(None);
+        }
+
+        let mut payload = vec![0_u8; payload_len];
+        self.reader.read_exact(&mut payload).await?;
+
+        let remaining_after_payload = remaining_bytes - payload_len as u64 - 1;
+        let is_pascal = hooks
+            .is_pascal_string(field_name, &payload, remaining_after_payload)
+            .unwrap_or(false);
+
+        if !is_pascal {
+            self.reader.seek(SeekFrom::Start(start)).await?;
+            return Ok(None);
+        }
+
+        self.read_bits += ((payload_len + 1) * 8) as u64;
+        let string =
+            String::from_utf8(payload).map_err(|_| CodecError::InvalidUtf8 { field_name })?;
+        Ok(Some(string))
+    }
+
+    async fn read_uvarint(&mut self, _field_name: &'static str) -> Result<u64, CodecError> {
+        let mut value = 0_u64;
+        loop {
+            let octet = self.reader.read_bits(8).await?;
             self.read_bits += 8;
 
             value = (value << 7) | u64::from(octet[0] & 0x7f);

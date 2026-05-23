@@ -25,6 +25,8 @@ use crate::boxes::iso14496_30::{WebVTTConfigurationBox, WebVTTSourceLabelBox};
 use crate::boxes::iso23001_5::PcmC;
 use crate::boxes::opus::DOps;
 use crate::boxes::vp::VpCodecConfiguration;
+#[cfg(feature = "async")]
+use crate::codec::unmarshal_async;
 use crate::codec::{CodecBox, CodecError, ImmutableBox, unmarshal};
 use crate::extract::{ExtractError, ExtractedBox, extract_boxes, extract_boxes_with_payload};
 #[cfg(feature = "async")]
@@ -1325,10 +1327,11 @@ where
     R: Read + Seek,
 {
     let ftyp_bytes = extract_root_box_bytes_sync(reader, FTYP)?;
-    let Some(moov_box_bytes) = extract_root_box_bytes_sync(reader, MOOV)? else {
+    let Some(moov_info) = find_root_box_info_sync(reader, MOOV)? else {
         return Ok(None);
     };
-    let Some(decoded_moov_box_bytes) = decode_compressed_movie_moov_box_bytes(&moov_box_bytes)?
+    let Some(decoded_moov_box_bytes) =
+        decode_compressed_movie_moov_box_bytes_sync(reader, moov_info)?
     else {
         return Ok(None);
     };
@@ -1342,13 +1345,43 @@ where
     Ok(Some(root_bytes))
 }
 
-fn decode_compressed_movie_moov_box_bytes(
-    moov_box_bytes: &[u8],
-) -> Result<Option<Vec<u8>>, ProbeError> {
-    let Some(cmov_box_bytes) = find_child_box_bytes_sync(moov_box_bytes, CMOV)? else {
+#[cfg(feature = "async")]
+pub(crate) async fn extract_compressed_movie_root_bytes_async<R>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let ftyp_bytes = extract_root_box_bytes_async(reader, FTYP).await?;
+    let Some(moov_info) = find_root_box_info_async(reader, MOOV).await? else {
         return Ok(None);
     };
-    let Some(dcom_payload) = find_child_box_payload_bytes_sync(&cmov_box_bytes, DCOM)? else {
+    let Some(decoded_moov_box_bytes) =
+        decode_compressed_movie_moov_box_bytes_async(reader, moov_info).await?
+    else {
+        return Ok(None);
+    };
+
+    let mut root_bytes =
+        Vec::with_capacity(ftyp_bytes.as_ref().map_or(0, Vec::len) + decoded_moov_box_bytes.len());
+    if let Some(ftyp_box_bytes) = ftyp_bytes {
+        root_bytes.extend_from_slice(&ftyp_box_bytes);
+    }
+    root_bytes.extend_from_slice(&decoded_moov_box_bytes);
+    Ok(Some(root_bytes))
+}
+
+fn decode_compressed_movie_moov_box_bytes_sync<R>(
+    reader: &mut R,
+    moov_info: BoxInfo,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: Read + Seek,
+{
+    let Some(cmov_info) = find_child_box_info_sync(reader, moov_info, CMOV)? else {
+        return Ok(None);
+    };
+    let Some(dcom_payload) = read_child_box_payload_bytes_sync(reader, cmov_info, DCOM)? else {
         return Err(ProbeError::MissingRequiredBox("dcom"));
     };
     if dcom_payload.as_slice() != ZLIB.as_bytes() {
@@ -1360,9 +1393,46 @@ fn decode_compressed_movie_moov_box_bytes(
             ),
         )));
     }
-    let Some(cmvd_payload) = find_child_box_payload_bytes_sync(&cmov_box_bytes, CMVD)? else {
+    let Some(cmvd_payload) = read_child_box_payload_bytes_sync(reader, cmov_info, CMVD)? else {
         return Err(ProbeError::MissingRequiredBox("cmvd"));
     };
+    decode_compressed_movie_cmvd_payload(&cmvd_payload)
+}
+
+#[cfg(feature = "async")]
+async fn decode_compressed_movie_moov_box_bytes_async<R>(
+    reader: &mut R,
+    moov_info: BoxInfo,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let Some(cmov_info) = find_child_box_info_async(reader, moov_info, CMOV).await? else {
+        return Ok(None);
+    };
+    let Some(dcom_payload) = read_child_box_payload_bytes_async(reader, cmov_info, DCOM).await?
+    else {
+        return Err(ProbeError::MissingRequiredBox("dcom"));
+    };
+    if dcom_payload.as_slice() != ZLIB.as_bytes() {
+        return Err(ProbeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported compressed movie method `{}`",
+                String::from_utf8_lossy(&dcom_payload)
+            ),
+        )));
+    }
+    let Some(cmvd_payload) = read_child_box_payload_bytes_async(reader, cmov_info, CMVD).await?
+    else {
+        return Err(ProbeError::MissingRequiredBox("cmvd"));
+    };
+    decode_compressed_movie_cmvd_payload(&cmvd_payload)
+}
+
+fn decode_compressed_movie_cmvd_payload(
+    cmvd_payload: &[u8],
+) -> Result<Option<Vec<u8>>, ProbeError> {
     if cmvd_payload.len() < 4 {
         return Err(ProbeError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1400,10 +1470,10 @@ fn decode_compressed_movie_moov_box_bytes(
     Ok(Some(decompressed))
 }
 
-fn extract_root_box_bytes_sync<R>(
+fn find_root_box_info_sync<R>(
     reader: &mut R,
     box_type: FourCc,
-) -> Result<Option<Vec<u8>>, ProbeError>
+) -> Result<Option<BoxInfo>, ProbeError>
 where
     R: Read + Seek,
 {
@@ -1418,17 +1488,49 @@ where
             }
             Err(error) => return Err(error.into()),
         };
-        let box_bytes = read_box_bytes_sync(reader, info)?;
         if info.box_type() == box_type {
-            return Ok(Some(box_bytes));
+            return Ok(Some(info));
         }
+        info.seek_to_end(reader)?;
     }
 }
 
-fn read_box_bytes_sync<R>(reader: &mut R, info: BoxInfo) -> Result<Vec<u8>, ProbeError>
+#[cfg(feature = "async")]
+async fn find_root_box_info_async<R>(
+    reader: &mut R,
+    box_type: FourCc,
+) -> Result<Option<BoxInfo>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    reader.seek(SeekFrom::Start(0)).await?;
+    loop {
+        let start = reader.stream_position().await?;
+        let info = match BoxInfo::read_async(reader).await {
+            Ok(info) => info,
+            Err(HeaderError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                reader.seek(SeekFrom::Start(start)).await?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if info.box_type() == box_type {
+            return Ok(Some(info));
+        }
+        info.seek_to_end_async(reader).await?;
+    }
+}
+
+fn extract_root_box_bytes_sync<R>(
+    reader: &mut R,
+    box_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError>
 where
     R: Read + Seek,
 {
+    let Some(info) = find_root_box_info_sync(reader, box_type)? else {
+        return Ok(None);
+    };
     info.seek_to_start(reader)?;
     let mut bytes = vec![
         0_u8;
@@ -1437,63 +1539,125 @@ where
         })?
     ];
     reader.read_exact(&mut bytes)?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
-fn find_child_box_bytes_sync(
-    parent_box_bytes: &[u8],
+#[cfg(feature = "async")]
+async fn extract_root_box_bytes_async<R>(
+    reader: &mut R,
+    box_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let Some(info) = find_root_box_info_async(reader, box_type).await? else {
+        return Ok(None);
+    };
+    info.seek_to_start_async(reader).await?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(info.size()).map_err(|_| ProbeError::NumericOverflow {
+            field_name: "box size",
+        })?
+    ];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut bytes).await?;
+    Ok(Some(bytes))
+}
+
+fn find_child_box_info_sync<R>(
+    reader: &mut R,
+    parent_info: BoxInfo,
     child_type: FourCc,
-) -> Result<Option<Vec<u8>>, ProbeError> {
-    let mut cursor = Cursor::new(parent_box_bytes);
-    let parent_info = BoxInfo::read(&mut cursor)?;
+) -> Result<Option<BoxInfo>, ProbeError>
+where
+    R: Read + Seek,
+{
     let parent_end = parent_info.offset() + parent_info.size();
-    let mut next_offset = parent_info.offset() + parent_info.header_size();
-    while next_offset < parent_end {
-        Seek::seek(&mut cursor, SeekFrom::Start(next_offset))?;
-        let child_info = BoxInfo::read(&mut cursor)?;
-        let child_start =
-            usize::try_from(child_info.offset()).map_err(|_| ProbeError::NumericOverflow {
-                field_name: "child box start",
-            })?;
-        let child_end = usize::try_from(child_info.offset() + child_info.size()).map_err(|_| {
-            ProbeError::NumericOverflow {
-                field_name: "child box end",
-            }
-        })?;
-        if child_end > parent_box_bytes.len() {
-            return Err(ProbeError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "child box exceeds the available parent bytes",
-            )));
-        }
+    reader.seek(SeekFrom::Start(
+        parent_info.offset() + parent_info.header_size(),
+    ))?;
+    while reader.stream_position()? < parent_end {
+        let child_info = BoxInfo::read(reader)?;
         if child_info.box_type() == child_type {
-            return Ok(Some(parent_box_bytes[child_start..child_end].to_vec()));
+            return Ok(Some(child_info));
         }
-        next_offset = child_info.offset() + child_info.size();
+        child_info.seek_to_end(reader)?;
     }
     Ok(None)
 }
 
-fn find_child_box_payload_bytes_sync(
-    parent_box_bytes: &[u8],
+#[cfg(feature = "async")]
+async fn find_child_box_info_async<R>(
+    reader: &mut R,
+    parent_info: BoxInfo,
     child_type: FourCc,
-) -> Result<Option<Vec<u8>>, ProbeError> {
-    let Some(child_box_bytes) = find_child_box_bytes_sync(parent_box_bytes, child_type)? else {
+) -> Result<Option<BoxInfo>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let parent_end = parent_info.offset() + parent_info.size();
+    reader
+        .seek(SeekFrom::Start(
+            parent_info.offset() + parent_info.header_size(),
+        ))
+        .await?;
+    while reader.stream_position().await? < parent_end {
+        let child_info = BoxInfo::read_async(reader).await?;
+        if child_info.box_type() == child_type {
+            return Ok(Some(child_info));
+        }
+        child_info.seek_to_end_async(reader).await?;
+    }
+    Ok(None)
+}
+
+fn read_child_box_payload_bytes_sync<R>(
+    reader: &mut R,
+    parent_info: BoxInfo,
+    child_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: Read + Seek,
+{
+    let Some(child_info) = find_child_box_info_sync(reader, parent_info, child_type)? else {
         return Ok(None);
     };
-    let mut cursor = Cursor::new(child_box_bytes.as_slice());
-    let child_info = BoxInfo::read(&mut cursor)?;
-    let payload_start =
-        usize::try_from(child_info.header_size()).map_err(|_| ProbeError::NumericOverflow {
-            field_name: "child box payload start",
-        })?;
-    if payload_start > child_box_bytes.len() {
-        return Err(ProbeError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "child box payload start exceeds the encoded child box length",
-        )));
-    }
-    Ok(Some(child_box_bytes[payload_start..].to_vec()))
+    child_info.seek_to_payload(reader)?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(child_info.payload_size()?).map_err(|_| {
+            ProbeError::NumericOverflow {
+                field_name: "child box payload size",
+            }
+        })?
+    ];
+    reader.read_exact(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+#[cfg(feature = "async")]
+async fn read_child_box_payload_bytes_async<R>(
+    reader: &mut R,
+    parent_info: BoxInfo,
+    child_type: FourCc,
+) -> Result<Option<Vec<u8>>, ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let Some(child_info) = find_child_box_info_async(reader, parent_info, child_type).await? else {
+        return Ok(None);
+    };
+    child_info.seek_to_payload_async(reader).await?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(child_info.payload_size()?).map_err(|_| {
+            ProbeError::NumericOverflow {
+                field_name: "child box payload size",
+            }
+        })?
+    ];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut bytes).await?;
+    Ok(Some(bytes))
 }
 
 /// Probes a file through the additive Tokio-based async surface with expansion controls and
@@ -1508,7 +1672,16 @@ where
     R: AsyncReadSeek,
 {
     let paths = root_probe_box_paths(options);
-    let infos = extract_boxes_async(reader, None, &paths).await?;
+    let infos = match extract_boxes_async(reader, None, &paths).await {
+        Ok(infos) => infos,
+        Err(error) => {
+            if let Some(root_bytes) = extract_compressed_movie_root_bytes_async(reader).await? {
+                let mut cursor = Cursor::new(root_bytes);
+                return probe_codec_detailed_with_options(&mut cursor, options);
+            }
+            return Err(error.into());
+        }
+    };
 
     let mut summary = CodecDetailedProbeInfo::default();
     let mut mdat_appeared = false;
@@ -1543,6 +1716,16 @@ where
                 mdat_appeared = true;
             }
             _ => {}
+        }
+    }
+
+    if (summary.tracks.is_empty() || summary.timescale == 0)
+        && let Some(root_bytes) = extract_compressed_movie_root_bytes_async(reader).await?
+    {
+        let mut cursor = Cursor::new(root_bytes);
+        let fallback = probe_codec_detailed_with_options(&mut cursor, options)?;
+        if !fallback.tracks.is_empty() || fallback.timescale != 0 {
+            return Ok(fallback);
         }
     }
 
@@ -3883,20 +4066,8 @@ where
     reader
         .seek(SeekFrom::Start(info.offset() + info.header_size()))
         .await?;
-    let mut payload_bytes = Vec::with_capacity(info.payload_size()?.try_into().unwrap_or(0));
-    let mut payload_reader = (&mut *reader).take(info.payload_size()?);
-    let payload_read = payload_reader.read_to_end(&mut payload_bytes).await? as u64;
-    if payload_read != info.payload_size()? {
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-    }
-
     let mut decoded = B::default();
-    unmarshal(
-        &mut Cursor::new(payload_bytes.as_slice()),
-        info.payload_size()?,
-        &mut decoded,
-        None,
-    )?;
+    unmarshal_async(reader, info.payload_size()?, &mut decoded, None).await?;
     Ok(decoded)
 }
 

@@ -16,6 +16,8 @@ use crate::boxes::iso14496_12::{
     TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT, Tfdt, Tfhd, Tkhd,
     Trex, Trun,
 };
+#[cfg(feature = "async")]
+use crate::codec::unmarshal_async;
 use crate::codec::{CodecBox, CodecError, ImmutableBox, MutableBox, marshal, unmarshal};
 use crate::extract::{ExtractError, extract_box_as, extract_boxes};
 #[cfg(feature = "async")]
@@ -1993,22 +1995,12 @@ where
 async fn read_payload_as_async<R, B>(reader: &mut R, info: &BoxInfo) -> Result<B, SidxAnalysisError>
 where
     R: AsyncReadSeek,
-    B: CodecBox + Default,
+    B: CodecBox + Default + Send,
 {
     info.seek_to_payload_async(reader).await?;
     let payload_size = info.payload_size()?;
-    let mut payload = usize::try_from(payload_size)
-        .map(Vec::with_capacity)
-        .unwrap_or_else(|_| Vec::new());
-    let mut limited = (&mut *reader).take(payload_size);
-    let copied = limited.read_to_end(&mut payload).await? as u64;
-    if copied != payload_size {
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-    }
-
-    let mut payload_reader = Cursor::new(payload);
     let mut decoded = B::default();
-    unmarshal(&mut payload_reader, payload_size, &mut decoded, None)?;
+    unmarshal_async(reader, payload_size, &mut decoded, None).await?;
     Ok(decoded)
 }
 

@@ -17,6 +17,10 @@ use mp4forge::boxes::metadata::{
     TvShowNameData, WriterData,
 };
 use mp4forge::boxes::{AnyTypeBox, BoxLookupContext, default_registry};
+#[cfg(feature = "async")]
+use mp4forge::codec::marshal_async;
+#[cfg(feature = "async")]
+use mp4forge::codec::unmarshal_async;
 use mp4forge::codec::{CodecBox, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any};
 use mp4forge::stringify::stringify;
 
@@ -330,6 +334,54 @@ fn metadata_catalog_roundtrips() {
         &keys_payload,
         "Version=0 Flags=0x000000 EntryCount=2 Entries=[{KeySize=27 KeyNamespace=\"mdta\" KeyValue=\"com.android.version\"}, {KeySize=25 KeyNamespace=\"mdta\" KeyValue=\"com.android.model\"}]",
     );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_nested_numbered_metadata_item_marshal_matches_sync_layout() {
+    let nested_numbered_payload = [
+        0x00, 0x00, 0x00, 0x15, b'd', b'a', b't', b'a', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x31, 0x2e, 0x30, 0x2e, 0x30,
+    ];
+    let mut decoded_nested_numbered = NumberedMetadataItem::default();
+    decoded_nested_numbered.set_box_type(FourCc::from_u32(1));
+    let mut reader = Cursor::new(nested_numbered_payload);
+    let read = unmarshal(
+        &mut reader,
+        nested_numbered_payload.len() as u64,
+        &mut decoded_nested_numbered,
+        None,
+    )
+    .unwrap();
+    assert_eq!(read, nested_numbered_payload.len() as u64);
+
+    let mut async_encoded_nested_numbered = Cursor::new(Vec::new());
+    let nested_written = marshal_async(
+        &mut async_encoded_nested_numbered,
+        &decoded_nested_numbered,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(nested_written, nested_numbered_payload.len() as u64);
+    assert_eq!(
+        async_encoded_nested_numbered.into_inner(),
+        nested_numbered_payload
+    );
+
+    let mut async_reader = Cursor::new(nested_numbered_payload);
+    let mut async_decoded_nested_numbered = NumberedMetadataItem::default();
+    async_decoded_nested_numbered.set_box_type(FourCc::from_u32(1));
+    let async_read = unmarshal_async(
+        &mut async_reader,
+        nested_numbered_payload.len() as u64,
+        &mut async_decoded_nested_numbered,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(async_read, nested_numbered_payload.len() as u64);
+    assert_eq!(async_decoded_nested_numbered, decoded_nested_numbered);
 }
 
 #[test]

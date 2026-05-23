@@ -9,9 +9,11 @@ use crate::boxes::{AnyTypeBox, BoxLookupContext, BoxRegistry};
 use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
-    untrusted_prealloc_hint,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_array_untrusted,
+    read_exact_vec_untrusted, untrusted_prealloc_hint,
 };
+#[cfg(feature = "async")]
+use crate::codec::{read_exact_array_untrusted_async, read_exact_vec_untrusted_async};
 use crate::stringify::stringify;
 use crate::{BoxInfo, FourCc, codec_field};
 
@@ -283,10 +285,7 @@ fn encode_data_payload(data: &Data) -> Vec<u8> {
     payload
 }
 
-fn decode_data_payload(
-    field_name: &'static str,
-    payload: Vec<u8>,
-) -> Result<Data, FieldValueError> {
+fn decode_data_payload(field_name: &'static str, payload: &[u8]) -> Result<Data, FieldValueError> {
     if payload.len() < 8 {
         return Err(invalid_value(
             field_name,
@@ -2319,7 +2318,7 @@ impl FieldValueWrite for NumberedMetadataItem {
                 Ok(())
             }
             ("Data", FieldValue::Bytes(value)) => {
-                self.data = decode_data_payload(field_name, value)?;
+                self.data = decode_data_payload(field_name, &value)?;
                 Ok(())
             }
             (field_name, value) => Err(unexpected_field(field_name, value)),
@@ -2371,13 +2370,65 @@ impl CodecBox for NumberedMetadataItem {
             return Ok(None);
         }
 
-        let data_payload = read_exact_vec_untrusted(reader, (payload_size - 8) as usize)?;
-
         self.full_box = FullBoxState::default();
         self.layout = NumberedMetadataLayout::NestedDataBox;
         self.item_name = item_name;
-        self.data = decode_data_payload("Data", data_payload)?;
+        let mut data_header = [0_u8; 8];
+        reader.read_exact(&mut data_header)?;
+        let data_len = usize::try_from(payload_size - 16)
+            .map_err(|_| invalid_value("Data", "payload exceeds the supported in-memory range"))?;
+        let mut data = vec![0_u8; data_len];
+        reader.read_exact(&mut data)?;
+        self.data = Data {
+            data_type: u32::from_be_bytes(data_header[0..4].try_into().unwrap()),
+            data_lang: u32::from_be_bytes(data_header[4..8].try_into().unwrap()),
+            data,
+        };
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, crate::codec::CodecError>> {
+        Box::pin(async move {
+            if payload_size < 16 {
+                return Ok(None);
+            }
+
+            let start = tokio::io::AsyncSeekExt::stream_position(reader).await?;
+            let mut header = [0_u8; 8];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut header).await?;
+
+            let nested_size =
+                u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+            let item_name = FourCc::from_bytes([header[4], header[5], header[6], header[7]]);
+
+            if nested_size != payload_size || item_name != FourCc::from_bytes(*b"data") {
+                tokio::io::AsyncSeekExt::seek(reader, SeekFrom::Start(start)).await?;
+                return Ok(None);
+            }
+
+            let mut data_header = [0_u8; 8];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut data_header).await?;
+            let data_len = usize::try_from(payload_size - 16).map_err(|_| {
+                invalid_value("Data", "payload exceeds the supported in-memory range")
+            })?;
+            let mut data = vec![0_u8; data_len];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut data).await?;
+
+            self.full_box = FullBoxState::default();
+            self.layout = NumberedMetadataLayout::NestedDataBox;
+            self.item_name = item_name;
+            self.data = Data {
+                data_type: u32::from_be_bytes(data_header[0..4].try_into().unwrap()),
+                data_lang: u32::from_be_bytes(data_header[4..8].try_into().unwrap()),
+                data,
+            };
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -2587,14 +2638,12 @@ impl CodecBox for Id32 {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, crate::codec::CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        if payload_len < 6 {
+        if payload_size < 6 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let payload = read_exact_vec_untrusted(reader, payload_len)?;
-        let version = payload[0];
+        let header = read_exact_array_untrusted::<6, _>(reader)?;
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -2602,16 +2651,61 @@ impl CodecBox for Id32 {
             });
         }
 
-        let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+        let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
         if flags != 0 {
             return Err(invalid_value("Flags", "non-zero flags are not supported").into());
         }
 
+        let trailing_len = usize::try_from(payload_size - 6)
+            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
         self.full_box = FullBoxState { version, flags };
         self.language =
-            decode_iso639_2_language("Language", u16::from_be_bytes([payload[4], payload[5]]))?;
-        self.id3v2_data = payload[6..].to_vec();
+            decode_iso639_2_language("Language", u16::from_be_bytes([header[4], header[5]]))?;
+        self.id3v2_data = if trailing_len == 0 {
+            Vec::new()
+        } else {
+            read_exact_vec_untrusted(reader, trailing_len)?
+        };
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, crate::codec::CodecError>> {
+        Box::pin(async move {
+            if payload_size < 6 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let header = read_exact_array_untrusted_async::<6, _>(reader).await?;
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+            if flags != 0 {
+                return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+            }
+
+            let trailing_len = usize::try_from(payload_size - 6)
+                .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
+            self.full_box = FullBoxState { version, flags };
+            self.language =
+                decode_iso639_2_language("Language", u16::from_be_bytes([header[4], header[5]]))?;
+            self.id3v2_data = if trailing_len == 0 {
+                Vec::new()
+            } else {
+                read_exact_vec_untrusted_async(reader, trailing_len).await?
+            };
+            Ok(Some(payload_size))
+        })
     }
 }
 

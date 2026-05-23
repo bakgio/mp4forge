@@ -891,6 +891,7 @@ pub struct MuxRequest {
     output_layout: MuxOutputLayout,
     destination_mode: MuxDestinationMode,
     duration_mode: Option<MuxDurationMode>,
+    preserve_flat_authority_layout: bool,
 }
 
 impl MuxRequest {
@@ -901,6 +902,7 @@ impl MuxRequest {
             output_layout: MuxOutputLayout::Flat,
             destination_mode: MuxDestinationMode::CreateNew,
             duration_mode: None,
+            preserve_flat_authority_layout: false,
         }
     }
 
@@ -924,6 +926,10 @@ impl MuxRequest {
         self.duration_mode
     }
 
+    pub(crate) const fn preserve_flat_authority_layout(&self) -> bool {
+        self.preserve_flat_authority_layout
+    }
+
     /// Returns a copy of this request with one explicit container layout configured.
     pub const fn with_output_layout(mut self, output_layout: MuxOutputLayout) -> Self {
         self.output_layout = output_layout;
@@ -941,6 +947,14 @@ impl MuxRequest {
         self.duration_mode = Some(duration_mode);
         self
     }
+
+    pub(crate) const fn with_preserve_flat_authority_layout(
+        mut self,
+        preserve_flat_authority_layout: bool,
+    ) -> Self {
+        self.preserve_flat_authority_layout = preserve_flat_authority_layout;
+        self
+    }
 }
 
 /// Interleave policy used when ordering staged media items into one output payload.
@@ -950,6 +964,10 @@ pub enum MuxInterleavePolicy {
     /// source-offset order.
     #[default]
     DecodeTime,
+    /// Orders coordinated chunks by chunk ordinal first, then keeps ties stable by source and
+    /// source-offset order. This is used only on preserved-authority flat carry paths where the
+    /// authority layout dictates the interleave window sequence directly.
+    ChunkOrdinalThenSource,
 }
 
 /// One staged media item that a later mux step can schedule into one output payload.
@@ -1173,6 +1191,11 @@ pub struct MuxFileConfig {
     emit_default_flat_tool_metadata: bool,
     flat_source_encoding_metadata: Option<String>,
     flat_source_encoder_metadata: Option<String>,
+    flat_source_movie_creation_time: Option<u64>,
+    flat_source_movie_modification_time: Option<u64>,
+    preserved_flat_prefix_bytes: Vec<u8>,
+    preserved_flat_iods_bytes: Option<Vec<u8>>,
+    preserved_flat_udta_bytes: Option<Vec<u8>>,
 }
 
 impl MuxFileConfig {
@@ -1193,6 +1216,11 @@ impl MuxFileConfig {
             emit_default_flat_tool_metadata: true,
             flat_source_encoding_metadata: None,
             flat_source_encoder_metadata: None,
+            flat_source_movie_creation_time: None,
+            flat_source_movie_modification_time: None,
+            preserved_flat_prefix_bytes: Vec::new(),
+            preserved_flat_iods_bytes: None,
+            preserved_flat_udta_bytes: None,
         }
     }
 
@@ -1332,6 +1360,66 @@ impl MuxFileConfig {
         self.flat_source_encoder_metadata = flat_source_encoder_metadata;
         self
     }
+
+    pub(crate) const fn flat_source_movie_creation_time(&self) -> Option<u64> {
+        self.flat_source_movie_creation_time
+    }
+
+    pub(crate) const fn with_flat_source_movie_creation_time(
+        mut self,
+        flat_source_movie_creation_time: Option<u64>,
+    ) -> Self {
+        self.flat_source_movie_creation_time = flat_source_movie_creation_time;
+        self
+    }
+
+    pub(crate) const fn flat_source_movie_modification_time(&self) -> Option<u64> {
+        self.flat_source_movie_modification_time
+    }
+
+    pub(crate) const fn with_flat_source_movie_modification_time(
+        mut self,
+        flat_source_movie_modification_time: Option<u64>,
+    ) -> Self {
+        self.flat_source_movie_modification_time = flat_source_movie_modification_time;
+        self
+    }
+
+    pub(crate) fn preserved_flat_prefix_bytes(&self) -> &[u8] {
+        &self.preserved_flat_prefix_bytes
+    }
+
+    pub(crate) fn with_preserved_flat_prefix_bytes(
+        mut self,
+        preserved_flat_prefix_bytes: Vec<u8>,
+    ) -> Self {
+        self.preserved_flat_prefix_bytes = preserved_flat_prefix_bytes;
+        self
+    }
+
+    pub(crate) fn preserved_flat_iods_bytes(&self) -> Option<&[u8]> {
+        self.preserved_flat_iods_bytes.as_deref()
+    }
+
+    pub(crate) fn with_preserved_flat_iods_bytes(
+        mut self,
+        preserved_flat_iods_bytes: Option<Vec<u8>>,
+    ) -> Self {
+        self.preserved_flat_iods_bytes = preserved_flat_iods_bytes;
+        self
+    }
+
+    pub(crate) fn preserved_flat_udta_bytes(&self) -> Option<&[u8]> {
+        self.preserved_flat_udta_bytes.as_deref()
+    }
+
+    pub(crate) fn with_preserved_flat_udta_bytes(
+        mut self,
+        preserved_flat_udta_bytes: Option<Vec<u8>>,
+    ) -> Self {
+        self.preserved_flat_udta_bytes = preserved_flat_udta_bytes;
+        self
+    }
 }
 
 /// Track kind used by the real MP4 mux surface.
@@ -1408,7 +1496,9 @@ pub struct MuxTrackConfig {
     flat_audio_profile_level_indication: Option<u8>,
     fragmented_reference_group_fragment_counts: Option<Vec<u32>>,
     flat_source_track_creation_time: Option<u64>,
+    flat_source_track_modification_time: Option<u64>,
     flat_source_media_creation_time: Option<u64>,
+    flat_source_media_modification_time: Option<u64>,
     omit_flat_iods: bool,
     flat_stsc_override: Option<crate::boxes::iso14496_12::Stsc>,
     preserved_flat_stbl_boxes: Vec<Vec<u8>>,
@@ -1470,7 +1560,9 @@ impl MuxTrackConfig {
             flat_audio_profile_level_indication: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
+            flat_source_track_modification_time: None,
             flat_source_media_creation_time: None,
+            flat_source_media_modification_time: None,
             omit_flat_iods: false,
             flat_stsc_override: None,
             preserved_flat_stbl_boxes: Vec::new(),
@@ -1511,7 +1603,9 @@ impl MuxTrackConfig {
             flat_audio_profile_level_indication: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
+            flat_source_track_modification_time: None,
             flat_source_media_creation_time: None,
+            flat_source_media_modification_time: None,
             omit_flat_iods: false,
             flat_stsc_override: None,
             preserved_flat_stbl_boxes: Vec::new(),
@@ -1552,7 +1646,9 @@ impl MuxTrackConfig {
             flat_audio_profile_level_indication: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
+            flat_source_track_modification_time: None,
             flat_source_media_creation_time: None,
+            flat_source_media_modification_time: None,
             omit_flat_iods: false,
             flat_stsc_override: None,
             preserved_flat_stbl_boxes: Vec::new(),
@@ -1593,7 +1689,9 @@ impl MuxTrackConfig {
             flat_audio_profile_level_indication: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
+            flat_source_track_modification_time: None,
             flat_source_media_creation_time: None,
+            flat_source_media_modification_time: None,
             omit_flat_iods: false,
             flat_stsc_override: None,
             preserved_flat_stbl_boxes: Vec::new(),
@@ -1652,8 +1750,16 @@ impl MuxTrackConfig {
         self.flat_source_track_creation_time
     }
 
+    pub(crate) const fn flat_source_track_modification_time(&self) -> Option<u64> {
+        self.flat_source_track_modification_time
+    }
+
     pub(crate) const fn flat_source_media_creation_time(&self) -> Option<u64> {
         self.flat_source_media_creation_time
+    }
+
+    pub(crate) const fn flat_source_media_modification_time(&self) -> Option<u64> {
+        self.flat_source_media_modification_time
     }
 
     pub(crate) const fn omit_flat_iods(&self) -> bool {
@@ -1716,11 +1822,27 @@ impl MuxTrackConfig {
         self
     }
 
+    pub(crate) const fn with_flat_source_track_modification_time(
+        mut self,
+        flat_source_track_modification_time: Option<u64>,
+    ) -> Self {
+        self.flat_source_track_modification_time = flat_source_track_modification_time;
+        self
+    }
+
     pub(crate) const fn with_flat_source_media_creation_time(
         mut self,
         flat_source_media_creation_time: Option<u64>,
     ) -> Self {
         self.flat_source_media_creation_time = flat_source_media_creation_time;
+        self
+    }
+
+    pub(crate) const fn with_flat_source_media_modification_time(
+        mut self,
+        flat_source_media_modification_time: Option<u64>,
+    ) -> Self {
+        self.flat_source_media_modification_time = flat_source_media_modification_time;
         self
     }
 
@@ -2252,7 +2374,7 @@ pub(crate) fn plan_staged_media_items_with_coordination(
         .collect::<Vec<_>>();
 
     match interleave_policy {
-        MuxInterleavePolicy::DecodeTime => {
+        MuxInterleavePolicy::DecodeTime | MuxInterleavePolicy::ChunkOrdinalThenSource => {
             // Keep equal decode-time items stable by source and byte offset before the queue
             // layer applies the decode-time ordering key. This preserves path-first merge order
             // even when a carried track keeps a large external track identifier such as a TS PID.
@@ -2641,6 +2763,7 @@ struct MuxTrackPlanState {
 
 #[derive(Clone, Copy)]
 struct PlannedChunk {
+    chunk_index: usize,
     order_key: PlannedChunkOrderKey,
     track_id: u32,
     start_index: usize,
@@ -2665,7 +2788,7 @@ fn build_planned_items_from_tracks(
     for (&track_id, items) in items_by_track {
         let chunk_sample_counts = coordination.chunk_sample_counts(track_id)?;
         let mut start_index = 0_usize;
-        for &samples_per_chunk in chunk_sample_counts {
+        for (chunk_index, &samples_per_chunk) in chunk_sample_counts.iter().enumerate() {
             let chunk_len = usize::try_from(samples_per_chunk)
                 .map_err(|_| MuxError::LayoutOverflow("chunk sample-count conversion"))?;
             let end_index = start_index
@@ -2679,6 +2802,7 @@ fn build_planned_items_from_tracks(
                         message: "chunk boundaries ran past the staged sample count".to_string(),
                     })?;
             chunks.push(PlannedChunk {
+                chunk_index,
                 order_key: PlannedChunkOrderKey {
                     decode_time: first_sample.decode_time(),
                     source_index: first_sample.source_index(),
@@ -2702,6 +2826,17 @@ fn build_planned_items_from_tracks(
     match interleave_policy {
         MuxInterleavePolicy::DecodeTime => {
             chunks.sort_by_key(|chunk| chunk.order_key);
+        }
+        MuxInterleavePolicy::ChunkOrdinalThenSource => {
+            chunks.sort_by_key(|chunk| {
+                (
+                    chunk.chunk_index,
+                    chunk.order_key.source_index,
+                    chunk.order_key.data_offset,
+                    chunk.order_key.track_id,
+                    chunk.order_key.decode_time,
+                )
+            });
         }
     }
 
@@ -2898,5 +3033,33 @@ mod tests {
         assert_eq!(planned[1].output_offset(), 4);
         assert_eq!(planned[2].output_offset(), 8);
         assert_eq!(planned[3].output_offset(), 11);
+    }
+
+    #[test]
+    fn chunk_ordinal_interleave_keeps_aligned_chunks_in_source_pair_order() {
+        let plan = plan_staged_media_items_with_coordination(
+            vec![
+                MuxStagedMediaItem::new(0, 1, 0, 10, 0, 4),
+                MuxStagedMediaItem::new(0, 1, 10, 10, 4, 4),
+                MuxStagedMediaItem::new(0, 1, 20, 10, 8, 4),
+                MuxStagedMediaItem::new(0, 1, 30, 10, 12, 4),
+                MuxStagedMediaItem::new(1, 2, 0, 10, 0, 3),
+                MuxStagedMediaItem::new(1, 2, 15, 10, 3, 3),
+                MuxStagedMediaItem::new(1, 2, 31, 10, 6, 3),
+            ],
+            MuxInterleavePolicy::ChunkOrdinalThenSource,
+            vec![
+                TrackCoordinationDirective::new(1, vec![1, 1, 1, 1]),
+                TrackCoordinationDirective::new(2, vec![1, 1, 1]),
+            ],
+        )
+        .unwrap();
+
+        let track_order = plan
+            .planned_items()
+            .iter()
+            .map(|item| item.staged().track_id())
+            .collect::<Vec<_>>();
+        assert_eq!(track_order, vec![1, 2, 1, 2, 1, 2, 1]);
     }
 }

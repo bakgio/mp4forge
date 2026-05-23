@@ -2377,6 +2377,28 @@ fn elng_preserves_payloads_without_full_box_header_bytes() {
 
 #[cfg(feature = "async")]
 #[tokio::test]
+async fn async_elng_preserves_payloads_without_full_box_header_bytes() {
+    let payload = [b'd', b'k', 0x00];
+    let mut decoded = Elng::default();
+    let mut reader = Cursor::new(payload.to_vec());
+    let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+        .await
+        .unwrap();
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded.extended_language, "dk");
+    assert_eq!(
+        stringify(&decoded, None).unwrap(),
+        "Version=0 Flags=0x000000 ExtendedLanguage=\"dk\""
+    );
+
+    let mut encoded = Cursor::new(Vec::new());
+    let written = marshal_async(&mut encoded, &decoded, None).await.unwrap();
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(encoded.into_inner(), payload);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
 async fn async_meta_and_prft_roundtrips_preserve_typed_behavior() {
     let meta_payload = [
         0x00, 0x00, 0x01, 0x00, b'h', b'd', b'l', b'r', 0x00, 0x00, 0x00, 0x00,
@@ -2430,6 +2452,207 @@ async fn async_meta_and_prft_roundtrips_preserve_typed_behavior() {
     .unwrap();
     assert_eq!(any_read, 24);
     assert_eq!(any_box.as_any().downcast_ref::<Prft>().unwrap(), &prft);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_uuid_and_decoder_configs_roundtrip_reader_first_paths() {
+    let avcc = AVCDecoderConfiguration {
+        configuration_version: 1,
+        profile: 100,
+        profile_compatibility: 0,
+        level: 31,
+        length_size_minus_one: 3,
+        num_of_sequence_parameter_sets: 1,
+        sequence_parameter_sets: vec![AVCParameterSet {
+            length: 3,
+            nal_unit: vec![0x67, 0x64, 0x00],
+        }],
+        num_of_picture_parameter_sets: 1,
+        picture_parameter_sets: vec![AVCParameterSet {
+            length: 2,
+            nal_unit: vec![0x68, 0xee],
+        }],
+        high_profile_fields_enabled: false,
+        chroma_format: 0,
+        bit_depth_luma_minus8: 0,
+        bit_depth_chroma_minus8: 0,
+        num_of_sequence_parameter_set_ext: 0,
+        sequence_parameter_sets_ext: Vec::new(),
+    };
+
+    let hvcc = HEVCDecoderConfiguration {
+        configuration_version: 1,
+        general_profile_space: 0,
+        general_tier_flag: false,
+        general_profile_idc: 1,
+        general_profile_compatibility: [false; 32],
+        general_constraint_indicator: [0; 6],
+        general_level_idc: 120,
+        min_spatial_segmentation_idc: 0,
+        parallelism_type: 0,
+        chroma_format_idc: 1,
+        bit_depth_luma_minus8: 0,
+        bit_depth_chroma_minus8: 0,
+        avg_frame_rate: 0,
+        constant_frame_rate: 0,
+        num_temporal_layers: 1,
+        temporal_id_nested: 1,
+        length_size_minus_one: 3,
+        num_of_nalu_arrays: 1,
+        nalu_arrays: vec![HEVCNaluArray {
+            completeness: true,
+            reserved: false,
+            nalu_type: 32,
+            num_nalus: 1,
+            nalus: vec![HEVCNalu {
+                length: 2,
+                nal_unit: vec![0xaa, 0xbb],
+            }],
+        }],
+    };
+
+    let mut legacy_sample_encryption = Senc::default();
+    legacy_sample_encryption.set_version(0);
+    legacy_sample_encryption.set_flags(SENC_USE_SUBSAMPLE_ENCRYPTION);
+    legacy_sample_encryption.sample_count = 1;
+    legacy_sample_encryption.samples = vec![SencSample {
+        initialization_vector: vec![0x10, 0x20, 0x30, 0x40],
+        subsamples: vec![SencSubsample {
+            bytes_of_clear_data: 2,
+            bytes_of_protected_data: 4,
+        }],
+    }];
+
+    let uuid = Uuid {
+        user_type: UUID_SAMPLE_ENCRYPTION,
+        payload: UuidPayload::SampleEncryption(legacy_sample_encryption),
+    };
+
+    async fn assert_async_roundtrip<T>(src: T)
+    where
+        T: CodecBox + Default + PartialEq + std::fmt::Debug + 'static,
+    {
+        let mut encoded = Cursor::new(Vec::new());
+        let written = marshal_async(&mut encoded, &src, None).await.unwrap();
+        let payload = encoded.into_inner();
+        assert_eq!(written, payload.len() as u64);
+
+        let mut decoded = T::default();
+        let mut reader = Cursor::new(payload.clone());
+        let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+            .await
+            .unwrap();
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(decoded, src);
+
+        let registry = default_registry();
+        let mut any_reader = Cursor::new(payload);
+        let payload_len = any_reader.get_ref().len() as u64;
+        let (any_box, any_read) = unmarshal_any_async(
+            &mut any_reader,
+            payload_len,
+            src.box_type(),
+            &registry,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(any_read, payload_len);
+        assert_eq!(any_box.as_any().downcast_ref::<T>().unwrap(), &src);
+    }
+
+    assert_async_roundtrip(avcc).await;
+    assert_async_roundtrip(hvcc).await;
+    assert_async_roundtrip(uuid).await;
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_loudness_and_elng_roundtrips_reader_first_paths() {
+    let mut elng = Elng::default();
+    elng.extended_language = "en-US".into();
+
+    let mut tlou = TrackLoudnessInfo::default();
+    tlou.set_version(1);
+    tlou.entries = vec![LoudnessEntry {
+        eq_set_id: 7,
+        downmix_id: 12,
+        drc_set_id: 18,
+        bs_sample_peak_level: 528,
+        bs_true_peak_level: 801,
+        measurement_system_for_tp: 4,
+        reliability_for_tp: 6,
+        measurements: vec![
+            LoudnessMeasurement {
+                method_definition: 7,
+                method_value: 8,
+                measurement_system: 9,
+                reliability: 10,
+            },
+            LoudnessMeasurement {
+                method_definition: 11,
+                method_value: 12,
+                measurement_system: 13,
+                reliability: 14,
+            },
+        ],
+    }];
+
+    let mut alou = AlbumLoudnessInfo::default();
+    alou.set_version(0);
+    alou.entries = vec![LoudnessEntry {
+        downmix_id: 9,
+        drc_set_id: 17,
+        bs_sample_peak_level: 274,
+        bs_true_peak_level: 291,
+        measurement_system_for_tp: 2,
+        reliability_for_tp: 3,
+        measurements: vec![LoudnessMeasurement {
+            method_definition: 1,
+            method_value: 2,
+            measurement_system: 4,
+            reliability: 5,
+        }],
+        ..LoudnessEntry::default()
+    }];
+
+    async fn assert_async_roundtrip<T>(src: T)
+    where
+        T: CodecBox + Default + PartialEq + std::fmt::Debug + 'static,
+    {
+        let mut encoded = Cursor::new(Vec::new());
+        let written = marshal_async(&mut encoded, &src, None).await.unwrap();
+        let payload = encoded.into_inner();
+        assert_eq!(written, payload.len() as u64);
+
+        let mut decoded = T::default();
+        let mut reader = Cursor::new(payload.clone());
+        let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+            .await
+            .unwrap();
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(decoded, src);
+
+        let registry = default_registry();
+        let mut any_reader = Cursor::new(payload);
+        let payload_len = any_reader.get_ref().len() as u64;
+        let (any_box, any_read) = unmarshal_any_async(
+            &mut any_reader,
+            payload_len,
+            src.box_type(),
+            &registry,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(any_read, payload_len);
+        assert_eq!(any_box.as_any().downcast_ref::<T>().unwrap(), &src);
+    }
+
+    assert_async_roundtrip(elng).await;
+    assert_async_roundtrip(tlou).await;
+    assert_async_roundtrip(alou).await;
 }
 
 #[test]

@@ -7,7 +7,7 @@
 use std::any::type_name;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Cursor, Read, Seek};
+use std::io::{self, Cursor, Read, Seek, Write};
 #[cfg(feature = "async")]
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,11 @@ use crate::FourCc;
 #[cfg(feature = "async")]
 use crate::async_io::AsyncReadSeek;
 use crate::boxes::{BoxRegistry, default_registry};
-use crate::codec::{CodecBox, CodecError, DynCodecBox, unmarshal_any_with_context};
+use crate::codec::{
+    CodecBox, CodecError, DynCodecBox, read_exact_vec_untrusted, unmarshal_any_with_context,
+};
+#[cfg(feature = "async")]
+use crate::codec::{read_exact_vec_untrusted_async, unmarshal_any_with_context_async};
 use crate::header::HeaderError;
 #[cfg(feature = "async")]
 use crate::walk::{
@@ -27,6 +31,8 @@ use crate::walk::{
     BoxPath, PathMatch, WalkControl, WalkError, WalkHandle, walk_structure_from_box_with_registry,
     walk_structure_with_registry,
 };
+#[cfg(feature = "async")]
+use tokio::io::AsyncWrite;
 #[cfg(feature = "async")]
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -214,6 +220,84 @@ where
     extract_boxes_payload_bytes_with_registry(reader, parent, paths, &registry)
 }
 
+/// Copies every box that matches `path` to `writer` as exact serialized bytes, including the
+/// original box headers, and returns the byte length of each copied match.
+pub fn copy_box_bytes_to<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let paths = [path];
+    copy_boxes_bytes_to(reader, parent, &paths, writer)
+}
+
+/// Copies every box that matches any path in `paths` to `writer` as exact serialized bytes,
+/// including the original box headers, and returns the byte length of each copied match.
+pub fn copy_boxes_bytes_to<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let registry = default_registry();
+    copy_matched_bytes_to(
+        reader,
+        parent,
+        paths,
+        &registry,
+        ExtractedByteRange::FullBox,
+        writer,
+    )
+}
+
+/// Copies every payload that matches `path` to `writer` as exact on-disk bytes and returns the
+/// byte length of each copied match.
+pub fn copy_box_payload_bytes_to<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let paths = [path];
+    copy_boxes_payload_bytes_to(reader, parent, &paths, writer)
+}
+
+/// Copies every payload that matches any path in `paths` to `writer` as exact on-disk bytes and
+/// returns the byte length of each copied match.
+pub fn copy_boxes_payload_bytes_to<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let registry = default_registry();
+    copy_matched_bytes_to(
+        reader,
+        parent,
+        paths,
+        &registry,
+        ExtractedByteRange::Payload,
+        writer,
+    )
+}
+
 /// Extracts every box that matches `path` through the additive Tokio-based async surface and
 /// returns the matching header metadata.
 #[cfg(feature = "async")]
@@ -326,17 +410,9 @@ where
         .map_err(|_| io::Error::other("async match collector remained shared"))?
         .into_inner()
         .map_err(|_| io::Error::other("async match collector poisoned"))?;
-    let mut staged = Vec::with_capacity(matched_boxes.len());
-
+    let mut matches = Vec::with_capacity(matched_boxes.len());
     for matched in matched_boxes {
-        let payload_bytes =
-            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
-        staged.push((matched, payload_bytes));
-    }
-
-    let mut matches = Vec::with_capacity(staged.len());
-    for (matched, payload_bytes) in staged {
-        let payload = decode_payload_from_bytes(&matched, &registry, &payload_bytes)?;
+        let payload = decode_payload_async(reader, &matched, &registry).await?;
         matches.push(ExtractedBox {
             info: matched.info,
             payload,
@@ -402,17 +478,9 @@ where
         .map_err(|_| io::Error::other("async match collector remained shared"))?
         .into_inner()
         .map_err(|_| io::Error::other("async match collector poisoned"))?;
-    let mut staged = Vec::with_capacity(matched_boxes.len());
-
+    let mut payloads = Vec::with_capacity(matched_boxes.len());
     for matched in matched_boxes {
-        let payload_bytes =
-            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
-        staged.push((matched, payload_bytes));
-    }
-
-    let mut payloads = Vec::with_capacity(staged.len());
-    for (matched, payload_bytes) in staged {
-        let payload = decode_payload_from_bytes(&matched, &registry, &payload_bytes)?;
+        let payload = decode_payload_async(reader, &matched, &registry).await?;
         let typed = payload
             .as_ref()
             .as_any()
@@ -558,6 +626,102 @@ where
     }
 
     Ok(extracted)
+}
+
+/// Copies every box that matches `path` through the additive Tokio-based async surface to
+/// `writer` as exact serialized bytes, including the original box header, and returns the byte
+/// length of each copied match.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn copy_box_bytes_to_async<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    copy_boxes_bytes_to_async(reader, parent.as_ref(), &paths, writer).await
+}
+
+/// Copies every box that matches any path in `paths` through the additive Tokio-based async
+/// surface to `writer` as exact serialized bytes, including the original box headers, and returns
+/// the byte length of each copied match.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn copy_boxes_bytes_to_async<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    copy_matched_bytes_to_async(
+        reader,
+        parent.as_ref(),
+        &paths,
+        &registry,
+        ExtractedByteRange::FullBox,
+        writer,
+    )
+    .await
+}
+
+/// Copies every payload that matches `path` through the additive Tokio-based async surface to
+/// `writer` as exact on-disk bytes and returns the byte length of each copied match.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn copy_box_payload_bytes_to_async<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    path: BoxPath,
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    let parent = parent.copied();
+    let paths = [path];
+    copy_boxes_payload_bytes_to_async(reader, parent.as_ref(), &paths, writer).await
+}
+
+/// Copies every payload that matches any path in `paths` through the additive Tokio-based async
+/// surface to `writer` as exact on-disk bytes and returns the byte length of each copied match.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub async fn copy_boxes_payload_bytes_to_async<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    let parent = parent.copied();
+    let paths = paths.to_vec();
+    let registry = default_registry();
+    copy_matched_bytes_to_async(
+        reader,
+        parent.as_ref(),
+        &paths,
+        &registry,
+        ExtractedByteRange::Payload,
+        writer,
+    )
+    .await
 }
 
 /// Extracts every box that matches `path`, decodes the payloads, and clones them as `T` from an
@@ -777,17 +941,9 @@ where
         .map_err(|_| io::Error::other("async match collector remained shared"))?
         .into_inner()
         .map_err(|_| io::Error::other("async match collector poisoned"))?;
-    let mut staged = Vec::with_capacity(matched_boxes.len());
-
+    let mut matches = Vec::with_capacity(matched_boxes.len());
     for matched in matched_boxes {
-        let payload_bytes =
-            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
-        staged.push((matched, payload_bytes));
-    }
-
-    let mut matches = Vec::with_capacity(staged.len());
-    for (matched, payload_bytes) in staged {
-        let payload = decode_payload_from_bytes(&matched, registry, &payload_bytes)?;
+        let payload = decode_payload_async(reader, &matched, registry).await?;
         matches.push(ExtractedBox {
             info: matched.info,
             payload,
@@ -926,17 +1082,9 @@ where
         .map_err(|_| io::Error::other("async match collector remained shared"))?
         .into_inner()
         .map_err(|_| io::Error::other("async match collector poisoned"))?;
-    let mut staged = Vec::with_capacity(matched_boxes.len());
-
+    let mut payloads = Vec::with_capacity(matched_boxes.len());
     for matched in matched_boxes {
-        let payload_bytes =
-            read_matched_bytes_async(reader, matched.info, ExtractedByteRange::Payload).await?;
-        staged.push((matched, payload_bytes));
-    }
-
-    let mut payloads = Vec::with_capacity(staged.len());
-    for (matched, payload_bytes) in staged {
-        let payload = decode_payload_from_bytes(&matched, registry, &payload_bytes)?;
+        let payload = decode_payload_async(reader, &matched, registry).await?;
         let typed = payload
             .as_ref()
             .as_any()
@@ -1074,6 +1222,41 @@ where
     Ok(matches)
 }
 
+#[cfg(feature = "async")]
+async fn collect_matches_async<R>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+) -> Result<Vec<MatchedBox>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    validate_paths(paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let visitor = AsyncMatchCollector {
+        has_parent: parent.is_some(),
+        paths: paths.to_vec(),
+        matches: Arc::clone(&matches),
+    };
+
+    if let Some(parent) = parent {
+        walk_structure_from_box_with_registry_async(reader, parent, registry, visitor).await?;
+    } else {
+        walk_structure_with_registry_async(reader, registry, visitor).await?;
+    }
+
+    Arc::try_unwrap(matches)
+        .map_err(|_| io::Error::other("async match collector remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("async match collector poisoned"))
+        .map_err(ExtractError::Io)
+}
+
 fn extract_matched_bytes<R>(
     reader: &mut R,
     parent: Option<&BoxInfo>,
@@ -1094,6 +1277,33 @@ where
     Ok(extracted)
 }
 
+fn copy_matched_bytes_to<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+    range: ExtractedByteRange,
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let matched_boxes = collect_matches(reader, parent, paths, registry)?;
+    let mut copied = Vec::with_capacity(matched_boxes.len());
+
+    for matched in matched_boxes {
+        copied.push(copy_matched_bytes_range_to(
+            reader,
+            &matched.info,
+            range,
+            writer,
+        )?);
+    }
+
+    Ok(copied)
+}
+
 fn decode_payload<R>(
     reader: &mut R,
     matched: &MatchedBox,
@@ -1104,24 +1314,43 @@ where
 {
     matched.info.seek_to_payload(reader)?;
     let payload_size = matched.info.payload_size()?;
-    let payload_bytes = read_exact_bytes(reader, payload_size)?;
-    decode_payload_from_bytes(matched, registry, &payload_bytes)
-}
-
-fn decode_payload_from_bytes(
-    matched: &MatchedBox,
-    registry: &BoxRegistry,
-    payload_bytes: &[u8],
-) -> Result<Box<dyn DynCodecBox>, ExtractError> {
-    let mut payload_reader = Cursor::new(payload_bytes);
     let (payload, _) = unmarshal_any_with_context(
-        &mut payload_reader,
-        payload_bytes.len() as u64,
+        reader,
+        payload_size,
         matched.info.box_type(),
         registry,
         matched.info.lookup_context(),
         None,
     )
+    .map_err(|source| ExtractError::PayloadDecode {
+        path: matched.path.clone(),
+        box_type: matched.info.box_type(),
+        offset: matched.info.offset(),
+        source,
+    })?;
+    Ok(payload)
+}
+
+#[cfg(feature = "async")]
+async fn decode_payload_async<R>(
+    reader: &mut R,
+    matched: &MatchedBox,
+    registry: &BoxRegistry,
+) -> Result<Box<dyn DynCodecBox>, ExtractError>
+where
+    R: AsyncReadSeek,
+{
+    matched.info.seek_to_payload_async(reader).await?;
+    let payload_size = matched.info.payload_size()?;
+    let (payload, _) = unmarshal_any_with_context_async(
+        reader,
+        payload_size,
+        matched.info.box_type(),
+        registry,
+        matched.info.lookup_context(),
+        None,
+    )
+    .await
     .map_err(|source| ExtractError::PayloadDecode {
         path: matched.path.clone(),
         box_type: matched.info.box_type(),
@@ -1176,23 +1405,103 @@ where
     read_exact_bytes_async(reader, len).await
 }
 
+fn copy_matched_bytes_range_to<R, W>(
+    reader: &mut R,
+    info: &BoxInfo,
+    range: ExtractedByteRange,
+    writer: &mut W,
+) -> Result<u64, ExtractError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let len = match range {
+        ExtractedByteRange::FullBox => {
+            info.seek_to_start(reader)?;
+            info.size()
+        }
+        ExtractedByteRange::Payload => {
+            info.seek_to_payload(reader)?;
+            info.payload_size()?
+        }
+    };
+    let mut limited = (&mut *reader).take(len);
+    let copied = io::copy(&mut limited, writer)?;
+    if copied != len {
+        return Err(ExtractError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "extracted byte range was truncated during copy",
+        )));
+    }
+    Ok(copied)
+}
+
+#[cfg(feature = "async")]
+async fn copy_matched_bytes_to_async<R, W>(
+    reader: &mut R,
+    parent: Option<&BoxInfo>,
+    paths: &[BoxPath],
+    registry: &BoxRegistry,
+    range: ExtractedByteRange,
+    writer: &mut W,
+) -> Result<Vec<u64>, ExtractError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    let matched_boxes = collect_matches_async(reader, parent, paths, registry).await?;
+    let mut copied = Vec::with_capacity(matched_boxes.len());
+    for matched in matched_boxes {
+        copied.push(copy_matched_bytes_range_to_async(reader, matched.info, range, writer).await?);
+    }
+    Ok(copied)
+}
+
+#[cfg(feature = "async")]
+async fn copy_matched_bytes_range_to_async<R, W>(
+    reader: &mut R,
+    info: BoxInfo,
+    range: ExtractedByteRange,
+    writer: &mut W,
+) -> Result<u64, ExtractError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    let len = match range {
+        ExtractedByteRange::FullBox => {
+            reader.seek(io::SeekFrom::Start(info.offset())).await?;
+            info.size()
+        }
+        ExtractedByteRange::Payload => {
+            reader
+                .seek(io::SeekFrom::Start(info.offset() + info.header_size()))
+                .await?;
+            info.payload_size()?
+        }
+    };
+    let mut limited = (&mut *reader).take(len);
+    let copied = tokio::io::copy(&mut limited, writer).await?;
+    if copied != len {
+        return Err(ExtractError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "extracted byte range was truncated during async copy",
+        )));
+    }
+    Ok(copied)
+}
+
 fn read_exact_bytes<R>(reader: &mut R, len: u64) -> Result<Vec<u8>, ExtractError>
 where
     R: Read,
 {
-    let mut bytes = usize::try_from(len)
-        .map(Vec::with_capacity)
-        .unwrap_or_else(|_| Vec::new());
-
-    // `Read::read_to_end` on a `Take` reader does not error on an early underlying EOF, so the
-    // copied byte count must be checked explicitly to preserve exact-byte semantics.
-    let mut limited = reader.take(len);
-    let copied = limited.read_to_end(&mut bytes)? as u64;
-    if copied != len {
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-    }
-
-    Ok(bytes)
+    let len = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "requested byte range exceeds the supported in-memory size",
+        )
+    })?;
+    read_exact_vec_untrusted(reader, len).map_err(ExtractError::Io)
 }
 
 #[cfg(feature = "async")]
@@ -1200,17 +1509,15 @@ async fn read_exact_bytes_async<R>(reader: &mut R, len: u64) -> Result<Vec<u8>, 
 where
     R: AsyncReadSeek,
 {
-    let mut bytes = usize::try_from(len)
-        .map(Vec::with_capacity)
-        .unwrap_or_else(|_| Vec::new());
-
-    let mut limited = (&mut *reader).take(len);
-    let copied = limited.read_to_end(&mut bytes).await? as u64;
-    if copied != len {
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-    }
-
-    Ok(bytes)
+    let len = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "requested byte range exceeds the supported in-memory size",
+        )
+    })?;
+    read_exact_vec_untrusted_async(reader, len)
+        .await
+        .map_err(ExtractError::Io)
 }
 
 fn validate_paths(paths: &[BoxPath]) -> Result<(), ExtractError> {

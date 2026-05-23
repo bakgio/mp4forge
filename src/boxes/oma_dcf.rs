@@ -2,10 +2,14 @@
 
 use std::io::Write;
 
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::BoxRegistry;
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode, read_exact_vec_untrusted,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode,
 };
 use crate::{FourCc, codec_field};
 
@@ -299,15 +303,13 @@ impl CodecBox for Odhe {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 5 {
+        if payload_size < 5 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
+        let mut header = [0_u8; 5];
+        reader.read_exact(&mut header).map_err(CodecError::Io)?;
 
-        let version = payload[0];
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -315,18 +317,66 @@ impl CodecBox for Odhe {
             });
         }
 
-        let content_type_len = usize::from(payload[4]);
+        let content_type_len = usize::from(header[4]);
         let fixed_len = 5 + content_type_len;
-        if payload.len() < fixed_len {
+        if payload_size < u64::try_from(fixed_len).unwrap() {
             return Err(invalid_value("Payload", "content-type bytes are truncated").into());
         }
+        let mut content_type_bytes = vec![0_u8; content_type_len];
+        reader
+            .read_exact(&mut content_type_bytes)
+            .map_err(CodecError::Io)?;
 
         self.full_box = FullBoxState {
             version,
-            flags: ((payload[1] as u32) << 16) | ((payload[2] as u32) << 8) | u32::from(payload[3]),
+            flags: ((header[1] as u32) << 16) | ((header[2] as u32) << 8) | u32::from(header[3]),
         };
-        self.content_type = decode_utf8_string("ContentType", &payload[5..fixed_len])?;
+        self.content_type = decode_utf8_string("ContentType", &content_type_bytes)?;
         Ok(Some(fixed_len as u64))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 5 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let mut header = [0_u8; 5];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut header)
+                .await
+                .map_err(CodecError::Io)?;
+
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let content_type_len = usize::from(header[4]);
+            let fixed_len = 5 + content_type_len;
+            if payload_size < u64::try_from(fixed_len).unwrap() {
+                return Err(invalid_value("Payload", "content-type bytes are truncated").into());
+            }
+            let mut content_type_bytes = vec![0_u8; content_type_len];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut content_type_bytes)
+                .await
+                .map_err(CodecError::Io)?;
+
+            self.full_box = FullBoxState {
+                version,
+                flags: ((header[1] as u32) << 16)
+                    | ((header[2] as u32) << 8)
+                    | u32::from(header[3]),
+            };
+            self.content_type = decode_utf8_string("ContentType", &content_type_bytes)?;
+            Ok(Some(fixed_len as u64))
+        })
     }
 }
 
@@ -483,15 +533,13 @@ impl CodecBox for Ohdr {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 20 {
+        if payload_size < 20 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
+        let mut header = [0_u8; 20];
+        reader.read_exact(&mut header).map_err(CodecError::Io)?;
 
-        let version = payload[0];
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -499,36 +547,97 @@ impl CodecBox for Ohdr {
             });
         }
 
-        let content_id_len = usize::from(read_u16(&payload, 14));
-        let rights_issuer_url_len = usize::from(read_u16(&payload, 16));
-        let textual_headers_len = usize::from(read_u16(&payload, 18));
+        let content_id_len = usize::from(read_u16(&header, 14));
+        let rights_issuer_url_len = usize::from(read_u16(&header, 16));
+        let textual_headers_len = usize::from(read_u16(&header, 18));
         let fixed_len = 20 + content_id_len + rights_issuer_url_len + textual_headers_len;
-        if payload.len() < fixed_len {
+        if payload_size < u64::try_from(fixed_len).unwrap() {
             return Err(invalid_value("Payload", "header strings are truncated").into());
         }
-
-        let content_id_offset = 20;
-        let rights_issuer_url_offset = content_id_offset + content_id_len;
-        let textual_headers_offset = rights_issuer_url_offset + rights_issuer_url_len;
+        let mut content_id_bytes = vec![0_u8; content_id_len];
+        let mut rights_issuer_url_bytes = vec![0_u8; rights_issuer_url_len];
+        let mut textual_headers = vec![0_u8; textual_headers_len];
+        reader
+            .read_exact(&mut content_id_bytes)
+            .map_err(CodecError::Io)?;
+        reader
+            .read_exact(&mut rights_issuer_url_bytes)
+            .map_err(CodecError::Io)?;
+        reader
+            .read_exact(&mut textual_headers)
+            .map_err(CodecError::Io)?;
 
         self.full_box = FullBoxState {
             version,
-            flags: ((payload[1] as u32) << 16) | ((payload[2] as u32) << 8) | u32::from(payload[3]),
+            flags: ((header[1] as u32) << 16) | ((header[2] as u32) << 8) | u32::from(header[3]),
         };
-        self.encryption_method = payload[4];
-        self.padding_scheme = payload[5];
-        self.plaintext_length = read_u64(&payload, 6);
-        self.content_id = decode_utf8_string(
-            "ContentId",
-            &payload[content_id_offset..rights_issuer_url_offset],
-        )?;
-        self.rights_issuer_url = decode_utf8_string(
-            "RightsIssuerUrl",
-            &payload[rights_issuer_url_offset..textual_headers_offset],
-        )?;
-        self.textual_headers =
-            payload[textual_headers_offset..textual_headers_offset + textual_headers_len].to_vec();
+        self.encryption_method = header[4];
+        self.padding_scheme = header[5];
+        self.plaintext_length = read_u64(&header, 6);
+        self.content_id = decode_utf8_string("ContentId", &content_id_bytes)?;
+        self.rights_issuer_url = decode_utf8_string("RightsIssuerUrl", &rights_issuer_url_bytes)?;
+        self.textual_headers = textual_headers;
         Ok(Some(fixed_len as u64))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 20 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let mut header = [0_u8; 20];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut header)
+                .await
+                .map_err(CodecError::Io)?;
+
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let content_id_len = usize::from(read_u16(&header, 14));
+            let rights_issuer_url_len = usize::from(read_u16(&header, 16));
+            let textual_headers_len = usize::from(read_u16(&header, 18));
+            let fixed_len = 20 + content_id_len + rights_issuer_url_len + textual_headers_len;
+            if payload_size < u64::try_from(fixed_len).unwrap() {
+                return Err(invalid_value("Payload", "header strings are truncated").into());
+            }
+            let mut content_id_bytes = vec![0_u8; content_id_len];
+            let mut rights_issuer_url_bytes = vec![0_u8; rights_issuer_url_len];
+            let mut textual_headers = vec![0_u8; textual_headers_len];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut content_id_bytes)
+                .await
+                .map_err(CodecError::Io)?;
+            tokio::io::AsyncReadExt::read_exact(reader, &mut rights_issuer_url_bytes)
+                .await
+                .map_err(CodecError::Io)?;
+            tokio::io::AsyncReadExt::read_exact(reader, &mut textual_headers)
+                .await
+                .map_err(CodecError::Io)?;
+
+            self.full_box = FullBoxState {
+                version,
+                flags: ((header[1] as u32) << 16)
+                    | ((header[2] as u32) << 8)
+                    | u32::from(header[3]),
+            };
+            self.encryption_method = header[4];
+            self.padding_scheme = header[5];
+            self.plaintext_length = read_u64(&header, 6);
+            self.content_id = decode_utf8_string("ContentId", &content_id_bytes)?;
+            self.rights_issuer_url =
+                decode_utf8_string("RightsIssuerUrl", &rights_issuer_url_bytes)?;
+            self.textual_headers = textual_headers;
+            Ok(Some(fixed_len as u64))
+        })
     }
 }
 
@@ -616,13 +725,11 @@ impl CodecBox for Odaf {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() != 7 {
+        if payload_size != 7 {
             return Err(invalid_value("Payload", "payload length must be exactly 7 bytes").into());
         }
+        let mut payload = [0_u8; 7];
+        reader.read_exact(&mut payload).map_err(CodecError::Io)?;
 
         let version = payload[0];
         if version != 0 {
@@ -640,6 +747,44 @@ impl CodecBox for Odaf {
         self.key_indicator_length = payload[5];
         self.iv_length = payload[6];
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size != 7 {
+                return Err(
+                    invalid_value("Payload", "payload length must be exactly 7 bytes").into(),
+                );
+            }
+            let mut payload = [0_u8; 7];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut payload)
+                .await
+                .map_err(CodecError::Io)?;
+
+            let version = payload[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            self.full_box = FullBoxState {
+                version,
+                flags: ((payload[1] as u32) << 16)
+                    | ((payload[2] as u32) << 8)
+                    | u32::from(payload[3]),
+            };
+            self.selective_encryption = payload[4] & 0x80 != 0;
+            self.key_indicator_length = payload[5];
+            self.iv_length = payload[6];
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -728,15 +873,13 @@ impl CodecBox for Odda {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 12 {
+        if payload_size < 12 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
+        let mut header = [0_u8; 12];
+        reader.read_exact(&mut header).map_err(CodecError::Io)?;
 
-        let version = payload[0];
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -744,23 +887,76 @@ impl CodecBox for Odda {
             });
         }
 
-        let encrypted_data_length = usize::try_from(read_u64(&payload, 4)).map_err(|_| {
+        let encrypted_data_length = usize::try_from(read_u64(&header, 4)).map_err(|_| {
             invalid_value("EncryptedPayload", "payload length does not fit in usize")
         })?;
-        if payload.len() != 12 + encrypted_data_length {
+        if payload_size != 12 + u64::try_from(encrypted_data_length).unwrap() {
             return Err(invalid_value(
                 "EncryptedPayload",
                 "explicit payload length does not match the actual bytes",
             )
             .into());
         }
+        let mut encrypted_payload = vec![0_u8; encrypted_data_length];
+        reader
+            .read_exact(&mut encrypted_payload)
+            .map_err(CodecError::Io)?;
 
         self.full_box = FullBoxState {
             version,
-            flags: ((payload[1] as u32) << 16) | ((payload[2] as u32) << 8) | u32::from(payload[3]),
+            flags: ((header[1] as u32) << 16) | ((header[2] as u32) << 8) | u32::from(header[3]),
         };
-        self.encrypted_payload = payload[12..].to_vec();
+        self.encrypted_payload = encrypted_payload;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 12 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let mut header = [0_u8; 12];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut header)
+                .await
+                .map_err(CodecError::Io)?;
+
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let encrypted_data_length = usize::try_from(read_u64(&header, 4)).map_err(|_| {
+                invalid_value("EncryptedPayload", "payload length does not fit in usize")
+            })?;
+            if payload_size != 12 + u64::try_from(encrypted_data_length).unwrap() {
+                return Err(invalid_value(
+                    "EncryptedPayload",
+                    "explicit payload length does not match the actual bytes",
+                )
+                .into());
+            }
+            let mut encrypted_payload = vec![0_u8; encrypted_data_length];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut encrypted_payload)
+                .await
+                .map_err(CodecError::Io)?;
+
+            self.full_box = FullBoxState {
+                version,
+                flags: ((header[1] as u32) << 16)
+                    | ((header[2] as u32) << 8)
+                    | u32::from(header[3]),
+            };
+            self.encrypted_payload = encrypted_payload;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -879,15 +1075,13 @@ impl CodecBox for Grpi {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 9 {
+        if payload_size < 9 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
+        let mut header = [0_u8; 9];
+        reader.read_exact(&mut header).map_err(CodecError::Io)?;
 
-        let version = payload[0];
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -895,28 +1089,86 @@ impl CodecBox for Grpi {
             });
         }
 
-        let group_id_len = usize::from(read_u16(&payload, 4));
-        let group_key_len = usize::from(read_u16(&payload, 7));
+        let group_id_len = usize::from(read_u16(&header, 4));
+        let group_key_len = usize::from(read_u16(&header, 7));
         let fixed_len = 9 + group_id_len + group_key_len;
-        if payload.len() != fixed_len {
+        if payload_size != u64::try_from(fixed_len).unwrap() {
             return Err(invalid_value(
                 "Payload",
                 "group-id and group-key lengths do not match the payload size",
             )
             .into());
         }
-
-        let group_id_offset = 9;
-        let group_key_offset = group_id_offset + group_id_len;
+        let mut group_id_bytes = vec![0_u8; group_id_len];
+        let mut group_key = vec![0_u8; group_key_len];
+        reader
+            .read_exact(&mut group_id_bytes)
+            .map_err(CodecError::Io)?;
+        reader.read_exact(&mut group_key).map_err(CodecError::Io)?;
 
         self.full_box = FullBoxState {
             version,
-            flags: ((payload[1] as u32) << 16) | ((payload[2] as u32) << 8) | u32::from(payload[3]),
+            flags: ((header[1] as u32) << 16) | ((header[2] as u32) << 8) | u32::from(header[3]),
         };
-        self.key_encryption_method = payload[6];
-        self.group_id = decode_utf8_string("GroupId", &payload[group_id_offset..group_key_offset])?;
-        self.group_key = payload[group_key_offset..].to_vec();
+        self.key_encryption_method = header[6];
+        self.group_id = decode_utf8_string("GroupId", &group_id_bytes)?;
+        self.group_key = group_key;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 9 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let mut header = [0_u8; 9];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut header)
+                .await
+                .map_err(CodecError::Io)?;
+
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let group_id_len = usize::from(read_u16(&header, 4));
+            let group_key_len = usize::from(read_u16(&header, 7));
+            let fixed_len = 9 + group_id_len + group_key_len;
+            if payload_size != u64::try_from(fixed_len).unwrap() {
+                return Err(invalid_value(
+                    "Payload",
+                    "group-id and group-key lengths do not match the payload size",
+                )
+                .into());
+            }
+            let mut group_id_bytes = vec![0_u8; group_id_len];
+            let mut group_key = vec![0_u8; group_key_len];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut group_id_bytes)
+                .await
+                .map_err(CodecError::Io)?;
+            tokio::io::AsyncReadExt::read_exact(reader, &mut group_key)
+                .await
+                .map_err(CodecError::Io)?;
+
+            self.full_box = FullBoxState {
+                version,
+                flags: ((header[1] as u32) << 16)
+                    | ((header[2] as u32) << 8)
+                    | u32::from(header[3]),
+            };
+            self.key_encryption_method = header[6];
+            self.group_id = decode_utf8_string("GroupId", &group_id_bytes)?;
+            self.group_key = group_key;
+            Ok(Some(payload_size))
+        })
     }
 }
 

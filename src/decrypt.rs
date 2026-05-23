@@ -55,6 +55,8 @@ use crate::encryption::{
     SampleEncryptionContext, resolve_sample_encryption,
 };
 use crate::extract::{ExtractError, extract_box, extract_box_as, extract_box_payload_bytes};
+#[cfg(feature = "async")]
+use crate::extract::{extract_box_as_async, extract_box_async};
 use crate::queue::{
     DecryptorReuseCache, DecryptorReuseKey, OrderedWorkQueue, QueueAuxiliaryInfoSpan,
     QueueRangeWorkItem, QueueWorkItem, RangeQueueParser, RangeQueueParserStage, RawOffsetQueue,
@@ -1389,6 +1391,22 @@ struct MovieSampleEdit {
     process: MovieSampleProcessKind,
 }
 
+impl QueueWorkItem for MovieSampleEdit {
+    fn queue_order_key(&self) -> u64 {
+        self.absolute_offset
+    }
+}
+
+impl QueueRangeWorkItem for MovieSampleEdit {
+    fn queue_range_start(&self) -> u64 {
+        self.absolute_offset
+    }
+
+    fn queue_range_size(&self) -> u64 {
+        u64::from(self.sample_size)
+    }
+}
+
 struct CommonEncryptionSampleEdit {
     absolute_offset: u64,
     sample_size: u32,
@@ -2073,7 +2091,7 @@ fn build_common_encryption_init_stream_plan<R>(
 where
     R: Read + Seek,
 {
-    let init_bytes = collect_selected_root_box_bytes_from_reader(input, root_boxes, |_| true)?;
+    let init_bytes = collect_common_encryption_init_moov_bytes_from_reader(input, root_boxes)?;
     let context = analyze_init_segment(&init_bytes)?;
     let rebuilt_moov = rebuild_common_encryption_moov(&init_bytes, &context, keys)?;
     let original_moov = root_boxes
@@ -2098,7 +2116,7 @@ where
     R: AsyncReadSeek,
 {
     let init_bytes =
-        collect_selected_root_box_bytes_from_async_reader(input, root_boxes, |_| true).await?;
+        collect_common_encryption_init_moov_bytes_from_async_reader(input, root_boxes).await?;
     let context = analyze_init_segment(&init_bytes)?;
     let rebuilt_moov = rebuild_common_encryption_moov(&init_bytes, &context, keys)?;
     let original_moov = root_boxes
@@ -2282,6 +2300,30 @@ where
     Ok(bytes)
 }
 
+fn collect_common_encryption_init_moov_bytes_from_reader<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: Read + Seek,
+{
+    collect_selected_root_box_bytes_from_reader(input, root_boxes, |info| info.box_type() == MOOV)
+}
+
+#[cfg(feature = "async")]
+async fn collect_common_encryption_init_moov_bytes_from_async_reader<R>(
+    input: &mut R,
+    root_boxes: &[BoxInfo],
+) -> Result<Vec<u8>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    collect_selected_root_box_bytes_from_async_reader(input, root_boxes, |info| {
+        info.box_type() == MOOV
+    })
+    .await
+}
+
 fn collect_non_mdat_root_box_bytes_from_reader<R>(
     input: &mut R,
     root_boxes: &[BoxInfo],
@@ -2304,6 +2346,20 @@ where
         info.box_type() != MDAT
     })
     .await
+}
+
+fn extract_required_root_box_bytes(
+    input: &[u8],
+    box_type: FourCc,
+    description: &'static str,
+) -> Result<Vec<u8>, DecryptError> {
+    let root_boxes = read_root_box_infos(input)?;
+    let info = root_boxes
+        .iter()
+        .copied()
+        .find(|info| info.box_type() == box_type)
+        .ok_or_else(|| invalid_layout(format!("expected one root {description} box")))?;
+    Ok(slice_box_bytes(input, info)?.to_vec())
 }
 
 type StreamedMoviePayloadPlan = (
@@ -3420,6 +3476,8 @@ where
     W: Write + Seek,
 {
     output.seek(SeekFrom::Start(0))?;
+    let mut raw_queue = RawOffsetQueue::new(0);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
     for root_info in &plan.root_boxes {
         if root_info.box_type() == MDAT {
             continue;
@@ -3432,13 +3490,15 @@ where
     }
     output.write_all(&plan.clear_mdat_header)?;
     for sample_edit in &plan.sample_edits {
-        let encrypted = read_sample_bytes_from_reader(
+        with_range_from_seekable_queue(
             input,
+            &mut raw_queue,
+            &mut queue_buffer,
             sample_edit.absolute_offset,
-            sample_edit.sample_size,
+            u64::from(sample_edit.sample_size),
+            "movie sample execution",
+            |sample_bytes| write_processed_movie_sample(output, &sample_edit.process, sample_bytes),
         )?;
-        let clear = process_movie_sample_bytes(&sample_edit.process, &encrypted)?;
-        output.write_all(&clear)?;
     }
     output.flush()?;
     Ok(())
@@ -3455,6 +3515,8 @@ where
     W: AsyncWriteSeek,
 {
     output.seek(SeekFrom::Start(0)).await?;
+    let mut raw_queue = RawOffsetQueue::new(0);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
     for root_info in &plan.root_boxes {
         if root_info.box_type() == MDAT {
             continue;
@@ -3467,14 +3529,17 @@ where
     }
     output.write_all(&plan.clear_mdat_header).await?;
     for sample_edit in &plan.sample_edits {
-        let encrypted = read_sample_bytes_from_async_reader(
+        let encrypted = with_range_from_seekable_queue_async(
             input,
+            &mut raw_queue,
+            &mut queue_buffer,
             sample_edit.absolute_offset,
-            sample_edit.sample_size,
+            u64::from(sample_edit.sample_size),
+            "movie sample execution",
+            |sample_bytes| Ok(sample_bytes.to_vec()),
         )
         .await?;
-        let clear = process_movie_sample_bytes(&sample_edit.process, &encrypted)?;
-        output.write_all(&clear).await?;
+        write_processed_movie_sample_async(output, &sample_edit.process, &encrypted).await?;
     }
     output.flush().await?;
     Ok(())
@@ -3494,6 +3559,8 @@ where
     let mut sample_indices = BTreeMap::new();
     let mut rebuilt_sample_sizes = BTreeMap::<u32, Vec<u64>>::new();
     let mut relative_offsets = BTreeMap::<u32, Vec<u64>>::new();
+    let mut raw_queue = RawOffsetQueue::new(0);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
     for track in tracks {
         sample_indices.insert(track.track_id, 0_u32);
         rebuilt_sample_sizes.insert(track.track_id, Vec::new());
@@ -3553,12 +3620,21 @@ where
                 sample_offset,
                 sample_size,
             )?;
-            let sample_bytes =
-                read_sample_bytes_for_rewrite_from_reader(input, sample_offset, sample_size)?;
-            let clear_size =
-                u64::try_from(process_movie_sample_bytes(&process, &sample_bytes)?.len()).map_err(
-                    |_| invalid_layout("rebuilt movie sample size does not fit in u64".to_owned()),
-                )?;
+            let clear_size = with_range_from_seekable_queue(
+                input,
+                &mut raw_queue,
+                &mut queue_buffer,
+                sample_offset,
+                u64::from(sample_size),
+                "movie sample planning",
+                |sample_bytes| {
+                    Ok(processed_movie_sample_len_from_bytes(
+                        &process,
+                        sample_bytes,
+                    )?)
+                },
+            )
+            .map_err(|error| invalid_layout(error.to_string()))?;
             rebuilt_sample_sizes
                 .get_mut(&track_id)
                 .unwrap()
@@ -3600,6 +3676,8 @@ where
     let mut sample_indices = BTreeMap::new();
     let mut rebuilt_sample_sizes = BTreeMap::<u32, Vec<u64>>::new();
     let mut relative_offsets = BTreeMap::<u32, Vec<u64>>::new();
+    let mut raw_queue = RawOffsetQueue::new(0);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
     for track in tracks {
         sample_indices.insert(track.track_id, 0_u32);
         rebuilt_sample_sizes.insert(track.track_id, Vec::new());
@@ -3659,13 +3737,22 @@ where
                 sample_offset,
                 sample_size,
             )?;
-            let sample_bytes =
-                read_sample_bytes_for_rewrite_from_async_reader(input, sample_offset, sample_size)
-                    .await?;
-            let clear_size =
-                u64::try_from(process_movie_sample_bytes(&process, &sample_bytes)?.len()).map_err(
-                    |_| invalid_layout("rebuilt movie sample size does not fit in u64".to_owned()),
-                )?;
+            let clear_size = with_range_from_seekable_queue_async(
+                input,
+                &mut raw_queue,
+                &mut queue_buffer,
+                sample_offset,
+                u64::from(sample_size),
+                "movie sample planning",
+                |sample_bytes| {
+                    Ok(processed_movie_sample_len_from_bytes(
+                        &process,
+                        sample_bytes,
+                    )?)
+                },
+            )
+            .await
+            .map_err(|error| invalid_layout(error.to_string()))?;
             rebuilt_sample_sizes
                 .get_mut(&track_id)
                 .unwrap()
@@ -3730,78 +3817,6 @@ fn ensure_sample_range_in_mdat(
         absolute_offset,
         sample_size,
     })
-}
-
-fn read_sample_bytes_from_reader<R>(
-    input: &mut R,
-    absolute_offset: u64,
-    sample_size: u32,
-) -> Result<Vec<u8>, DecryptError>
-where
-    R: Read + Seek,
-{
-    input.seek(SeekFrom::Start(absolute_offset))?;
-    let mut bytes = vec![
-        0_u8;
-        usize::try_from(sample_size).map_err(|_| DecryptError::InvalidInput {
-            reason: "sample size does not fit in usize".to_owned(),
-        })?
-    ];
-    input.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn read_sample_bytes_for_rewrite_from_reader<R>(
-    input: &mut R,
-    absolute_offset: u64,
-    sample_size: u32,
-) -> Result<Vec<u8>, DecryptRewriteError>
-where
-    R: Read + Seek,
-{
-    read_sample_bytes_from_reader(input, absolute_offset, sample_size).map_err(|error| {
-        invalid_layout(format!(
-            "failed to read movie sample bytes from the source reader at offset {absolute_offset}: {error}"
-        ))
-    })
-}
-
-#[cfg(feature = "async")]
-async fn read_sample_bytes_from_async_reader<R>(
-    input: &mut R,
-    absolute_offset: u64,
-    sample_size: u32,
-) -> Result<Vec<u8>, DecryptError>
-where
-    R: AsyncReadSeek,
-{
-    input.seek(SeekFrom::Start(absolute_offset)).await?;
-    let mut bytes = vec![
-        0_u8;
-        usize::try_from(sample_size).map_err(|_| DecryptError::InvalidInput {
-            reason: "sample size does not fit in usize".to_owned(),
-        })?
-    ];
-    input.read_exact(&mut bytes).await?;
-    Ok(bytes)
-}
-
-#[cfg(feature = "async")]
-async fn read_sample_bytes_for_rewrite_from_async_reader<R>(
-    input: &mut R,
-    absolute_offset: u64,
-    sample_size: u32,
-) -> Result<Vec<u8>, DecryptRewriteError>
-where
-    R: AsyncReadSeek,
-{
-    read_sample_bytes_from_async_reader(input, absolute_offset, sample_size)
-        .await
-        .map_err(|error| {
-            invalid_layout(format!(
-                "failed to read movie sample bytes from the source reader at offset {absolute_offset}: {error}"
-            ))
-        })
 }
 
 fn read_box_bytes_from_reader<R>(reader: &mut R, info: BoxInfo) -> Result<Vec<u8>, DecryptError>
@@ -3897,22 +3912,9 @@ where
     let has_mdat = root_boxes.iter().any(|info| info.box_type() == MDAT);
     let has_odrm = root_boxes.iter().any(|info| info.box_type() == ODRM);
 
-    let ftyp = if let Some(ftyp_info) = root_boxes
-        .iter()
-        .copied()
-        .find(|info| info.box_type() == FTYP)
-    {
-        let ftyp_bytes = read_box_bytes_from_reader(reader, ftyp_info)?;
-        extract_single_as::<_, Ftyp>(
-            &mut Cursor::new(&ftyp_bytes),
-            None,
-            BoxPath::from([FTYP]),
-            "ftyp",
-        )
-        .map(Some)?
-    } else {
-        None
-    };
+    let ftyp = extract_box_as::<_, Ftyp>(reader, None, BoxPath::from([FTYP]))?
+        .into_iter()
+        .next();
     let is_marlin_ipmp_movie = ftyp.as_ref().is_some_and(|entry| {
         entry.major_brand == MARLIN_BRAND_MGSV
             || entry.compatible_brands.contains(&MARLIN_BRAND_MGSV)
@@ -3926,15 +3928,7 @@ where
         if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file && is_marlin_ipmp_movie {
             Some(DecryptInputLayout::MarlinIpmpFile)
         } else if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file {
-            let mut metadata = Vec::new();
-            for info in root_boxes
-                .iter()
-                .copied()
-                .filter(|info| info.box_type() != MDAT)
-            {
-                metadata.extend_from_slice(&read_box_bytes_from_reader(reader, info)?);
-            }
-            detect_non_fragmented_protected_movie_layout(&metadata)?
+            detect_non_fragmented_protected_movie_layout_from_reader(reader)?
         } else {
             None
         };
@@ -3993,22 +3987,10 @@ where
     let has_mdat = root_boxes.iter().any(|info| info.box_type() == MDAT);
     let has_odrm = root_boxes.iter().any(|info| info.box_type() == ODRM);
 
-    let ftyp = if let Some(ftyp_info) = root_boxes
-        .iter()
-        .copied()
-        .find(|info| info.box_type() == FTYP)
-    {
-        let ftyp_bytes = read_box_bytes_from_async_reader(reader, ftyp_info).await?;
-        extract_single_as::<_, Ftyp>(
-            &mut Cursor::new(&ftyp_bytes),
-            None,
-            BoxPath::from([FTYP]),
-            "ftyp",
-        )
-        .map(Some)?
-    } else {
-        None
-    };
+    let ftyp = extract_box_as_async::<_, Ftyp>(reader, None, BoxPath::from([FTYP]))
+        .await?
+        .into_iter()
+        .next();
     let is_marlin_ipmp_movie = ftyp.as_ref().is_some_and(|entry| {
         entry.major_brand == MARLIN_BRAND_MGSV
             || entry.compatible_brands.contains(&MARLIN_BRAND_MGSV)
@@ -4022,15 +4004,7 @@ where
         if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file && is_marlin_ipmp_movie {
             Some(DecryptInputLayout::MarlinIpmpFile)
         } else if has_moov && has_mdat && !has_moof && !is_oma_dcf_atom_file {
-            let mut metadata = Vec::new();
-            for info in root_boxes
-                .iter()
-                .copied()
-                .filter(|info| info.box_type() != MDAT)
-            {
-                metadata.extend_from_slice(&read_box_bytes_from_async_reader(reader, info).await?);
-            }
-            detect_non_fragmented_protected_movie_layout(&metadata)?
+            detect_non_fragmented_protected_movie_layout_from_async_reader(reader).await?
         } else {
             None
         };
@@ -4309,11 +4283,12 @@ where
 {
     let init_bytes = match layout {
         DecryptInputLayout::FragmentedFile => {
-            collect_common_encryption_init_segment_bytes_from_reader(input, root_boxes)?
+            collect_common_encryption_init_moov_bytes_from_reader(input, root_boxes)?
         }
-        DecryptInputLayout::MediaSegment => fragments_info_bytes
-            .ok_or(DecryptError::MissingFragmentsInfo)?
-            .to_vec(),
+        DecryptInputLayout::MediaSegment => {
+            let bytes = fragments_info_bytes.ok_or(DecryptError::MissingFragmentsInfo)?;
+            extract_required_root_box_bytes(bytes, MOOV, "moov")?
+        }
         _ => {
             return Err(DecryptError::InvalidInput {
                 reason: "the stream-first Common Encryption core expects either a fragmented file or a standalone media segment".to_owned(),
@@ -4365,12 +4340,12 @@ where
 {
     let init_bytes = match layout {
         DecryptInputLayout::FragmentedFile => {
-            collect_common_encryption_init_segment_bytes_from_async_reader(input, root_boxes)
-                .await?
+            collect_common_encryption_init_moov_bytes_from_async_reader(input, root_boxes).await?
         }
-        DecryptInputLayout::MediaSegment => fragments_info_bytes
-            .ok_or(DecryptError::MissingFragmentsInfo)?
-            .to_vec(),
+        DecryptInputLayout::MediaSegment => {
+            let bytes = fragments_info_bytes.ok_or(DecryptError::MissingFragmentsInfo)?;
+            extract_required_root_box_bytes(bytes, MOOV, "moov")?
+        }
         _ => {
             return Err(DecryptError::InvalidInput {
                 reason: "the stream-first Common Encryption core expects either a fragmented file or a standalone media segment".to_owned(),
@@ -6071,6 +6046,119 @@ where
     Ok(bytes)
 }
 
+fn with_range_from_seekable_queue<R, T, F>(
+    input: &mut R,
+    raw_queue: &mut RawOffsetQueue,
+    buffer: &mut [u8],
+    start: u64,
+    size: u64,
+    stage: &'static str,
+    read: F,
+) -> Result<T, DecryptError>
+where
+    R: Read + Seek,
+    F: FnOnce(&[u8]) -> Result<T, DecryptError>,
+{
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+            reason: format!("{stage} range overflowed u64"),
+        })?;
+    if start < raw_queue.head() || start > raw_queue.tail() {
+        input.seek(SeekFrom::Start(start))?;
+        *raw_queue = RawOffsetQueue::new(start);
+    }
+    fill_progressive_raw_queue(input, raw_queue, end, buffer, stage)?;
+    let value = raw_queue
+        .with_range_bytes(start, size, read)
+        .map_err(|error| map_raw_offset_queue_error(stage, start, size, error))??;
+    raw_queue
+        .trim_to(end)
+        .map_err(|error| map_raw_offset_queue_error(stage, end, 0, error))?;
+    Ok(value)
+}
+
+#[cfg(feature = "async")]
+async fn with_range_from_seekable_queue_async<R, T, F>(
+    input: &mut R,
+    raw_queue: &mut RawOffsetQueue,
+    buffer: &mut [u8],
+    start: u64,
+    size: u64,
+    stage: &'static str,
+    read: F,
+) -> Result<T, DecryptError>
+where
+    R: AsyncReadSeek,
+    F: FnOnce(&[u8]) -> Result<T, DecryptError>,
+{
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| DecryptRewriteError::InvalidLayout {
+            reason: format!("{stage} range overflowed u64"),
+        })?;
+    if start < raw_queue.head() || start > raw_queue.tail() {
+        input.seek(SeekFrom::Start(start)).await?;
+        *raw_queue = RawOffsetQueue::new(start);
+    }
+    fill_progressive_raw_queue_async(input, raw_queue, end, buffer, stage).await?;
+    let value = raw_queue
+        .with_range_bytes(start, size, read)
+        .map_err(|error| map_raw_offset_queue_error(stage, start, size, error))??;
+    raw_queue
+        .trim_to(end)
+        .map_err(|error| map_raw_offset_queue_error(stage, end, 0, error))?;
+    Ok(value)
+}
+
+fn processed_movie_sample_len_from_bytes(
+    process: &MovieSampleProcessKind,
+    sample_bytes: &[u8],
+) -> Result<u64, DecryptRewriteError> {
+    match process {
+        MovieSampleProcessKind::Copy => Ok(sample_bytes.len() as u64),
+        _ => {
+            u64::try_from(process_movie_sample_bytes(process, sample_bytes)?.len()).map_err(|_| {
+                invalid_layout("rebuilt movie sample size does not fit in u64".to_owned())
+            })
+        }
+    }
+}
+
+fn write_processed_movie_sample<W>(
+    output: &mut W,
+    process: &MovieSampleProcessKind,
+    sample_bytes: &[u8],
+) -> Result<(), DecryptError>
+where
+    W: Write,
+{
+    match process {
+        MovieSampleProcessKind::Copy => output.write_all(sample_bytes)?,
+        _ => output.write_all(&process_movie_sample_bytes(process, sample_bytes)?)?,
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn write_processed_movie_sample_async<W>(
+    output: &mut W,
+    process: &MovieSampleProcessKind,
+    sample_bytes: &[u8],
+) -> Result<(), DecryptError>
+where
+    W: AsyncWriteSeek,
+{
+    match process {
+        MovieSampleProcessKind::Copy => output.write_all(sample_bytes).await?,
+        _ => {
+            let clear = process_movie_sample_bytes(process, sample_bytes)?;
+            output.write_all(&clear).await?;
+        }
+    }
+    Ok(())
+}
+
 fn find_mdat_info_containing_sample(
     mdat_infos: &[BoxInfo],
     absolute_offset: u64,
@@ -6165,6 +6253,37 @@ fn detect_non_fragmented_protected_movie_layout(
     Ok(None)
 }
 
+fn detect_non_fragmented_protected_movie_layout_from_reader<R>(
+    reader: &mut R,
+) -> Result<Option<DecryptInputLayout>, DecryptError>
+where
+    R: Read + Seek,
+{
+    if contains_oma_dcf_protected_sample_entries_from_reader(reader)? {
+        return Ok(Some(DecryptInputLayout::OmaDcfProtectedMovieFile));
+    }
+    if contains_iaec_protected_sample_entries_from_reader(reader)? {
+        return Ok(Some(DecryptInputLayout::IaecProtectedMovieFile));
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "async")]
+async fn detect_non_fragmented_protected_movie_layout_from_async_reader<R>(
+    reader: &mut R,
+) -> Result<Option<DecryptInputLayout>, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    if contains_oma_dcf_protected_sample_entries_from_async_reader(reader).await? {
+        return Ok(Some(DecryptInputLayout::OmaDcfProtectedMovieFile));
+    }
+    if contains_iaec_protected_sample_entries_from_async_reader(reader).await? {
+        return Ok(Some(DecryptInputLayout::IaecProtectedMovieFile));
+    }
+    Ok(None)
+}
+
 fn contains_oma_dcf_protected_sample_entries(input: &[u8]) -> Result<bool, DecryptError> {
     let mut reader = Cursor::new(input);
     let odkm_infos = extract_box(
@@ -6196,6 +6315,77 @@ fn contains_oma_dcf_protected_sample_entries(input: &[u8]) -> Result<bool, Decry
     Ok(schm_boxes.iter().any(|entry| entry.scheme_type == ODKM))
 }
 
+fn contains_oma_dcf_protected_sample_entries_from_reader<R>(
+    reader: &mut R,
+) -> Result<bool, DecryptError>
+where
+    R: Read + Seek,
+{
+    let odkm_infos = extract_box(
+        reader,
+        None,
+        BoxPath::from([
+            MOOV,
+            TRAK,
+            MDIA,
+            MINF,
+            STBL,
+            STSD,
+            FourCc::ANY,
+            SINF,
+            SCHI,
+            ODKM,
+        ]),
+    )?;
+    if !odkm_infos.is_empty() {
+        return Ok(true);
+    }
+
+    let schm_boxes = extract_box_as::<_, Schm>(
+        reader,
+        None,
+        BoxPath::from([MOOV, TRAK, MDIA, MINF, STBL, STSD, FourCc::ANY, SINF, SCHM]),
+    )?;
+    Ok(schm_boxes.iter().any(|entry| entry.scheme_type == ODKM))
+}
+
+#[cfg(feature = "async")]
+async fn contains_oma_dcf_protected_sample_entries_from_async_reader<R>(
+    reader: &mut R,
+) -> Result<bool, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let odkm_infos = extract_box_async(
+        reader,
+        None,
+        BoxPath::from([
+            MOOV,
+            TRAK,
+            MDIA,
+            MINF,
+            STBL,
+            STSD,
+            FourCc::ANY,
+            SINF,
+            SCHI,
+            ODKM,
+        ]),
+    )
+    .await?;
+    if !odkm_infos.is_empty() {
+        return Ok(true);
+    }
+
+    let schm_boxes = extract_box_as_async::<_, Schm>(
+        reader,
+        None,
+        BoxPath::from([MOOV, TRAK, MDIA, MINF, STBL, STSD, FourCc::ANY, SINF, SCHM]),
+    )
+    .await?;
+    Ok(schm_boxes.iter().any(|entry| entry.scheme_type == ODKM))
+}
+
 fn contains_iaec_protected_sample_entries(input: &[u8]) -> Result<bool, DecryptError> {
     let mut reader = Cursor::new(input);
     let scheme_boxes = extract_box_as::<_, Schm>(
@@ -6203,6 +6393,36 @@ fn contains_iaec_protected_sample_entries(input: &[u8]) -> Result<bool, DecryptE
         None,
         BoxPath::from([MOOV, TRAK, MDIA, MINF, STBL, STSD, FourCc::ANY, SINF, SCHM]),
     )?;
+    Ok(scheme_boxes.iter().any(|entry| entry.scheme_type == IAEC))
+}
+
+fn contains_iaec_protected_sample_entries_from_reader<R>(
+    reader: &mut R,
+) -> Result<bool, DecryptError>
+where
+    R: Read + Seek,
+{
+    let scheme_boxes = extract_box_as::<_, Schm>(
+        reader,
+        None,
+        BoxPath::from([MOOV, TRAK, MDIA, MINF, STBL, STSD, FourCc::ANY, SINF, SCHM]),
+    )?;
+    Ok(scheme_boxes.iter().any(|entry| entry.scheme_type == IAEC))
+}
+
+#[cfg(feature = "async")]
+async fn contains_iaec_protected_sample_entries_from_async_reader<R>(
+    reader: &mut R,
+) -> Result<bool, DecryptError>
+where
+    R: AsyncReadSeek,
+{
+    let scheme_boxes = extract_box_as_async::<_, Schm>(
+        reader,
+        None,
+        BoxPath::from([MOOV, TRAK, MDIA, MINF, STBL, STSD, FourCc::ANY, SINF, SCHM]),
+    )
+    .await?;
     Ok(scheme_boxes.iter().any(|entry| entry.scheme_type == IAEC))
 }
 
@@ -7505,8 +7725,18 @@ where
         })?;
 
     ensure_sample_range_in_mdat(mdat_ranges, od_track_id, 1, sample_offset, sample_size)?;
-    let sample_bytes =
-        read_sample_bytes_for_rewrite_from_reader(original_reader, sample_offset, sample_size)?;
+    let mut raw_queue = RawOffsetQueue::new(0);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
+    let sample_bytes = with_range_from_seekable_queue(
+        original_reader,
+        &mut raw_queue,
+        &mut queue_buffer,
+        sample_offset,
+        u64::from(sample_size),
+        "Marlin OD sample read",
+        |sample_bytes| Ok(sample_bytes.to_vec()),
+    )
+    .map_err(|error| invalid_layout(error.to_string()))?;
     let commands = parse_descriptor_commands(&sample_bytes).map_err(|error| {
         invalid_layout(format!(
             "failed to parse Marlin OD track command stream: {error}"
@@ -7588,12 +7818,19 @@ where
         })?;
 
     ensure_sample_range_in_mdat(mdat_ranges, od_track_id, 1, sample_offset, sample_size)?;
-    let sample_bytes = read_sample_bytes_for_rewrite_from_async_reader(
+    let mut raw_queue = RawOffsetQueue::new(0);
+    let mut queue_buffer = vec![0_u8; 64 * 1024];
+    let sample_bytes = with_range_from_seekable_queue_async(
         original_reader,
+        &mut raw_queue,
+        &mut queue_buffer,
         sample_offset,
-        sample_size,
+        u64::from(sample_size),
+        "Marlin OD sample read",
+        |sample_bytes| Ok(sample_bytes.to_vec()),
     )
-    .await?;
+    .await
+    .map_err(|error| invalid_layout(error.to_string()))?;
     let commands = parse_descriptor_commands(&sample_bytes).map_err(|error| {
         invalid_layout(format!(
             "failed to parse Marlin OD track command stream: {error}"

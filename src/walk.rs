@@ -18,6 +18,8 @@ use crate::boxes::iso14496_12::{
 };
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
+#[cfg(feature = "async")]
+use crate::codec::unmarshal_any_with_context_async;
 use crate::codec::{CodecError, DynCodecBox, unmarshal, unmarshal_any_with_context};
 use crate::fourcc::ParseFourCcError;
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
@@ -433,30 +435,25 @@ where
     pub async fn read_payload_async(&mut self) -> Result<(Box<dyn DynCodecBox>, u64), WalkError> {
         self.info.seek_to_payload_async(self.reader).await?;
         let payload_size = self.info.payload_size()?;
-        let payload = crate::codec::read_exact_vec_untrusted_async(
+        let (boxed, read) = unmarshal_any_with_context_async(
             self.reader,
-            usize::try_from(payload_size)
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-        )
-        .await?;
-        self.info.seek_to_payload_async(self.reader).await?;
-
-        let mut payload_reader = std::io::Cursor::new(payload.as_slice());
-        let (boxed, read) = crate::codec::unmarshal_any_with_context(
-            &mut payload_reader,
             payload_size,
             self.info.box_type(),
             self.registry,
             self.info.lookup_context(),
             None,
-        )?;
-        self.children_layout = Some(children_layout_for_buffered_payload(
-            &self.info,
-            payload_size,
-            read,
-            payload_uses_optional_trailing_bytes(boxed.as_ref()),
-            &payload,
-        )?);
+        )
+        .await?;
+        self.children_layout = Some(
+            children_layout_for_payload_async(
+                self.reader,
+                &self.info,
+                payload_size,
+                read,
+                boxed.as_ref(),
+            )
+            .await?,
+        );
         Ok((boxed, read))
     }
 
@@ -876,21 +873,24 @@ where
 }
 
 #[cfg(feature = "async")]
-fn children_layout_for_buffered_payload(
+async fn children_layout_for_payload_async<R>(
+    reader: &mut R,
     info: &BoxInfo,
     payload_size: u64,
     payload_read: u64,
-    uses_optional_trailing_bytes: bool,
-    payload: &[u8],
-) -> Result<ChildrenLayout, WalkError> {
+    payload: &dyn DynCodecBox,
+) -> Result<ChildrenLayout, WalkError>
+where
+    R: AsyncReadSeek,
+{
     let offset = info.offset() + info.header_size() + payload_read;
-    let size = if uses_optional_trailing_bytes {
-        let payload_read = usize::try_from(payload_read)
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-        let remaining = payload
-            .get(payload_read..)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-        split_box_children_with_optional_trailing_bytes(remaining) as u64
+    let size = if payload_uses_optional_trailing_bytes(payload) {
+        visual_sample_entry_child_payload_size_async(
+            reader,
+            offset,
+            payload_size.saturating_sub(payload_read),
+        )
+        .await?
     } else {
         payload_size.saturating_sub(payload_read)
     };
@@ -926,6 +926,38 @@ where
     })?;
     let mut bytes = vec![0; extension_len];
     reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn visual_sample_entry_child_payload_size_async<R>(
+    reader: &mut R,
+    extension_offset: u64,
+    extension_size: u64,
+) -> Result<u64, WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let checkpoint = reader.stream_position().await?;
+    reader.seek(SeekFrom::Start(extension_offset)).await?;
+    let bytes = read_extension_bytes_async(reader, extension_size).await?;
+    reader.seek(SeekFrom::Start(checkpoint)).await?;
+    Ok(split_box_children_with_optional_trailing_bytes(&bytes) as u64)
+}
+
+#[cfg(feature = "async")]
+async fn read_extension_bytes_async<R>(
+    reader: &mut R,
+    extension_size: u64,
+) -> Result<Vec<u8>, WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let extension_len = usize::try_from(extension_size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload extension is too large")
+    })?;
+    let mut bytes = vec![0; extension_len];
+    reader.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
 

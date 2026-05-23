@@ -7,7 +7,9 @@ use mp4forge::boxes::default_registry;
 use mp4forge::boxes::iso23001_7::{
     Pssh, PsshKid, SENC_USE_SUBSAMPLE_ENCRYPTION, Senc, SencSample, SencSubsample, Tenc,
 };
-use mp4forge::codec::{CodecBox, MutableBox, marshal, unmarshal, unmarshal_any};
+use mp4forge::codec::{CodecBox, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any};
+#[cfg(feature = "async")]
+use mp4forge::codec::{marshal_async, unmarshal_any_async, unmarshal_async};
 use mp4forge::stringify::stringify;
 
 fn assert_box_roundtrip<T>(src: T, payload: &[u8], expected: &str)
@@ -233,6 +235,59 @@ fn protection_catalog_roundtrips() {
         ],
         "Version=1 Flags=0x000000 Reserved=0 DefaultCryptByteBlock=10 DefaultSkipByteBlock=11 DefaultIsProtected=1 DefaultPerSampleIVSize=1 DefaultKID=01234567-89ab-cdef-0123-456789abcdef",
     );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_senc_roundtrip_preserves_inferred_sample_layout() {
+    let mut senc = Senc::default();
+    senc.set_version(0);
+    senc.set_flags(SENC_USE_SUBSAMPLE_ENCRYPTION);
+    senc.sample_count = 2;
+    senc.samples = vec![
+        SencSample {
+            initialization_vector: vec![0x11, 0x22, 0x33, 0x44],
+            subsamples: vec![SencSubsample {
+                bytes_of_clear_data: 7,
+                bytes_of_protected_data: 9,
+            }],
+        },
+        SencSample {
+            initialization_vector: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            subsamples: vec![SencSubsample {
+                bytes_of_clear_data: 3,
+                bytes_of_protected_data: 5,
+            }],
+        },
+    ];
+
+    let mut encoded = Cursor::new(Vec::new());
+    let written = marshal_async(&mut encoded, &senc, None).await.unwrap();
+    let payload = encoded.into_inner();
+    assert_eq!(written, payload.len() as u64);
+
+    let mut decoded = Senc::default();
+    let mut reader = Cursor::new(payload.clone());
+    let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+        .await
+        .unwrap();
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded, senc);
+
+    let registry = default_registry();
+    let mut any_reader = Cursor::new(payload);
+    let payload_len = any_reader.get_ref().len() as u64;
+    let (any_box, any_read) = unmarshal_any_async(
+        &mut any_reader,
+        payload_len,
+        senc.box_type(),
+        &registry,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(any_read, payload_len);
+    assert_eq!(any_box.as_any().downcast_ref::<Senc>().unwrap(), &senc);
 }
 
 #[test]
