@@ -1532,6 +1532,7 @@ where
     let Some(info) = find_root_box_info_sync(reader, box_type)? else {
         return Ok(None);
     };
+    validate_box_fits_stream_sync(reader, info, "root box")?;
     info.seek_to_start(reader)?;
     let mut bytes = vec![
         0_u8;
@@ -1554,6 +1555,7 @@ where
     let Some(info) = find_root_box_info_async(reader, box_type).await? else {
         return Ok(None);
     };
+    validate_box_fits_stream_async(reader, info, "root box").await?;
     info.seek_to_start_async(reader).await?;
     let mut bytes = vec![
         0_u8;
@@ -1623,6 +1625,8 @@ where
     let Some(child_info) = find_child_box_info_sync(reader, parent_info, child_type)? else {
         return Ok(None);
     };
+    validate_child_box_fits_parent(child_info, parent_info)?;
+    validate_box_fits_stream_sync(reader, child_info, "child box")?;
     child_info.seek_to_payload(reader)?;
     let mut bytes = vec![
         0_u8;
@@ -1648,6 +1652,8 @@ where
     let Some(child_info) = find_child_box_info_async(reader, parent_info, child_type).await? else {
         return Ok(None);
     };
+    validate_child_box_fits_parent(child_info, parent_info)?;
+    validate_box_fits_stream_async(reader, child_info, "child box").await?;
     child_info.seek_to_payload_async(reader).await?;
     let mut bytes = vec![
         0_u8;
@@ -1659,6 +1665,71 @@ where
     ];
     tokio::io::AsyncReadExt::read_exact(reader, &mut bytes).await?;
     Ok(Some(bytes))
+}
+
+fn validate_child_box_fits_parent(
+    child_info: BoxInfo,
+    parent_info: BoxInfo,
+) -> Result<(), ProbeError> {
+    let child_end = checked_box_end(child_info, "child box end")?;
+    let parent_end = checked_box_end(parent_info, "parent box end")?;
+    if child_end > parent_end {
+        return Err(truncated_box_error("child box"));
+    }
+    Ok(())
+}
+
+fn validate_box_fits_stream_sync<R>(
+    reader: &mut R,
+    info: BoxInfo,
+    label: &'static str,
+) -> Result<(), ProbeError>
+where
+    R: Seek,
+{
+    let position = reader.stream_position()?;
+    let stream_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(position))?;
+    validate_box_end_within_stream(info, stream_len, label)
+}
+
+#[cfg(feature = "async")]
+async fn validate_box_fits_stream_async<R>(
+    reader: &mut R,
+    info: BoxInfo,
+    label: &'static str,
+) -> Result<(), ProbeError>
+where
+    R: AsyncReadSeek,
+{
+    let position = reader.stream_position().await?;
+    let stream_len = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(position)).await?;
+    validate_box_end_within_stream(info, stream_len, label)
+}
+
+fn validate_box_end_within_stream(
+    info: BoxInfo,
+    stream_len: u64,
+    label: &'static str,
+) -> Result<(), ProbeError> {
+    if checked_box_end(info, "box end")? > stream_len {
+        return Err(truncated_box_error(label));
+    }
+    Ok(())
+}
+
+fn checked_box_end(info: BoxInfo, field_name: &'static str) -> Result<u64, ProbeError> {
+    info.offset()
+        .checked_add(info.size())
+        .ok_or(ProbeError::NumericOverflow { field_name })
+}
+
+fn truncated_box_error(label: &'static str) -> ProbeError {
+    ProbeError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("declared {label} extends beyond input"),
+    ))
 }
 
 /// Probes a file through the additive Tokio-based async surface with expansion controls and

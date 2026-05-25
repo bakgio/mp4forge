@@ -561,6 +561,14 @@ pub fn rewrite_mhas_samples_to_stream(samples: &[&[u8]]) -> Result<Vec<u8>, Mhas
                     if !saw_leading_sync {
                         saw_leading_sync = true;
                     }
+                    if offset == payload_end {
+                        return Err(MhasRewriteError::TruncatedPacketPayload {
+                            sample_index,
+                            offset,
+                            declared_size: 1,
+                            remaining_size: 0,
+                        });
+                    }
                     let marker = sample[offset];
                     if marker != 0xA5 {
                         return Err(MhasRewriteError::InvalidLeadingSyncMarker { marker });

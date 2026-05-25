@@ -192,6 +192,23 @@ fn rewrite_mhas_rejects_samples_without_the_required_leading_sync_packet() {
     assert_eq!(error, MhasRewriteError::MissingLeadingSyncPacket);
 }
 
+#[test]
+fn rewrite_mhas_rejects_empty_leading_sync_payload() {
+    let sample = build_test_mhas_packet(6, &[]);
+
+    let error = rewrite_mhas_samples_to_stream(&[sample.as_slice()]).unwrap_err();
+
+    assert_eq!(
+        error,
+        MhasRewriteError::TruncatedPacketPayload {
+            sample_index: 0,
+            offset: 2,
+            declared_size: 1,
+            remaining_size: 0,
+        }
+    );
+}
+
 fn build_test_mhas_frame_packet(payload: &[u8]) -> Vec<u8> {
     let mut frame_payload = Vec::with_capacity(payload.len() + 1);
     frame_payload.push(0x80);

@@ -268,6 +268,77 @@ fn walk_structure_reports_invalid_zero_sized_boxes() {
 }
 
 #[test]
+fn walk_structure_rejects_truncated_root_payload_read_without_large_allocation() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+    bytes.extend_from_slice(b"moov");
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+    let mut visited = false;
+    let error = walk_structure(&mut Cursor::new(bytes), |handle| {
+        visited = true;
+        handle.read_payload()?;
+        Ok(WalkControl::Continue)
+    })
+    .unwrap_err();
+
+    assert!(visited);
+    assert!(matches!(error, WalkError::UnexpectedEof));
+}
+
+#[test]
+fn walk_structure_rejects_root_box_end_overflow_without_looping() {
+    let mut bytes = encode_raw_box(fourcc("free"), &[]);
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.extend_from_slice(b"mdat");
+    bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+
+    let error = walk_structure(&mut Cursor::new(bytes), |_| Ok(WalkControl::Continue)).unwrap_err();
+
+    assert!(matches!(error, WalkError::UnexpectedEof));
+}
+
+#[test]
+fn walk_structure_handles_truncated_supported_root_payload_without_looping() {
+    let bytes = vec![
+        93, 93, 115, 98, 115, 105, 108, 98, 101, 118, 99, 115, 116, 116, 0, 4, 117,
+    ];
+
+    walk_structure(&mut Cursor::new(bytes), |handle| {
+        if !handle.is_supported_type() {
+            return Ok(WalkControl::Continue);
+        }
+
+        if handle.read_payload().is_ok() {
+            Ok(WalkControl::Descend)
+        } else {
+            Ok(WalkControl::Continue)
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn walk_structure_handles_truncated_supported_root_payload_from_slice_without_looping() {
+    let bytes = [
+        93, 93, 115, 98, 115, 105, 108, 98, 101, 118, 99, 115, 116, 116, 0, 4, 117,
+    ];
+
+    walk_structure(&mut Cursor::new(bytes.as_slice()), |handle| {
+        if !handle.is_supported_type() {
+            return Ok(WalkControl::Continue);
+        }
+
+        if handle.read_payload().is_ok() {
+            Ok(WalkControl::Descend)
+        } else {
+            Ok(WalkControl::Continue)
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn walk_structure_ignores_truncated_trailing_root_box_after_valid_boxes() {
     let moov = encode_supported_box(&Moov, &[]);
     let mut truncated_mdat = Vec::new();

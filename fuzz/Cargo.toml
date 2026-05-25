@@ -9,7 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-mp4forge = { path = ".." }
+mp4forge = { path = "..", features = ["async", "decrypt", "mux"] }
+tempfile = "3"
+tokio = { version = "1.52.1", features = ["io-util", "rt", "rt-multi-thread"] }
 
 [[bin]]
 name = "read_box_structure"
@@ -63,6 +65,55 @@ bench = false
 [[bin]]
 name = "typed_rewrites"
 path = "fuzz_targets/typed_rewrites.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_demux_inputs"
+path = "fuzz_targets/mux_demux_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_sample_rewrites"
+path = "fuzz_targets/mux_sample_rewrites.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sidx_plan_apply"
+path = "fuzz_targets/sidx_plan_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_more_boxes"
+path = "fuzz_targets/roundtrip_more_boxes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitio_boundaries"
+path = "fuzz_targets/bitio_boundaries.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "async_api_parity"
+path = "fuzz_targets/async_api_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt_bytes_surfaces"
+path = "fuzz_targets/decrypt_bytes_surfaces.rs"
 test = false
 doc = false
 bench = false

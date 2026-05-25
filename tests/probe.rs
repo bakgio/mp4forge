@@ -39,10 +39,10 @@ use mp4forge::boxes::opus::DOps;
 use mp4forge::boxes::vp::VpCodecConfiguration;
 use mp4forge::codec::{CodecBox, MutableBox, marshal};
 use mp4forge::probe::{
-    AacProfileInfo, EditListEntry, ProbeOptions, TrackCodec, TrackCodecDetails, TrackCodecFamily,
-    average_sample_bitrate, average_segment_bitrate, detect_aac_profile, find_idr_frames,
-    max_sample_bitrate, max_segment_bitrate, normalized_codec_family_name, probe, probe_bytes,
-    probe_bytes_with_options, probe_codec_detailed, probe_codec_detailed_bytes,
+    AacProfileInfo, EditListEntry, ProbeError, ProbeOptions, TrackCodec, TrackCodecDetails,
+    TrackCodecFamily, average_sample_bitrate, average_segment_bitrate, detect_aac_profile,
+    find_idr_frames, max_sample_bitrate, max_segment_bitrate, normalized_codec_family_name, probe,
+    probe_bytes, probe_bytes_with_options, probe_codec_detailed, probe_codec_detailed_bytes,
     probe_codec_detailed_bytes_with_options, probe_codec_detailed_with_options, probe_detailed,
     probe_detailed_bytes, probe_detailed_bytes_with_options, probe_detailed_with_options,
     probe_extended_media_characteristics, probe_extended_media_characteristics_bytes, probe_fra,
@@ -168,6 +168,18 @@ fn probe_summarizes_movie_tracks_samples_and_codecs() {
 
     let idr_frames = find_idr_frames(&mut reader, video).unwrap();
     assert_eq!(idr_frames, vec![0]);
+}
+
+#[test]
+fn probe_rejects_declared_root_box_past_input_without_large_allocation() {
+    let mut file = include_bytes!("fixtures/av1_opus.mp4").to_vec();
+    file[0] = file[10];
+
+    let error =
+        probe_codec_detailed_with_options(&mut Cursor::new(file), ProbeOptions::lightweight())
+            .unwrap_err();
+
+    assert_unexpected_eof_probe_error(error);
 }
 
 #[test]
@@ -3532,6 +3544,13 @@ fn segment_info(track_id: u32, size: u32, duration: u32) -> mp4forge::probe::Seg
         size,
         duration,
         ..mp4forge::probe::SegmentInfo::default()
+    }
+}
+
+fn assert_unexpected_eof_probe_error(error: ProbeError) {
+    match error {
+        ProbeError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+        other => panic!("expected unexpected EOF, got {other:?}"),
     }
 }
 

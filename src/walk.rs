@@ -360,6 +360,7 @@ where
 
     /// Decodes the current payload into a descriptor-backed runtime box value.
     pub fn read_payload(&mut self) -> Result<(Box<dyn DynCodecBox>, u64), WalkError> {
+        validate_box_fits_stream(self.reader, &self.info)?;
         self.info.seek_to_payload(self.reader)?;
         let payload_size = self.info.payload_size()?;
         let (boxed, read) = unmarshal_any_with_context(
@@ -385,6 +386,7 @@ where
     where
         W: Write,
     {
+        validate_box_fits_stream(self.reader, &self.info)?;
         self.info.seek_to_payload(self.reader)?;
         let payload_size = self.info.payload_size()?;
         let mut limited = (&mut *self.reader).take(payload_size);
@@ -433,6 +435,7 @@ where
 
     /// Decodes the current payload into a descriptor-backed runtime box value.
     pub async fn read_payload_async(&mut self) -> Result<(Box<dyn DynCodecBox>, u64), WalkError> {
+        validate_box_fits_stream_async(self.reader, &self.info).await?;
         self.info.seek_to_payload_async(self.reader).await?;
         let payload_size = self.info.payload_size()?;
         let (boxed, read) = unmarshal_any_with_context_async(
@@ -462,6 +465,7 @@ where
     where
         W: AsyncWrite + Unpin,
     {
+        validate_box_fits_stream_async(self.reader, &self.info).await?;
         self.info.seek_to_payload_async(self.reader).await?;
         let payload_size = self.info.payload_size()?;
         let mut limited = (&mut *self.reader).take(payload_size);
@@ -548,6 +552,7 @@ where
         &mut visitor,
         &mut parent,
         &BoxPath::default(),
+        false,
     )
 }
 
@@ -628,6 +633,7 @@ where
         &mut visitor,
         &mut parent,
         &BoxPath::default(),
+        false,
     )
     .await
 }
@@ -671,7 +677,7 @@ where
         }
 
         info.set_lookup_context(sibling_lookup_context);
-        walk_box(reader, registry, visitor, &mut info, path)?;
+        walk_box(reader, registry, visitor, &mut info, path, is_root)?;
 
         if info.lookup_context().is_quicktime_compatible() {
             sibling_lookup_context = sibling_lookup_context.with_quicktime_compatible(true);
@@ -695,6 +701,7 @@ fn walk_box<R, F>(
     visitor: &mut F,
     info: &mut BoxInfo,
     path: &BoxPath,
+    is_root: bool,
 ) -> Result<(), WalkError>
 where
     R: Read + Seek,
@@ -730,7 +737,7 @@ where
         )?;
     }
 
-    handle.info.seek_to_end(handle.reader)?;
+    seek_to_box_end(handle.reader, &handle.info, is_root)?;
     Ok(())
 }
 
@@ -776,7 +783,7 @@ where
         }
 
         info.set_lookup_context(sibling_lookup_context);
-        walk_box_async(reader, registry, visitor, &mut info, path).await?;
+        walk_box_async(reader, registry, visitor, &mut info, path, is_root).await?;
 
         if info.lookup_context().is_quicktime_compatible() {
             sibling_lookup_context = sibling_lookup_context.with_quicktime_compatible(true);
@@ -801,6 +808,7 @@ async fn walk_box_async<R, V>(
     visitor: &mut V,
     info: &mut BoxInfo,
     path: &BoxPath,
+    is_root: bool,
 ) -> Result<(), WalkError>
 where
     R: AsyncReadSeek,
@@ -844,7 +852,7 @@ where
     }
 
     let info = handle.info;
-    info.seek_to_end_async(handle.reader).await?;
+    seek_to_box_end_async(handle.reader, &info, is_root).await?;
     Ok(())
 }
 
@@ -1051,6 +1059,50 @@ where
     Ok(start >= end)
 }
 
+fn validate_box_fits_stream<R>(reader: &mut R, info: &BoxInfo) -> Result<(), WalkError>
+where
+    R: Seek,
+{
+    let position = reader.stream_position()?;
+    let stream_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(position))?;
+    validate_box_end_within_stream(info, stream_len)
+}
+
+fn validate_box_end_within_stream(info: &BoxInfo, stream_len: u64) -> Result<(), WalkError> {
+    let end = checked_box_end(info)?;
+    if end > stream_len {
+        return Err(WalkError::UnexpectedEof);
+    }
+    Ok(())
+}
+
+fn checked_box_end(info: &BoxInfo) -> Result<u64, WalkError> {
+    info.offset()
+        .checked_add(info.size())
+        .ok_or(WalkError::UnexpectedEof)
+}
+
+fn seek_to_box_end<R>(
+    reader: &mut R,
+    info: &BoxInfo,
+    clamp_to_stream_end: bool,
+) -> Result<u64, WalkError>
+where
+    R: Seek,
+{
+    let end = checked_box_end(info)?;
+    let target = if clamp_to_stream_end {
+        let position = reader.stream_position()?;
+        let stream_len = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(position))?;
+        end.min(stream_len)
+    } else {
+        end
+    };
+    reader.seek(SeekFrom::Start(target)).map_err(WalkError::Io)
+}
+
 #[cfg(feature = "async")]
 async fn clean_root_eof_async<R>(
     reader: &mut R,
@@ -1066,6 +1118,41 @@ where
 
     let end = reader.seek(SeekFrom::End(0)).await?;
     Ok(start >= end)
+}
+
+#[cfg(feature = "async")]
+async fn validate_box_fits_stream_async<R>(reader: &mut R, info: &BoxInfo) -> Result<(), WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let position = reader.stream_position().await?;
+    let stream_len = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(position)).await?;
+    validate_box_end_within_stream(info, stream_len)
+}
+
+#[cfg(feature = "async")]
+async fn seek_to_box_end_async<R>(
+    reader: &mut R,
+    info: &BoxInfo,
+    clamp_to_stream_end: bool,
+) -> Result<u64, WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let end = checked_box_end(info)?;
+    let target = if clamp_to_stream_end {
+        let position = reader.stream_position().await?;
+        let stream_len = reader.seek(SeekFrom::End(0)).await?;
+        reader.seek(SeekFrom::Start(position)).await?;
+        end.min(stream_len)
+    } else {
+        end
+    };
+    reader
+        .seek(SeekFrom::Start(target))
+        .await
+        .map_err(WalkError::Io)
 }
 
 /// Errors raised while walking a box tree.
