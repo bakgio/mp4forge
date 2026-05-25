@@ -24,7 +24,7 @@ use mp4forge::mux::{MuxFileConfig, MuxTrackConfig};
 use support::{
     TestAviAvc1Stream, TestAviH264Stream, TestAviMp4vStream, TestAviPcmStream, TestMuxSample,
     TestQcpCodecKind, build_test_av1_sequence_header_obu, build_test_mp4v_decoder_specific_info,
-    build_test_vp10_keyframe, encode_supported_box, fixture_path, fourcc,
+    build_test_vp10_keyframe, encode_supported_box, fixture_path, fourcc, temp_output_dir,
     write_single_track_mp4_input, write_temp_file, write_test_ac4_file, write_test_adts_file,
     write_test_aifc_pcm_file, write_test_aiff_pcm_file, write_test_amr_file,
     write_test_amr_wb_file, write_test_av1_annex_b_file, write_test_av1_ivf_file,
@@ -63,7 +63,7 @@ fn mux_command_validates_argument_shape() {
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
         concat!(
-            "USAGE: mp4forge mux --track <SPEC> [--track <SPEC> ...] [--layout <flat|fragmented>] [--segment_duration <SECONDS> | --fragment_duration <SECONDS>] [--out <PATH>] [DEST]\n",
+            "USAGE: mp4forge mux --track <SPEC> [--track <SPEC> ...] [--layout <flat|fragmented>] [--segment_duration <SECONDS> | --fragment_duration <SECONDS>] [--out <PATH> | --init_out <PATH> --media_out <PATH>] [DEST]\n",
             "\n",
             "OPTIONS:\n",
             "  --track <SPEC>                Add one mux input using the path-first track-spec grammar\n",
@@ -71,13 +71,15 @@ fn mux_command_validates_argument_shape() {
             "                               Select one MP4 track when needed with: PATH#video, PATH#audio, PATH#audio:N, PATH#text, PATH#text:N, PATH#track:ID\n",
             "                               Current path-only auto-detection covers MP4, VobSub, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported MPEG-PS MPEG audio streams plus LPCM audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS MPEG audio streams plus AAC LATM/MHAS plus AC-3/E-AC-3/AC-4/DTS/TrueHD audio plus MPEG-2/AV1/AVS3/MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC ADTS, AAC LATM, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS-family core audio, Dolby TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video, H.264 Annex B, H.265 Annex B, VVC Annex B, raw AV1 OBU, raw AV1 Annex B, IVF AV1/VP8/VP9/VP10, JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg FLAC, Ogg Opus, Ogg Vorbis, Ogg Speex, Ogg Theora, and CAF ALAC\n",
             "                               Broader DTS-family sample-entry variants remain supported through MP4 track import\n",
-            "  --segment_duration <SECONDS> Set one target segment duration for supported single-input jobs\n",
-            "  --fragment_duration <SECONDS> Set one target fragment duration for supported single-input jobs\n",
+            "  --segment_duration <SECONDS> Set one target segment duration for supported fragmented jobs\n",
+            "  --fragment_duration <SECONDS> Set one target fragment duration for supported fragmented jobs\n",
             "  --layout <flat|fragmented>   Choose the output container layout; defaults to flat\n",
             "  --out <PATH>                 Force one newly created output destination at PATH\n",
+            "  --init_out <PATH>            Write fragmented initialization boxes to PATH\n",
+            "  --media_out <PATH>           Write fragmented index and media fragments to PATH\n",
             "  -warnings                    Emit warning-grade diagnostics to stderr after a successful run\n",
             "\n",
-            "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH`. Path-only MP4 inputs import all supported tracks unless you add one selector suffix.\n",
+            "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. `--init_out PATH --media_out PATH` writes a fragmented job as separate outputs. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH` or separate fragmented outputs. Path-only MP4 inputs import all supported tracks unless you add one selector suffix.\n",
         )
     );
 }
@@ -513,7 +515,7 @@ fn mux_command_writes_real_mp4_output_from_path_only_avi_mp3_input() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc(".mp3"));
     assert_eq!(audio_entries[0].channel_count, 2);
     assert_eq!(mdhd_boxes.len(), 1);
-    assert_eq!(mdhd_boxes[0].timescale, 1_000);
+    assert_eq!(mdhd_boxes[0].timescale, 48_000);
 }
 
 #[test]
@@ -562,7 +564,7 @@ fn mux_command_writes_real_mp4_output_from_path_only_avi_ac3_input() {
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("ac-3"));
     assert_eq!(audio_entries[0].channel_count, 2);
     assert_eq!(mdhd_boxes.len(), 1);
-    assert_eq!(mdhd_boxes[0].timescale, 1_000);
+    assert_eq!(mdhd_boxes[0].timescale, 48_000);
 }
 
 #[test]
@@ -2129,13 +2131,17 @@ fn mux_command_rejects_multiple_video_tracks() {
 }
 
 #[test]
-fn mux_command_rejects_fragmented_multi_track_jobs() {
+fn mux_command_writes_fragmented_multi_track_jobs() {
+    let audio_input =
+        build_audio_input_file("mux-cli-fragmented-multi-audio-input", fourcc("dash"));
+    let video_input =
+        build_video_input_file("mux-cli-fragmented-multi-video-input", fourcc("isom"));
     let output = write_temp_file("mux-cli-fragmented-multi-track-output", &[]);
     let args = vec![
         "--track".to_string(),
-        "first.mp4#audio".to_string(),
+        format!("{}#audio", audio_input.display()),
         "--track".to_string(),
-        "second.mp4#video".to_string(),
+        format!("{}#video", video_input.display()),
         "--layout".to_string(),
         "fragmented".to_string(),
         "--fragment_duration".to_string(),
@@ -2146,11 +2152,21 @@ fn mux_command_rejects_fragmented_multi_track_jobs() {
     let mut stderr = Vec::new();
     let exit_code = mux::run(&args, &mut stderr);
 
-    assert_eq!(exit_code, 1);
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let output_bytes = fs::read(output).unwrap();
+    let root_boxes = read_root_boxes(&output_bytes);
     assert_eq!(
-        String::from_utf8(stderr).unwrap(),
-        "Error [stage=request category=input]: invalid mux layout `fragmented`: the current fragmented mux follow-on only supports single-track jobs\n"
+        root_boxes.iter().map(BoxInfo::box_type).collect::<Vec<_>>(),
+        vec![
+            fourcc("ftyp"),
+            fourcc("moov"),
+            fourcc("sidx"),
+            fourcc("moof"),
+            fourcc("mdat"),
+        ]
     );
+    assert_eq!(mdat_payload(&output_bytes, root_boxes[4]), b"audvideo");
 }
 
 #[test]
@@ -2200,7 +2216,12 @@ fn mux_command_writes_real_mp4_output_from_mp4_tracks() {
     let root_boxes = read_root_boxes(&output_bytes);
     assert_eq!(
         root_boxes.iter().map(BoxInfo::box_type).collect::<Vec<_>>(),
-        vec![fourcc("ftyp"), fourcc("moov"), fourcc("mdat")]
+        vec![
+            fourcc("ftyp"),
+            fourcc("moov"),
+            fourcc("mdat"),
+            fourcc("free"),
+        ]
     );
     assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), b"audvideo");
 }
@@ -2277,6 +2298,71 @@ fn mux_command_writes_fragmented_output_when_requested() {
             fourcc("moof"),
             fourcc("mdat"),
         ]
+    );
+}
+
+#[test]
+fn mux_command_writes_separate_fragmented_outputs_when_requested() {
+    let audio_input =
+        build_audio_input_file("mux-cli-fragmented-split-audio-input", fourcc("isom"));
+    let output_dir = temp_output_dir("mux-cli-fragmented-split-output-dir");
+    let init_output = output_dir.join("init.mp4");
+    let media_output = output_dir.join("media.mp4");
+    let args = vec![
+        "--track".to_string(),
+        format!("{}#audio", audio_input.display()),
+        "--layout".to_string(),
+        "fragmented".to_string(),
+        "--fragment_duration".to_string(),
+        "0.015".to_string(),
+        "--init_out".to_string(),
+        init_output.to_string_lossy().into_owned(),
+        "--media_out".to_string(),
+        media_output.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    let init_bytes = fs::read(init_output).unwrap();
+    let media_bytes = fs::read(media_output).unwrap();
+    let init_boxes = read_root_boxes(&init_bytes);
+    let media_boxes = read_root_boxes(&media_bytes);
+    assert_eq!(
+        init_boxes.iter().map(BoxInfo::box_type).collect::<Vec<_>>(),
+        vec![fourcc("ftyp"), fourcc("moov")]
+    );
+    assert_eq!(
+        media_boxes
+            .iter()
+            .map(BoxInfo::box_type)
+            .collect::<Vec<_>>(),
+        vec![fourcc("sidx"), fourcc("moof"), fourcc("mdat")]
+    );
+}
+
+#[test]
+fn mux_command_rejects_separate_outputs_for_flat_layout() {
+    let audio_input = build_audio_input_file("mux-cli-flat-split-audio-input", fourcc("isom"));
+    let output_dir = temp_output_dir("mux-cli-flat-split-output-dir");
+    let args = vec![
+        "--track".to_string(),
+        format!("{}#audio", audio_input.display()),
+        "--init_out".to_string(),
+        output_dir.join("init.mp4").to_string_lossy().into_owned(),
+        "--media_out".to_string(),
+        output_dir.join("media.mp4").to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = mux::run(&args, &mut stderr);
+
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "Error [stage=request category=input]: invalid mux layout `flat`: separate fragmented output requires fragmented layout\n"
     );
 }
 
@@ -3261,7 +3347,7 @@ fn mux_command_writes_real_mp4_output_from_path_first_ogg_flac_tracks() {
     );
     assert_eq!(audio_entries.len(), 1);
     assert_eq!(audio_entries[0].sample_entry.box_type, fourcc("fLaC"));
-    assert_eq!(mdhd_boxes[0].timescale, 48_000);
+    assert_eq!(mdhd_boxes[0].timescale, 1_000);
 }
 
 #[test]
@@ -3745,7 +3831,7 @@ fn mux_command_writes_real_mp4_output_from_path_first_h263_tracks() {
     assert_eq!(video_entries[0].width, 176);
     assert_eq!(video_entries[0].height, 144);
     assert_eq!(mdhd_boxes.len(), 1);
-    assert_eq!(mdhd_boxes[0].timescale, 15_000);
+    assert_eq!(mdhd_boxes[0].timescale, 1_200_000);
 }
 
 #[test]
@@ -3999,7 +4085,12 @@ fn dispatch_routes_mux_command() {
     let root_boxes = read_root_boxes(&output_bytes);
     assert_eq!(
         root_boxes.iter().map(BoxInfo::box_type).collect::<Vec<_>>(),
-        vec![fourcc("ftyp"), fourcc("moov"), fourcc("mdat")]
+        vec![
+            fourcc("ftyp"),
+            fourcc("moov"),
+            fourcc("mdat"),
+            fourcc("free"),
+        ]
     );
     assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), b"audvideo");
 }

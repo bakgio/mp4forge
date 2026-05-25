@@ -58,6 +58,9 @@ pub(crate) use coordination::{
     rebalance_small_multi_audio_chunk_sample_counts,
 };
 pub(crate) use event::{MuxEventCursor, MuxEventGraph, MuxSampleEvent};
+pub use import::mux_fragmented_to_paths;
+#[cfg(feature = "async")]
+pub use import::mux_fragmented_to_paths_async;
 pub use import::mux_into_path;
 #[cfg(feature = "async")]
 pub use import::mux_into_path_async;
@@ -804,8 +807,8 @@ fn parse_raw_video_params(spec: &str, rawvideo_text: &str) -> Result<MuxRawVideo
 /// Duration-boundary mode for the narrowed public mux surface.
 ///
 /// The current `mp4forge` mux follow-on keeps the public duration surface intentionally narrow:
-/// callers may request exactly one boundary mode, and today those duration-boundary modes are
-/// limited to single-track jobs when the current one-file MP4 output can model them correctly.
+/// callers may request exactly one boundary mode for fragmented output when the current one-file
+/// MP4 output can model it correctly.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MuxDurationMode {
     /// Coordinate track chunks around one target segment duration in seconds.
@@ -880,6 +883,207 @@ impl MuxDestinationMode {
     }
 }
 
+/// Event-message metadata to emit before one fragmented media fragment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MuxFragmentEventMessage {
+    fragment_index: u32,
+    version: u8,
+    scheme_id_uri: String,
+    value: String,
+    timescale: u32,
+    presentation_time_delta: u32,
+    presentation_time: u64,
+    event_duration: u32,
+    id: u32,
+    message_data: Vec<u8>,
+}
+
+impl MuxFragmentEventMessage {
+    /// Creates one version-0 event message for the zero-based fragment index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v0<S, V, M>(
+        fragment_index: u32,
+        scheme_id_uri: S,
+        value: V,
+        timescale: u32,
+        presentation_time_delta: u32,
+        event_duration: u32,
+        id: u32,
+        message_data: M,
+    ) -> Self
+    where
+        S: Into<String>,
+        V: Into<String>,
+        M: Into<Vec<u8>>,
+    {
+        Self {
+            fragment_index,
+            version: 0,
+            scheme_id_uri: scheme_id_uri.into(),
+            value: value.into(),
+            timescale,
+            presentation_time_delta,
+            presentation_time: 0,
+            event_duration,
+            id,
+            message_data: message_data.into(),
+        }
+    }
+
+    /// Creates one version-1 event message for the zero-based fragment index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v1<S, V, M>(
+        fragment_index: u32,
+        scheme_id_uri: S,
+        value: V,
+        timescale: u32,
+        presentation_time: u64,
+        event_duration: u32,
+        id: u32,
+        message_data: M,
+    ) -> Self
+    where
+        S: Into<String>,
+        V: Into<String>,
+        M: Into<Vec<u8>>,
+    {
+        Self {
+            fragment_index,
+            version: 1,
+            scheme_id_uri: scheme_id_uri.into(),
+            value: value.into(),
+            timescale,
+            presentation_time_delta: 0,
+            presentation_time,
+            event_duration,
+            id,
+            message_data: message_data.into(),
+        }
+    }
+
+    /// Returns the zero-based output fragment index this message belongs to.
+    pub const fn fragment_index(&self) -> u32 {
+        self.fragment_index
+    }
+
+    /// Returns the encoded `emsg` version.
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Returns the event scheme identifier.
+    pub fn scheme_id_uri(&self) -> &str {
+        &self.scheme_id_uri
+    }
+
+    /// Returns the event value string.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Returns the event timescale.
+    pub const fn timescale(&self) -> u32 {
+        self.timescale
+    }
+
+    /// Returns the version-0 presentation time delta.
+    pub const fn presentation_time_delta(&self) -> u32 {
+        self.presentation_time_delta
+    }
+
+    /// Returns the version-1 presentation time.
+    pub const fn presentation_time(&self) -> u64 {
+        self.presentation_time
+    }
+
+    /// Returns the event duration.
+    pub const fn event_duration(&self) -> u32 {
+        self.event_duration
+    }
+
+    /// Returns the event identifier.
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Returns the event payload bytes.
+    pub fn message_data(&self) -> &[u8] {
+        &self.message_data
+    }
+}
+
+/// Producer-reference-time metadata to emit before one fragmented media fragment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MuxProducerReferenceTime {
+    fragment_index: u32,
+    version: u8,
+    flags: u32,
+    reference_track_id: u32,
+    ntp_timestamp: u64,
+    media_time: u64,
+}
+
+impl MuxProducerReferenceTime {
+    /// Creates one version-1 producer-reference-time entry for the zero-based fragment index.
+    pub const fn new(
+        fragment_index: u32,
+        reference_track_id: u32,
+        ntp_timestamp: u64,
+        media_time: u64,
+    ) -> Self {
+        Self {
+            fragment_index,
+            version: 1,
+            flags: 0,
+            reference_track_id,
+            ntp_timestamp,
+            media_time,
+        }
+    }
+
+    /// Returns a copy of this entry with an explicit encoded `prft` version.
+    pub const fn with_version(mut self, version: u8) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Returns a copy of this entry with explicit `prft` flags.
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Returns the zero-based output fragment index this entry belongs to.
+    pub const fn fragment_index(&self) -> u32 {
+        self.fragment_index
+    }
+
+    /// Returns the encoded `prft` version.
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Returns the encoded `prft` flags.
+    pub const fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// Returns the referenced track identifier.
+    pub const fn reference_track_id(&self) -> u32 {
+        self.reference_track_id
+    }
+
+    /// Returns the NTP timestamp payload.
+    pub const fn ntp_timestamp(&self) -> u64 {
+        self.ntp_timestamp
+    }
+
+    /// Returns the media-time payload before version-specific narrowing.
+    pub const fn media_time(&self) -> u64 {
+        self.media_time
+    }
+}
+
 /// One high-level mux request aligned with the public CLI surface.
 ///
 /// The narrowed public `mux` surface now centers on repeated [`MuxTrackSpec`] values, one
@@ -892,6 +1096,8 @@ pub struct MuxRequest {
     destination_mode: MuxDestinationMode,
     duration_mode: Option<MuxDurationMode>,
     preserve_flat_authority_layout: bool,
+    fragment_event_messages: Vec<MuxFragmentEventMessage>,
+    producer_reference_times: Vec<MuxProducerReferenceTime>,
 }
 
 impl MuxRequest {
@@ -903,6 +1109,8 @@ impl MuxRequest {
             destination_mode: MuxDestinationMode::CreateNew,
             duration_mode: None,
             preserve_flat_authority_layout: false,
+            fragment_event_messages: Vec::new(),
+            producer_reference_times: Vec::new(),
         }
     }
 
@@ -930,6 +1138,16 @@ impl MuxRequest {
         self.preserve_flat_authority_layout
     }
 
+    /// Returns configured event messages for fragmented output.
+    pub fn fragment_event_messages(&self) -> &[MuxFragmentEventMessage] {
+        &self.fragment_event_messages
+    }
+
+    /// Returns configured producer-reference-time entries for fragmented output.
+    pub fn producer_reference_times(&self) -> &[MuxProducerReferenceTime] {
+        &self.producer_reference_times
+    }
+
     /// Returns a copy of this request with one explicit container layout configured.
     pub const fn with_output_layout(mut self, output_layout: MuxOutputLayout) -> Self {
         self.output_layout = output_layout;
@@ -953,6 +1171,18 @@ impl MuxRequest {
         preserve_flat_authority_layout: bool,
     ) -> Self {
         self.preserve_flat_authority_layout = preserve_flat_authority_layout;
+        self
+    }
+
+    /// Returns a copy of this request with one appended fragmented event message.
+    pub fn with_fragment_event_message(mut self, message: MuxFragmentEventMessage) -> Self {
+        self.fragment_event_messages.push(message);
+        self
+    }
+
+    /// Returns a copy of this request with one appended fragmented producer-reference-time entry.
+    pub fn with_producer_reference_time(mut self, entry: MuxProducerReferenceTime) -> Self {
+        self.producer_reference_times.push(entry);
         self
     }
 }
@@ -985,6 +1215,7 @@ pub struct MuxStagedMediaItem {
     data_offset: u64,
     data_size: u32,
     is_sync_sample: bool,
+    sample_description_index: u32,
 }
 
 impl MuxStagedMediaItem {
@@ -1006,6 +1237,7 @@ impl MuxStagedMediaItem {
             data_offset,
             data_size,
             is_sync_sample: false,
+            sample_description_index: 1,
         }
     }
 
@@ -1049,6 +1281,11 @@ impl MuxStagedMediaItem {
         self.is_sync_sample
     }
 
+    /// Returns the one-based sample-description index used for this staged sample.
+    pub const fn sample_description_index(&self) -> u32 {
+        self.sample_description_index
+    }
+
     /// Returns a copy of this item with a non-zero composition offset.
     pub const fn with_composition_time_offset(mut self, composition_time_offset: i32) -> Self {
         self.composition_time_offset = composition_time_offset;
@@ -1058,6 +1295,12 @@ impl MuxStagedMediaItem {
     /// Returns a copy of this item with an explicit sync-sample marker.
     pub const fn with_sync_sample(mut self, is_sync_sample: bool) -> Self {
         self.is_sync_sample = is_sync_sample;
+        self
+    }
+
+    /// Returns a copy of this item with an explicit one-based sample-description index.
+    pub const fn with_sample_description_index(mut self, sample_description_index: u32) -> Self {
+        self.sample_description_index = sample_description_index;
         self
     }
 }
@@ -1196,6 +1439,8 @@ pub struct MuxFileConfig {
     preserved_flat_prefix_bytes: Vec<u8>,
     preserved_flat_iods_bytes: Option<Vec<u8>>,
     preserved_flat_udta_bytes: Option<Vec<u8>>,
+    fragment_event_messages: Vec<MuxFragmentEventMessage>,
+    producer_reference_times: Vec<MuxProducerReferenceTime>,
 }
 
 impl MuxFileConfig {
@@ -1221,6 +1466,8 @@ impl MuxFileConfig {
             preserved_flat_prefix_bytes: Vec::new(),
             preserved_flat_iods_bytes: None,
             preserved_flat_udta_bytes: None,
+            fragment_event_messages: Vec::new(),
+            producer_reference_times: Vec::new(),
         }
     }
 
@@ -1420,6 +1667,30 @@ impl MuxFileConfig {
         self.preserved_flat_udta_bytes = preserved_flat_udta_bytes;
         self
     }
+
+    pub(crate) fn fragment_event_messages(&self) -> &[MuxFragmentEventMessage] {
+        &self.fragment_event_messages
+    }
+
+    pub(crate) fn with_fragment_event_messages(
+        mut self,
+        fragment_event_messages: Vec<MuxFragmentEventMessage>,
+    ) -> Self {
+        self.fragment_event_messages = fragment_event_messages;
+        self
+    }
+
+    pub(crate) fn producer_reference_times(&self) -> &[MuxProducerReferenceTime] {
+        &self.producer_reference_times
+    }
+
+    pub(crate) fn with_producer_reference_times(
+        mut self,
+        producer_reference_times: Vec<MuxProducerReferenceTime>,
+    ) -> Self {
+        self.producer_reference_times = producer_reference_times;
+        self
+    }
 }
 
 /// Track kind used by the real MP4 mux surface.
@@ -1467,9 +1738,8 @@ const fn default_alternate_group_for_kind(kind: MuxTrackKind) -> i16 {
 
 /// Per-track configuration for the real MP4 mux surface.
 ///
-/// The current real muxer expects one fully encoded sample-entry box per track. That keeps the
-/// public API codec-agnostic while still letting callers build container output with the crate's
-/// existing typed box models or with retained encoded sample-entry bytes from elsewhere.
+/// The muxer accepts a primary encoded sample-entry box and can retain additional entries for
+/// imported tracks that switch sample descriptions over time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MuxTrackConfig {
     track_id: u32,
@@ -1489,11 +1759,13 @@ pub struct MuxTrackConfig {
     sample_roll_distance: Option<i16>,
     emit_roll_sbgp: bool,
     sample_entry_box: Vec<u8>,
+    sample_entry_boxes: Vec<Vec<u8>>,
     sync_sample_table_mode: SyncSampleTableMode,
     stts_run_encoding_mode: SttsRunEncodingMode,
     stsc_run_encoding_mode: StscRunEncodingMode,
     flat_timing_override: Option<FlatTimingOverride>,
     flat_audio_profile_level_indication: Option<u8>,
+    fragmented_decode_time_offset: Option<u64>,
     fragmented_reference_group_fragment_counts: Option<Vec<u32>>,
     flat_source_track_creation_time: Option<u64>,
     flat_source_track_modification_time: Option<u64>,
@@ -1552,12 +1824,14 @@ impl MuxTrackConfig {
             edit_media_time: None,
             sample_roll_distance: None,
             emit_roll_sbgp: true,
-            sample_entry_box,
+            sample_entry_box: sample_entry_box.clone(),
+            sample_entry_boxes: vec![sample_entry_box],
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
             flat_audio_profile_level_indication: None,
+            fragmented_decode_time_offset: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
             flat_source_track_modification_time: None,
@@ -1595,12 +1869,14 @@ impl MuxTrackConfig {
             edit_media_time: None,
             sample_roll_distance: None,
             emit_roll_sbgp: true,
-            sample_entry_box,
+            sample_entry_box: sample_entry_box.clone(),
+            sample_entry_boxes: vec![sample_entry_box],
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
             flat_audio_profile_level_indication: None,
+            fragmented_decode_time_offset: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
             flat_source_track_modification_time: None,
@@ -1638,12 +1914,14 @@ impl MuxTrackConfig {
             edit_media_time: None,
             sample_roll_distance: None,
             emit_roll_sbgp: true,
-            sample_entry_box,
+            sample_entry_box: sample_entry_box.clone(),
+            sample_entry_boxes: vec![sample_entry_box],
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
             flat_audio_profile_level_indication: None,
+            fragmented_decode_time_offset: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
             flat_source_track_modification_time: None,
@@ -1681,12 +1959,14 @@ impl MuxTrackConfig {
             edit_media_time: None,
             sample_roll_distance: None,
             emit_roll_sbgp: true,
-            sample_entry_box,
+            sample_entry_box: sample_entry_box.clone(),
+            sample_entry_boxes: vec![sample_entry_box],
             sync_sample_table_mode: SyncSampleTableMode::Auto,
             stts_run_encoding_mode: SttsRunEncodingMode::CollapseIdentical,
             stsc_run_encoding_mode: StscRunEncodingMode::CollapseIdentical,
             flat_timing_override: None,
             flat_audio_profile_level_indication: None,
+            fragmented_decode_time_offset: None,
             fragmented_reference_group_fragment_counts: None,
             flat_source_track_creation_time: None,
             flat_source_track_modification_time: None,
@@ -1792,9 +2072,14 @@ impl MuxTrackConfig {
         self.emit_roll_sbgp
     }
 
-    /// Returns the full encoded sample-entry box written under `stsd`.
+    /// Returns the primary full encoded sample-entry box written under `stsd`.
     pub fn sample_entry_box(&self) -> &[u8] {
         &self.sample_entry_box
+    }
+
+    /// Returns every encoded sample-entry box written under `stsd`.
+    pub fn sample_entry_boxes(&self) -> &[Vec<u8>] {
+        &self.sample_entry_boxes
     }
 
     /// Returns a copy of this configuration with a different language code.
@@ -1893,6 +2178,14 @@ impl MuxTrackConfig {
         self
     }
 
+    pub(crate) fn with_sample_entry_boxes(mut self, sample_entry_boxes: Vec<Vec<u8>>) -> Self {
+        if let Some(first) = sample_entry_boxes.first() {
+            self.sample_entry_box = first.clone();
+        }
+        self.sample_entry_boxes = sample_entry_boxes;
+        self
+    }
+
     pub(crate) const fn with_sync_sample_table_mode(
         mut self,
         sync_sample_table_mode: SyncSampleTableMode,
@@ -1946,6 +2239,18 @@ impl MuxTrackConfig {
         flat_audio_profile_level_indication: u8,
     ) -> Self {
         self.flat_audio_profile_level_indication = Some(flat_audio_profile_level_indication);
+        self
+    }
+
+    pub(crate) const fn fragmented_decode_time_offset(&self) -> Option<u64> {
+        self.fragmented_decode_time_offset
+    }
+
+    pub(crate) const fn with_fragmented_decode_time_offset(
+        mut self,
+        fragmented_decode_time_offset: u64,
+    ) -> Self {
+        self.fragmented_decode_time_offset = Some(fragmented_decode_time_offset);
         self
     }
 
@@ -2363,6 +2668,28 @@ pub fn plan_staged_media_items(
     plan_staged_media_items_with_coordination(items, interleave_policy, Vec::new())
 }
 
+/// Plans one output payload order with explicit per-track chunk sample counts.
+///
+/// The chunk counts are required by fragmented low-level writers because each media fragment is
+/// built from one chunk ordinal across the participating tracks. The counts for each track must
+/// cover that track's staged samples exactly.
+pub fn plan_staged_media_items_with_chunk_sample_counts<I>(
+    items: Vec<MuxStagedMediaItem>,
+    interleave_policy: MuxInterleavePolicy,
+    chunk_sample_counts_by_track: I,
+) -> Result<MuxPlan, MuxError>
+where
+    I: IntoIterator<Item = (u32, Vec<u32>)>,
+{
+    let coordination = chunk_sample_counts_by_track
+        .into_iter()
+        .map(|(track_id, chunk_sample_counts)| {
+            TrackCoordinationDirective::new(track_id, chunk_sample_counts)
+        })
+        .collect();
+    plan_staged_media_items_with_coordination(items, interleave_policy, coordination)
+}
+
 pub(crate) fn plan_staged_media_items_with_coordination(
     items: Vec<MuxStagedMediaItem>,
     interleave_policy: MuxInterleavePolicy,
@@ -2482,6 +2809,149 @@ where
     mp4::write_mp4_mux_to_path(source_paths, output_path, file_config, track_configs, plan)
 }
 
+/// Writes one fragmented MP4 to `writer` from staged seekable `sources`, `plan`, and track
+/// metadata.
+///
+/// The emitted byte stream is one initialization section, one top-level index when present, and
+/// one or more media fragments in the same order as the high-level fragmented mux request path.
+pub fn write_fragmented_mp4_mux<R, W>(
+    sources: &mut [R],
+    writer: &mut W,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    mp4::write_fragmented_mp4_mux(
+        sources,
+        writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+}
+
+/// Opens staged source files and writes one fragmented MP4 file to `output_path`.
+pub fn write_fragmented_mp4_mux_to_path<P, Q>(
+    source_paths: &[P],
+    output_path: Q,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    let mut sources = source_paths
+        .iter()
+        .map(File::open)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut writer = File::create(output_path)?;
+    write_fragmented_mp4_mux(
+        &mut sources,
+        &mut writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+}
+
+/// Writes fragmented initialization bytes and media-fragment bytes to separate writers.
+///
+/// Concatenating the init writer output followed by the media writer output yields the same byte
+/// stream as [`write_fragmented_mp4_mux`] except for volatile creation-time fields.
+pub fn write_fragmented_mp4_mux_split<R, I, M>(
+    sources: &mut [R],
+    init_writer: &mut I,
+    media_writer: &mut M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: Read + Seek,
+    I: Write,
+    M: Write,
+{
+    mp4::write_fragmented_mp4_mux_split(
+        sources,
+        init_writer,
+        media_writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+}
+
+/// Opens staged source files and writes fragmented init/media outputs to separate paths.
+pub fn write_fragmented_mp4_mux_split_to_paths<P, I, M>(
+    source_paths: &[P],
+    init_path: I,
+    media_path: M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    P: AsRef<Path>,
+    I: AsRef<Path>,
+    M: AsRef<Path>,
+{
+    let mut sources = source_paths
+        .iter()
+        .map(File::open)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut init_writer = File::create(init_path)?;
+    let mut media_writer = File::create(media_path)?;
+    write_fragmented_mp4_mux_split(
+        &mut sources,
+        &mut init_writer,
+        &mut media_writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+}
+
+/// Writes one fragmented MP4 and flushes the writer after the top-level index and after each
+/// media fragment.
+///
+/// This preserves the same final bytes as [`write_fragmented_mp4_mux`] while exposing deterministic
+/// flush points for callers that send the stream incrementally.
+pub fn write_fragmented_mp4_mux_chunked<R, W>(
+    sources: &mut [R],
+    writer: &mut W,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    mp4::write_fragmented_mp4_mux_chunked(
+        sources,
+        writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+}
+
 /// Writes one real MP4 file through the additive Tokio-based async mux surface.
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
@@ -2515,6 +2985,120 @@ where
 {
     mp4::write_mp4_mux_to_path_async(source_paths, output_path, file_config, track_configs, plan)
         .await
+}
+
+/// Writes one fragmented MP4 through the additive Tokio-based async mux surface.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
+pub async fn write_fragmented_mp4_mux_async<R, W>(
+    sources: &mut [R],
+    writer: &mut W,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    mp4::write_fragmented_mp4_mux_async(
+        sources,
+        writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+    .await
+}
+
+/// Opens staged source files asynchronously and writes one fragmented MP4 to `output_path`.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
+pub async fn write_fragmented_mp4_mux_to_path_async<P, Q>(
+    source_paths: &[P],
+    output_path: Q,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    let mut sources = Vec::with_capacity(source_paths.len());
+    for path in source_paths {
+        sources.push(TokioFile::open(path).await?);
+    }
+    let output = TokioFile::create(output_path).await?;
+    let mut writer = tokio::io::BufWriter::new(output);
+    write_fragmented_mp4_mux_async(
+        &mut sources,
+        &mut writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+    .await
+}
+
+/// Writes fragmented initialization bytes and media-fragment bytes to separate async writers.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
+pub async fn write_fragmented_mp4_mux_split_async<R, I, M>(
+    sources: &mut [R],
+    init_writer: &mut I,
+    media_writer: &mut M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+    I: AsyncWrite + Unpin,
+    M: AsyncWrite + Unpin,
+{
+    mp4::write_fragmented_mp4_mux_split_async(
+        sources,
+        init_writer,
+        media_writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+    .await
+}
+
+/// Writes one fragmented MP4 asynchronously and flushes after the top-level index and each media
+/// fragment.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
+pub async fn write_fragmented_mp4_mux_chunked_async<R, W>(
+    sources: &mut [R],
+    writer: &mut W,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+    W: AsyncWrite + Unpin,
+{
+    mp4::write_fragmented_mp4_mux_chunked_async(
+        sources,
+        writer,
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        plan,
+    )
+    .await
 }
 
 /// Copies the payload bytes described by `plan` from the staged seekable `sources` into

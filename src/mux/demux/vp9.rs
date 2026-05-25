@@ -256,17 +256,13 @@ fn parse_vp9_config(
         Some(value) => value,
         None => return Ok(default_vp9_config(profile)),
     };
-    let (
-        video_full_range_flag,
-        chroma_subsampling,
-        colour_primaries,
-        transfer_characteristics,
-        matrix_coefficients,
-    ) = if color_space == 7 {
+    let (colour_primaries, transfer_characteristics, matrix_coefficients) =
+        vp9_color_space_to_cicp(color_space);
+    let (video_full_range_flag, chroma_subsampling) = if color_space == 7 {
         if profile == 1 || profile == 3 {
             let _reserved_zero = bits.read_bit().unwrap_or(false);
         }
-        (1_u8, 3_u8, 1_u8, 13_u8, 0_u8)
+        (1_u8, 3_u8)
     } else {
         let video_full_range_flag = u8::from(bits.read_bit().unwrap_or(false));
         let chroma_subsampling = if profile != 1 && profile != 3 {
@@ -277,7 +273,7 @@ fn parse_vp9_config(
             let _reserved_zero = bits.read_bit().unwrap_or(false);
             ((subsampling_x << 1) | subsampling_y) + 1
         };
-        (video_full_range_flag, chroma_subsampling, 5_u8, 5_u8, 6_u8)
+        (video_full_range_flag, chroma_subsampling)
     };
 
     let parsed_width = match bits.read_bits_u16(16) {
@@ -308,6 +304,18 @@ fn parse_vp9_config(
     config.codec_initialization_data_size = 0;
     config.codec_initialization_data = Vec::new();
     Ok(config)
+}
+
+fn vp9_color_space_to_cicp(color_space: u8) -> (u8, u8, u8) {
+    const COLOUR_PRIMARIES: [u8; 8] = [2, 5, 1, 6, 7, 9, 2, 1];
+    const TRANSFER_CHARACTERISTICS: [u8; 8] = [2, 5, 1, 6, 7, 9, 2, 13];
+    const MATRIX_COEFFICIENTS: [u8; 8] = [2, 6, 1, 2, 2, 9, 2, 0];
+    let index = usize::from(color_space.min(7));
+    (
+        COLOUR_PRIMARIES[index],
+        TRANSFER_CHARACTERISTICS[index],
+        MATRIX_COEFFICIENTS[index],
+    )
 }
 
 fn default_vp9_config(profile: u8) -> VpCodecConfiguration {

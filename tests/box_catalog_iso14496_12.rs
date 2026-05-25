@@ -14,18 +14,19 @@ use mp4forge::boxes::iso14496_12::{
     Meta, Mfhd, Mfra, Mfro, Mime, Minf, Moof, Moov, Mpod, Mvex, Mvhd, Nmhd,
     PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS, PRFT_TIME_ARBITRARY_CONSISTENT, PRFT_TIME_CAPTURED,
     PRFT_TIME_ENCODER_INPUT, PRFT_TIME_ENCODER_OUTPUT, PRFT_TIME_MOOF_FINALIZED,
-    PRFT_TIME_MOOF_WRITTEN, Pasp, Prft, Saio, Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm, Sdtp,
-    SdtpSampleElem, SeigEntry, SeigEntryL, Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf, Skip,
-    SmDm, Smhd, SphericalVideoV1Metadata, Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd, Stsc,
-    StscEntry, Stsd, Stss, Stsz, Stts, SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt, Sync,
-    TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TRUN_DATA_OFFSET_PRESENT,
-    TRUN_FIRST_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT,
-    TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry,
-    TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra, TfraEntry, Tkhd, TrackLoudnessInfo, Traf, Trak,
-    Tref, Trep, Trex, Trun, TrunEntry, UUID_FRAGMENT_ABSOLUTE_TIMING, UUID_FRAGMENT_RUN_TABLE,
-    UUID_SAMPLE_ENCRYPTION, UUID_SPHERICAL_VIDEO_V1, Udta, Uuid, UuidFragmentAbsoluteTiming,
-    UuidFragmentRunEntry, UuidFragmentRunTable, UuidPayload, Vdep, VisualRandomAccessEntry,
-    VisualSampleEntry, Vmhd, Vplx, Wave, XMLSubtitleSampleEntry,
+    PRFT_TIME_MOOF_WRITTEN, Padb, Pasp, Prft, Saio, Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm,
+    Sdtp, SdtpSampleElem, SeigEntry, SeigEntryL, Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf,
+    Skip, SmDm, Smhd, SphericalVideoV1Metadata, Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd,
+    Stsc, StscEntry, Stsd, Stss, Stsz, Stts, SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt,
+    Sync, TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
+    TRUN_DATA_OFFSET_PRESENT, TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
+    TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
+    TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry, TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra,
+    TfraEntry, Tkhd, TrackLoudnessInfo, Traf, Trak, Tref, Trep, Trex, Trun, TrunEntry,
+    UUID_FRAGMENT_ABSOLUTE_TIMING, UUID_FRAGMENT_RUN_TABLE, UUID_SAMPLE_ENCRYPTION,
+    UUID_SPHERICAL_VIDEO_V1, Udta, Uuid, UuidFragmentAbsoluteTiming, UuidFragmentRunEntry,
+    UuidFragmentRunTable, UuidPayload, Vdep, VisualRandomAccessEntry, VisualSampleEntry, Vmhd,
+    Vplx, Wave, XMLSubtitleSampleEntry,
 };
 use mp4forge::boxes::iso23001_7::{SENC_USE_SUBSAMPLE_ENCRYPTION, Senc, SencSample, SencSubsample};
 use mp4forge::boxes::{AnyTypeBox, default_registry};
@@ -347,6 +348,11 @@ fn core_iso14496_12_catalog_roundtrips() {
             sample_delta: 0x6789abcd,
         },
     ];
+
+    let mut padb = Padb::default();
+    padb.set_version(0);
+    padb.sample_count = 3;
+    padb.padding_bits = b"AB".to_vec();
 
     let mut tfdt_v0 = Tfdt::default();
     tfdt_v0.set_version(0);
@@ -772,6 +778,11 @@ fn core_iso14496_12_catalog_roundtrips() {
             0x67, 0x89, 0x45, 0x67, 0x89, 0xab, 0x67, 0x89, 0xab, 0xcd,
         ],
         "Version=0 Flags=0x000000 EntryCount=2 Entries=[{SampleCount=19088743 SampleDelta=591751049}, {SampleCount=1164413355 SampleDelta=1737075661}]",
+    );
+    assert_box_roundtrip(
+        padb,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'A', b'B'],
+        "Version=0 Flags=0x000000 SampleCount=3 PaddingBits=\"AB\"",
     );
     assert_box_roundtrip(
         tfdt_v0,
@@ -3387,7 +3398,9 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"leva")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ludt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"avc1")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"avc2")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"avc3")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"avc4")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mime")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mp4a")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"dvbs")));
@@ -3407,6 +3420,7 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"sqcp")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sevc")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ssmv")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dts-")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"QDM2")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"schm")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sbtt")));

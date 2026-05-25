@@ -10,9 +10,9 @@ use mp4forge::boxes::AnyTypeBox;
 use mp4forge::boxes::av1::AV1CodecConfiguration;
 use mp4forge::boxes::etsi_ts_102_366::Dac3;
 use mp4forge::boxes::iso14496_12::{
-    AVCDecoderConfiguration, AudioSampleEntry, Frma, Ftyp, HEVCDecoderConfiguration, Mdhd,
-    SampleEntry, Schm, Sinf, Stco, Stsc, StscEntry, Stsd, Stsz, Stts, SttsEntry,
-    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+    AVCDecoderConfiguration, AVCParameterSet, AudioSampleEntry, Frma, Ftyp,
+    HEVCDecoderConfiguration, Mdhd, SampleEntry, Schm, Sinf, Stco, Stsc, StscEntry, Stsd, Stsz,
+    Stts, SttsEntry, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
     TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, Tfdt, Tfhd, Tkhd, Trun, TrunEntry,
     VisualSampleEntry, XMLSubtitleSampleEntry,
 };
@@ -1970,6 +1970,10 @@ fn build_video_trak_with_profile(
     mdhd.timescale = 1_000;
     mdhd.duration_v0 = 1_000;
 
+    let high_profile_fields_enabled = matches!(
+        profile,
+        44 | 83 | 86 | 100 | 110 | 118 | 122 | 128 | 134 | 135 | 138 | 139 | 144 | 244
+    );
     let avcc = encode_supported_box(
         &AVCDecoderConfiguration {
             configuration_version: 1,
@@ -1977,7 +1981,25 @@ fn build_video_trak_with_profile(
             profile_compatibility,
             level,
             length_size_minus_one: 3,
-            ..AVCDecoderConfiguration::default()
+            num_of_sequence_parameter_sets: 1,
+            sequence_parameter_sets: vec![AVCParameterSet {
+                length: 24,
+                nal_unit: vec![
+                    0x67, 0x64, 0x00, 0x0d, 0xac, 0x34, 0xe5, 0x05, 0x06, 0x7e, 0x78, 0x40, 0x00,
+                    0x00, 0x19, 0x00, 0x00, 0x05, 0xda, 0xa3, 0xc5, 0x0a, 0x45, 0x80,
+                ],
+            }],
+            num_of_picture_parameter_sets: 1,
+            picture_parameter_sets: vec![AVCParameterSet {
+                length: 5,
+                nal_unit: vec![0x68, 0xee, 0xb2, 0xc8, 0xb0],
+            }],
+            high_profile_fields_enabled,
+            chroma_format: if high_profile_fields_enabled { 1 } else { 0 },
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            num_of_sequence_parameter_set_ext: 0,
+            sequence_parameter_sets_ext: Vec::new(),
         },
         &[],
     );

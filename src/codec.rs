@@ -99,7 +99,10 @@ where
 }
 
 /// Box-specific overrides used by the generic descriptor codec.
-pub trait FieldHooks: Sync {
+pub trait FieldHooks
+where
+    Self: Sync,
+{
     /// Returns a dynamic bit width for `name` when the descriptor requests one.
     fn field_size(&self, _name: &'static str) -> Option<u32> {
         None
@@ -791,7 +794,10 @@ pub trait FieldValueWrite {
 }
 
 /// Compile-time descriptor contract for a concrete box type.
-pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite + Send {
+pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite
+where
+    Self: Send,
+{
     /// Static descriptor table for the box payload.
     const FIELD_TABLE: FieldTable;
     /// Supported versions for the box type. An empty slice means any version is accepted.
@@ -841,7 +847,10 @@ pub trait CodecBox: MutableBox + FieldValueRead + FieldValueWrite + Send {
 }
 
 /// Object-safe view of the descriptor-backed box surface.
-pub trait CodecDescription: MutableBox + FieldValueRead + FieldValueWrite + Send {
+pub trait CodecDescription: MutableBox + FieldValueRead + FieldValueWrite
+where
+    Self: Send,
+{
     /// Returns the runtime field table for the box.
     fn field_table(&self) -> FieldTable;
 

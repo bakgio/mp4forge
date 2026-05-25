@@ -173,6 +173,7 @@ impl BoxLookupContext {
         const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
         const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
         const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
+        const DTS_MINUS: FourCc = FourCc::from_bytes(*b"dts-");
         const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
         const DTSY: FourCc = FourCc::from_bytes(*b"dtsy");
         const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
@@ -199,6 +200,7 @@ impl BoxLookupContext {
                 | DTSH
                 | DTSL
                 | DTSM
+                | DTS_MINUS
                 | DTSX
                 | DTSY
                 | FLAC

@@ -36,7 +36,7 @@ const AIFC_COMPRESSION_FL32: FourCc = FourCc::from_bytes(*b"fl32");
 const AIFC_COMPRESSION_FL64: FourCc = FourCc::from_bytes(*b"fl64");
 const SAMPLE_ENTRY_IPCM: FourCc = FourCc::from_bytes(*b"ipcm");
 const SAMPLE_ENTRY_FPCM: FourCc = FourCc::from_bytes(*b"fpcm");
-const AIFC_FLOAT_VENDOR_CODE: [u8; 4] = *b"GPAC";
+const AIFC_FLOAT_VENDOR_CODE: [u8; 4] = [0, 0, 0, 0];
 const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
 ];
@@ -1261,7 +1261,7 @@ fn finalize_pcm_track_sync(
     let (data_offset, frame_size) = if transformed_source.is_some() {
         let frame_size = u32::from(format.channel_count)
             .checked_mul(2)
-            .ok_or(MuxError::LayoutOverflow("companded PCM output frame size"))?;
+            .ok_or(MuxError::LayoutOverflow("PCM output frame size"))?;
         (0, frame_size)
     } else {
         (data_offset, frame_size)
@@ -1333,7 +1333,7 @@ async fn finalize_pcm_track_async(
     let (data_offset, frame_size) = if transformed_source.is_some() {
         let frame_size = u32::from(format.channel_count)
             .checked_mul(2)
-            .ok_or(MuxError::LayoutOverflow("companded PCM output frame size"))?;
+            .ok_or(MuxError::LayoutOverflow("PCM output frame size"))?;
         (0, frame_size)
     } else {
         (data_offset, frame_size)
@@ -1445,13 +1445,21 @@ fn build_inline_companded_pcm_source(
     companded_kind: CompandedPcmKind,
 ) -> Result<SegmentedMuxSourceSpec, MuxError> {
     let decoded = decode_companded_pcm_payload(encoded, companded_kind);
-    let total_size = u64::try_from(decoded.len())
-        .map_err(|_| MuxError::LayoutOverflow("companded PCM output size"))?;
+    build_inline_pcm_source(path, decoded, "companded PCM output size")
+}
+
+fn build_inline_pcm_source(
+    path: &Path,
+    payload: Vec<u8>,
+    overflow_context: &'static str,
+) -> Result<SegmentedMuxSourceSpec, MuxError> {
+    let total_size =
+        u64::try_from(payload.len()).map_err(|_| MuxError::LayoutOverflow(overflow_context))?;
     Ok(SegmentedMuxSourceSpec {
         path: path.to_path_buf(),
         segments: vec![SegmentedMuxSourceSegment {
             logical_offset: 0,
-            data: SegmentedMuxSourceSegmentData::Bytes(decoded),
+            data: SegmentedMuxSourceSegmentData::Bytes(payload),
         }],
         total_size,
     })

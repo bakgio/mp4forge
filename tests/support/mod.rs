@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 #![allow(clippy::field_reassign_with_default)]
 
+use std::cell::RefCell;
 #[cfg(feature = "decrypt")]
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 #[cfg(feature = "decrypt")]
 use std::io::{Cursor, Seek};
 use std::path::{Path, PathBuf};
@@ -81,6 +83,47 @@ pub fn fourcc(value: &str) -> FourCc {
     FourCc::try_from(value).unwrap()
 }
 
+struct RegisteredTempPaths {
+    paths: RefCell<Vec<PathBuf>>,
+}
+
+impl RegisteredTempPaths {
+    fn register(&self, path: PathBuf) {
+        self.paths.borrow_mut().push(path);
+    }
+}
+
+impl Drop for RegisteredTempPaths {
+    fn drop(&mut self) {
+        for path in self.paths.get_mut().drain(..).rev() {
+            remove_temp_path(&path);
+        }
+    }
+}
+
+thread_local! {
+    static REGISTERED_TEMP_PATHS: RegisteredTempPaths = RegisteredTempPaths {
+        paths: RefCell::new(Vec::new()),
+    };
+}
+
+fn register_temp_path(path: &Path) {
+    REGISTERED_TEMP_PATHS.with(|registry| registry.register(path.to_path_buf()));
+}
+
+fn remove_temp_path(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let _ = fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(path);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+}
+
 pub fn write_temp_file(prefix: &str, data: &[u8]) -> PathBuf {
     write_temp_file_with_extension(prefix, "mp4", data)
 }
@@ -95,6 +138,7 @@ pub fn write_temp_file_with_extension(prefix: &str, extension: &str, data: &[u8]
         std::process::id()
     ));
     fs::write(&path, data).unwrap();
+    register_temp_path(&path);
     path
 }
 
@@ -270,16 +314,7 @@ pub fn write_test_eac3_file_with_dependent_substream(prefix: &str, payloads: &[&
 #[cfg(feature = "mux")]
 pub fn write_test_ac4_file(prefix: &str, frame_count: usize) -> PathBuf {
     let bytes = build_test_ac4_stream_bytes(frame_count);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "mp4forge-{prefix}-{}-{unique}.ac4",
-        std::process::id()
-    ));
-    fs::write(&path, bytes).unwrap();
-    path
+    write_temp_file_with_extension(prefix, "ac4", &bytes)
 }
 
 #[cfg(feature = "mux")]
@@ -2448,6 +2483,8 @@ pub fn write_test_vobsub_files(
 
     fs::write(&idx_path, idx.as_bytes()).unwrap();
     fs::write(&sub_path, &sub_bytes).unwrap();
+    register_temp_path(&idx_path);
+    register_temp_path(&sub_path);
     (idx_path, sub_path)
 }
 
@@ -4438,7 +4475,10 @@ pub fn temp_output_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("mp4forge-{prefix}-{}-{unique}", std::process::id()))
+    let path =
+        std::env::temp_dir().join(format!("mp4forge-{prefix}-{}-{unique}", std::process::id()));
+    register_temp_path(&path);
+    path
 }
 
 pub fn fixture_path(name: &str) -> PathBuf {

@@ -49,6 +49,7 @@ const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
 const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
 const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
 const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
+const DTS_MINUS: FourCc = FourCc::from_bytes(*b"dts-");
 const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
 const DTSY: FourCc = FourCc::from_bytes(*b"dtsy");
 const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
@@ -1691,8 +1692,8 @@ fn track_layout(track: &DetailedTrackInfo) -> Result<TrackLayout, DivideError> {
             height: None,
         }),
         Some(
-            OPUS | AC_3 | EC_3 | AC_4 | ALAC | DTSC | DTSE | DTSH | DTSL | DTSM | DTSX | DTSY
-            | FLAC | IAMF | MHA1 | MHA2 | MHM1 | MHM2 | IPCM | FPCM,
+            OPUS | AC_3 | EC_3 | AC_4 | ALAC | DTSC | DTSE | DTSH | DTSL | DTSM | DTS_MINUS | DTSX
+            | DTSY | FLAC | IAMF | MHA1 | MHA2 | MHM1 | MHM2 | IPCM | FPCM,
         ) => Ok(TrackLayout {
             role: DivideTrackRole::Audio,
             kind: audio_track_kind(track),

@@ -120,6 +120,7 @@ const DTSE: FourCc = FourCc::from_bytes(*b"dtse");
 const DTSH: FourCc = FourCc::from_bytes(*b"dtsh");
 const DTSL: FourCc = FourCc::from_bytes(*b"dtsl");
 const DTSM: FourCc = FourCc::from_bytes(*b"dtsm");
+const DTS_MINUS: FourCc = FourCc::from_bytes(*b"dts-");
 const DTSX: FourCc = FourCc::from_bytes(*b"dtsx");
 const DTSY: FourCc = FourCc::from_bytes(*b"dtsy");
 const FLAC: FourCc = FourCc::from_bytes(*b"fLaC");
@@ -975,7 +976,7 @@ pub fn normalized_codec_family_name(
             Some(SEVC) => "evrc",
             Some(SSMV) => "smv",
             Some(MLPA) => "truehd",
-            Some(DTSC | DTSE | DTSH | DTSL | DTSM | DTSX | DTSY) => "dts",
+            Some(DTSC | DTSE | DTSH | DTSL | DTSM | DTS_MINUS | DTSX | DTSY) => "dts",
             Some(FLAC) => "flac",
             Some(IAMF) => "iamf",
             Some(MHA1 | MHA2 | MHM1 | MHM2) => "mpeg_h",
@@ -2730,8 +2731,8 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
     ];
     let audio_sample_entries = [
         MP4A, DOT_MP3, ALAW, MLAW, OPUS, SPEX, SAMR, SAWB, SQCP, SEVC, SSMV, ULAW, AC_3, EC_3,
-        AC_4, ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTSX, DTSY, FLAC, IAMF, MHA1, MHA2, MHM1,
-        MHM2, IPCM, FPCM, ENCA,
+        AC_4, ALAC, MLPA, DTSC, DTSE, DTSH, DTSL, DTSM, DTS_MINUS, DTSX, DTSY, FLAC, IAMF, MHA1,
+        MHA2, MHM1, MHM2, IPCM, FPCM, ENCA,
     ];
     let mut paths = vec![
         BoxPath::from([TKHD]),
@@ -2811,6 +2812,7 @@ fn track_probe_box_paths(options: ProbeOptions) -> Vec<BoxPath> {
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSH]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSL]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSM]),
+        BoxPath::from([MDIA, MINF, STBL, STSD, DTS_MINUS]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSX]),
         BoxPath::from([MDIA, MINF, STBL, STSD, DTSY]),
         BoxPath::from([MDIA, MINF, STBL, STSD, FLAC]),
@@ -3283,6 +3285,10 @@ fn parse_trak_rich_details(
             }
             DTSM => {
                 track.sample_entry_type = Some(DTSM);
+                audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
+            }
+            DTS_MINUS => {
+                track.sample_entry_type = Some(DTS_MINUS);
                 audio_sample_entry = Some(downcast_clone::<AudioSampleEntry>(&extracted)?);
             }
             DTSX => {

@@ -11,7 +11,7 @@ use super::{format_post_run_diagnostics_unavailable, write_error_line, write_war
 use crate::cli::divide::collect_fragmented_file_warnings;
 use crate::mux::{
     MuxDestinationMode, MuxDurationMode, MuxError, MuxOutputLayout, MuxRequest, MuxTrackSpec,
-    mux_into_path, mux_to_path,
+    mux_fragmented_to_paths, mux_into_path, mux_to_path,
 };
 
 /// Runs the mux subcommand with `args`, writing failures to `stderr`.
@@ -39,7 +39,7 @@ where
 {
     writeln!(
         writer,
-        "USAGE: mp4forge mux --track <SPEC> [--track <SPEC> ...] [--layout <flat|fragmented>] [--segment_duration <SECONDS> | --fragment_duration <SECONDS>] [--out <PATH>] [DEST]"
+        "USAGE: mp4forge mux --track <SPEC> [--track <SPEC> ...] [--layout <flat|fragmented>] [--segment_duration <SECONDS> | --fragment_duration <SECONDS>] [--out <PATH> | --init_out <PATH> --media_out <PATH>] [DEST]"
     )?;
     writeln!(writer)?;
     writeln!(writer, "OPTIONS:")?;
@@ -62,11 +62,11 @@ where
     )?;
     writeln!(
         writer,
-        "  --segment_duration <SECONDS> Set one target segment duration for supported single-input jobs"
+        "  --segment_duration <SECONDS> Set one target segment duration for supported fragmented jobs"
     )?;
     writeln!(
         writer,
-        "  --fragment_duration <SECONDS> Set one target fragment duration for supported single-input jobs"
+        "  --fragment_duration <SECONDS> Set one target fragment duration for supported fragmented jobs"
     )?;
     writeln!(
         writer,
@@ -78,12 +78,20 @@ where
     )?;
     writeln!(
         writer,
+        "  --init_out <PATH>            Write fragmented initialization boxes to PATH"
+    )?;
+    writeln!(
+        writer,
+        "  --media_out <PATH>           Write fragmented index and media fragments to PATH"
+    )?;
+    writeln!(
+        writer,
         "  -warnings                    Emit warning-grade diagnostics to stderr after a successful run"
     )?;
     writeln!(writer)?;
     writeln!(
         writer,
-        "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH`. Path-only MP4 inputs import all supported tracks unless you add one selector suffix."
+        "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. `--init_out PATH --media_out PATH` writes a fragmented job as separate outputs. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH` or separate fragmented outputs. Path-only MP4 inputs import all supported tracks unless you add one selector suffix."
     )
 }
 
@@ -138,6 +146,10 @@ struct ParsedMuxArgs {
 enum MuxCliTarget {
     Destination(PathBuf),
     Out(PathBuf),
+    Split {
+        init_path: PathBuf,
+        media_path: PathBuf,
+    },
 }
 
 fn run_inner<E>(args: &[String], stderr: &mut E) -> Result<(), MuxCliError>
@@ -145,15 +157,26 @@ where
     E: Write,
 {
     let parsed = parse_args(args)?;
-    let output_path = parsed.target.output_path().to_path_buf();
+    let output_path = parsed.target.primary_output_path().to_path_buf();
     let output_layout = parsed.request.output_layout();
-    match parsed.target {
+    let warnings_target_supported = matches!(
+        &parsed.target,
+        MuxCliTarget::Out(_) | MuxCliTarget::Destination(_)
+    );
+    match &parsed.target {
         MuxCliTarget::Destination(destination_path) => {
-            mux_into_path(&parsed.request, &destination_path)?
+            mux_into_path(&parsed.request, destination_path)?
         }
-        MuxCliTarget::Out(output_path) => mux_to_path(&parsed.request, &output_path)?,
+        MuxCliTarget::Out(output_path) => mux_to_path(&parsed.request, output_path)?,
+        MuxCliTarget::Split {
+            init_path,
+            media_path,
+        } => mux_fragmented_to_paths(&parsed.request, init_path, media_path)?,
     }
-    if parsed.emit_warnings && matches!(output_layout, MuxOutputLayout::Fragmented) {
+    if parsed.emit_warnings
+        && matches!(output_layout, MuxOutputLayout::Fragmented)
+        && warnings_target_supported
+    {
         emit_fragmented_mux_warnings(&output_path, stderr);
     }
     Ok(())
@@ -165,6 +188,8 @@ fn parse_args(args: &[String]) -> Result<ParsedMuxArgs, MuxCliError> {
     let mut destination_mode = MuxDestinationMode::UpdateOrCreateDestination;
     let mut duration_mode = None::<MuxDurationMode>;
     let mut out_path = None::<PathBuf>;
+    let mut init_out_path = None::<PathBuf>;
+    let mut media_out_path = None::<PathBuf>;
     let mut emit_warnings = false;
     let mut positional = Vec::new();
     let mut index = 0usize;
@@ -237,6 +262,36 @@ fn parse_args(args: &[String]) -> Result<ParsedMuxArgs, MuxCliError> {
                 destination_mode = MuxDestinationMode::CreateNew;
                 index += 2;
             }
+            "--init_out" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(MuxCliError::InvalidArgument(
+                        "missing value for --init_out".to_string(),
+                    ));
+                };
+                if init_out_path.is_some() {
+                    return Err(MuxCliError::InvalidArgument(
+                        "--init_out may only be supplied once".to_string(),
+                    ));
+                }
+                init_out_path = Some(PathBuf::from(value));
+                destination_mode = MuxDestinationMode::CreateNew;
+                index += 2;
+            }
+            "--media_out" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(MuxCliError::InvalidArgument(
+                        "missing value for --media_out".to_string(),
+                    ));
+                };
+                if media_out_path.is_some() {
+                    return Err(MuxCliError::InvalidArgument(
+                        "--media_out may only be supplied once".to_string(),
+                    ));
+                }
+                media_out_path = Some(PathBuf::from(value));
+                destination_mode = MuxDestinationMode::CreateNew;
+                index += 2;
+            }
             value if value.starts_with('-') => {
                 return Err(MuxCliError::InvalidArgument(format!(
                     "unknown mux option: {value}"
@@ -252,15 +307,45 @@ fn parse_args(args: &[String]) -> Result<ParsedMuxArgs, MuxCliError> {
     if tracks.is_empty() {
         return Err(MuxCliError::UsageRequested);
     }
-    let target = match (out_path, positional.len()) {
-        (Some(path), 0) => MuxCliTarget::Out(path),
-        (Some(_), _) => {
+    let target = match (out_path, init_out_path, media_out_path, positional.len()) {
+        (Some(path), None, None, 0) => MuxCliTarget::Out(path),
+        (Some(_), None, None, _) => {
             return Err(MuxCliError::InvalidArgument(
                 "--out <PATH> may not be used together with a positional DEST path".to_string(),
             ));
         }
-        (None, 1) => MuxCliTarget::Destination(positional.remove(0)),
-        (None, _) => return Err(MuxCliError::UsageRequested),
+        (Some(_), _, _, 0) => {
+            return Err(MuxCliError::InvalidArgument(
+                "--out <PATH> may not be used together with separate outputs".to_string(),
+            ));
+        }
+        (Some(_), _, _, _) => {
+            return Err(MuxCliError::InvalidArgument(
+                "--out <PATH> may not be used together with separate outputs or a positional DEST path".to_string(),
+            ));
+        }
+        (None, Some(init_path), Some(media_path), 0) => MuxCliTarget::Split {
+            init_path,
+            media_path,
+        },
+        (None, Some(_), None, _) => {
+            return Err(MuxCliError::InvalidArgument(
+                "--init_out requires --media_out".to_string(),
+            ));
+        }
+        (None, None, Some(_), _) => {
+            return Err(MuxCliError::InvalidArgument(
+                "--media_out requires --init_out".to_string(),
+            ));
+        }
+        (None, Some(_), Some(_), _) => {
+            return Err(MuxCliError::InvalidArgument(
+                "separate fragmented outputs may not be used with a positional DEST path"
+                    .to_string(),
+            ));
+        }
+        (None, None, None, 1) => MuxCliTarget::Destination(positional.remove(0)),
+        (None, None, None, _) => return Err(MuxCliError::UsageRequested),
     };
 
     let mut request = MuxRequest::new(tracks)
@@ -318,7 +403,31 @@ fn validate_mux_cli_request_shape(
 ) -> Result<(), MuxCliError> {
     let output_path = match target {
         MuxCliTarget::Destination(path) | MuxCliTarget::Out(path) => path.as_path(),
+        MuxCliTarget::Split { media_path, .. } => media_path.as_path(),
     };
+
+    if matches!(target, MuxCliTarget::Split { .. })
+        && !matches!(request.output_layout(), MuxOutputLayout::Fragmented)
+    {
+        return Err(MuxError::InvalidOutputLayout {
+            layout: request.output_layout().label(),
+            message: "separate fragmented output requires fragmented layout".to_string(),
+        }
+        .into());
+    }
+
+    if let MuxCliTarget::Split {
+        init_path,
+        media_path,
+    } = target
+        && absolute_cli_path(init_path)? == absolute_cli_path(media_path)?
+    {
+        return Err(MuxError::InvalidDestinationMode {
+            mode: MuxDestinationMode::CreateNew.label(),
+            message: "separate fragmented output paths must be distinct".to_string(),
+        }
+        .into());
+    }
 
     match (request.output_layout(), request.duration_mode()) {
         (MuxOutputLayout::Flat, Some(duration_mode)) => {
@@ -335,14 +444,6 @@ fn validate_mux_cli_request_shape(
             return Err(MuxError::InvalidOutputLayout {
                 layout: request.output_layout().label(),
                 message: "fragmented output requires exactly one of `--segment_duration` or `--fragment_duration`".to_string(),
-            }
-            .into());
-        }
-        (MuxOutputLayout::Fragmented, Some(_)) if request.tracks().len() != 1 => {
-            return Err(MuxError::InvalidOutputLayout {
-                layout: request.output_layout().label(),
-                message: "the current fragmented mux follow-on only supports single-track jobs"
-                    .to_string(),
             }
             .into());
         }
@@ -387,6 +488,16 @@ fn validate_mux_cli_request_shape(
             }
             .into());
         }
+        if let MuxCliTarget::Split { init_path, .. } = target {
+            let init_absolute = absolute_cli_path(init_path)?;
+            if input_absolute == init_absolute {
+                return Err(MuxError::OutputPathConflict {
+                    output: init_absolute,
+                    input: input_absolute,
+                }
+                .into());
+            }
+        }
     }
 
     Ok(())
@@ -414,9 +525,10 @@ fn is_existing_mp4_destination(path: &Path) -> bool {
 }
 
 impl MuxCliTarget {
-    fn output_path(&self) -> &Path {
+    fn primary_output_path(&self) -> &Path {
         match self {
             Self::Destination(path) | Self::Out(path) => path.as_path(),
+            Self::Split { media_path, .. } => media_path.as_path(),
         }
     }
 }

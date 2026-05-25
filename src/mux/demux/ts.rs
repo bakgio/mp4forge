@@ -63,7 +63,7 @@ use super::mp4v::{
 };
 #[cfg(feature = "async")]
 use super::mpeg2v::scan_mpeg2v_segmented_async;
-use super::mpeg2v::scan_mpeg2v_segmented_sync;
+use super::mpeg2v::{build_mpeg2v_sample_entry_box, scan_mpeg2v_segmented_sync};
 #[cfg(feature = "async")]
 use super::truehd::scan_truehd_segmented_async;
 use super::truehd::{build_truehd_sample_entry_box_with_btrt, scan_truehd_segmented_sync};
@@ -1425,50 +1425,6 @@ fn build_transport_timestamped_audio_samples(
         })
     }
 
-    fn intrinsically_rescaled_transport_audio_samples(
-        spec: &str,
-        label: &str,
-        samples: &[StagedSample],
-        source_timescale: u32,
-    ) -> Result<Vec<CandidateSample>, MuxError> {
-        let mut cumulative_source = 0_u64;
-        let mut cumulative_rescaled = 0_u64;
-        let mut rescaled = Vec::with_capacity(samples.len());
-        for sample in samples {
-            cumulative_source = cumulative_source
-                .checked_add(u64::from(sample.duration))
-                .ok_or(MuxError::LayoutOverflow(
-                    "transport-stream timestamped audio cumulative duration",
-                ))?;
-            let scaled = cumulative_source
-                .checked_mul(u64::from(TRANSPORT_VIDEO_TIMESCALE))
-                .ok_or(MuxError::LayoutOverflow(
-                    "transport-stream timestamped audio cumulative rescale",
-                ))?;
-            let next_rescaled = scaled.checked_add(u64::from(source_timescale) / 2).ok_or(
-                MuxError::LayoutOverflow("transport-stream timestamped audio cumulative rounding"),
-            )? / u64::from(source_timescale);
-            let duration =
-                next_rescaled
-                    .checked_sub(cumulative_rescaled)
-                    .ok_or(MuxError::LayoutOverflow(
-                        "transport-stream timestamped audio duration delta",
-                    ))?;
-            let duration = u32::try_from(duration).map_err(|_| {
-                MuxError::LayoutOverflow("transport-stream timestamped audio duration")
-            })?;
-            cumulative_rescaled = next_rescaled;
-            rescaled.push(rescaled_transport_audio_sample(
-                spec,
-                label,
-                sample,
-                duration,
-                source_timescale,
-            )?);
-        }
-        Ok(rescaled)
-    }
-
     fn floored_transport_audio_samples(
         spec: &str,
         label: &str,
@@ -1504,12 +1460,7 @@ fn build_transport_timestamped_audio_samples(
     if pts_anchors.is_empty() {
         return Ok((
             TRANSPORT_VIDEO_TIMESCALE,
-            intrinsically_rescaled_transport_audio_samples(
-                spec,
-                label,
-                &samples,
-                source_timescale,
-            )?,
+            floored_transport_audio_samples(spec, label, &samples, source_timescale)?,
         ));
     }
 
@@ -1530,12 +1481,7 @@ fn build_transport_timestamped_audio_samples(
     if samples.is_empty() || !anchors_by_offset.contains_key(&samples[0].data_offset) {
         return Ok((
             TRANSPORT_VIDEO_TIMESCALE,
-            intrinsically_rescaled_transport_audio_samples(
-                spec,
-                label,
-                &samples,
-                source_timescale,
-            )?,
+            floored_transport_audio_samples(spec, label, &samples, source_timescale)?,
         ));
     }
 
@@ -2139,8 +2085,7 @@ fn finalize_transport_mp3_track_sync(
         } else {
             expected = Some(descriptor);
         }
-        samples.push(CandidateSample {
-            source_index: usize::MAX,
+        samples.push(StagedSample {
             data_offset: offset,
             data_size: parsed.frame_length,
             duration: parsed.sample_duration,
@@ -2159,23 +2104,31 @@ fn finalize_transport_mp3_track_sync(
             spec: spec.to_string(),
             message: "transport stream input did not contain any MPEG audio frames".to_string(),
         })?;
+    let sample_entry_box = build_mp3_sample_entry_box(
+        sample_rate,
+        channel_count,
+        samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+    )?;
+    let (timescale, samples) = build_transport_timestamped_audio_samples(
+        spec,
+        "transport-stream MPEG audio",
+        samples,
+        sample_rate,
+        &builder.pts_anchors,
+    )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
             track_id: u32::from(builder.pid),
             kind: MuxTrackKind::Audio,
-            timescale: sample_rate,
+            timescale,
             language: *b"und",
             handler_name: direct_ingest_handler_name("mp3"),
             mux_policy: direct_ingest_mux_policy("mp3", MuxTrackKind::Audio),
             width: 0,
             height: 0,
-            sample_entry_box: build_mp3_sample_entry_box(
-                sample_rate,
-                channel_count,
-                samples
-                    .iter()
-                    .map(|sample| (sample.data_size, sample.duration)),
-            )?,
+            sample_entry_box,
             source_edit_media_time: None,
             samples,
         },
@@ -2383,6 +2336,17 @@ fn finalize_transport_mpeg2v_track_sync(
         parsed.timescale,
         &builder.pts_anchors,
     )?;
+    let sample_entry_box = build_mpeg2v_sample_entry_box(
+        parsed.width,
+        parsed.height,
+        &parsed.decoder_specific_info,
+        parsed.object_type_indication,
+        TRANSPORT_VIDEO_TIMESCALE,
+        transport_samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+        parsed.pixel_aspect_ratio,
+    )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
             track_id: u32::from(builder.pid),
@@ -2393,7 +2357,7 @@ fn finalize_transport_mpeg2v_track_sync(
             mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video),
             width: parsed.width,
             height: parsed.height,
-            sample_entry_box: parsed.sample_entry_box,
+            sample_entry_box,
             source_edit_media_time,
             samples: transport_samples,
         },
@@ -2901,8 +2865,7 @@ async fn finalize_transport_mp3_track_async(
         } else {
             expected = Some(descriptor);
         }
-        samples.push(CandidateSample {
-            source_index: usize::MAX,
+        samples.push(StagedSample {
             data_offset: offset,
             data_size: parsed.frame_length,
             duration: parsed.sample_duration,
@@ -2921,23 +2884,31 @@ async fn finalize_transport_mp3_track_async(
             spec: spec.to_string(),
             message: "transport stream input did not contain any MPEG audio frames".to_string(),
         })?;
+    let sample_entry_box = build_mp3_sample_entry_box(
+        sample_rate,
+        channel_count,
+        samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+    )?;
+    let (timescale, samples) = build_transport_timestamped_audio_samples(
+        spec,
+        "transport-stream MPEG audio",
+        samples,
+        sample_rate,
+        &builder.pts_anchors,
+    )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
             track_id: u32::from(builder.pid),
             kind: MuxTrackKind::Audio,
-            timescale: sample_rate,
+            timescale,
             language: *b"und",
             handler_name: direct_ingest_handler_name("mp3"),
             mux_policy: direct_ingest_mux_policy("mp3", MuxTrackKind::Audio),
             width: 0,
             height: 0,
-            sample_entry_box: build_mp3_sample_entry_box(
-                sample_rate,
-                channel_count,
-                samples
-                    .iter()
-                    .map(|sample| (sample.data_size, sample.duration)),
-            )?,
+            sample_entry_box,
             source_edit_media_time: None,
             samples,
         },
@@ -3155,6 +3126,17 @@ async fn finalize_transport_mpeg2v_track_async(
         parsed.timescale,
         &builder.pts_anchors,
     )?;
+    let sample_entry_box = build_mpeg2v_sample_entry_box(
+        parsed.width,
+        parsed.height,
+        &parsed.decoder_specific_info,
+        parsed.object_type_indication,
+        TRANSPORT_VIDEO_TIMESCALE,
+        transport_samples
+            .iter()
+            .map(|sample| (sample.data_size, sample.duration)),
+        parsed.pixel_aspect_ratio,
+    )?;
     Ok(CompositeTrackCandidate {
         track: TrackCandidate {
             track_id: u32::from(builder.pid),
@@ -3165,7 +3147,7 @@ async fn finalize_transport_mpeg2v_track_async(
             mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video),
             width: parsed.width,
             height: parsed.height,
-            sample_entry_box: parsed.sample_entry_box,
+            sample_entry_box,
             source_edit_media_time,
             samples: transport_samples,
         },
@@ -3323,18 +3305,20 @@ fn build_transport_mpeg2v_samples(
         ));
     }
 
-    let mut anchors_by_offset = BTreeMap::<u64, u64>::new();
-    for anchor in pts_anchors {
-        match anchors_by_offset.insert(anchor.sample_offset, anchor.pts_90k) {
-            Some(existing) if existing != anchor.pts_90k => {
-                return Err(MuxError::UnsupportedTrackImport {
-                    spec: spec.to_string(),
-                    message:
-                        "transport-stream MPEG-2 video carried multiple conflicting PES timestamps for the same sample boundary".to_string(),
-                });
-            }
-            _ => {}
-        }
+    if pts_anchors.len() == 1 && samples.len() > 1 {
+        let duration = TRANSPORT_VIDEO_TIMESCALE / 30;
+        let transport_samples = samples
+            .into_iter()
+            .map(|sample| CandidateSample {
+                source_index: usize::MAX,
+                data_offset: sample.data_offset,
+                data_size: sample.data_size,
+                duration,
+                composition_time_offset: 0,
+                is_sync_sample: sample.is_sync_sample,
+            })
+            .collect();
+        return Ok((transport_samples, None));
     }
 
     let mut transport_samples = Vec::with_capacity(samples.len());

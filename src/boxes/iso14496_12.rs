@@ -7919,6 +7919,82 @@ impl CodecBox for Sdtp {
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
 
+/// Sample padding bits box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Padb {
+    full_box: FullBoxState,
+    pub sample_count: u32,
+    pub padding_bits: Vec<u8>,
+}
+
+impl FieldHooks for Padb {
+    fn field_length(&self, name: &'static str) -> Option<u32> {
+        match name {
+            "PaddingBits" => usize::try_from(self.sample_count)
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .map(|count| count / 2)
+                .and_then(|count| field_len_bytes(count, 1)),
+            _ => None,
+        }
+    }
+
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "PaddingBits" => Some(quote_bytes(&self.padding_bits)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Padb, *b"padb");
+
+impl FieldValueRead for Padb {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "SampleCount" => Ok(FieldValue::Unsigned(u64::from(self.sample_count))),
+            "PaddingBits" => Ok(FieldValue::Bytes(self.padding_bits.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Padb {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("SampleCount", FieldValue::Unsigned(value)) => {
+                self.sample_count = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PaddingBits", FieldValue::Bytes(bytes)) => {
+                self.padding_bits = bytes;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Padb {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("SampleCount", 2, with_bit_width(32)),
+        codec_field!(
+            "PaddingBits",
+            3,
+            with_bit_width(8),
+            with_dynamic_length(),
+            as_bytes()
+        ),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+}
+
 /// Length-prefixed roll-distance description.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RollDistanceWithLength {
@@ -13645,7 +13721,9 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<EventMessageSampleEntry>(FourCc::from_bytes(*b"evte"));
     registry.register::<AlbumLoudnessInfo>(FourCc::from_bytes(*b"alou"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc1"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc2"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc3"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc4"));
     registry.register_contextual_any::<WaveAudioData>(
         FourCc::from_bytes(*b"enca"),
         is_quicktime_wave_audio_context,
@@ -13721,6 +13799,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsh"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsl"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsm"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dts-"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsx"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsy"));
     registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"iamf"));
@@ -13795,6 +13874,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Stts>(FourCc::from_bytes(*b"stts"));
     registry.register::<Styp>(FourCc::from_bytes(*b"styp"));
     registry.register::<Subs>(FourCc::from_bytes(*b"subs"));
+    registry.register::<Padb>(FourCc::from_bytes(*b"padb"));
     registry.register::<Tfdt>(FourCc::from_bytes(*b"tfdt"));
     registry.register::<Tfhd>(FourCc::from_bytes(*b"tfhd"));
     registry.register::<Tfra>(FourCc::from_bytes(*b"tfra"));

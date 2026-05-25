@@ -11,10 +11,10 @@ use crate::FourCc;
 use crate::boxes::av1::AV1CodecConfiguration;
 use crate::boxes::iso14496_12::{Colr, Pasp};
 
-use super::super::import::build_visual_sample_entry_box;
 use super::super::import::{
     SegmentedMuxSourceSegment, SegmentedMuxSourceSegmentData, SegmentedMuxSourceSpec, StagedSample,
 };
+use super::super::import::{build_btrt_from_sample_sizes, build_visual_sample_entry_box};
 use super::super::{MuxError, MuxRawCodec};
 #[cfg(feature = "async")]
 use super::container_common::read_segmented_bytes_async;
@@ -28,6 +28,8 @@ use super::ivf_common::{read_indexed_sample_sync, scan_ivf_video_file_sync};
 const AV1_COLOUR_TYPE_NCLX: FourCc = FourCc::from_bytes(*b"nclx");
 const OBU_SEQUENCE_HEADER: u8 = 1;
 const OBU_TEMPORAL_DELIMITER: u8 = 2;
+const OBU_FRAME_HEADER: u8 = 3;
+const OBU_FRAME: u8 = 6;
 const RAW_AV1_OBU_TIMESCALE: u32 = 1_200_000;
 const RAW_AV1_OBU_SAMPLE_DURATION: u32 = 48_000;
 const RAW_AV1_ANNEX_B_TIMESCALE: u32 = 25_000;
@@ -263,8 +265,19 @@ fn scan_av1_ivf_sync(path: &Path, spec: &str) -> Result<ParsedAv1Track, MuxError
         spec,
         "IVF AV1 sample payload is truncated",
     )?;
-    let (sample_entry_box, width, height) =
-        build_av1_sample_entry_box_from_sample(&first_sample, spec)?;
+    let first_sequence_header = parse_av1_sequence_header_from_sample(&first_sample, spec)?;
+    annotate_av1_ivf_sync_samples_sync(
+        path,
+        spec,
+        &mut indexed.samples,
+        first_sequence_header.reduced_still_picture_header,
+    )?;
+    let (sample_entry_box, width, height) = build_av1_sample_entry_box_from_sample(
+        &first_sample,
+        &indexed.samples,
+        indexed.timescale,
+        spec,
+    )?;
     Ok(ParsedAv1Track {
         width,
         height,
@@ -286,8 +299,20 @@ async fn scan_av1_ivf_async(path: &Path, spec: &str) -> Result<ParsedAv1Track, M
         "IVF AV1 sample payload is truncated",
     )
     .await?;
-    let (sample_entry_box, width, height) =
-        build_av1_sample_entry_box_from_sample(&first_sample, spec)?;
+    let first_sequence_header = parse_av1_sequence_header_from_sample(&first_sample, spec)?;
+    annotate_av1_ivf_sync_samples_async(
+        path,
+        spec,
+        &mut indexed.samples,
+        first_sequence_header.reduced_still_picture_header,
+    )
+    .await?;
+    let (sample_entry_box, width, height) = build_av1_sample_entry_box_from_sample(
+        &first_sample,
+        &indexed.samples,
+        indexed.timescale,
+        spec,
+    )?;
     Ok(ParsedAv1Track {
         width,
         height,
@@ -851,13 +876,24 @@ where
 
 fn build_av1_sample_entry_box_from_sample(
     sample: &[u8],
+    samples: &[StagedSample],
+    timescale: u32,
     spec: &str,
 ) -> Result<(Vec<u8>, u16, u16), MuxError> {
     let (config, colr, width, height) = parse_av1_sample_entry_details(sample, spec)?;
-    let child_boxes = vec![
+    let mut child_boxes = vec![
         super::super::mp4::encode_typed_box(&config, &[])?,
         super::super::mp4::encode_typed_box(&colr, &[])?,
     ];
+    if samples.len() > 1 {
+        let btrt = build_btrt_from_sample_sizes(
+            samples
+                .iter()
+                .map(|sample| (sample.data_size, sample.duration)),
+            timescale,
+        )?;
+        child_boxes.push(super::super::mp4::encode_typed_box(&btrt, &[])?);
+    }
     let sample_entry_box =
         build_visual_sample_entry_box(FourCc::from_bytes(*b"av01"), width, height, &child_boxes)?;
     Ok((sample_entry_box, width, height))
@@ -881,8 +917,8 @@ fn build_transport_av1_sample_entry_box_from_sample(
 fn build_raw_av1_sample_entry_box_from_sample(
     profile: RawAv1TrackProfile,
     sample: &[u8],
-    _samples: &[StagedSample],
-    _timescale: u32,
+    samples: &[StagedSample],
+    timescale: u32,
     spec: &str,
 ) -> Result<(Vec<u8>, u16, u16), MuxError> {
     let (config, colr, width, height) = parse_av1_sample_entry_details(sample, spec)?;
@@ -897,6 +933,15 @@ fn build_raw_av1_sample_entry_box_from_sample(
         )?);
     }
     child_boxes.push(super::super::mp4::encode_typed_box(&colr, &[])?);
+    if samples.len() > 1 {
+        let btrt = build_btrt_from_sample_sizes(
+            samples
+                .iter()
+                .map(|sample| (sample.data_size, sample.duration)),
+            timescale,
+        )?;
+        child_boxes.push(super::super::mp4::encode_typed_box(&btrt, &[])?);
+    }
     let sample_entry_box =
         build_visual_sample_entry_box(FourCc::from_bytes(*b"av01"), width, height, &child_boxes)?;
     Ok((sample_entry_box, width, height))
@@ -1066,6 +1111,99 @@ fn parse_av1_sample_entry_details(
     Ok((config, colr, sequence_header.width, sequence_header.height))
 }
 
+fn parse_av1_sequence_header_from_sample(
+    sample: &[u8],
+    spec: &str,
+) -> Result<ParsedAv1SequenceHeader, MuxError> {
+    find_av1_sequence_header_obu(sample, spec).map(|(_, sequence_header)| sequence_header)
+}
+
+fn av1_sample_is_sync(
+    sample: &[u8],
+    reduced_still_picture_header: bool,
+    spec: &str,
+) -> Result<bool, MuxError> {
+    let mut offset = 0usize;
+    while offset < sample.len() {
+        let header = *sample
+            .get(offset)
+            .ok_or_else(|| unsupported(spec, "AV1 OBU header is truncated"))?;
+        offset += 1;
+        if header >> 7 != 0 {
+            return Err(unsupported(
+                spec,
+                "AV1 OBU header used a non-zero forbidden bit",
+            ));
+        }
+        let obu_type = (header >> 3) & 0x0F;
+        let extension_flag = (header >> 2) & 0x01 != 0;
+        let has_size_field = (header >> 1) & 0x01 != 0;
+        if header & 0x01 != 0 {
+            return Err(unsupported(
+                spec,
+                "AV1 OBU header used a non-zero reserved bit",
+            ));
+        }
+        if extension_flag {
+            if sample.get(offset).is_none() {
+                return Err(unsupported(spec, "AV1 OBU extension header is truncated"));
+            }
+            offset += 1;
+        }
+        if !has_size_field {
+            return Err(unsupported(
+                spec,
+                "AV1 frame OBUs without explicit size fields are not supported",
+            ));
+        }
+        let (obu_size, leb_bytes) = read_leb128_from_slice(
+            sample.get(offset..).unwrap_or_default(),
+            spec,
+            "AV1 OBU size",
+            u64::try_from(offset).unwrap_or(u64::MAX),
+        )?;
+        offset = offset
+            .checked_add(leb_bytes)
+            .ok_or(MuxError::LayoutOverflow("AV1 OBU header size"))?;
+        let payload_end = offset
+            .checked_add(
+                usize::try_from(obu_size).map_err(|_| MuxError::LayoutOverflow("AV1 OBU size"))?,
+            )
+            .ok_or(MuxError::LayoutOverflow("AV1 OBU size"))?;
+        if payload_end > sample.len() {
+            return Err(unsupported(
+                spec,
+                "AV1 OBU payload overruns the sample payload",
+            ));
+        }
+        if obu_type == OBU_FRAME_HEADER || obu_type == OBU_FRAME {
+            return av1_frame_header_is_sync(
+                &sample[offset..payload_end],
+                reduced_still_picture_header,
+                spec,
+            );
+        }
+        offset = payload_end;
+    }
+    Ok(false)
+}
+
+fn av1_frame_header_is_sync(
+    payload: &[u8],
+    reduced_still_picture_header: bool,
+    spec: &str,
+) -> Result<bool, MuxError> {
+    if reduced_still_picture_header {
+        return Ok(true);
+    }
+    let mut bits = BitCursor::new(payload);
+    if bits.read_bit(spec, "AV1 show_existing_frame")? {
+        return Ok(false);
+    }
+    let frame_type = bits.read_bits_u8(2, spec, "AV1 frame_type")?;
+    Ok(frame_type == 0)
+}
+
 fn normalize_av1_ivf_sample_spans_sync(
     path: &Path,
     indexed: &mut super::ivf_common::IndexedIvfTrack,
@@ -1116,6 +1254,63 @@ async fn normalize_av1_ivf_sample_spans_async(
     )
     .await?;
     apply_av1_ivf_span_trim(&mut indexed.first_sample_span, trim, spec)?;
+    Ok(())
+}
+
+fn annotate_av1_ivf_sync_samples_sync(
+    path: &Path,
+    spec: &str,
+    samples: &mut [StagedSample],
+    reduced_still_picture_header: bool,
+) -> Result<(), MuxError> {
+    let mut file = File::open(path)?;
+    for sample in samples {
+        file.seek(SeekFrom::Start(sample.data_offset))?;
+        let mut sample_bytes = vec![
+            0_u8;
+            usize::try_from(sample.data_size).map_err(|_| {
+                MuxError::LayoutOverflow("IVF AV1 sample size")
+            })?
+        ];
+        file.read_exact(&mut sample_bytes).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                unsupported(spec, "IVF AV1 sample payload is truncated")
+            } else {
+                MuxError::Io(error)
+            }
+        })?;
+        sample.is_sync_sample =
+            av1_sample_is_sync(&sample_bytes, reduced_still_picture_header, spec)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn annotate_av1_ivf_sync_samples_async(
+    path: &Path,
+    spec: &str,
+    samples: &mut [StagedSample],
+    reduced_still_picture_header: bool,
+) -> Result<(), MuxError> {
+    let mut file = TokioFile::open(path).await?;
+    for sample in samples {
+        file.seek(SeekFrom::Start(sample.data_offset)).await?;
+        let mut sample_bytes = vec![
+            0_u8;
+            usize::try_from(sample.data_size).map_err(|_| {
+                MuxError::LayoutOverflow("IVF AV1 sample size")
+            })?
+        ];
+        file.read_exact(&mut sample_bytes).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                unsupported(spec, "IVF AV1 sample payload is truncated")
+            } else {
+                MuxError::Io(error)
+            }
+        })?;
+        sample.is_sync_sample =
+            av1_sample_is_sync(&sample_bytes, reduced_still_picture_header, spec)?;
+    }
     Ok(())
 }
 
@@ -1966,6 +2161,7 @@ struct ParsedAv1SequenceHeader {
     seq_profile: u8,
     seq_level_idx_0: u8,
     seq_tier_0: u8,
+    reduced_still_picture_header: bool,
     width: u16,
     height: u16,
     high_bitdepth: bool,
@@ -2115,11 +2311,11 @@ fn parse_av1_sequence_header(
         let seq_choose_screen_content_tools =
             bits.read_bit(spec, "AV1 seq_choose_screen_content_tools")?;
         let seq_force_screen_content_tools = if seq_choose_screen_content_tools {
-            None
+            2_u8
         } else {
-            Some(bits.read_bit(spec, "AV1 seq_force_screen_content_tools")?)
+            u8::from(bits.read_bit(spec, "AV1 seq_force_screen_content_tools")?)
         };
-        if seq_force_screen_content_tools == Some(true) {
+        if seq_force_screen_content_tools > 0 {
             let seq_choose_integer_mv = bits.read_bit(spec, "AV1 seq_choose_integer_mv")?;
             if !seq_choose_integer_mv {
                 bits.skip_bits(1, spec, "AV1 seq_force_integer_mv")?;
@@ -2143,6 +2339,7 @@ fn parse_av1_sequence_header(
         seq_profile,
         seq_level_idx_0,
         seq_tier_0,
+        reduced_still_picture_header,
         width,
         height,
         high_bitdepth: color_info.high_bitdepth,
