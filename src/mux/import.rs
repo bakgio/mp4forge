@@ -38,6 +38,11 @@ use crate::codec::{CodecBox, ImmutableBox, MutableBox};
 use crate::extract::{
     ExtractedBox, extract_box, extract_box_as, extract_box_bytes, extract_box_with_payload,
 };
+#[cfg(feature = "async")]
+use crate::extract::{
+    extract_box_as_async, extract_box_async, extract_box_bytes_async,
+    extract_box_with_payload_async,
+};
 use crate::header::BoxInfo as HeaderInfo;
 use crate::walk::BoxPath;
 
@@ -411,7 +416,7 @@ async fn mux_fragmented_to_paths_async_inner(
     init_path: &Path,
     media_path: &Path,
 ) -> Result<(), MuxError> {
-    validate_fragmented_split_paths(request, init_path, media_path)?;
+    validate_fragmented_split_paths_async(request, init_path, media_path).await?;
     let prepared = prepare_request_async(request, media_path).await?;
     let mut sources = Vec::with_capacity(prepared.source_specs.len());
     for spec in &prepared.source_specs {
@@ -462,7 +467,7 @@ async fn mux_into_path_async_inner(
     request: &MuxRequest,
     destination_path: &Path,
 ) -> Result<(), MuxError> {
-    if should_preserve_destination_mp4(destination_path) {
+    if should_preserve_destination_mp4_async(destination_path).await {
         let amended_request = build_destination_preserving_request(request, destination_path)?;
         let temp_path = create_update_temp_path(destination_path, request.destination_mode())?;
         let write_result = mux_to_path_async_inner(&amended_request, &temp_path).await;
@@ -500,6 +505,13 @@ struct ImportedFragmentBatch {
     base_decode_time: Option<u64>,
     samples: Vec<CandidateSample>,
     sample_description_indices: Vec<u32>,
+}
+
+struct ImportedFragmentSamples {
+    samples: Vec<CandidateSample>,
+    sample_description_indices: Vec<u32>,
+    first_base_decode_time: Option<u64>,
+    fragmented_decode_time_gaps: Vec<FragmentedDecodeTimeGap>,
 }
 
 #[derive(Clone)]
@@ -690,13 +702,13 @@ impl SegmentedSyncMuxSource {
             else {
                 break;
             };
-            let segment_logical_offset = self.segments[segment_index].logical_offset;
-            let segment_data = self.segments[segment_index].data.clone();
+            let segment = &self.segments[segment_index];
+            let segment_logical_offset = segment.logical_offset;
             let segment_offset =
                 usize::try_from(self.position - segment_logical_offset).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "logical offset overflow")
                 })?;
-            match segment_data {
+            match &segment.data {
                 SegmentedMuxSourceSegmentData::Prefix(prefix) => {
                     let available = prefix.len().saturating_sub(segment_offset);
                     let to_copy = available.min(buf.len() - written);
@@ -716,26 +728,36 @@ impl SegmentedSyncMuxSource {
                 SegmentedMuxSourceSegmentData::FileRange {
                     source_offset,
                     size,
-                } => self.read_file_range_into(
-                    &self.primary_path.clone(),
-                    source_offset,
-                    size,
-                    segment_offset,
-                    buf,
-                    &mut written,
-                )?,
+                } => {
+                    let source_offset = *source_offset;
+                    let size = *size;
+                    let primary_path = self.primary_path.clone();
+                    self.read_file_range_into(
+                        &primary_path,
+                        source_offset,
+                        size,
+                        segment_offset,
+                        buf,
+                        &mut written,
+                    )?
+                }
                 SegmentedMuxSourceSegmentData::ExternalFileRange {
                     path,
                     source_offset,
                     size,
-                } => self.read_file_range_into(
-                    &path,
-                    source_offset,
-                    size,
-                    segment_offset,
-                    buf,
-                    &mut written,
-                )?,
+                } => {
+                    let path = path.clone();
+                    let source_offset = *source_offset;
+                    let size = *size;
+                    self.read_file_range_into(
+                        &path,
+                        source_offset,
+                        size,
+                        segment_offset,
+                        buf,
+                        &mut written,
+                    )?
+                }
             }
         }
         Ok(written)
@@ -934,7 +956,7 @@ impl SegmentedAsyncMuxSource {
                     )));
                 }
             };
-        let to_read = available.min(buf.remaining()).min(8192);
+        let to_read = available.min(buf.remaining());
         let file_offset = source_offset + u64::try_from(segment_offset).unwrap();
         let should_seek =
             self.file_path.as_deref() != Some(path) || self.file_position != Some(file_offset);
@@ -974,33 +996,31 @@ impl SegmentedAsyncMuxSource {
             }
         }
 
-        let mut scratch = [0_u8; 8192];
-        let mut temp = ReadBuf::new(&mut scratch[..to_read]);
-        let poll = {
+        let read = {
+            let dst = buf.initialize_unfilled_to(to_read);
+            let mut limited = ReadBuf::new(dst);
             let file = match self.file_for_path_mut(path) {
                 Ok(file) => file,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            Pin::new(file).poll_read(cx, &mut temp)
-        };
-        match poll {
-            Poll::Ready(Ok(())) => {
-                let read = temp.filled().len();
-                if read == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated segmented mux source input",
-                    )));
-                }
-                buf.put_slice(temp.filled());
-                self.position += u64::try_from(read).unwrap();
-                self.file_path = Some(path.to_path_buf());
-                self.file_position = Some(file_offset + u64::try_from(read).unwrap());
-                Poll::Ready(Ok(()))
+            match Pin::new(file).poll_read(cx, &mut limited) {
+                Poll::Ready(Ok(())) => limited.filled().len(),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
+        };
+
+        if read == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated segmented mux source input",
+            )));
         }
+        buf.advance(read);
+        self.position += u64::try_from(read).unwrap();
+        self.file_path = Some(path.to_path_buf());
+        self.file_position = Some(file_offset + u64::try_from(read).unwrap());
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -4263,16 +4283,133 @@ async fn parse_mp4_source_async_with_selector<R>(
 where
     R: AsyncReadSeek,
 {
-    let file_size = reader.seek(SeekFrom::End(0)).await?;
+    let source_file_size = reader.seek(SeekFrom::End(0)).await?;
     reader.seek(SeekFrom::Start(0)).await?;
-    let mut bytes = vec![
-        0_u8;
-        usize::try_from(file_size)
-            .map_err(|_| MuxError::LayoutOverflow("async MP4 source size"))?
-    ];
-    reader.read_exact(&mut bytes).await?;
-    let mut cursor = Cursor::new(bytes);
-    parse_mp4_source_sync_with_selector(path, source_index, &mut cursor, selector)
+    let mut file_config = probe_file_config_async(reader).await?;
+    let mut source_movie_timescale = file_config.movie_timescale();
+    let mut compressed_root_cursor = None::<Cursor<Vec<u8>>>;
+    let fragmented_hint = !extract_box_async(reader, None, BoxPath::from([MOOF]))
+        .await?
+        .is_empty();
+    let mut track_infos = match extract_box_async(reader, None, BoxPath::from([MOOV, TRAK])).await {
+        Ok(track_infos) => track_infos,
+        Err(error) => {
+            if let Some(root_bytes) =
+                crate::probe::extract_compressed_movie_root_bytes_async(reader).await?
+            {
+                let mut cursor = Cursor::new(root_bytes);
+                let fallback_file_config = probe_file_config_sync(&mut cursor)?;
+                let fallback_track_infos =
+                    extract_box(&mut cursor, None, BoxPath::from([MOOV, TRAK]))?;
+                if !fallback_track_infos.is_empty() || fallback_file_config.movie_timescale() != 0 {
+                    file_config = fallback_file_config;
+                    source_movie_timescale = file_config.movie_timescale();
+                    compressed_root_cursor = Some(cursor);
+                    fallback_track_infos
+                } else {
+                    return Err(error.into());
+                }
+            } else {
+                return Err(error.into());
+            }
+        }
+    };
+    if compressed_root_cursor.is_none()
+        && (track_infos.is_empty() || source_movie_timescale == 0)
+        && let Some(root_bytes) =
+            crate::probe::extract_compressed_movie_root_bytes_async(reader).await?
+    {
+        let mut cursor = Cursor::new(root_bytes);
+        let fallback_file_config = probe_file_config_sync(&mut cursor)?;
+        let fallback_track_infos = extract_box(&mut cursor, None, BoxPath::from([MOOV, TRAK]))?;
+        if !fallback_track_infos.is_empty() || fallback_file_config.movie_timescale() != 0 {
+            file_config = fallback_file_config;
+            source_movie_timescale = file_config.movie_timescale();
+            track_infos = fallback_track_infos;
+            compressed_root_cursor = Some(cursor);
+        }
+    }
+    let mut tracks = Vec::new();
+    let mut carries_by_track_id = BTreeMap::new();
+    let mut source_segments = Vec::<SegmentedMuxSourceSegment>::new();
+    let mut uses_external_data_reference = false;
+    if let Some(metadata_reader) = compressed_root_cursor.as_mut() {
+        for trak_info in track_infos {
+            if let Some(selector) = selector
+                && !track_may_match_selector_sync(metadata_reader, &trak_info, selector)?
+            {
+                continue;
+            }
+            let components = extract_track_candidate_components_sync(
+                path,
+                fragmented_hint,
+                metadata_reader,
+                &trak_info,
+            )?;
+            if let Some(parsed_track) = finish_parsed_track_candidate_async(
+                path,
+                source_index,
+                fragmented_hint,
+                source_movie_timescale,
+                source_file_size,
+                reader,
+                components,
+            )
+            .await?
+            {
+                source_segments.extend(parsed_track.source_segments.iter().cloned());
+                uses_external_data_reference |= parsed_track.uses_external_data_reference;
+                carries_by_track_id.insert(parsed_track.track.track_id, parsed_track.carry);
+                tracks.push(parsed_track.track);
+            }
+        }
+    } else {
+        for trak_info in track_infos {
+            if let Some(selector) = selector
+                && !track_may_match_selector_async(reader, &trak_info, selector).await?
+            {
+                continue;
+            }
+            if let Some(parsed_track) = parse_track_candidate_async(
+                path,
+                source_index,
+                fragmented_hint,
+                source_movie_timescale,
+                source_file_size,
+                reader,
+                &trak_info,
+            )
+            .await?
+            {
+                source_segments.extend(parsed_track.source_segments.iter().cloned());
+                uses_external_data_reference |= parsed_track.uses_external_data_reference;
+                carries_by_track_id.insert(parsed_track.track.track_id, parsed_track.carry);
+                tracks.push(parsed_track.track);
+            }
+        }
+    }
+    populate_empty_fragmented_track_samples_async(
+        path,
+        source_index,
+        reader,
+        &mut tracks,
+        &mut carries_by_track_id,
+    )
+    .await?;
+    Ok(PathSourceMetadata {
+        file_config: Some(file_config),
+        tracks,
+        carries_by_track_id,
+        source_override: if uses_external_data_reference {
+            Some(build_mp4_import_source_override(
+                path,
+                source_segments,
+                source_file_size,
+            )?)
+        } else {
+            None
+        },
+    })
 }
 
 fn track_may_match_selector_sync<R>(
@@ -4320,6 +4457,55 @@ where
         .unwrap_or(true))
 }
 
+#[cfg(feature = "async")]
+async fn track_may_match_selector_async<R>(
+    reader: &mut R,
+    trak_info: &HeaderInfo,
+    selector: MuxMp4TrackSelector,
+) -> Result<bool, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    match selector {
+        MuxMp4TrackSelector::TrackId { track_id } => {
+            let tkhd = extract_required_single_as_async::<_, Tkhd>(
+                reader,
+                trak_info,
+                BoxPath::from([TKHD]),
+                "tkhd",
+            )
+            .await?;
+            Ok(tkhd.track_id == track_id)
+        }
+        MuxMp4TrackSelector::Audio { .. } => {
+            track_matches_handler_selector_async(reader, trak_info, &[SOUN]).await
+        }
+        MuxMp4TrackSelector::Video => {
+            track_matches_handler_selector_async(reader, trak_info, &[VIDE]).await
+        }
+        MuxMp4TrackSelector::Text { .. } => {
+            track_matches_handler_selector_async(reader, trak_info, &[TEXT, SUBT, SUBP]).await
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+async fn track_matches_handler_selector_async<R>(
+    reader: &mut R,
+    trak_info: &HeaderInfo,
+    accepted_handler_types: &[FourCc],
+) -> Result<bool, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let hdlr =
+        extract_optional_single_as_async::<_, Hdlr>(reader, trak_info, BoxPath::from([MDIA, HDLR]))
+            .await?;
+    Ok(hdlr
+        .map(|hdlr| accepted_handler_types.contains(&hdlr.handler_type))
+        .unwrap_or(true))
+}
+
 fn populate_empty_fragmented_track_samples_sync<R>(
     path: &Path,
     source_index: usize,
@@ -4347,12 +4533,7 @@ where
     for track in tracks.iter_mut().filter(|track| track.samples.is_empty()) {
         let reconcile_fragment_durations =
             sample_entry_box_type(&track.sample_entry_box) != Some(FourCc::from_bytes(*b"ac-3"));
-        let (
-            samples,
-            sample_description_indices,
-            first_base_decode_time,
-            fragmented_decode_time_gaps,
-        ) = collect_fragment_candidate_samples_sync(
+        let fragment_samples = collect_fragment_candidate_samples_sync(
             path,
             source_index,
             reader,
@@ -4361,17 +4542,17 @@ where
             trex_by_track_id.get(&track.track_id),
             reconcile_fragment_durations,
         )?;
-        if !samples.is_empty() {
-            if let Some(first_base_decode_time) = first_base_decode_time
+        if !fragment_samples.samples.is_empty() {
+            if let Some(first_base_decode_time) = fragment_samples.first_base_decode_time
                 && let Some(mut header_policy) = track.mux_policy.header_policy()
             {
                 header_policy.source_media_decode_time_offset = Some(first_base_decode_time);
                 track.mux_policy = track.mux_policy.with_header_policy(header_policy);
             }
             let carry = carries_by_track_id.entry(track.track_id).or_default();
-            carry.sample_description_indices = Some(sample_description_indices);
-            carry.fragmented_decode_time_gaps = fragmented_decode_time_gaps;
-            track.samples = samples;
+            carry.sample_description_indices = Some(fragment_samples.sample_description_indices);
+            carry.fragmented_decode_time_gaps = fragment_samples.fragmented_decode_time_gaps;
+            track.samples = fragment_samples.samples;
         }
     }
     Ok(())
@@ -4385,15 +4566,7 @@ fn collect_fragment_candidate_samples_sync<R>(
     moof_infos: &[HeaderInfo],
     trex: Option<&Trex>,
     reconcile_fragment_durations: bool,
-) -> Result<
-    (
-        Vec<CandidateSample>,
-        Vec<u32>,
-        Option<u64>,
-        Vec<FragmentedDecodeTimeGap>,
-    ),
-    MuxError,
->
+) -> Result<ImportedFragmentSamples, MuxError>
 where
     R: Read + Seek,
 {
@@ -4465,12 +4638,161 @@ where
         sample_description_indices.extend(batch.sample_description_indices);
         samples.extend(batch.samples);
     }
-    Ok((
+    Ok(ImportedFragmentSamples {
         samples,
         sample_description_indices,
         first_base_decode_time,
         fragmented_decode_time_gaps,
-    ))
+    })
+}
+
+#[cfg(feature = "async")]
+async fn populate_empty_fragmented_track_samples_async<R>(
+    path: &Path,
+    source_index: usize,
+    reader: &mut R,
+    tracks: &mut [TrackCandidate],
+    carries_by_track_id: &mut BTreeMap<u32, ImportedMp4TrackCarry>,
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+{
+    if tracks.iter().all(|track| !track.samples.is_empty()) {
+        return Ok(());
+    }
+
+    let moof_infos = extract_box_async(reader, None, BoxPath::from([MOOF])).await?;
+    if moof_infos.is_empty() {
+        return Ok(());
+    }
+    let trex_by_track_id =
+        extract_box_as_async::<_, Trex>(reader, None, BoxPath::from([MOOV, MVEX, TREX]))
+            .await?
+            .into_iter()
+            .map(|trex| (trex.track_id, trex))
+            .collect::<BTreeMap<_, _>>();
+
+    for track in tracks.iter_mut().filter(|track| track.samples.is_empty()) {
+        let reconcile_fragment_durations =
+            sample_entry_box_type(&track.sample_entry_box) != Some(FourCc::from_bytes(*b"ac-3"));
+        let fragment_samples = collect_fragment_candidate_samples_async(
+            path,
+            source_index,
+            reader,
+            track.track_id,
+            &moof_infos,
+            trex_by_track_id.get(&track.track_id),
+            reconcile_fragment_durations,
+        )
+        .await?;
+        if !fragment_samples.samples.is_empty() {
+            if let Some(first_base_decode_time) = fragment_samples.first_base_decode_time
+                && let Some(mut header_policy) = track.mux_policy.header_policy()
+            {
+                header_policy.source_media_decode_time_offset = Some(first_base_decode_time);
+                track.mux_policy = track.mux_policy.with_header_policy(header_policy);
+            }
+            let carry = carries_by_track_id.entry(track.track_id).or_default();
+            carry.sample_description_indices = Some(fragment_samples.sample_description_indices);
+            carry.fragmented_decode_time_gaps = fragment_samples.fragmented_decode_time_gaps;
+            track.samples = fragment_samples.samples;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn collect_fragment_candidate_samples_async<R>(
+    path: &Path,
+    source_index: usize,
+    reader: &mut R,
+    track_id: u32,
+    moof_infos: &[HeaderInfo],
+    trex: Option<&Trex>,
+    reconcile_fragment_durations: bool,
+) -> Result<ImportedFragmentSamples, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let mut fragment_batches = Vec::<ImportedFragmentBatch>::new();
+    for moof_info in moof_infos {
+        let traf_infos = extract_box_async(reader, Some(moof_info), BoxPath::from([TRAF])).await?;
+        for traf_info in traf_infos {
+            let tfhd = extract_required_single_as_async::<_, Tfhd>(
+                reader,
+                &traf_info,
+                BoxPath::from([TFHD]),
+                "tfhd",
+            )
+            .await?;
+            if tfhd.track_id != track_id {
+                continue;
+            }
+            let tfdt = extract_optional_single_as_async::<_, Tfdt>(
+                reader,
+                &traf_info,
+                BoxPath::from([FourCc::from_bytes(*b"tfdt")]),
+            )
+            .await?;
+            let truns =
+                extract_box_as_async::<_, Trun>(reader, Some(&traf_info), BoxPath::from([TRUN]))
+                    .await?;
+            let trun_infos =
+                extract_box_async(reader, Some(&traf_info), BoxPath::from([TRUN])).await?;
+            if tfdt.is_none() && truns.iter().any(|trun| trun.sample_count != 0) {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: path.display().to_string(),
+                    message: format!(
+                        "track {track_id} has a non-empty fragmented run without tfdt decode time"
+                    ),
+                });
+            }
+            let context = FragmentRunContext {
+                path,
+                source_index,
+                track_id,
+                moof_offset: moof_info.offset(),
+                trex,
+            };
+            let mut fragment_samples = Vec::new();
+            let mut fragment_sample_description_indices = Vec::new();
+            collect_fragment_candidate_samples_from_runs(
+                &context,
+                &tfhd,
+                &truns,
+                &trun_infos,
+                &mut fragment_samples,
+                &mut fragment_sample_description_indices,
+            )?;
+            if !fragment_samples.is_empty() {
+                fragment_batches.push(ImportedFragmentBatch {
+                    base_decode_time: tfdt.as_ref().map(fragment_tfdt_base_decode_time),
+                    samples: fragment_samples,
+                    sample_description_indices: fragment_sample_description_indices,
+                });
+            }
+        }
+    }
+    if reconcile_fragment_durations {
+        reconcile_imported_fragment_sample_durations(path, track_id, &mut fragment_batches)?;
+    }
+    let first_base_decode_time = fragment_batches
+        .iter()
+        .find_map(|batch| batch.base_decode_time);
+    let fragmented_decode_time_gaps =
+        collect_fragmented_decode_time_gaps(path, track_id, &fragment_batches)?;
+    let mut samples = Vec::new();
+    let mut sample_description_indices = Vec::new();
+    for batch in fragment_batches {
+        sample_description_indices.extend(batch.sample_description_indices);
+        samples.extend(batch.samples);
+    }
+    Ok(ImportedFragmentSamples {
+        samples,
+        sample_description_indices,
+        first_base_decode_time,
+        fragmented_decode_time_gaps,
+    })
 }
 
 fn fragment_tfdt_base_decode_time(tfdt: &Tfdt) -> u64 {
@@ -4993,6 +5315,33 @@ where
     )
 }
 
+#[cfg(feature = "async")]
+async fn parse_track_candidate_async<R>(
+    path: &Path,
+    source_index: usize,
+    fragmented_hint: bool,
+    source_movie_timescale: u32,
+    source_file_size: u64,
+    reader: &mut R,
+    trak_info: &HeaderInfo,
+) -> Result<Option<ParsedMp4Track>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let components =
+        extract_track_candidate_components_async(path, fragmented_hint, reader, trak_info).await?;
+    finish_parsed_track_candidate_async(
+        path,
+        source_index,
+        fragmented_hint,
+        source_movie_timescale,
+        source_file_size,
+        reader,
+        components,
+    )
+    .await
+}
+
 fn extract_track_candidate_components_sync<R>(
     path: &Path,
     fragmented_hint: bool,
@@ -5185,6 +5534,217 @@ where
     })
 }
 
+#[cfg(feature = "async")]
+async fn extract_track_candidate_components_async<R>(
+    path: &Path,
+    fragmented_hint: bool,
+    reader: &mut R,
+    trak_info: &HeaderInfo,
+) -> Result<ParsedTrackCandidateComponents, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let tkhd = extract_required_single_as_async::<_, Tkhd>(
+        reader,
+        trak_info,
+        BoxPath::from([TKHD]),
+        "tkhd",
+    )
+    .await?;
+    let mdhd = extract_required_single_as_async::<_, Mdhd>(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MDHD]),
+        "mdhd",
+    )
+    .await?;
+    let hdlr =
+        extract_optional_single_as_async::<_, Hdlr>(reader, trak_info, BoxPath::from([MDIA, HDLR]))
+            .await?;
+    let stsd_info = extract_required_single_info_async(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MINF, STBL, STSD]),
+        "stsd",
+    )
+    .await?;
+    let stbl_info = extract_required_single_info_async(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MINF, STBL]),
+        "stbl",
+    )
+    .await?;
+    let stsd = extract_required_single_as_async::<_, crate::boxes::iso14496_12::Stsd>(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MINF, STBL, STSD]),
+        "stsd",
+    )
+    .await?;
+    let (mut sample_entries, sample_entry_boxes) =
+        extract_stsd_sample_entries_async(path, reader, &stsd_info, &stsd, tkhd.track_id).await?;
+    let data_references =
+        extract_data_references_async(path, reader, trak_info, tkhd.track_id).await?;
+    let sample_entry = sample_entries.remove(0);
+    let sample_entry_box =
+        sample_entry_boxes
+            .first()
+            .cloned()
+            .ok_or_else(|| MuxError::UnsupportedTrackImport {
+                spec: path.display().to_string(),
+                message: format!("track {} is missing a sample-entry payload", tkhd.track_id),
+            })?;
+    let elst =
+        extract_optional_single_as_async::<_, Elst>(reader, trak_info, BoxPath::from([EDTS, ELST]))
+            .await?;
+    let elst_box_size = extract_box_async(reader, Some(trak_info), BoxPath::from([EDTS, ELST]))
+        .await?
+        .into_iter()
+        .next()
+        .map(|info| info.size());
+    let sgpd = extract_optional_single_as_async::<_, Sgpd>(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MINF, STBL, FourCc::from_bytes(*b"sgpd")]),
+    )
+    .await?;
+    let sbgp = extract_optional_single_as_async::<_, Sbgp>(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MINF, STBL, FourCc::from_bytes(*b"sbgp")]),
+    )
+    .await?;
+    let preserved_flat_stbl_boxes =
+        extract_preserved_flat_stbl_boxes_async(reader, &stbl_info).await?;
+    let mut preserved_flat_trak_boxes =
+        extract_box_bytes_async(reader, Some(trak_info), BoxPath::from([EDTS])).await?;
+    preserved_flat_trak_boxes
+        .extend(extract_box_bytes_async(reader, Some(trak_info), BoxPath::from([TREF])).await?);
+    preserved_flat_trak_boxes
+        .extend(extract_box_bytes_async(reader, Some(trak_info), BoxPath::from([UDTA])).await?);
+
+    let (stts, ctts, stsc, sample_sizes, stco, co64, stss) = if fragmented_hint {
+        (None, None, None, None, None, None, None)
+    } else {
+        let stsz = extract_optional_single_as_async::<_, Stsz>(
+            reader,
+            trak_info,
+            BoxPath::from([MDIA, MINF, STBL, STSZ]),
+        )
+        .await?;
+        let stz2_boxes =
+            extract_box_bytes_async(reader, Some(&stbl_info), BoxPath::from([STZ2])).await?;
+        let sample_sizes = match (stsz, stz2_boxes.as_slice()) {
+            (Some(stsz), []) => expand_sample_sizes(&stsz, path, tkhd.track_id)?,
+            (None, [stz2_bytes]) => parse_compact_sample_sizes(stz2_bytes, path, tkhd.track_id)?,
+            (Some(_), [_]) => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: path.display().to_string(),
+                    message: format!(
+                        "track {} exposes both stsz and stz2 sample size tables",
+                        tkhd.track_id
+                    ),
+                });
+            }
+            (Some(_), stz2_boxes) => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: path.display().to_string(),
+                    message: format!(
+                        "track {} exposes stsz plus {} compact sample size tables",
+                        tkhd.track_id,
+                        stz2_boxes.len()
+                    ),
+                });
+            }
+            (None, []) => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: path.display().to_string(),
+                    message: format!("track {} is missing a sample size table", tkhd.track_id),
+                });
+            }
+            (None, stz2_boxes) => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: path.display().to_string(),
+                    message: format!(
+                        "track {} exposes {} compact sample size tables",
+                        tkhd.track_id,
+                        stz2_boxes.len()
+                    ),
+                });
+            }
+        };
+        (
+            Some(
+                extract_required_single_as_async::<_, Stts>(
+                    reader,
+                    trak_info,
+                    BoxPath::from([MDIA, MINF, STBL, STTS]),
+                    "stts",
+                )
+                .await?,
+            ),
+            extract_optional_single_as_async::<_, Ctts>(
+                reader,
+                trak_info,
+                BoxPath::from([MDIA, MINF, STBL, CTTS]),
+            )
+            .await?,
+            Some(
+                extract_required_single_as_async::<_, Stsc>(
+                    reader,
+                    trak_info,
+                    BoxPath::from([MDIA, MINF, STBL, STSC]),
+                    "stsc",
+                )
+                .await?,
+            ),
+            Some(sample_sizes),
+            extract_optional_single_as_async::<_, Stco>(
+                reader,
+                trak_info,
+                BoxPath::from([MDIA, MINF, STBL, STCO]),
+            )
+            .await?,
+            extract_optional_single_as_async::<_, Co64>(
+                reader,
+                trak_info,
+                BoxPath::from([MDIA, MINF, STBL, CO64]),
+            )
+            .await?,
+            extract_optional_single_as_async::<_, Stss>(
+                reader,
+                trak_info,
+                BoxPath::from([MDIA, MINF, STBL, STSS]),
+            )
+            .await?,
+        )
+    };
+
+    Ok(ParsedTrackCandidateComponents {
+        tkhd,
+        mdhd,
+        hdlr,
+        sample_entry,
+        sample_entry_box,
+        sample_entry_boxes,
+        data_references,
+        elst,
+        elst_box_size,
+        sample_roll_distance: extracted_sample_roll_distance(sgpd.as_ref()),
+        emit_roll_sbgp: extracted_roll_sbgp_present(sbgp.as_ref()),
+        preserved_flat_stbl_boxes,
+        preserved_flat_trak_boxes,
+        stts,
+        ctts,
+        stsc,
+        sample_sizes,
+        stco,
+        co64,
+        stss,
+    })
+}
+
 fn finish_parsed_track_candidate_sync<R>(
     path: &Path,
     source_index: usize,
@@ -5262,6 +5822,87 @@ where
         components.preserved_flat_stbl_boxes,
         components.preserved_flat_trak_boxes,
     )
+}
+
+#[cfg(feature = "async")]
+async fn finish_parsed_track_candidate_async<R>(
+    path: &Path,
+    source_index: usize,
+    fragmented_hint: bool,
+    source_movie_timescale: u32,
+    source_file_size: u64,
+    reader: &mut R,
+    components: ParsedTrackCandidateComponents,
+) -> Result<Option<ParsedMp4Track>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    if fragmented_hint {
+        return build_track_candidate_from_components(
+            path,
+            components.tkhd,
+            components.mdhd,
+            components.hdlr,
+            &components.sample_entry,
+            components.sample_entry_box,
+            components.sample_entry_boxes,
+            components.elst,
+            false,
+            source_movie_timescale,
+            components.sample_roll_distance,
+            components.emit_roll_sbgp,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            components.preserved_flat_stbl_boxes,
+            components.preserved_flat_trak_boxes,
+            Vec::new(),
+        );
+    }
+
+    let track_id = components.tkhd.track_id;
+    parse_track_candidate_from_components_async(
+        path,
+        reader,
+        source_index,
+        components.tkhd,
+        components.mdhd,
+        components.hdlr,
+        &components.sample_entry,
+        components.sample_entry_box,
+        components.sample_entry_boxes,
+        components.data_references,
+        components.stts.ok_or(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!("track {track_id} is missing stts timing entries"),
+        })?,
+        components.ctts,
+        components.elst,
+        components.elst_box_size,
+        source_movie_timescale,
+        source_file_size,
+        components.sample_roll_distance,
+        components.emit_roll_sbgp,
+        components.stsc.ok_or(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!("track {track_id} is missing stsc chunk entries"),
+        })?,
+        components
+            .sample_sizes
+            .ok_or(MuxError::UnsupportedTrackImport {
+                spec: path.display().to_string(),
+                message: format!("track {track_id} is missing sample sizes"),
+            })?,
+        components.stco,
+        components.co64,
+        components.stss,
+        components.preserved_flat_stbl_boxes,
+        components.preserved_flat_trak_boxes,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5415,6 +6056,227 @@ where
         &mut sample_description_indices,
         &mut sync_samples,
     )?;
+    let sample_data_references = sample_data_references_for_description_indices(
+        path,
+        tkhd.track_id,
+        &sample_entry_boxes,
+        &data_references,
+        &sample_description_indices,
+    )?;
+    let resolved_sample_offsets = resolved_sample_logical_offsets(
+        &sample_offsets,
+        &sample_sizes,
+        &sample_data_references,
+        source_file_size,
+    )?;
+    let source_segments = sample_source_segments(
+        path,
+        tkhd.track_id,
+        &resolved_sample_offsets,
+        &sample_offsets,
+        &sample_sizes,
+        &sample_data_references,
+    )?;
+
+    let mut samples = Vec::with_capacity(sample_sizes.len());
+    for index in 0..sample_sizes.len() {
+        samples.push(CandidateSample {
+            source_index,
+            data_offset: resolved_sample_offsets[index],
+            data_size: sample_sizes[index],
+            duration: sample_durations[index],
+            composition_time_offset: composition_offsets[index],
+            is_sync_sample: sync_samples[index],
+        });
+    }
+
+    let mut parsed = build_track_candidate_from_components(
+        path,
+        tkhd,
+        mdhd,
+        hdlr,
+        sample_entry,
+        sample_entry_box,
+        sample_entry_boxes,
+        elst,
+        synthesized_speex_elst_tail,
+        source_movie_timescale,
+        sample_roll_distance,
+        emit_roll_sbgp,
+        stss.as_ref()
+            .is_some_and(|stss| stss.entry_count == 1 && stss.sample_number.as_slice() == [1]),
+        stts.entry_count == 0,
+        Some(flat_chunk_sample_counts),
+        Some(stsc),
+        Some(sample_description_indices),
+        source_sync_samples,
+        preserved_flat_stbl_boxes,
+        preserved_flat_trak_boxes,
+        samples,
+    )?;
+    if let Some(parsed) = parsed.as_mut() {
+        parsed.source_segments = source_segments;
+        parsed.uses_external_data_reference = uses_external_data_reference;
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
+async fn parse_track_candidate_from_components_async<R>(
+    path: &Path,
+    reader: &mut R,
+    source_index: usize,
+    tkhd: Tkhd,
+    mdhd: Mdhd,
+    hdlr: Option<Hdlr>,
+    sample_entry: &ExtractedBox,
+    sample_entry_box: Vec<u8>,
+    sample_entry_boxes: Vec<Vec<u8>>,
+    data_references: Vec<ImportedDataReference>,
+    stts: Stts,
+    ctts: Option<Ctts>,
+    elst: Option<Elst>,
+    elst_box_size: Option<u64>,
+    source_movie_timescale: u32,
+    source_file_size: u64,
+    sample_roll_distance: Option<i16>,
+    emit_roll_sbgp: bool,
+    stsc: Stsc,
+    mut sample_sizes: Vec<u32>,
+    stco: Option<Stco>,
+    co64: Option<Co64>,
+    stss: Option<Stss>,
+    preserved_flat_stbl_boxes: Vec<Vec<u8>>,
+    preserved_flat_trak_boxes: Vec<Vec<u8>>,
+) -> Result<Option<ParsedMp4Track>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let sample_entry_type = sample_entry.info.box_type();
+    let mut sample_durations =
+        expand_sample_durations(&stts, sample_sizes.len(), path, tkhd.track_id)?;
+    let mut composition_offsets =
+        expand_composition_offsets(ctts.as_ref(), sample_sizes.len(), path, tkhd.track_id)?;
+    let chunk_offsets = select_chunk_offsets(stco.as_ref(), co64.as_ref(), path, tkhd.track_id)?;
+    let mut flat_chunk_sample_counts =
+        expand_chunk_sample_counts(&stsc, chunk_offsets.len(), path, tkhd.track_id)?;
+    let (mut sample_offsets, mut sample_description_indices) =
+        expand_sample_offsets_and_description_indices(
+            &stsc,
+            &sample_sizes,
+            &chunk_offsets,
+            path,
+            tkhd.track_id,
+        )?;
+    let mut sync_samples = expand_sync_samples(
+        stss.as_ref(),
+        sample_entry_type,
+        sample_sizes.len(),
+        path,
+        tkhd.track_id,
+    )?;
+    let mut source_sync_samples = stss.as_ref().map(|_| sync_samples.clone());
+    let sample_data_references = sample_data_references_for_description_indices(
+        path,
+        tkhd.track_id,
+        &sample_entry_boxes,
+        &data_references,
+        &sample_description_indices,
+    )?;
+    let uses_external_data_reference = sample_data_references
+        .iter()
+        .any(|reference| matches!(reference, ImportedDataReference::LocalFile(_)));
+
+    if uses_external_data_reference {
+        validate_imported_sample_data_references_async(
+            path,
+            tkhd.track_id,
+            &sample_offsets,
+            &sample_sizes,
+            &sample_data_references,
+            source_file_size,
+        )
+        .await?;
+    } else {
+        let available_sample_count = imported_sample_prefix_len_within_source_file(
+            &sample_offsets,
+            &sample_sizes,
+            source_file_size,
+        );
+        if available_sample_count < sample_sizes.len() {
+            sample_sizes.truncate(available_sample_count);
+            sample_durations.truncate(available_sample_count);
+            composition_offsets.truncate(available_sample_count);
+            sample_offsets.truncate(available_sample_count);
+            sample_description_indices.truncate(available_sample_count);
+            sync_samples.truncate(available_sample_count);
+            if let Some(source_sync_samples) = source_sync_samples.as_mut() {
+                source_sync_samples.truncate(available_sample_count);
+            }
+            trim_flat_chunk_sample_counts_to_sample_count(
+                &mut flat_chunk_sample_counts,
+                available_sample_count,
+            )?;
+        }
+
+        if should_drop_truncated_terminal_imported_sample(
+            sample_offsets.last().copied(),
+            sample_sizes.last().copied(),
+            source_file_size,
+        ) {
+            sample_sizes.pop();
+            sample_durations.pop();
+            composition_offsets.pop();
+            sample_offsets.pop();
+            sample_description_indices.pop();
+            sync_samples.pop();
+            if let Some(source_sync_samples) = source_sync_samples.as_mut() {
+                source_sync_samples.pop();
+            }
+            if let Some(last_chunk_sample_count) = flat_chunk_sample_counts.last_mut() {
+                if *last_chunk_sample_count > 1 {
+                    *last_chunk_sample_count -= 1;
+                } else {
+                    flat_chunk_sample_counts.pop();
+                }
+            }
+        }
+    }
+    if !uses_external_data_reference {
+        supplement_imported_mp4_avc_sync_samples_async(
+            reader,
+            sample_entry_type,
+            &sample_entry_box,
+            stss.as_ref(),
+            &sample_offsets,
+            &sample_sizes,
+            &mut sync_samples,
+        )
+        .await?;
+        supplement_imported_mp4_hevc_sync_samples_async(
+            reader,
+            sample_entry_type,
+            &sample_entry_box,
+            &sample_offsets,
+            &sample_sizes,
+            &mut sync_samples,
+        )
+        .await?;
+    }
+    let synthesized_speex_elst_tail = synthesize_imported_speex_elst_tail_async(
+        reader,
+        sample_entry,
+        elst.as_ref(),
+        elst_box_size,
+        &mut sample_offsets,
+        &mut sample_sizes,
+        &mut sample_durations,
+        &mut composition_offsets,
+        &mut sample_description_indices,
+        &mut sync_samples,
+    )
+    .await?;
     let sample_data_references = sample_data_references_for_description_indices(
         path,
         tkhd.track_id,
@@ -5769,6 +6631,56 @@ fn validate_imported_sample_data_references(
     Ok(())
 }
 
+#[cfg(feature = "async")]
+async fn validate_imported_sample_data_references_async(
+    path: &Path,
+    track_id: u32,
+    sample_offsets: &[u64],
+    sample_sizes: &[u32],
+    data_references: &[ImportedDataReference],
+    source_file_size: u64,
+) -> Result<(), MuxError> {
+    for ((sample_offset, sample_size), data_reference) in sample_offsets
+        .iter()
+        .copied()
+        .zip(sample_sizes.iter().copied())
+        .zip(data_references.iter())
+    {
+        let sample_end = sample_offset
+            .checked_add(u64::from(sample_size))
+            .ok_or(MuxError::LayoutOverflow("data-reference sample range"))?;
+        match data_reference {
+            ImportedDataReference::SelfContained => {
+                if sample_end > source_file_size {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: path.display().to_string(),
+                        message: format!(
+                            "track {track_id} has a self-contained sample outside the source file"
+                        ),
+                    });
+                }
+            }
+            ImportedDataReference::LocalFile(reference_path) => {
+                let size = tokio::fs::metadata(reference_path)
+                    .await
+                    .map_err(|error| {
+                        mux_io_at_path("inspect referenced media", reference_path, error)
+                    })?
+                    .len();
+                if sample_end > size {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: path.display().to_string(),
+                        message: format!(
+                            "track {track_id} has a referenced sample outside the referenced media"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_mp4_import_source_override(
     path: &Path,
     mut segments: Vec<SegmentedMuxSourceSegment>,
@@ -5886,6 +6798,107 @@ where
         Some(&sample_entry.info),
         BoxPath::from([FourCc::from_bytes(*b"skip")]),
     )?
+    .into_iter()
+    .next();
+    let Some(skip_info) = skip_info else {
+        return Ok(false);
+    };
+    let skip_size = u32::try_from(skip_info.size())
+        .map_err(|_| MuxError::LayoutOverflow("imported speex skip sample size"))?;
+    let synthetic_edit_entry_count = usize::try_from((u64::from(trailing_bytes) - 8) / 12)
+        .map_err(|_| MuxError::LayoutOverflow("imported speex synthetic edit count"))?;
+    if synthetic_edit_entry_count < 2 {
+        return Ok(false);
+    }
+
+    let removed_terminal_sample_offset = sample_offsets.pop();
+    let removed_terminal_sample_size = sample_sizes.pop();
+    let removed_terminal_sample_description_index = sample_description_indices.pop();
+    sample_durations.pop();
+    composition_offsets.pop();
+    sync_samples.pop();
+
+    let synthetic_sample_offset = removed_terminal_sample_offset.unwrap_or(skip_info.offset());
+    let synthetic_sample_size = removed_terminal_sample_size.unwrap_or(skip_size);
+    let synthetic_sample_description_index = removed_terminal_sample_description_index.unwrap_or(1);
+    let repeated_tail_sample_offset = sample_offsets
+        .first()
+        .copied()
+        .unwrap_or(synthetic_sample_offset);
+    let repeated_tail_sample_size = sample_sizes
+        .first()
+        .copied()
+        .unwrap_or(synthetic_sample_size);
+    let repeated_tail_sample_description_index = sample_description_indices
+        .first()
+        .copied()
+        .unwrap_or(synthetic_sample_description_index);
+
+    sample_offsets.push(synthetic_sample_offset);
+    sample_sizes.push(synthetic_sample_size);
+    sample_durations.push(trailing_bytes);
+    composition_offsets.push(0);
+    sample_description_indices.push(synthetic_sample_description_index);
+    sync_samples.push(true);
+
+    for _ in 0..synthetic_edit_entry_count.saturating_sub(2) {
+        sample_offsets.push(repeated_tail_sample_offset);
+        sample_sizes.push(repeated_tail_sample_size);
+        sample_durations.push(1);
+        composition_offsets.push(0);
+        sample_description_indices.push(repeated_tail_sample_description_index);
+        sync_samples.push(true);
+    }
+
+    sample_offsets.push(repeated_tail_sample_offset);
+    sample_sizes.push(repeated_tail_sample_size);
+    sample_durations.push(0);
+    composition_offsets.push(0);
+    sample_description_indices.push(repeated_tail_sample_description_index);
+    sync_samples.push(true);
+
+    Ok(true)
+}
+
+#[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
+async fn synthesize_imported_speex_elst_tail_async<R>(
+    reader: &mut R,
+    sample_entry: &ExtractedBox,
+    elst: Option<&Elst>,
+    elst_box_size: Option<u64>,
+    sample_offsets: &mut Vec<u64>,
+    sample_sizes: &mut Vec<u32>,
+    sample_durations: &mut Vec<u32>,
+    composition_offsets: &mut Vec<i32>,
+    sample_description_indices: &mut Vec<u32>,
+    sync_samples: &mut Vec<bool>,
+) -> Result<bool, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    if sample_entry.info.box_type() != FourCc::from_bytes(*b"spex") {
+        return Ok(false);
+    }
+    let Some(elst) = elst else {
+        return Ok(false);
+    };
+    let Some(elst_box_size) = elst_box_size else {
+        return Ok(false);
+    };
+    let Some(trailing_bytes) = imported_track_elst_trailing_bytes(elst, elst_box_size) else {
+        return Ok(false);
+    };
+    if sample_durations.last().copied() != Some(0) {
+        return Ok(false);
+    }
+
+    let skip_info = extract_box_async(
+        reader,
+        Some(&sample_entry.info),
+        BoxPath::from([FourCc::from_bytes(*b"skip")]),
+    )
+    .await?
     .into_iter()
     .next();
     let Some(skip_info) = skip_info else {
@@ -7030,6 +8043,147 @@ where
     Ok(references)
 }
 
+#[cfg(feature = "async")]
+async fn extract_stsd_sample_entries_async<R>(
+    path: &Path,
+    reader: &mut R,
+    stsd_info: &HeaderInfo,
+    stsd: &crate::boxes::iso14496_12::Stsd,
+    track_id: u32,
+) -> Result<(Vec<ExtractedBox>, Vec<Vec<u8>>), MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let sample_entry_infos =
+        extract_box_async(reader, Some(stsd_info), BoxPath::from([FourCc::ANY]))
+            .await?
+            .into_iter()
+            .filter(|info| !stsd_child_is_padding(info.box_type()))
+            .collect::<Vec<_>>();
+    if sample_entry_infos.is_empty() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!("track {} does not expose a sample-entry payload", track_id),
+        });
+    }
+    if usize::try_from(stsd.entry_count).unwrap_or(usize::MAX) != sample_entry_infos.len() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!(
+                "track {} declares {} sample descriptions but exposes {} sample-entry payloads",
+                track_id,
+                stsd.entry_count,
+                sample_entry_infos.len()
+            ),
+        });
+    }
+
+    let sample_entries =
+        extract_box_with_payload_async(reader, Some(stsd_info), BoxPath::from([FourCc::ANY]))
+            .await?
+            .into_iter()
+            .filter(|entry| !stsd_child_is_padding(entry.info.box_type()))
+            .collect::<Vec<_>>();
+    if sample_entries.len() != sample_entry_infos.len() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!("track {track_id} exposes inconsistent sample-entry payloads"),
+        });
+    }
+    let mut sample_entry_boxes = Vec::with_capacity(sample_entry_infos.len());
+    for sample_entry_info in sample_entry_infos {
+        let sample_entry_box = read_box_bytes_async(reader, &sample_entry_info).await?;
+        sample_entry_boxes.push(sample_entry_box);
+    }
+    Ok((sample_entries, sample_entry_boxes))
+}
+
+#[cfg(feature = "async")]
+async fn extract_data_references_async<R>(
+    path: &Path,
+    reader: &mut R,
+    trak_info: &HeaderInfo,
+    track_id: u32,
+) -> Result<Vec<ImportedDataReference>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let dref_infos = extract_box_async(
+        reader,
+        Some(trak_info),
+        BoxPath::from([MDIA, MINF, DINF, DREF]),
+    )
+    .await?;
+    if dref_infos.is_empty() {
+        return Ok(vec![ImportedDataReference::SelfContained]);
+    }
+    let [dref_info] = dref_infos.as_slice() else {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!("track {track_id} exposes multiple data-reference tables"),
+        });
+    };
+    let dref = extract_required_single_as_async::<_, Dref>(
+        reader,
+        trak_info,
+        BoxPath::from([MDIA, MINF, DINF, DREF]),
+        "dref",
+    )
+    .await?;
+    let entry_infos =
+        extract_box_async(reader, Some(dref_info), BoxPath::from([FourCc::ANY])).await?;
+    if usize::try_from(dref.entry_count).unwrap_or(usize::MAX) != entry_infos.len() {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: path.display().to_string(),
+            message: format!(
+                "track {track_id} declares {} data references but exposes {} entries",
+                dref.entry_count,
+                entry_infos.len()
+            ),
+        });
+    }
+    let mut references = Vec::with_capacity(entry_infos.len());
+    for entry_info in entry_infos {
+        let entry_bytes = read_box_bytes_async(reader, &entry_info).await?;
+        let reference = match entry_info.box_type() {
+            value if value == URL => {
+                let url = super::mp4::decode_typed_box::<Url>(&entry_bytes)?;
+                if url.flags() & 1 != 0 {
+                    ImportedDataReference::SelfContained
+                } else {
+                    ImportedDataReference::LocalFile(resolve_local_data_reference_path(
+                        path,
+                        track_id,
+                        &url.location,
+                    )?)
+                }
+            }
+            value if value == URN => {
+                let urn = super::mp4::decode_typed_box::<Urn>(&entry_bytes)?;
+                if urn.flags() & 1 != 0 {
+                    ImportedDataReference::SelfContained
+                } else {
+                    ImportedDataReference::LocalFile(resolve_local_data_reference_path(
+                        path,
+                        track_id,
+                        &urn.location,
+                    )?)
+                }
+            }
+            value => {
+                return Err(MuxError::UnsupportedTrackImport {
+                    spec: path.display().to_string(),
+                    message: format!(
+                        "track {track_id} uses unsupported data-reference entry `{value}`"
+                    ),
+                });
+            }
+        };
+        references.push(reference);
+    }
+    Ok(references)
+}
+
 fn resolve_local_data_reference_path(
     movie_path: &Path,
     track_id: u32,
@@ -7156,6 +8310,19 @@ where
     let mut bytes = vec![0_u8; size];
     reader.seek(SeekFrom::Start(info.offset()))?;
     reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_box_bytes_async<R>(reader: &mut R, info: &HeaderInfo) -> Result<Vec<u8>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let size =
+        usize::try_from(info.size()).map_err(|_| MuxError::LayoutOverflow("box byte range"))?;
+    let mut bytes = vec![0_u8; size];
+    reader.seek(SeekFrom::Start(info.offset())).await?;
+    reader.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
 
@@ -16397,6 +17564,56 @@ fn validate_fragmented_split_paths(
     Ok(())
 }
 
+#[cfg(feature = "async")]
+async fn validate_fragmented_split_paths_async(
+    request: &MuxRequest,
+    init_path: &Path,
+    media_path: &Path,
+) -> Result<(), MuxError> {
+    if !matches!(request.output_layout(), MuxOutputLayout::Fragmented) {
+        return Err(MuxError::InvalidOutputLayout {
+            layout: request.output_layout().label(),
+            message: "separate fragmented output requires fragmented layout".to_string(),
+        });
+    }
+    validate_request_shape(request, media_path)?;
+    let init_absolute = absolute_path(init_path)?;
+    let media_absolute = absolute_path(media_path)?;
+    if init_absolute == media_absolute {
+        return Err(MuxError::InvalidDestinationMode {
+            mode: MuxDestinationMode::CreateNew.label(),
+            message: "separate fragmented output paths must be distinct".to_string(),
+        });
+    }
+    for (label, path) in [("init", init_path), ("media", media_path)] {
+        if tokio::fs::try_exists(path)
+            .await
+            .map_err(|error| mux_io_at_path("inspect mux output", path, error))?
+        {
+            return Err(MuxError::InvalidDestinationMode {
+                mode: MuxDestinationMode::CreateNew.label(),
+                message: format!("separate fragmented {label} output path already exists"),
+            });
+        }
+    }
+    for track in request.tracks() {
+        let input_absolute = absolute_path(track.input_path())?;
+        if input_absolute == init_absolute {
+            return Err(MuxError::OutputPathConflict {
+                output: init_absolute,
+                input: input_absolute,
+            });
+        }
+        if input_absolute == media_absolute {
+            return Err(MuxError::OutputPathConflict {
+                output: media_absolute,
+                input: input_absolute,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn build_destination_preserving_request(
     request: &MuxRequest,
     destination_path: &Path,
@@ -16425,6 +17642,14 @@ fn build_destination_preserving_request(
 
 fn should_preserve_destination_mp4(destination_path: &Path) -> bool {
     is_mp4_like_path(destination_path)
+}
+
+#[cfg(feature = "async")]
+async fn should_preserve_destination_mp4_async(destination_path: &Path) -> bool {
+    matches!(
+        detect_path_track_kind_async(destination_path).await,
+        Ok(DetectedPathTrackKind::Mp4)
+    )
 }
 
 fn create_update_temp_path(
@@ -19327,6 +20552,48 @@ where
     }
 }
 
+#[cfg(feature = "async")]
+async fn extract_required_single_as_async<R, T>(
+    reader: &mut R,
+    parent: &HeaderInfo,
+    path: BoxPath,
+    name: &'static str,
+) -> Result<T, MuxError>
+where
+    R: AsyncReadSeek,
+    T: CodecBox + Clone + 'static,
+{
+    let boxes = extract_box_as_async::<_, T>(reader, Some(parent), path).await?;
+    let [value] = boxes.as_slice() else {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: name.to_string(),
+            message: format!("expected exactly one {name} box but found {}", boxes.len()),
+        });
+    };
+    Ok(value.clone())
+}
+
+#[cfg(feature = "async")]
+async fn extract_optional_single_as_async<R, T>(
+    reader: &mut R,
+    parent: &HeaderInfo,
+    path: BoxPath,
+) -> Result<Option<T>, MuxError>
+where
+    R: AsyncReadSeek,
+    T: CodecBox + Clone + 'static,
+{
+    let boxes = extract_box_as_async::<_, T>(reader, Some(parent), path).await?;
+    match boxes.len() {
+        0 => Ok(None),
+        1 => Ok(Some(boxes[0].clone())),
+        _ => Err(MuxError::UnsupportedTrackImport {
+            spec: "track".to_string(),
+            message: "expected at most one optional box".to_string(),
+        }),
+    }
+}
+
 fn extract_required_single_info_sync<R>(
     reader: &mut R,
     parent: &HeaderInfo,
@@ -19337,6 +20604,26 @@ where
     R: Read + Seek,
 {
     let infos = extract_box(reader, Some(parent), path)?;
+    let [info] = infos.as_slice() else {
+        return Err(MuxError::UnsupportedTrackImport {
+            spec: name.to_string(),
+            message: format!("expected exactly one {name} box but found {}", infos.len()),
+        });
+    };
+    Ok(*info)
+}
+
+#[cfg(feature = "async")]
+async fn extract_required_single_info_async<R>(
+    reader: &mut R,
+    parent: &HeaderInfo,
+    path: BoxPath,
+    name: &'static str,
+) -> Result<HeaderInfo, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let infos = extract_box_async(reader, Some(parent), path).await?;
     let [info] = infos.as_slice() else {
         return Err(MuxError::UnsupportedTrackImport {
             spec: name.to_string(),
@@ -19389,6 +20676,32 @@ where
         Some(stbl_info),
         BoxPath::from([SBGP]),
     )?);
+    Ok(preserved)
+}
+
+#[cfg(feature = "async")]
+async fn extract_preserved_flat_stbl_boxes_async<R>(
+    reader: &mut R,
+    stbl_info: &HeaderInfo,
+) -> Result<Vec<Vec<u8>>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let mut preserved = Vec::new();
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([CSLG])).await?);
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([SDTP])).await?);
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([STPS])).await?);
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([STDP])).await?);
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([SUBS])).await?);
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([SGPD])).await?);
+    preserved
+        .extend(extract_box_bytes_async(reader, Some(stbl_info), BoxPath::from([SBGP])).await?);
     Ok(preserved)
 }
 
@@ -19994,6 +21307,114 @@ where
     Ok(())
 }
 
+#[cfg(feature = "async")]
+async fn supplement_imported_mp4_avc_sync_samples_async<R>(
+    reader: &mut R,
+    sample_entry_type: FourCc,
+    sample_entry_box: &[u8],
+    _source_stss: Option<&Stss>,
+    sample_offsets: &[u64],
+    sample_sizes: &[u32],
+    sync_samples: &mut [bool],
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+{
+    if sample_entry_type != FourCc::from_bytes(*b"avc1")
+        && sample_entry_type != FourCc::from_bytes(*b"avc3")
+    {
+        return Ok(());
+    }
+    let Some(length_size) = imported_mp4_avc_length_size(sample_entry_box)? else {
+        return Ok(());
+    };
+    if length_size == 0 || length_size > 4 {
+        return Ok(());
+    }
+    for ((sample_offset, sample_size), is_sync_sample) in sample_offsets
+        .iter()
+        .copied()
+        .zip(sample_sizes.iter().copied())
+        .zip(sync_samples.iter_mut())
+    {
+        if *is_sync_sample || sample_size == 0 {
+            continue;
+        }
+        let sample_size = usize::try_from(sample_size)
+            .map_err(|_| MuxError::LayoutOverflow("AVC sample size inspection"))?;
+        let mut sample_bytes = vec![0_u8; sample_size];
+        reader
+            .seek(SeekFrom::Start(sample_offset))
+            .await
+            .map_err(MuxError::Io)?;
+        match reader.read_exact(&mut sample_bytes).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(MuxError::Io(error)),
+        }
+        if imported_mp4_avc_sample_contains_sync_nal(&sample_bytes, length_size) {
+            *is_sync_sample = true;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn supplement_imported_mp4_hevc_sync_samples_async<R>(
+    reader: &mut R,
+    sample_entry_type: FourCc,
+    sample_entry_box: &[u8],
+    sample_offsets: &[u64],
+    sample_sizes: &[u32],
+    sync_samples: &mut [bool],
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+{
+    if sample_entry_type != FourCc::from_bytes(*b"hvc1")
+        && sample_entry_type != FourCc::from_bytes(*b"hev1")
+        && sample_entry_type != FourCc::from_bytes(*b"dvh1")
+        && sample_entry_type != FourCc::from_bytes(*b"dvhe")
+    {
+        return Ok(());
+    }
+    let Some(length_size) = imported_mp4_hevc_length_size(sample_entry_box)? else {
+        return Ok(());
+    };
+    if length_size == 0 || length_size > 4 {
+        return Ok(());
+    }
+
+    for ((sample_offset, sample_size), is_sync_sample) in sample_offsets
+        .iter()
+        .copied()
+        .zip(sample_sizes.iter().copied())
+        .zip(sync_samples.iter_mut())
+    {
+        if *is_sync_sample || sample_size == 0 {
+            continue;
+        }
+        let sample_size = usize::try_from(sample_size)
+            .map_err(|_| MuxError::LayoutOverflow("HEVC sample size inspection"))?;
+        let mut sample_bytes = vec![0_u8; sample_size];
+        reader
+            .seek(SeekFrom::Start(sample_offset))
+            .await
+            .map_err(MuxError::Io)?;
+        match reader.read_exact(&mut sample_bytes).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(MuxError::Io(error)),
+        }
+        if imported_mp4_hevc_sample_contains_sync_nal(&sample_bytes, length_size) {
+            *is_sync_sample = true;
+        }
+    }
+
+    Ok(())
+}
+
 fn imported_mp4_hevc_sample_contains_sync_nal(sample_bytes: &[u8], length_size: usize) -> bool {
     let mut offset = 0_usize;
     while sample_bytes.len().saturating_sub(offset) >= length_size {
@@ -20153,6 +21574,30 @@ where
     Ok(config)
 }
 
+#[cfg(feature = "async")]
+async fn probe_file_config_async<R>(reader: &mut R) -> Result<MuxFileConfig, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    use crate::probe::probe_with_options_async;
+    let summary =
+        probe_with_options_async(reader, crate::probe::ProbeOptions::lightweight()).await?;
+    let config = MuxFileConfig::new(summary.timescale.max(1))
+        .with_major_brand(summary.major_brand)
+        .with_minor_version(summary.minor_version)
+        .with_compatible_brands(summary.compatible_brands)
+        .with_flat_source_movie_creation_time(
+            extract_preserved_flat_movie_creation_time_async(reader).await?,
+        )
+        .with_flat_source_movie_modification_time(
+            extract_preserved_flat_movie_modification_time_async(reader).await?,
+        )
+        .with_preserved_flat_prefix_bytes(extract_preserved_flat_prefix_bytes_async(reader).await?)
+        .with_preserved_flat_iods_bytes(extract_preserved_flat_iods_bytes_async(reader).await?)
+        .with_preserved_flat_udta_bytes(extract_preserved_flat_udta_bytes_async(reader).await?);
+    Ok(config)
+}
+
 fn extract_preserved_flat_movie_creation_time_sync<R>(
     reader: &mut R,
 ) -> Result<Option<u64>, MuxError>
@@ -20167,6 +21612,22 @@ where
     )
 }
 
+#[cfg(feature = "async")]
+async fn extract_preserved_flat_movie_creation_time_async<R>(
+    reader: &mut R,
+) -> Result<Option<u64>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    Ok(
+        extract_box_as_async::<_, Mvhd>(reader, None, BoxPath::from([MOOV, MVHD]))
+            .await?
+            .into_iter()
+            .next()
+            .map(|mvhd| mvhd.creation_time()),
+    )
+}
+
 fn extract_preserved_flat_movie_modification_time_sync<R>(
     reader: &mut R,
 ) -> Result<Option<u64>, MuxError>
@@ -20175,6 +21636,22 @@ where
 {
     Ok(
         extract_box_as::<_, Mvhd>(reader, None, BoxPath::from([MOOV, MVHD]))?
+            .into_iter()
+            .next()
+            .map(|mvhd| mvhd.modification_time()),
+    )
+}
+
+#[cfg(feature = "async")]
+async fn extract_preserved_flat_movie_modification_time_async<R>(
+    reader: &mut R,
+) -> Result<Option<u64>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    Ok(
+        extract_box_as_async::<_, Mvhd>(reader, None, BoxPath::from([MOOV, MVHD]))
+            .await?
             .into_iter()
             .next()
             .map(|mvhd| mvhd.modification_time()),
@@ -20236,6 +21713,62 @@ where
     Ok(preserved)
 }
 
+#[cfg(feature = "async")]
+async fn extract_preserved_flat_prefix_bytes_async<R>(reader: &mut R) -> Result<Vec<u8>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    let file_size = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(0)).await?;
+    let mut saw_ftyp = false;
+    let mut preserved = Vec::new();
+    loop {
+        let offset = reader.stream_position().await?;
+        if offset >= file_size {
+            break;
+        }
+        let info = match HeaderInfo::read_async(reader).await {
+            Ok(info) => info,
+            Err(crate::HeaderError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(error) => {
+                return Err(MuxError::InvalidOutputLayout {
+                    layout: "flat",
+                    message: format!(
+                        "failed to parse root box header while probing preserved flat prefix boxes: {error}"
+                    ),
+                });
+            }
+        };
+        let box_end = info
+            .offset()
+            .checked_add(info.size())
+            .ok_or(MuxError::LayoutOverflow("preserved flat prefix box range"))?;
+        if box_end > file_size {
+            break;
+        }
+        let box_type = info.box_type();
+        if box_type == FTYP {
+            saw_ftyp = true;
+        } else if saw_ftyp && box_type == FREE {
+            reader.seek(SeekFrom::Start(info.offset())).await?;
+            let mut box_bytes = vec![
+                0_u8;
+                usize::try_from(info.size()).map_err(|_| {
+                    MuxError::LayoutOverflow("preserved flat prefix box size")
+                })?
+            ];
+            reader.read_exact(&mut box_bytes).await?;
+            preserved.extend_from_slice(&box_bytes);
+        } else if saw_ftyp {
+            break;
+        }
+        reader.seek(SeekFrom::Start(box_end)).await?;
+    }
+    Ok(preserved)
+}
+
 fn extract_preserved_flat_udta_bytes_sync<R>(reader: &mut R) -> Result<Option<Vec<u8>>, MuxError>
 where
     R: Read + Seek,
@@ -20247,12 +21780,42 @@ where
     )
 }
 
+#[cfg(feature = "async")]
+async fn extract_preserved_flat_udta_bytes_async<R>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    Ok(
+        extract_box_bytes_async(reader, None, BoxPath::from([MOOV, UDTA]))
+            .await?
+            .into_iter()
+            .next(),
+    )
+}
+
 fn extract_preserved_flat_iods_bytes_sync<R>(reader: &mut R) -> Result<Option<Vec<u8>>, MuxError>
 where
     R: Read + Seek,
 {
     Ok(
         extract_box_bytes(reader, None, BoxPath::from([MOOV, IODS]))?
+            .into_iter()
+            .next(),
+    )
+}
+
+#[cfg(feature = "async")]
+async fn extract_preserved_flat_iods_bytes_async<R>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, MuxError>
+where
+    R: AsyncReadSeek,
+{
+    Ok(
+        extract_box_bytes_async(reader, None, BoxPath::from([MOOV, IODS]))
+            .await?
             .into_iter()
             .next(),
     )

@@ -18,16 +18,17 @@ fn main() {
     let mut sources = [Cursor::new(b"HEADwvttTAIL".to_vec())];
     let mut reader =
         PlannedSampleReader::new_with_track_configs(&mut sources, &plan, &track_configs);
+    let mut sample_bytes = Vec::new();
 
-    while let Some(sample) = reader.next_sample().unwrap() {
-        let track = sample.metadata().track().unwrap();
+    while let Some(metadata) = reader.next_sample_into(&mut sample_bytes).unwrap() {
+        let track = metadata.track().unwrap();
         println!(
             "track {} {:?} {} at output {} -> {} bytes",
-            sample.metadata().track_id(),
+            metadata.track_id(),
             track.kind(),
             std::str::from_utf8(&track.language()).unwrap(),
-            sample.metadata().output_offset(),
-            sample.bytes().len()
+            metadata.output_offset(),
+            sample_bytes.len()
         );
     }
 }

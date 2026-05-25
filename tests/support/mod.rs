@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 #![allow(clippy::field_reassign_with_default)]
 
-use std::cell::RefCell;
 #[cfg(feature = "decrypt")]
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::Write;
 #[cfg(feature = "decrypt")]
 use std::io::{Cursor, Seek};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::ops::Deref;
+use std::path::{Path, PathBuf as StdPathBuf};
+use std::sync::Arc;
 
 #[cfg(feature = "decrypt")]
 use aes::Aes128;
@@ -58,6 +58,7 @@ use mp4forge::mux::{
 #[cfg(feature = "decrypt")]
 use mp4forge::walk::BoxPath;
 use mp4forge::{BoxInfo, FourCc};
+use tempfile::{Builder, TempDir, TempPath};
 
 #[cfg(feature = "mux")]
 const TS_PACKET_SIZE: usize = 188;
@@ -83,63 +84,101 @@ pub fn fourcc(value: &str) -> FourCc {
     FourCc::try_from(value).unwrap()
 }
 
-struct RegisteredTempPaths {
-    paths: RefCell<Vec<PathBuf>>,
+#[allow(dead_code)]
+enum TestTempPathOwner {
+    File(TempPath),
+    Dir(TempDir),
 }
 
-impl RegisteredTempPaths {
-    fn register(&self, path: PathBuf) {
-        self.paths.borrow_mut().push(path);
+#[derive(Clone)]
+pub struct TestTempPath {
+    path: StdPathBuf,
+    _owner: Arc<TestTempPathOwner>,
+}
+
+impl TestTempPath {
+    fn from_temp_path(path: TempPath) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            _owner: Arc::new(TestTempPathOwner::File(path)),
+        }
+    }
+
+    fn from_temp_dir_entry(path: StdPathBuf, dir: Arc<TestTempPathOwner>) -> Self {
+        Self { path, _owner: dir }
+    }
+
+    pub fn as_path(&self) -> &Path {
+        self.path.as_path()
     }
 }
 
-impl Drop for RegisteredTempPaths {
-    fn drop(&mut self) {
-        for path in self.paths.get_mut().drain(..).rev() {
-            remove_temp_path(&path);
-        }
+impl AsRef<Path> for TestTempPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
     }
 }
 
-thread_local! {
-    static REGISTERED_TEMP_PATHS: RegisteredTempPaths = RegisteredTempPaths {
-        paths: RefCell::new(Vec::new()),
-    };
-}
+impl Deref for TestTempPath {
+    type Target = Path;
 
-fn register_temp_path(path: &Path) {
-    REGISTERED_TEMP_PATHS.with(|registry| registry.register(path.to_path_buf()));
-}
-
-fn remove_temp_path(path: &Path) {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {
-            let _ = fs::remove_dir_all(path);
-        }
-        Ok(_) => {
-            let _ = fs::remove_file(path);
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(_) => {}
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
     }
 }
 
-pub fn write_temp_file(prefix: &str, data: &[u8]) -> PathBuf {
+impl From<&TestTempPath> for StdPathBuf {
+    fn from(path: &TestTempPath) -> Self {
+        path.as_path().to_path_buf()
+    }
+}
+
+pub type PathBuf = TestTempPath;
+
+#[derive(Clone)]
+pub struct TestTempDir {
+    path: StdPathBuf,
+    _dir: Arc<TempDir>,
+}
+
+impl TestTempDir {
+    pub fn as_path(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
+impl AsRef<Path> for TestTempDir {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl Deref for TestTempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+impl From<&TestTempDir> for StdPathBuf {
+    fn from(path: &TestTempDir) -> Self {
+        path.as_path().to_path_buf()
+    }
+}
+
+pub fn write_temp_file(prefix: &str, data: &[u8]) -> TestTempPath {
     write_temp_file_with_extension(prefix, "mp4", data)
 }
 
-pub fn write_temp_file_with_extension(prefix: &str, extension: &str, data: &[u8]) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "mp4forge-{prefix}-{}-{unique}.{extension}",
-        std::process::id()
-    ));
-    fs::write(&path, data).unwrap();
-    register_temp_path(&path);
-    path
+pub fn write_temp_file_with_extension(prefix: &str, extension: &str, data: &[u8]) -> TestTempPath {
+    let mut file = Builder::new()
+        .prefix(&format!("mp4forge-{prefix}-"))
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .unwrap();
+    file.write_all(data).unwrap();
+    TestTempPath::from_temp_path(file.into_temp_path())
 }
 
 #[cfg(feature = "mux")]
@@ -2441,14 +2480,12 @@ pub fn write_test_vobsub_files(
 ) -> (PathBuf, PathBuf) {
     assert_eq!(start_times_ms.len(), sample_payloads.len());
 
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let base =
-        std::env::temp_dir().join(format!("mp4forge-{prefix}-{}-{unique}", std::process::id()));
-    let idx_path = base.with_extension("idx");
-    let sub_path = base.with_extension("sub");
+    let dir = Builder::new()
+        .prefix(&format!("mp4forge-{prefix}-"))
+        .tempdir()
+        .unwrap();
+    let idx_path = dir.path().join("input.idx");
+    let sub_path = dir.path().join("input.sub");
 
     let mut sub_bytes = Vec::new();
     let mut positions = Vec::with_capacity(sample_payloads.len());
@@ -2483,9 +2520,11 @@ pub fn write_test_vobsub_files(
 
     fs::write(&idx_path, idx.as_bytes()).unwrap();
     fs::write(&sub_path, &sub_bytes).unwrap();
-    register_temp_path(&idx_path);
-    register_temp_path(&sub_path);
-    (idx_path, sub_path)
+    let owner = Arc::new(TestTempPathOwner::Dir(dir));
+    (
+        TestTempPath::from_temp_dir_entry(idx_path, owner.clone()),
+        TestTempPath::from_temp_dir_entry(sub_path, owner),
+    )
 }
 
 #[cfg(feature = "mux")]
@@ -4470,19 +4509,20 @@ fn decode_test_hex_bytes(hex: &str) -> Vec<u8> {
     bytes
 }
 
-pub fn temp_output_dir(prefix: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("mp4forge-{prefix}-{}-{unique}", std::process::id()));
-    register_temp_path(&path);
-    path
+pub fn temp_output_dir(prefix: &str) -> TestTempDir {
+    let dir = Builder::new()
+        .prefix(&format!("mp4forge-{prefix}-"))
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("out");
+    TestTempDir {
+        path,
+        _dir: Arc::new(dir),
+    }
 }
 
-pub fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+pub fn fixture_path(name: &str) -> StdPathBuf {
+    StdPathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join(name)
@@ -4490,16 +4530,16 @@ pub fn fixture_path(name: &str) -> PathBuf {
 
 #[cfg(feature = "decrypt")]
 pub struct RetainedDecryptFileFixture {
-    pub encrypted_path: PathBuf,
-    pub decrypted_path: PathBuf,
+    pub encrypted_path: StdPathBuf,
+    pub decrypted_path: StdPathBuf,
     pub keys: Vec<DecryptionKey>,
 }
 
 #[cfg(feature = "decrypt")]
 pub struct RetainedFragmentedDecryptFixture {
-    pub fragments_info_path: PathBuf,
-    pub encrypted_segment_path: PathBuf,
-    pub clear_segment_path: PathBuf,
+    pub fragments_info_path: StdPathBuf,
+    pub encrypted_segment_path: StdPathBuf,
+    pub clear_segment_path: StdPathBuf,
     pub keys: Vec<DecryptionKey>,
 }
 
@@ -4679,12 +4719,12 @@ pub fn piff_cbc_segment_fixture() -> RetainedFragmentedDecryptFixture {
 }
 
 #[cfg(feature = "decrypt")]
-pub fn marlin_ipmp_acbc_encrypted_fixture_path() -> PathBuf {
+pub fn marlin_ipmp_acbc_encrypted_fixture_path() -> StdPathBuf {
     fixture_path("marlin_ipmp_acbc_encrypted.mp4")
 }
 
 #[cfg(feature = "decrypt")]
-pub fn marlin_ipmp_acbc_decrypted_fixture_path() -> PathBuf {
+pub fn marlin_ipmp_acbc_decrypted_fixture_path() -> StdPathBuf {
     fixture_path("marlin_ipmp_acbc_decrypted.mp4")
 }
 
@@ -4718,12 +4758,12 @@ pub fn marlin_ipmp_acbc_fixture() -> RetainedDecryptFileFixture {
 }
 
 #[cfg(feature = "decrypt")]
-pub fn marlin_ipmp_acgk_encrypted_fixture_path() -> PathBuf {
+pub fn marlin_ipmp_acgk_encrypted_fixture_path() -> StdPathBuf {
     fixture_path("marlin_ipmp_acgk_encrypted.mp4")
 }
 
 #[cfg(feature = "decrypt")]
-pub fn marlin_ipmp_acgk_decrypted_fixture_path() -> PathBuf {
+pub fn marlin_ipmp_acgk_decrypted_fixture_path() -> StdPathBuf {
     fixture_path("marlin_ipmp_acgk_decrypted.mp4")
 }
 
@@ -6330,7 +6370,7 @@ pub fn read_text(path: &Path) -> String {
 
 pub fn read_golden(relative_path: &str) -> String {
     read_text(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        &StdPathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("golden")
             .join(relative_path),

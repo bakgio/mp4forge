@@ -6,7 +6,9 @@ mod mux_example_support;
 use std::error::Error;
 
 #[cfg(feature = "mux")]
-use mp4forge::mux::{MuxDurationMode, MuxMp4TrackSelector, MuxRequest, MuxTrackSpec, mux_to_path};
+use mp4forge::mux::{
+    MuxDurationMode, MuxMp4TrackSelector, MuxOutputLayout, MuxRequest, MuxTrackSpec, mux_to_path,
+};
 
 #[cfg(feature = "mux")]
 fn main() -> Result<(), Box<dyn Error>> {
@@ -19,9 +21,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_path = mux_example_support::write_temp_file("example-segment-output", "mp4", &[]);
 
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
+    .with_output_layout(MuxOutputLayout::Fragmented)
     .with_duration_mode(MuxDurationMode::Segment { seconds: 0.05 });
 
     mux_to_path(&request, &output_path)?;

@@ -19,13 +19,14 @@ fn main() {
         Cursor::new(b"PREMaudPOST".to_vec()),
     ];
     let mut reader = PlannedSampleReader::new(&mut sources, &plan);
+    let mut sample_bytes = Vec::new();
 
-    while let Some(sample) = reader.next_sample().unwrap() {
+    while let Some(metadata) = reader.next_sample_into(&mut sample_bytes).unwrap() {
         println!(
             "track {} at output {} -> {} bytes",
-            sample.metadata().track_id(),
-            sample.metadata().output_offset(),
-            sample.bytes().len()
+            metadata.track_id(),
+            metadata.output_offset(),
+            sample_bytes.len()
         );
     }
 }

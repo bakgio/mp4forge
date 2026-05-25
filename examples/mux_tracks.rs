@@ -27,8 +27,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_path = mux_example_support::write_temp_file("example-mux-output", "mp4", &[]);
 
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
     ]);
 
     mux_to_path(&request, &output_path)?;

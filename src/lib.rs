@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! MP4 and ISOBMFF toolkit with low-level building blocks and thin ergonomic helpers.
 //!
 //! The default surface is synchronous. Enable the optional `async` feature when you want the

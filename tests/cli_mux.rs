@@ -23,37 +23,38 @@ use mp4forge::mux::{MuxFileConfig, MuxTrackConfig};
 
 use support::{
     TestAviAvc1Stream, TestAviH264Stream, TestAviMp4vStream, TestAviPcmStream, TestMuxSample,
-    TestQcpCodecKind, build_test_av1_sequence_header_obu, build_test_mp4v_decoder_specific_info,
-    build_test_vp10_keyframe, encode_supported_box, fixture_path, fourcc, temp_output_dir,
-    write_single_track_mp4_input, write_temp_file, write_test_ac4_file, write_test_adts_file,
-    write_test_aifc_pcm_file, write_test_aiff_pcm_file, write_test_amr_file,
-    write_test_amr_wb_file, write_test_av1_annex_b_file, write_test_av1_ivf_file,
-    write_test_av1_obu_file, write_test_avi_ac3_file, write_test_avi_avc1_file,
-    write_test_avi_h263_file, write_test_avi_h264_file, write_test_avi_jpeg_file,
-    write_test_avi_mp3_file, write_test_avi_mp4v_file, write_test_avi_pcm_file,
-    write_test_avi_png_file, write_test_caf_alac_file, write_test_caf_alac_variable_packet_file,
-    write_test_dts_file, write_test_dts_little_endian_file, write_test_flac_file,
-    write_test_h263_file, write_test_h265_annexb_file, write_test_iamf_file, write_test_jpeg_file,
-    write_test_latm_file, write_test_mhas_file, write_test_mp3_file, write_test_mp4v_file,
-    write_test_ogg_flac_file, write_test_ogg_flac_mapping_file,
-    write_test_ogg_flac_split_header_file, write_test_ogg_opus_file, write_test_ogg_speex_file,
-    write_test_ogg_theora_file, write_test_ogg_vorbis_file, write_test_png_file,
-    write_test_program_stream_ac3_file, write_test_program_stream_h264_file,
-    write_test_program_stream_h264_open_ended_file, write_test_program_stream_h265_file,
-    write_test_program_stream_lpcm_file, write_test_program_stream_mp3_file,
-    write_test_program_stream_mp4v_file, write_test_program_stream_mpeg2v_file,
-    write_test_program_stream_vobsub_file, write_test_program_stream_vvc_file,
-    write_test_qcp_constant_file, write_test_transport_stream_ac3_file,
-    write_test_transport_stream_ac4_file, write_test_transport_stream_av1_file,
-    write_test_transport_stream_avs3_file, write_test_transport_stream_dts_file,
-    write_test_transport_stream_dvb_subtitle_file, write_test_transport_stream_dvb_teletext_file,
-    write_test_transport_stream_eac3_file, write_test_transport_stream_h264_file,
-    write_test_transport_stream_h265_file, write_test_transport_stream_latm_file,
-    write_test_transport_stream_mhas_file, write_test_transport_stream_mp3_file,
-    write_test_transport_stream_mp4v_file, write_test_transport_stream_mpeg2v_file,
-    write_test_transport_stream_truehd_file, write_test_transport_stream_vvc_file,
-    write_test_truehd_file, write_test_usac_latm_file, write_test_vobsub_files,
-    write_test_vp10_ivf_file, write_test_wave_pcm_file, write_test_wrapped_dts_file_with_tail,
+    TestQcpCodecKind, TestTempPath, build_test_av1_sequence_header_obu,
+    build_test_mp4v_decoder_specific_info, build_test_vp10_keyframe, encode_supported_box,
+    fixture_path, fourcc, temp_output_dir, write_single_track_mp4_input, write_temp_file,
+    write_test_ac4_file, write_test_adts_file, write_test_aifc_pcm_file, write_test_aiff_pcm_file,
+    write_test_amr_file, write_test_amr_wb_file, write_test_av1_annex_b_file,
+    write_test_av1_ivf_file, write_test_av1_obu_file, write_test_avi_ac3_file,
+    write_test_avi_avc1_file, write_test_avi_h263_file, write_test_avi_h264_file,
+    write_test_avi_jpeg_file, write_test_avi_mp3_file, write_test_avi_mp4v_file,
+    write_test_avi_pcm_file, write_test_avi_png_file, write_test_caf_alac_file,
+    write_test_caf_alac_variable_packet_file, write_test_dts_file,
+    write_test_dts_little_endian_file, write_test_flac_file, write_test_h263_file,
+    write_test_h265_annexb_file, write_test_iamf_file, write_test_jpeg_file, write_test_latm_file,
+    write_test_mhas_file, write_test_mp3_file, write_test_mp4v_file, write_test_ogg_flac_file,
+    write_test_ogg_flac_mapping_file, write_test_ogg_flac_split_header_file,
+    write_test_ogg_opus_file, write_test_ogg_speex_file, write_test_ogg_theora_file,
+    write_test_ogg_vorbis_file, write_test_png_file, write_test_program_stream_ac3_file,
+    write_test_program_stream_h264_file, write_test_program_stream_h264_open_ended_file,
+    write_test_program_stream_h265_file, write_test_program_stream_lpcm_file,
+    write_test_program_stream_mp3_file, write_test_program_stream_mp4v_file,
+    write_test_program_stream_mpeg2v_file, write_test_program_stream_vobsub_file,
+    write_test_program_stream_vvc_file, write_test_qcp_constant_file,
+    write_test_transport_stream_ac3_file, write_test_transport_stream_ac4_file,
+    write_test_transport_stream_av1_file, write_test_transport_stream_avs3_file,
+    write_test_transport_stream_dts_file, write_test_transport_stream_dvb_subtitle_file,
+    write_test_transport_stream_dvb_teletext_file, write_test_transport_stream_eac3_file,
+    write_test_transport_stream_h264_file, write_test_transport_stream_h265_file,
+    write_test_transport_stream_latm_file, write_test_transport_stream_mhas_file,
+    write_test_transport_stream_mp3_file, write_test_transport_stream_mp4v_file,
+    write_test_transport_stream_mpeg2v_file, write_test_transport_stream_truehd_file,
+    write_test_transport_stream_vvc_file, write_test_truehd_file, write_test_usac_latm_file,
+    write_test_vobsub_files, write_test_vp10_ivf_file, write_test_wave_pcm_file,
+    write_test_wrapped_dts_file_with_tail,
 };
 
 #[test]
@@ -4095,7 +4096,7 @@ fn dispatch_routes_mux_command() {
     assert_eq!(mdat_payload(&output_bytes, root_boxes[2]), b"audvideo");
 }
 
-fn build_audio_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> std::path::PathBuf {
+fn build_audio_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4115,7 +4116,7 @@ fn build_audio_input_file_with_type(
     prefix: &str,
     major_brand: mp4forge::FourCc,
     sample_entry_type: &str,
-) -> std::path::PathBuf {
+) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4135,7 +4136,7 @@ fn build_audio_input_file_with_type(
     )
 }
 
-fn build_video_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> std::path::PathBuf {
+fn build_video_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4155,7 +4156,7 @@ fn build_video_input_file_with_type(
     prefix: &str,
     major_brand: mp4forge::FourCc,
     sample_entry_type: &str,
-) -> std::path::PathBuf {
+) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4177,7 +4178,7 @@ fn build_video_input_file_with_type(
     )
 }
 
-fn build_text_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> std::path::PathBuf {
+fn build_text_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4200,7 +4201,7 @@ fn build_audio_input_file_with_metadata(
     language: [u8; 3],
     handler_name: &str,
     payload: &[u8],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4229,7 +4230,7 @@ fn build_video_input_file_with_metadata(
     language: [u8; 3],
     handler_name: &str,
     payload: &[u8],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     write_single_track_mp4_input(
         prefix,
         &MuxFileConfig::new(1_000)
@@ -4253,7 +4254,7 @@ fn build_video_input_file_with_metadata(
     )
 }
 
-fn build_mixed_text_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> std::path::PathBuf {
+fn build_mixed_text_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> TestTempPath {
     let first_source = write_temp_file(&format!("{prefix}-source-text"), b"wvtt");
     let second_source = write_temp_file(&format!("{prefix}-source-subtitle"), b"stpp");
     let output_path = write_temp_file(prefix, &[]);

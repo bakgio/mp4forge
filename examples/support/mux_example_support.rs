@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 
-use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::Write;
+use std::ops::Deref;
+use std::path::{Path, PathBuf as StdPathBuf};
+use std::sync::Arc;
 
 use mp4forge::BoxInfo;
 use mp4forge::FourCc;
+use mp4forge::bitio::BitWriter;
 use mp4forge::boxes::iso14496_12::{
     AudioSampleEntry, SampleEntry, VisualSampleEntry, XMLSubtitleSampleEntry,
 };
@@ -15,6 +17,48 @@ use mp4forge::mux::{
     MuxFileConfig, MuxInterleavePolicy, MuxStagedMediaItem, MuxTrackConfig,
     plan_staged_media_items, write_mp4_mux_to_path,
 };
+use tempfile::{Builder, TempPath};
+
+#[derive(Clone)]
+pub struct ExampleTempPath {
+    path: StdPathBuf,
+    _owner: Arc<TempPath>,
+}
+
+impl ExampleTempPath {
+    fn from_temp_path(path: TempPath) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            _owner: Arc::new(path),
+        }
+    }
+
+    pub fn as_path(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
+impl AsRef<Path> for ExampleTempPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl Deref for ExampleTempPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+impl From<&ExampleTempPath> for StdPathBuf {
+    fn from(path: &ExampleTempPath) -> Self {
+        path.as_path().to_path_buf()
+    }
+}
+
+type PathBuf = ExampleTempPath;
 
 #[derive(Clone, Copy)]
 struct TestMuxSample<'a> {
@@ -29,16 +73,13 @@ pub fn fourcc(value: &str) -> FourCc {
 }
 
 pub fn write_temp_file(prefix: &str, extension: &str, data: &[u8]) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "mp4forge-{prefix}-{}-{unique}.{extension}",
-        std::process::id()
-    ));
-    fs::write(&path, data).expect("write temp example file");
-    path
+    let mut file = Builder::new()
+        .prefix(&format!("mp4forge-{prefix}-"))
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .expect("create temp example file");
+    file.write_all(data).expect("write temp example file");
+    ExampleTempPath::from_temp_path(file.into_temp_path())
 }
 
 pub fn write_test_flac_file(prefix: &str, frame_payload: &[u8]) -> PathBuf {
@@ -47,7 +88,7 @@ pub fn write_test_flac_file(prefix: &str, frame_payload: &[u8]) -> PathBuf {
     bytes.push(0x80);
     bytes.extend_from_slice(&34_u32.to_be_bytes()[1..]);
     bytes.extend_from_slice(&build_flac_streaminfo_block(48_000, 2, 16, 1_024));
-    bytes.extend_from_slice(frame_payload);
+    bytes.extend_from_slice(&build_test_flac_frame(frame_payload));
     write_temp_file(prefix, "flac", &bytes)
 }
 
@@ -70,6 +111,44 @@ pub fn write_test_av1_ivf_file(
         frame_timestamps,
         frame_payloads,
     )
+}
+
+pub fn build_test_av1_sequence_header_obu(width: u16, height: u16) -> Vec<u8> {
+    let mut payload_writer = BitWriter::new(Vec::new());
+    write_bits_u64(&mut payload_writer, 0, 3);
+    payload_writer
+        .write_bit(true)
+        .expect("write AV1 still-picture flag");
+    payload_writer
+        .write_bit(true)
+        .expect("write AV1 reduced-header flag");
+    write_bits_u64(&mut payload_writer, 0, 5);
+    write_bits_u64(&mut payload_writer, 9, 4);
+    write_bits_u64(&mut payload_writer, 8, 4);
+    write_bits_u64(&mut payload_writer, u64::from(width.saturating_sub(1)), 10);
+    write_bits_u64(&mut payload_writer, u64::from(height.saturating_sub(1)), 9);
+    for _ in 0..11 {
+        payload_writer
+            .write_bit(false)
+            .expect("write AV1 sequence flag");
+    }
+    write_bits_u64(&mut payload_writer, 0, 2);
+    payload_writer
+        .write_bit(false)
+        .expect("write AV1 color-description flag");
+    payload_writer
+        .write_bit(false)
+        .expect("write AV1 timing-info flag");
+    align_bit_writer(&mut payload_writer);
+    let payload = payload_writer
+        .into_inner()
+        .expect("finish AV1 sequence header");
+
+    let mut obu = Vec::with_capacity(2 + payload.len());
+    obu.push(0x0A);
+    obu.push(u8::try_from(payload.len()).expect("AV1 sequence-header payload fits"));
+    obu.extend_from_slice(&payload);
+    obu
 }
 
 fn write_single_track_mp4_input(
@@ -234,6 +313,81 @@ fn build_flac_streaminfo_block(
     block[16] = u8::try_from((total_samples >> 8) & 0xFF).expect("sample-count byte fits");
     block[17] = u8::try_from(total_samples & 0xFF).expect("sample-count byte fits");
     block
+}
+
+fn build_test_flac_frame(seed_payload: &[u8]) -> Vec<u8> {
+    let mut writer = BitWriter::new(Vec::new());
+    write_bits_u64(&mut writer, 0x7FFC, 15);
+    writer.write_bit(false).expect("write FLAC reserved bit");
+    write_bits_u64(&mut writer, 10, 4);
+    write_bits_u64(&mut writer, 0, 4);
+    write_bits_u64(&mut writer, 1, 4);
+    write_bits_u64(&mut writer, 4, 3);
+    writer.write_bit(false).expect("write FLAC sample-size bit");
+    write_bits_u64(&mut writer, 0, 8);
+    align_bit_writer(&mut writer);
+    let mut frame = writer.into_inner().expect("finish FLAC header");
+    frame.push(flac_crc8(&frame));
+
+    let left_sample = u16::from(*seed_payload.first().unwrap_or(&0x11));
+    let right_sample = u16::from(*seed_payload.get(1).unwrap_or(&0x22));
+    let mut subframe_writer = BitWriter::new(Vec::new());
+    for sample in [left_sample, right_sample] {
+        subframe_writer
+            .write_bit(false)
+            .expect("write FLAC subframe padding");
+        write_bits_u64(&mut subframe_writer, 0, 6);
+        subframe_writer
+            .write_bit(false)
+            .expect("write FLAC wasted-bits flag");
+        write_bits_u64(&mut subframe_writer, u64::from(sample), 16);
+    }
+    align_bit_writer(&mut subframe_writer);
+    frame.extend_from_slice(&subframe_writer.into_inner().expect("finish FLAC subframes"));
+    frame.extend_from_slice(&flac_crc16(&frame).to_be_bytes());
+    frame
+}
+
+fn write_bits_u64(writer: &mut BitWriter<Vec<u8>>, value: u64, width: usize) {
+    writer
+        .write_bits(&value.to_be_bytes(), width)
+        .expect("write example FLAC bits");
+}
+
+fn align_bit_writer(writer: &mut BitWriter<Vec<u8>>) {
+    while !writer.is_aligned() {
+        writer.write_bit(false).expect("write example FLAC padding");
+    }
+}
+
+fn flac_crc8(data: &[u8]) -> u8 {
+    let mut crc = 0_u8;
+    for byte in data {
+        crc ^= *byte;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn flac_crc16(data: &[u8]) -> u16 {
+    let mut crc = 0_u16;
+    for byte in data {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 pub fn build_video_input_file(

@@ -43,6 +43,9 @@ use super::{
 const IDENTITY_MATRIX: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 const VMHD_DEFAULT_FLAGS: u32 = 0x0000_0001;
 const NON_KEY_SAMPLE_FLAGS: u32 = 0x0001_0000;
+const CSLG: FourCc = FourCc::from_bytes(*b"cslg");
+const SBGP: FourCc = FourCc::from_bytes(*b"sbgp");
+const SGPD: FourCc = FourCc::from_bytes(*b"sgpd");
 const SDSM: FourCc = FourCc::from_bytes(*b"sdsm");
 const ISOM_UNIX_EPOCH_OFFSET: u64 = 2_082_844_800;
 const AUTO_FLAT_MOVIE_TIMESCALE: u32 = 600;
@@ -3186,26 +3189,28 @@ fn build_stbl_bytes(
     let stsc = preserved_flat_stsc_or_built(track)?;
     let stsz = build_stsz(track)?;
     let chunk_offsets = build_chunk_offsets(track, mdat_data_start)?;
-    let preserved_box_types = track
-        .config
-        .preserved_flat_stbl_boxes()
-        .iter()
-        .filter_map(|box_bytes| box_bytes.get(4..8))
-        .filter_map(|box_type| box_type.try_into().ok())
-        .map(FourCc::from_bytes)
-        .collect::<Vec<_>>();
-    let (preserved_cslg_boxes, preserved_other_boxes): (Vec<_>, Vec<_>) = track
-        .config
-        .preserved_flat_stbl_boxes()
-        .iter()
-        .cloned()
-        .partition(|box_bytes| {
-            box_bytes
-                .get(4..8)
-                .and_then(|box_type| box_type.try_into().ok())
-                .map(FourCc::from_bytes)
-                == Some(FourCc::from_bytes(*b"cslg"))
-        });
+    let mut has_preserved_sbgp = false;
+    let mut has_preserved_sgpd = false;
+    let mut preserved_cslg_boxes = Vec::new();
+    let mut preserved_other_boxes = Vec::new();
+    for box_bytes in track.config.preserved_flat_stbl_boxes().iter().cloned() {
+        match box_bytes
+            .get(4..8)
+            .and_then(|box_type| box_type.try_into().ok())
+            .map(FourCc::from_bytes)
+        {
+            Some(CSLG) => preserved_cslg_boxes.push(box_bytes),
+            Some(SBGP) => {
+                has_preserved_sbgp = true;
+                preserved_other_boxes.push(box_bytes);
+            }
+            Some(SGPD) => {
+                has_preserved_sgpd = true;
+                preserved_other_boxes.push(box_bytes);
+            }
+            _ => preserved_other_boxes.push(box_bytes),
+        }
+    }
     let mut children = vec![stsd, encode_typed_box(&stts, &[])?];
     if let Some(ctts) = build_ctts(track)? {
         children.push(encode_typed_box(&ctts, &[])?);
@@ -3225,15 +3230,13 @@ fn build_stbl_bytes(
         children.push(encode_typed_box(&build_co64(&chunk_offsets)?, &[])?);
     }
     if let Some(sample_roll_distance) = track.config.sample_roll_distance() {
-        if !preserved_box_types.contains(&FourCc::from_bytes(*b"sgpd")) {
+        if !has_preserved_sgpd {
             children.push(encode_typed_box(
                 &build_roll_sgpd(sample_roll_distance),
                 &[],
             )?);
         }
-        if track.config.emit_roll_sbgp()
-            && !preserved_box_types.contains(&FourCc::from_bytes(*b"sbgp"))
-        {
+        if track.config.emit_roll_sbgp() && !has_preserved_sbgp {
             children.push(encode_typed_box(
                 &build_roll_sbgp(
                     u32::try_from(track.samples.len())

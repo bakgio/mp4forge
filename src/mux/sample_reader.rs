@@ -279,24 +279,44 @@ where
 
     /// Reads the next sample in planned order.
     pub fn next_sample(&mut self) -> Result<Option<SamplePacket>, SampleReaderError> {
+        let mut bytes = Vec::new();
+        let Some(metadata) = self.next_sample_into(&mut bytes)? else {
+            return Ok(None);
+        };
+        Ok(Some(SamplePacket { metadata, bytes }))
+    }
+
+    /// Reads the next sample in planned order into a caller-owned byte buffer.
+    ///
+    /// The buffer is cleared and resized to the next sample payload size, allowing callers that
+    /// process samples one at a time to reuse its allocation across reads.
+    pub fn next_sample_into(
+        &mut self,
+        bytes: &mut Vec<u8>,
+    ) -> Result<Option<SampleMetadata>, SampleReaderError> {
         let Some(event) = next_sample_event(&mut self.cursor) else {
             return Ok(None);
         };
         let staged = event.planned_item().staged();
+        let source_count = self.sources.len();
         let Some(source) = self.sources.get_mut(staged.source_index()) else {
             return Err(SampleReaderError::MissingSourceIndex {
                 source_index: staged.source_index(),
-                source_count: self.sources.len(),
+                source_count,
             });
         };
 
         source.seek(SeekFrom::Start(staged.data_offset()))?;
-        let bytes =
-            read_sample_bytes(source, staged.source_index(), u64::from(staged.data_size()))?;
-        Ok(Some(SamplePacket {
-            metadata: metadata_from_sample_event(event, &self.track_metadata),
+        read_sample_bytes_into(
+            source,
+            staged.source_index(),
+            u64::from(staged.data_size()),
             bytes,
-        }))
+        )?;
+        Ok(Some(metadata_from_sample_event(
+            event,
+            &self.track_metadata,
+        )))
     }
 }
 
@@ -344,14 +364,30 @@ where
 
     /// Reads the next sample in planned order.
     pub fn next_sample(&mut self) -> Result<Option<SamplePacket>, SampleReaderError> {
+        let mut bytes = Vec::new();
+        let Some(metadata) = self.next_sample_into(&mut bytes)? else {
+            return Ok(None);
+        };
+        Ok(Some(SamplePacket { metadata, bytes }))
+    }
+
+    /// Reads the next sample in planned order into a caller-owned byte buffer.
+    ///
+    /// The buffer is cleared and resized to the next sample payload size, allowing forward-only
+    /// consumers to reuse storage while the reader advances each source monotonically.
+    pub fn next_sample_into(
+        &mut self,
+        bytes: &mut Vec<u8>,
+    ) -> Result<Option<SampleMetadata>, SampleReaderError> {
         let Some(event) = next_sample_event(&mut self.cursor) else {
             return Ok(None);
         };
         let staged = event.planned_item().staged();
+        let source_count = self.sources.len();
         let Some(source) = self.sources.get_mut(staged.source_index()) else {
             return Err(SampleReaderError::MissingSourceIndex {
                 source_index: staged.source_index(),
-                source_count: self.sources.len(),
+                source_count,
             });
         };
 
@@ -363,16 +399,17 @@ where
             staged.data_offset(),
             &mut self.advance_buffer,
         )?;
-        let bytes = read_progressive_sample(
+        read_progressive_sample_into(
             source,
             staged.source_index(),
             source_offset,
             u64::from(staged.data_size()),
-        )?;
-        Ok(Some(SamplePacket {
-            metadata: metadata_from_sample_event(event, &self.track_metadata),
             bytes,
-        }))
+        )?;
+        Ok(Some(metadata_from_sample_event(
+            event,
+            &self.track_metadata,
+        )))
     }
 }
 
@@ -414,25 +451,45 @@ where
 
     /// Reads the next sample in planned order.
     pub async fn next_sample(&mut self) -> Result<Option<SamplePacket>, SampleReaderError> {
+        let mut bytes = Vec::new();
+        let Some(metadata) = self.next_sample_into(&mut bytes).await? else {
+            return Ok(None);
+        };
+        Ok(Some(SamplePacket { metadata, bytes }))
+    }
+
+    /// Reads the next sample in planned order into a caller-owned byte buffer.
+    ///
+    /// The buffer is cleared and resized to the next sample payload size, allowing async callers
+    /// that process samples one at a time to reuse its allocation across awaits.
+    pub async fn next_sample_into(
+        &mut self,
+        bytes: &mut Vec<u8>,
+    ) -> Result<Option<SampleMetadata>, SampleReaderError> {
         let Some(event) = next_sample_event(&mut self.cursor) else {
             return Ok(None);
         };
         let staged = event.planned_item().staged();
+        let source_count = self.sources.len();
         let Some(source) = self.sources.get_mut(staged.source_index()) else {
             return Err(SampleReaderError::MissingSourceIndex {
                 source_index: staged.source_index(),
-                source_count: self.sources.len(),
+                source_count,
             });
         };
 
         source.seek(SeekFrom::Start(staged.data_offset())).await?;
-        let bytes =
-            read_sample_bytes_async(source, staged.source_index(), u64::from(staged.data_size()))
-                .await?;
-        Ok(Some(SamplePacket {
-            metadata: metadata_from_sample_event(event, &self.track_metadata),
+        read_sample_bytes_into_async(
+            source,
+            staged.source_index(),
+            u64::from(staged.data_size()),
             bytes,
-        }))
+        )
+        .await?;
+        Ok(Some(metadata_from_sample_event(
+            event,
+            &self.track_metadata,
+        )))
     }
 }
 
@@ -480,14 +537,30 @@ where
 
     /// Reads the next sample in planned order.
     pub async fn next_sample(&mut self) -> Result<Option<SamplePacket>, SampleReaderError> {
+        let mut bytes = Vec::new();
+        let Some(metadata) = self.next_sample_into(&mut bytes).await? else {
+            return Ok(None);
+        };
+        Ok(Some(SamplePacket { metadata, bytes }))
+    }
+
+    /// Reads the next sample in planned order into a caller-owned byte buffer.
+    ///
+    /// The buffer is cleared and resized to the next sample payload size, allowing forward-only
+    /// async consumers to reuse storage while each source advances monotonically.
+    pub async fn next_sample_into(
+        &mut self,
+        bytes: &mut Vec<u8>,
+    ) -> Result<Option<SampleMetadata>, SampleReaderError> {
         let Some(event) = next_sample_event(&mut self.cursor) else {
             return Ok(None);
         };
         let staged = event.planned_item().staged();
+        let source_count = self.sources.len();
         let Some(source) = self.sources.get_mut(staged.source_index()) else {
             return Err(SampleReaderError::MissingSourceIndex {
                 source_index: staged.source_index(),
-                source_count: self.sources.len(),
+                source_count,
             });
         };
 
@@ -500,17 +573,18 @@ where
             &mut self.advance_buffer,
         )
         .await?;
-        let bytes = read_progressive_sample_async(
+        read_progressive_sample_into_async(
             source,
             staged.source_index(),
             source_offset,
             u64::from(staged.data_size()),
+            bytes,
         )
         .await?;
-        Ok(Some(SamplePacket {
-            metadata: metadata_from_sample_event(event, &self.track_metadata),
-            bytes,
-        }))
+        Ok(Some(metadata_from_sample_event(
+            event,
+            &self.track_metadata,
+        )))
     }
 }
 
@@ -552,20 +626,29 @@ fn metadata_from_sample_event(
     }
 }
 
-fn read_sample_bytes<R>(
+fn read_sample_bytes_into<R>(
     source: &mut R,
     source_index: usize,
     size: u64,
-) -> Result<Vec<u8>, SampleReaderError>
+    bytes: &mut Vec<u8>,
+) -> Result<(), SampleReaderError>
 where
     R: Read,
 {
     let len = usize::try_from(size).map_err(|_| SampleReaderError::SampleSizeOverflow { size })?;
-    let mut bytes = vec![0_u8; len];
+    bytes.clear();
+    bytes.resize(len, 0);
     let mut copied = 0_usize;
     while copied < len {
-        let read = source.read(&mut bytes[copied..])?;
+        let read = match source.read(&mut bytes[copied..]) {
+            Ok(read) => read,
+            Err(error) => {
+                bytes.truncate(copied);
+                return Err(SampleReaderError::Io(error));
+            }
+        };
         if read == 0 {
+            bytes.truncate(copied);
             return Err(SampleReaderError::IncompleteSample {
                 source_index,
                 expected_size: size,
@@ -574,7 +657,7 @@ where
         }
         copied += read;
     }
-    Ok(bytes)
+    Ok(())
 }
 
 fn advance_progressive_source<R>(
@@ -612,21 +695,30 @@ where
     Ok(())
 }
 
-fn read_progressive_sample<R>(
+fn read_progressive_sample_into<R>(
     source: &mut R,
     source_index: usize,
     current_offset: &mut u64,
     size: u64,
-) -> Result<Vec<u8>, SampleReaderError>
+    bytes: &mut Vec<u8>,
+) -> Result<(), SampleReaderError>
 where
     R: Read,
 {
     let len = usize::try_from(size).map_err(|_| SampleReaderError::SampleSizeOverflow { size })?;
-    let mut bytes = vec![0_u8; len];
+    bytes.clear();
+    bytes.resize(len, 0);
     let mut copied = 0_usize;
     while copied < len {
-        let read = source.read(&mut bytes[copied..])?;
+        let read = match source.read(&mut bytes[copied..]) {
+            Ok(read) => read,
+            Err(error) => {
+                bytes.truncate(copied);
+                return Err(SampleReaderError::Io(error));
+            }
+        };
         if read == 0 {
+            bytes.truncate(copied);
             return Err(SampleReaderError::IncompleteSample {
                 source_index,
                 expected_size: size,
@@ -638,24 +730,33 @@ where
     *current_offset = current_offset
         .checked_add(size)
         .ok_or(SampleReaderError::SampleSizeOverflow { size })?;
-    Ok(bytes)
+    Ok(())
 }
 
 #[cfg(feature = "async")]
-async fn read_sample_bytes_async<R>(
+async fn read_sample_bytes_into_async<R>(
     source: &mut R,
     source_index: usize,
     size: u64,
-) -> Result<Vec<u8>, SampleReaderError>
+    bytes: &mut Vec<u8>,
+) -> Result<(), SampleReaderError>
 where
     R: AsyncReadForward,
 {
     let len = usize::try_from(size).map_err(|_| SampleReaderError::SampleSizeOverflow { size })?;
-    let mut bytes = vec![0_u8; len];
+    bytes.clear();
+    bytes.resize(len, 0);
     let mut copied = 0_usize;
     while copied < len {
-        let read = source.read(&mut bytes[copied..]).await?;
+        let read = match source.read(&mut bytes[copied..]).await {
+            Ok(read) => read,
+            Err(error) => {
+                bytes.truncate(copied);
+                return Err(SampleReaderError::Io(error));
+            }
+        };
         if read == 0 {
+            bytes.truncate(copied);
             return Err(SampleReaderError::IncompleteSample {
                 source_index,
                 expected_size: size,
@@ -664,7 +765,7 @@ where
         }
         copied += read;
     }
-    Ok(bytes)
+    Ok(())
 }
 
 #[cfg(feature = "async")]
@@ -704,21 +805,30 @@ where
 }
 
 #[cfg(feature = "async")]
-async fn read_progressive_sample_async<R>(
+async fn read_progressive_sample_into_async<R>(
     source: &mut R,
     source_index: usize,
     current_offset: &mut u64,
     size: u64,
-) -> Result<Vec<u8>, SampleReaderError>
+    bytes: &mut Vec<u8>,
+) -> Result<(), SampleReaderError>
 where
     R: AsyncReadForward,
 {
     let len = usize::try_from(size).map_err(|_| SampleReaderError::SampleSizeOverflow { size })?;
-    let mut bytes = vec![0_u8; len];
+    bytes.clear();
+    bytes.resize(len, 0);
     let mut copied = 0_usize;
     while copied < len {
-        let read = source.read(&mut bytes[copied..]).await?;
+        let read = match source.read(&mut bytes[copied..]).await {
+            Ok(read) => read,
+            Err(error) => {
+                bytes.truncate(copied);
+                return Err(SampleReaderError::Io(error));
+            }
+        };
         if read == 0 {
+            bytes.truncate(copied);
             return Err(SampleReaderError::IncompleteSample {
                 source_index,
                 expected_size: size,
@@ -730,5 +840,5 @@ where
     *current_offset = current_offset
         .checked_add(size)
         .ok_or(SampleReaderError::SampleSizeOverflow { size })?;
-    Ok(bytes)
+    Ok(())
 }

@@ -653,7 +653,8 @@ fn divide_command_rejects_dynamic_only_dash_options_in_static_mode() {
 fn divide_command_rejects_session_state_options_in_validate_mode() {
     let input = build_divide_input_file();
     let input_path = write_temp_file("divide-validate-session-invalid-input", &input);
-    let session_path = temp_output_dir("divide-validate-session-state").join("dash.session");
+    let session_dir = temp_output_dir("divide-validate-session-state");
+    let session_path = session_dir.join("dash.session");
     let args = vec![
         "-validate".to_string(),
         "-dash-session-save".to_string(),
@@ -671,7 +672,7 @@ fn divide_command_rejects_session_state_options_in_validate_mode() {
     );
 
     let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(session_path.parent().unwrap());
+    let _ = fs::remove_dir_all(&session_dir);
 }
 
 #[test]

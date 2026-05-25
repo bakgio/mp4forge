@@ -4,7 +4,7 @@ mod support;
 
 use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use mp4forge::BoxInfo;
@@ -59,15 +59,15 @@ use tokio::io::AsyncWriteExt;
 
 use support::{
     TestAviAvc1Stream, TestAviH264Stream, TestAviMp4vStream, TestAviPcmStream, TestMuxSample,
-    TestQcpCodecKind, build_test_ac4_sample_payload_bytes, build_test_av1_sequence_header_obu,
-    build_test_mp4v_decoder_specific_info, build_test_mp4v_decoder_specific_info_with_vol_control,
-    build_test_mpeg2v_bytes, build_test_truehd_stream_bytes, build_test_vp8_keyframe,
-    build_test_vp9_keyframe, build_test_vp10_keyframe, encode_raw_box, encode_supported_box,
-    fixture_path, fourcc, temp_output_dir, write_single_track_mp4_input, write_temp_file,
-    write_temp_file_with_extension, write_test_ac3_44100_file, write_test_ac3_file,
-    write_test_ac4_file, write_test_adts_file, write_test_aifc_alaw_file,
-    write_test_aifc_alaw_file_with_declared_bits, write_test_aifc_float64_file,
-    write_test_aifc_pcm_file, write_test_aifc_ulaw_file,
+    TestQcpCodecKind, TestTempPath, build_test_ac4_sample_payload_bytes,
+    build_test_av1_sequence_header_obu, build_test_mp4v_decoder_specific_info,
+    build_test_mp4v_decoder_specific_info_with_vol_control, build_test_mpeg2v_bytes,
+    build_test_truehd_stream_bytes, build_test_vp8_keyframe, build_test_vp9_keyframe,
+    build_test_vp10_keyframe, encode_raw_box, encode_supported_box, fixture_path, fourcc,
+    temp_output_dir, write_single_track_mp4_input, write_temp_file, write_temp_file_with_extension,
+    write_test_ac3_44100_file, write_test_ac3_file, write_test_ac4_file, write_test_adts_file,
+    write_test_aifc_alaw_file, write_test_aifc_alaw_file_with_declared_bits,
+    write_test_aifc_float64_file, write_test_aifc_pcm_file, write_test_aifc_ulaw_file,
     write_test_aifc_ulaw_file_with_declared_bits, write_test_aiff_pcm_file, write_test_amr_file,
     write_test_amr_wb_file, write_test_av1_annex_b_file, write_test_av1_ivf_file,
     write_test_av1_obu_file, write_test_avi_ac3_file, write_test_avi_alaw_file,
@@ -112,7 +112,7 @@ use support::{
     write_test_wrapped_dts_file_with_tail,
 };
 
-fn corrupt_mpeg2ts_section_crc(input: &Path, target_pid: u16, prefix: &str) -> PathBuf {
+fn corrupt_mpeg2ts_section_crc(input: &Path, target_pid: u16, prefix: &str) -> TestTempPath {
     let mut bytes = fs::read(input).unwrap();
     for packet in bytes.chunks_mut(188) {
         if packet.first().copied() != Some(0x47) {
@@ -5462,11 +5462,8 @@ fn mux_to_path_merges_mp4_track_specs_and_uses_the_first_mp4_as_authority() {
         build_video_input_file("mux-request-video-input", fourcc("isom"), &[b"video"]);
     let output_path = write_temp_file("mux-request-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(
-            audio_input.clone(),
-            MuxMp4TrackSelector::Audio { occurrence: 1 },
-        ),
-        MuxTrackSpec::mp4(video_input.clone(), MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
     ]);
 
     mux_to_path(&request, &output_path).unwrap();
@@ -5517,7 +5514,7 @@ fn mux_to_path_imports_flat_mp4_compact_sample_sizes() {
             &compact_input_bytes,
         );
         let output = write_temp_file(&format!("mux-flat-compact-size-output-{label}"), &[]);
-        let request = MuxRequest::new(vec![MuxTrackSpec::path(compact_input)]);
+        let request = MuxRequest::new(vec![MuxTrackSpec::path(&compact_input)]);
 
         mux_to_path(&request, &output).unwrap();
 
@@ -5547,7 +5544,7 @@ fn mux_to_path_preserves_flat_mp4_multiple_sample_descriptions() {
     let input = build_multi_description_audio_input_file("mux-flat-multi-description-input");
     let output = write_temp_file("mux-flat-multi-description-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -5593,7 +5590,7 @@ fn mux_to_path_rejects_flat_mp4_stsc_sample_description_switching() {
     let patched_input = write_temp_file("mux-flat-stsc-description-switch-input", &patched);
     let output = write_temp_file("mux-flat-stsc-description-switch-output", b"unchanged");
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        patched_input,
+        &patched_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -5613,7 +5610,7 @@ fn mux_into_path_preserves_an_existing_mp4_destination() {
     let destination =
         build_video_input_file("mux-destination-video-input", fourcc("isom"), &[b"video"]);
     let audio_input = write_test_adts_file("mux-destination-audio-input", &[b"aud"]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(audio_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&audio_input)]);
 
     mux_into_path(&request, &destination).unwrap();
 
@@ -5650,7 +5647,7 @@ fn mux_into_path_appends_compatible_audio_to_existing_destination_track() {
     let audio_input =
         build_audio_input_file("mux-destination-append-audio-new", fourcc("isom"), &[b"a2"]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -5731,7 +5728,7 @@ fn mux_into_path_appends_audio_with_only_noncritical_sample_entry_difference() {
         }],
     );
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -5764,7 +5761,7 @@ fn mux_to_path_rewrites_local_data_reference_samples_into_self_contained_output(
     );
     let output_path = write_temp_file("mux-external-reference-audio-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -5813,7 +5810,7 @@ fn mux_to_path_rejects_missing_local_data_reference_before_output_mutation() {
     fs::remove_file(reference_media).unwrap();
     let output_path = write_temp_file("mux-external-reference-missing-output", b"unchanged");
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -5838,7 +5835,7 @@ fn mux_into_path_appends_compatible_video_to_existing_destination_track() {
     let video_input =
         build_video_input_file("mux-destination-append-video-new", fourcc("isom"), &[b"v2"]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        video_input,
+        &video_input,
         MuxMp4TrackSelector::Video,
     )]);
 
@@ -5923,7 +5920,7 @@ fn mux_into_path_appends_video_with_only_noncritical_sample_entry_difference() {
         }],
     );
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        video_input,
+        &video_input,
         MuxMp4TrackSelector::Video,
     )]);
 
@@ -5998,7 +5995,7 @@ fn mux_into_path_appends_video_with_distinct_metadata_sample_entries() {
         }],
     );
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        video_input,
+        &video_input,
         MuxMp4TrackSelector::Video,
     )]);
 
@@ -6056,11 +6053,11 @@ fn mux_into_path_rejects_ambiguous_compatible_destination_append_targets() {
     let destination = write_temp_file("mux-destination-append-ambiguous-output", &[]);
     let seed_request = MuxRequest::new(vec![
         MuxTrackSpec::mp4(
-            first_destination_track,
+            &first_destination_track,
             MuxMp4TrackSelector::Audio { occurrence: 1 },
         ),
         MuxTrackSpec::mp4(
-            second_destination_track,
+            &second_destination_track,
             MuxMp4TrackSelector::Audio { occurrence: 1 },
         ),
     ]);
@@ -6072,7 +6069,7 @@ fn mux_into_path_rejects_ambiguous_compatible_destination_append_targets() {
         &[b"a3"],
     );
     let append_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        incoming_track,
+        &incoming_track,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
     let before_update = fs::read(&destination).unwrap();
@@ -6096,7 +6093,7 @@ async fn mux_into_path_async_preserves_an_existing_mp4_destination() {
         &[b"video"],
     );
     let audio_input = write_test_adts_file("mux-destination-async-audio-input", &[b"aud"]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(audio_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&audio_input)]);
 
     mp4forge::mux::mux_into_path_async(&request, &destination)
         .await
@@ -6121,7 +6118,7 @@ fn mux_to_path_rejects_duration_modes_for_flat_layout() {
         build_audio_input_file("mux-flat-duration-audio-input", fourcc("dash"), &[b"aud"]);
     let output_path = write_temp_file("mux-flat-duration-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_duration_mode(MuxDurationMode::Fragment { seconds: 0.25 });
@@ -6147,7 +6144,7 @@ fn mux_to_path_requires_one_duration_mode_for_fragmented_layout() {
     );
     let output_path = write_temp_file("mux-fragmented-no-duration-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented);
@@ -6176,7 +6173,7 @@ fn mux_to_path_rejects_fragmented_import_missing_decode_time() {
     );
     let fragmented_input = write_temp_file("mux-fragmented-missing-decode-time-fragmented", &[]);
     let fragmented_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6195,7 +6192,7 @@ fn mux_to_path_rejects_fragmented_import_missing_decode_time() {
     let patched_input = write_temp_file("mux-fragmented-missing-decode-time-input", &patched_bytes);
     let output = write_temp_file("mux-fragmented-missing-decode-time-output", b"unchanged");
     let import_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        patched_input,
+        &patched_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -6219,7 +6216,7 @@ fn mux_to_path_rejects_fragmented_import_sample_description_switching() {
     );
     let fragmented_input = write_temp_file("mux-fragmented-description-switch-fragmented", &[]);
     let fragmented_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6231,7 +6228,7 @@ fn mux_to_path_rejects_fragmented_import_sample_description_switching() {
     let patched_input = write_temp_file("mux-fragmented-description-switch-input", &patched);
     let output = write_temp_file("mux-fragmented-description-switch-output", b"unchanged");
     let import_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        patched_input,
+        &patched_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -6248,7 +6245,7 @@ fn mux_to_path_imports_fragmented_sample_description_index() {
     let input = build_multi_description_audio_input_file("mux-frag-description-index-source");
     let fragmented_input = write_temp_file("mux-frag-description-index-fragmented", &[]);
     let fragmented_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6278,7 +6275,7 @@ fn mux_to_path_imports_fragmented_sample_description_index() {
 
     let output = write_temp_file("mux-frag-description-index-output", &[]);
     let import_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        fragmented_input,
+        &fragmented_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
     mux_to_path(&import_request, &output).unwrap();
@@ -6326,8 +6323,8 @@ fn mux_to_path_writes_fragmented_multi_track_output() {
     );
     let output_path = write_temp_file("mux-fragmented-multi-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
     ])
     .with_output_layout(MuxOutputLayout::Fragmented)
     .with_duration_mode(MuxDurationMode::Fragment { seconds: 0.015 });
@@ -6431,7 +6428,7 @@ fn mux_to_path_writes_fragmented_root_metadata_before_media_fragment() {
     );
     let output_path = write_temp_file("mux-fragmented-root-metadata-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6512,7 +6509,7 @@ fn mux_to_path_writes_later_fragment_metadata_versions() {
     );
     let output_path = write_temp_file("mux-fragmented-later-metadata-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6611,7 +6608,7 @@ fn mux_to_path_rejects_invalid_fragmented_root_metadata() {
 
     let prft_output = write_temp_file("mux-fragmented-invalid-prft-output", &[]);
     let prft_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6630,7 +6627,7 @@ fn mux_to_path_rejects_invalid_fragmented_root_metadata() {
         &[b"a1"],
     );
     let flags_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        flags_input,
+        &flags_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6659,8 +6656,8 @@ fn mux_to_path_writes_fragmented_audio_audio_output() {
     );
     let output_path = write_temp_file("mux-fragmented-audio-audio-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(first_audio, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(second_audio, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&first_audio, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&second_audio, MuxMp4TrackSelector::Audio { occurrence: 1 }),
     ])
     .with_output_layout(MuxOutputLayout::Fragmented)
     .with_duration_mode(MuxDurationMode::Fragment { seconds: 0.015 });
@@ -6700,8 +6697,8 @@ fn mux_to_path_writes_fragmented_video_text_output() {
     );
     let output_path = write_temp_file("mux-fragmented-video-text-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
-        MuxTrackSpec::mp4(text_input, MuxMp4TrackSelector::Text { occurrence: 1 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 1 }),
     ])
     .with_output_layout(MuxOutputLayout::Fragmented)
     .with_duration_mode(MuxDurationMode::Fragment { seconds: 0.015 });
@@ -6762,7 +6759,7 @@ fn mux_to_path_writes_fragmented_text_boundary_and_empty_interval_samples() {
     );
     let output_path = write_temp_file("mux-fragmented-text-boundary-empty-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        text_input,
+        &text_input,
         MuxMp4TrackSelector::Text { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -6824,8 +6821,8 @@ fn mux_to_path_writes_fragmented_mismatched_timescale_tracks() {
     );
     let output_path = write_temp_file("mux-fragmented-mismatched-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
     ])
     .with_output_layout(MuxOutputLayout::Fragmented)
     .with_duration_mode(MuxDurationMode::Fragment { seconds: 0.05 });
@@ -6871,8 +6868,8 @@ fn mux_to_path_writes_fragmented_sparse_track_fragments() {
     );
     let output_path = write_temp_file("mux-fragmented-sparse-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
     ])
     .with_output_layout(MuxOutputLayout::Fragmented)
     .with_duration_mode(MuxDurationMode::Fragment { seconds: 0.015 });
@@ -6905,7 +6902,7 @@ fn mux_to_path_writes_fragmented_single_track_output() {
     );
     let output_path = write_temp_file("mux-fragment-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7046,7 +7043,7 @@ fn mux_fragmented_to_paths_writes_recombinable_init_and_media_outputs() {
     let init_output = output_dir.join("init.mp4");
     let media_output = output_dir.join("media.mp4");
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7098,7 +7095,7 @@ fn mux_fragmented_to_paths_rejects_existing_split_output_without_mutation() {
     fs::create_dir_all(&output_dir).unwrap();
     fs::write(&media_output, b"unchanged").unwrap();
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7241,7 +7238,7 @@ fn mux_to_path_flat_mode_preserves_imported_edit_media_time() {
     );
     let output_path = write_temp_file("mux-flat-edit-media-time-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -7340,7 +7337,7 @@ fn mux_to_path_flat_mode_preserves_multi_entry_edit_list_when_timescale_matches(
     );
     let output_path = write_temp_file("mux-flat-multi-entry-edit-list-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )]);
 
@@ -7385,7 +7382,7 @@ fn mux_to_path_fragmented_segment_mode_honors_imported_edit_media_time() {
     );
     let output_path = write_temp_file("mux-fragment-segment-edit-shift-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7469,7 +7466,7 @@ fn mux_to_path_fragmented_video_mehd_uses_presentation_duration_for_imported_edi
         &samples,
     );
     let output_path = write_temp_file("mux-fragment-video-edit-duration-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(input, MuxMp4TrackSelector::Video)])
+    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(&input, MuxMp4TrackSelector::Video)])
         .with_output_layout(MuxOutputLayout::Fragmented)
         .with_duration_mode(MuxDurationMode::Fragment { seconds: 10.0 });
 
@@ -7552,7 +7549,7 @@ fn mux_to_path_fragmented_imported_vp8_empty_stss_stays_sync() {
 
     let output_path = write_temp_file("mux-fragmented-imported-vp8-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        flat_source,
+        &flat_source,
         MuxMp4TrackSelector::Video,
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7587,7 +7584,7 @@ fn mux_to_path_fragmented_imported_opus_uses_track_timescale() {
 
     let output_path = write_temp_file("mux-fragmented-imported-opus-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        flat_source,
+        &flat_source,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7628,7 +7625,7 @@ fn mux_to_path_fragmented_imported_eac3_groups_fragment_references() {
 
     let output_path = write_temp_file("mux-fragment-imported-eac3-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        flat_source,
+        &flat_source,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7696,7 +7693,7 @@ fn mux_to_path_fragmented_imported_alac_uses_dominant_trex_duration() {
     );
     let output_path = write_temp_file("mux-fragment-imported-alac-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7761,7 +7758,7 @@ fn mux_to_path_fragmented_segment_mode_aligns_video_boundaries_to_sync_samples()
         &samples,
     );
     let output_path = write_temp_file("mux-fragment-segment-video-sync-boundaries-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(input, MuxMp4TrackSelector::Video)])
+    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(&input, MuxMp4TrackSelector::Video)])
         .with_output_layout(MuxOutputLayout::Fragmented)
         .with_duration_mode(MuxDurationMode::Segment { seconds: 1.0 });
 
@@ -7828,7 +7825,7 @@ fn mux_to_path_fragmented_imported_dtsx_preserves_udts_child_boxes() {
     );
     let output_path = write_temp_file("mux-fragment-imported-dtsx-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -7924,7 +7921,7 @@ fn mux_to_path_fragmented_imported_dtsc_preserves_existing_ddts() {
     );
     let output_path = write_temp_file("mux-fragment-imported-dtsc-preserve-ddts-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -8007,7 +8004,7 @@ fn mux_to_path_fragmented_imported_flac_preserves_dfla_and_strips_btrt() {
     );
     let output_path = write_temp_file("mux-fragment-imported-flac-preserve-dfla-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        input,
+        &input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -8164,7 +8161,7 @@ fn mux_to_path_imports_mp4_text_track_selectors() {
     let text_input = build_wvtt_input_file("mux-text-selector-input", fourcc("dash"), &[b"wvtt"]);
     let output_path = write_temp_file("mux-text-selector-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        text_input,
+        &text_input,
         MuxMp4TrackSelector::Text { occurrence: 1 },
     )]);
 
@@ -8204,7 +8201,7 @@ fn mux_to_path_imports_mp4_text_occurrence_selectors() {
     let text_input = build_mixed_text_input_file("mux-text-occurrence-input", fourcc("isom"));
     let output_path = write_temp_file("mux-text-occurrence-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        text_input,
+        &text_input,
         MuxMp4TrackSelector::Text { occurrence: 2 },
     )]);
 
@@ -8244,7 +8241,7 @@ fn mux_to_path_imports_mp4_track_id_selectors_for_text_tracks() {
     let text_input = build_mixed_text_input_file("mux-text-trackid-input", fourcc("mp42"));
     let output_path = write_temp_file("mux-text-trackid-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        text_input,
+        &text_input,
         MuxMp4TrackSelector::TrackId { track_id: 2 },
     )]);
 
@@ -8276,13 +8273,10 @@ fn mux_to_path_preserves_language_and_handler_names_in_mixed_subtitle_jobs() {
     let text_input = build_mixed_text_input_file("mux-mixed-text-input", fourcc("mp42"));
     let output_path = write_temp_file("mux-mixed-subtitle-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(
-            text_input.clone(),
-            MuxMp4TrackSelector::Text { occurrence: 1 },
-        ),
-        MuxTrackSpec::mp4(text_input, MuxMp4TrackSelector::Text { occurrence: 2 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 1 }),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 2 }),
     ]);
 
     mux_to_path(&request, &output_path).unwrap();
@@ -8359,7 +8353,7 @@ fn mux_to_path_imports_mp4_broader_video_codec_track_families() {
         );
         let output_path =
             write_temp_file(&format!("mux-video-family-{sample_entry_type}-out"), &[]);
-        let request = MuxRequest::new(vec![MuxTrackSpec::mp4(input, MuxMp4TrackSelector::Video)]);
+        let request = MuxRequest::new(vec![MuxTrackSpec::mp4(&input, MuxMp4TrackSelector::Video)]);
 
         mux_to_path(&request, &output_path).unwrap();
 
@@ -8404,7 +8398,7 @@ fn mux_to_path_imports_mp4_broader_audio_codec_track_families() {
         let output_path =
             write_temp_file(&format!("mux-audio-family-{sample_entry_type}-out"), &[]);
         let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-            input,
+            &input,
             MuxMp4TrackSelector::Audio { occurrence: 1 },
         )]);
 
@@ -8439,7 +8433,7 @@ fn mux_to_path_imports_mp4_broader_audio_codec_track_families() {
 fn mux_to_path_imports_raw_aac_adts_inputs() {
     let aac_input = write_test_adts_file("mux-raw-aac-input", &[b"abc", b"defg"]);
     let output_path = write_temp_file("mux-raw-aac-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(aac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&aac_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -8474,7 +8468,7 @@ fn mux_to_path_flat_auto_profile_interleaves_long_raw_aac_inputs() {
     let payloads = (0..45).map(|_| b"abcdef".as_slice()).collect::<Vec<_>>();
     let aac_input = write_test_adts_file("mux-raw-aac-interleaved-input", &payloads);
     let output_path = write_temp_file("mux-raw-aac-interleaved-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(aac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&aac_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -8535,7 +8529,7 @@ fn mux_to_path_flat_auto_profile_interleaves_long_raw_mp3_inputs() {
     let payloads = (0..43).map(|_| b"abcdef".as_slice()).collect::<Vec<_>>();
     let mp3_input = write_test_mp3_file("mux-raw-mp3-interleaved-input", &payloads);
     let output_path = write_temp_file("mux-raw-mp3-interleaved-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(mp3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mp3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -8963,7 +8957,7 @@ fn mux_to_path_flat_auto_profile_preserves_terminal_mp3_chunk_run_boundary() {
     let payloads = (0..171).map(|_| b"abcdef".as_slice()).collect::<Vec<_>>();
     let mp3_input = write_test_mp3_44100_file("mux-raw-mp3-terminal-run-input", &payloads);
     let output_path = write_temp_file("mux-raw-mp3-terminal-run-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(mp3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mp3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -13220,7 +13214,7 @@ fn mux_to_path_imports_path_only_variable_packet_caf_alac_inputs() {
 fn mux_to_path_imports_path_only_raw_h265_annexb_inputs() {
     let h265_input = write_test_h265_annexb_file("mux-raw-h265-input", &[b"hevc"]);
     let output_path = write_temp_file("mux-raw-h265-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(h265_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&h265_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -13308,7 +13302,7 @@ fn mux_to_path_imports_multisample_h265_inputs_with_stream_timing() {
         &[b"\x80hevc", b"\x80tail"],
     );
     let output_path = write_temp_file("mux-raw-h265-timed-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(h265_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&h265_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -13421,8 +13415,8 @@ fn mux_to_path_flat_auto_profile_collapses_mixed_direct_video_tracks_into_one_ch
     let aac_input = write_test_adts_file("mux-flat-mixed-aac-input", &[b"abc", b"defg"]);
     let output_path = write_temp_file("mux-flat-mixed-h265-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::path(h265_input),
-        MuxTrackSpec::path(aac_input),
+        MuxTrackSpec::path(&h265_input),
+        MuxTrackSpec::path(&aac_input),
     ]);
 
     mux_to_path(&request, &output_path).unwrap();
@@ -13702,7 +13696,7 @@ fn mux_to_path_imports_path_first_ivf_video_inputs() {
                 build_test_av1_sequence_header_obu(640, 360),
                 build_test_av1_sequence_header_obu(640, 360),
             ],
-            write_test_av1_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_av1_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
         (
             "vp08",
@@ -13711,7 +13705,7 @@ fn mux_to_path_imports_path_first_ivf_video_inputs() {
                 build_test_vp8_keyframe(640, 360, 1, b"vp8-a"),
                 build_test_vp8_keyframe(640, 360, 1, b"vp8-b"),
             ],
-            write_test_vp8_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_vp8_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
         (
             "vp09",
@@ -13720,7 +13714,7 @@ fn mux_to_path_imports_path_first_ivf_video_inputs() {
                 build_test_vp9_keyframe(640, 360, 0),
                 build_test_vp9_keyframe(640, 360, 0),
             ],
-            write_test_vp9_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_vp9_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
         (
             "vp10",
@@ -13729,7 +13723,7 @@ fn mux_to_path_imports_path_first_ivf_video_inputs() {
                 build_test_vp10_keyframe(640, 360, 0),
                 build_test_vp10_keyframe(640, 360, 0),
             ],
-            write_test_vp10_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_vp10_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
     ] {
         let frame_refs = frame_payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -13922,25 +13916,25 @@ fn mux_to_path_imports_single_sample_ivf_video_inputs_with_zero_duration() {
             "av01",
             "mux-raw-single-av1",
             vec![build_test_av1_sequence_header_obu(640, 360)],
-            write_test_av1_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_av1_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
         (
             "vp08",
             "mux-raw-single-vp8",
             vec![build_test_vp8_keyframe(640, 360, 1, b"vp8-a")],
-            write_test_vp8_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_vp8_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
         (
             "vp09",
             "mux-raw-single-vp9",
             vec![build_test_vp9_keyframe(640, 360, 0)],
-            write_test_vp9_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_vp9_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
         (
             "vp10",
             "mux-raw-single-vp10",
             vec![build_test_vp10_keyframe(640, 360, 0)],
-            write_test_vp10_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> std::path::PathBuf,
+            write_test_vp10_ivf_file as fn(&str, u16, u16, &[u64], &[&[u8]]) -> TestTempPath,
         ),
     ] {
         let frame_refs = frame_payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -14185,7 +14179,7 @@ fn mux_to_path_imports_raw_mp3_inputs() {
     let mp3_input = write_test_mp3_file("mux-raw-mp3-input", &[b"abc", b"defg"]);
     let expected = fs::read(&mp3_input).unwrap();
     let output_path = write_temp_file("mux-raw-mp3-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(mp3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mp3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14237,7 +14231,7 @@ fn mux_to_path_imports_id3_prefixed_raw_mp3_inputs() {
     );
     let expected = fs::read(&mp3_input).unwrap();
     let output_path = write_temp_file("mux-raw-mp3-id3-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(mp3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mp3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14257,7 +14251,7 @@ fn mux_to_path_ignores_trailing_id3v1_metadata_after_raw_mp3_frames() {
     bytes.extend_from_slice(&tag);
     let mp3_input = write_temp_file("mux-raw-mp3-id3v1-input", &bytes);
     let output_path = write_temp_file("mux-raw-mp3-id3v1-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(mp3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mp3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14274,7 +14268,7 @@ fn mux_to_path_imports_raw_ac3_inputs() {
     let ac3_input = write_test_ac3_file("mux-raw-ac3-input", &[b"ac3"]);
     let expected = fs::read(&ac3_input).unwrap();
     let output_path = write_temp_file("mux-raw-ac3-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ac3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ac3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14306,7 +14300,7 @@ fn mux_to_path_imports_raw_ac3_44100hz_inputs() {
     let ac3_input = write_test_ac3_44100_file("mux-raw-ac3-44100-input", &[b"ac3"]);
     let expected = fs::read(&ac3_input).unwrap();
     let output_path = write_temp_file("mux-raw-ac3-44100-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ac3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ac3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14335,7 +14329,7 @@ fn mux_to_path_imports_raw_eac3_inputs() {
     let eac3_input = write_test_eac3_file("mux-raw-eac3-input", &[b"ec3"]);
     let expected = fs::read(&eac3_input).unwrap();
     let output_path = write_temp_file("mux-raw-eac3-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(eac3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&eac3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14368,7 +14362,7 @@ fn mux_to_path_imports_raw_eac3_inputs_with_dependent_substreams() {
         write_test_eac3_file_with_dependent_substream("mux-raw-eac3-dependent-input", &[b"ec3"]);
     let expected = fs::read(&eac3_input).unwrap();
     let output_path = write_temp_file("mux-raw-eac3-dependent-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(eac3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&eac3_input)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14406,7 +14400,7 @@ fn mux_to_path_reimports_hevc_outputs_with_decoder_configuration() {
     let final_output = write_temp_file("mux-hevc-reimport-output", &[]);
     let first_request = MuxRequest::new(vec![MuxTrackSpec::path(&h265_input)]);
     let second_request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        intermediate.clone(),
+        &intermediate,
         MuxMp4TrackSelector::Video,
     )]);
 
@@ -14431,7 +14425,7 @@ fn mux_to_path_accepts_imported_init_only_tracks_with_empty_sample_tables() {
         &[],
     );
     let output_path = write_temp_file("mux-empty-av1-init-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(input, MuxMp4TrackSelector::Video)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::mp4(&input, MuxMp4TrackSelector::Video)]);
 
     mux_to_path(&request, &output_path).unwrap();
 
@@ -14549,7 +14543,7 @@ fn mux_to_path_preserves_authority_movie_timescale_for_pure_imported_tracks() {
             &format!("mux-authority-timescale-output-{expected_movie_timescale}"),
             &[],
         );
-        let request = MuxRequest::new(vec![MuxTrackSpec::mp4(input, selector)]);
+        let request = MuxRequest::new(vec![MuxTrackSpec::mp4(&input, selector)]);
 
         mux_to_path(&request, &output_path).unwrap();
 
@@ -14904,8 +14898,8 @@ async fn mux_to_path_async_matches_sync_path_first_track_output() {
     let sync_output = write_temp_file("mux-async-sync-output", &[]);
     let async_output = write_temp_file("mux-async-async-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::path(audio_input),
-        MuxTrackSpec::path(video_input),
+        MuxTrackSpec::path(&audio_input),
+        MuxTrackSpec::path(&video_input),
     ]);
 
     mux_to_path(&request, &sync_output).unwrap();
@@ -14925,7 +14919,7 @@ async fn mux_to_path_async_matches_sync_raw_av1_annexb_output() {
     );
     let sync_output = write_temp_file("mux-async-av1-annexb-sync-output", &[]);
     let async_output = write_temp_file("mux-async-av1-annexb-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -14940,7 +14934,7 @@ async fn mux_to_path_async_matches_sync_program_stream_output() {
         write_test_program_stream_mp3_file("mux-async-program-stream-input", &[&[0x55; 96]]);
     let sync_output = write_temp_file("mux-async-program-stream-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -14955,7 +14949,7 @@ async fn mux_to_path_async_matches_sync_program_stream_mp2_output() {
         write_test_program_stream_mp2_file("mux-async-program-stream-mp2-input", &[&[0x55; 96]]);
     let sync_output = write_temp_file("mux-async-program-stream-mp2-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-mp2-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -14970,7 +14964,7 @@ async fn mux_to_path_async_matches_sync_program_stream_ac3_output() {
         write_test_program_stream_ac3_file("mux-async-program-stream-ac3-input", &[b"ac3"]);
     let sync_output = write_temp_file("mux-async-program-stream-ac3-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-ac3-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -14989,7 +14983,7 @@ async fn mux_to_path_async_matches_sync_program_stream_lpcm_output() {
     );
     let sync_output = write_temp_file("mux-async-program-stream-lpcm-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-lpcm-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15007,7 +15001,7 @@ async fn mux_to_path_async_matches_sync_program_stream_h264_open_ended_output() 
     let sync_output = write_temp_file("mux-async-program-stream-h264-open-ended-sync-output", &[]);
     let async_output =
         write_temp_file("mux-async-program-stream-h264-open-ended-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15024,7 +15018,7 @@ async fn mux_to_path_async_matches_sync_program_stream_mpeg2v_output() {
     );
     let sync_output = write_temp_file("mux-async-program-stream-mpeg2v-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-mpeg2v-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15041,7 +15035,7 @@ async fn mux_to_path_async_matches_sync_program_stream_mpeg2v_pts_dts_output() {
     );
     let sync_output = write_temp_file("mux-async-program-stream-mpeg2v-pts-dts-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-mpeg2v-pts-dts-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15056,7 +15050,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_output() {
         write_test_transport_stream_mp3_file("mux-async-transport-stream-input", &[&[0x66; 320]]);
     let sync_output = write_temp_file("mux-async-transport-stream-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15131,7 +15125,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_vvc_output() {
         write_test_transport_stream_vvc_file("mux-async-transport-stream-vvc-input", &[]);
     let sync_output = write_temp_file("mux-async-transport-stream-vvc-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-vvc-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15145,7 +15139,7 @@ async fn mux_to_path_async_matches_sync_program_stream_vvc_output() {
     let ps_input = write_test_program_stream_vvc_file("mux-async-program-stream-vvc-input", &[]);
     let sync_output = write_temp_file("mux-async-program-stream-vvc-sync-output", &[]);
     let async_output = write_temp_file("mux-async-program-stream-vvc-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ps_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ps_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15160,7 +15154,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_ac3_output() {
         write_test_transport_stream_ac3_file("mux-async-transport-stream-ac3-input", &[b"ac3"]);
     let sync_output = write_temp_file("mux-async-transport-stream-ac3-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-ac3-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15177,7 +15171,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_latm_output() {
     );
     let sync_output = write_temp_file("mux-async-transport-stream-latm-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-latm-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15200,7 +15194,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_latm_other_data_output(
         "mux-async-transport-stream-latm-other-data-async-output",
         &[],
     );
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15217,7 +15211,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_mhas_output() {
     );
     let sync_output = write_temp_file("mux-async-transport-stream-mhas-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-mhas-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15232,7 +15226,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_eac3_output() {
         write_test_transport_stream_eac3_file("mux-async-transport-stream-eac3-input", &[b"ec3"]);
     let sync_output = write_temp_file("mux-async-transport-stream-eac3-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-eac3-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15246,7 +15240,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_ac4_output() {
     let ts_input = write_test_transport_stream_ac4_file("mux-async-transport-stream-ac4-input", 2);
     let sync_output = write_temp_file("mux-async-transport-stream-ac4-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-ac4-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15263,7 +15257,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_truehd_output() {
     );
     let sync_output = write_temp_file("mux-async-transport-stream-truehd-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-truehd-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15277,7 +15271,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_dts_output() {
     let ts_input = write_test_transport_stream_dts_file("mux-async-transport-stream-dts-input", 2);
     let sync_output = write_temp_file("mux-async-transport-stream-dts-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-dts-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15300,7 +15294,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_dts_stream_type_output(
         "mux-async-transport-stream-dts-stream-type-async-output",
         &[],
     );
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15317,7 +15311,7 @@ async fn mux_to_path_async_matches_sync_transport_stream_dvb_subtitle_output() {
     );
     let sync_output = write_temp_file("mux-async-transport-stream-dvb-subtitle-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transport-stream-dvb-subtitle-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15418,8 +15412,8 @@ async fn mux_to_path_async_matches_sync_transformed_raw_track_output() {
     let sync_output = write_temp_file("mux-async-transformed-sync-output", &[]);
     let async_output = write_temp_file("mux-async-transformed-async-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::path(audio_input),
-        MuxTrackSpec::path(video_input),
+        MuxTrackSpec::path(&audio_input),
+        MuxTrackSpec::path(&video_input),
     ]);
 
     mux_to_path(&request, &sync_output).unwrap();
@@ -15434,7 +15428,7 @@ async fn mux_to_path_async_matches_sync_raw_eac3_output() {
     let eac3_input = write_test_eac3_file("mux-async-eac3-input", &[b"ec3"]);
     let sync_output = write_temp_file("mux-async-eac3-sync-output", &[]);
     let async_output = write_temp_file("mux-async-eac3-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(eac3_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&eac3_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15448,7 +15442,7 @@ async fn mux_to_path_async_matches_sync_raw_dts_output() {
     let dts_input = write_test_dts_file("mux-async-dts-input", 2);
     let sync_output = write_temp_file("mux-async-dts-sync-output", &[]);
     let async_output = write_temp_file("mux-async-dts-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(dts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&dts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15462,7 +15456,7 @@ async fn mux_to_path_async_matches_sync_wrapped_core_dts_output() {
     let dts_input = write_test_wrapped_dts_file("mux-async-dts-wrapped-input", 2);
     let sync_output = write_temp_file("mux-async-dts-wrapped-sync-output", &[]);
     let async_output = write_temp_file("mux-async-dts-wrapped-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(dts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&dts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15480,7 +15474,7 @@ async fn mux_to_path_async_matches_sync_wrapped_core_dts_output_with_trailing_fa
     );
     let sync_output = write_temp_file("mux-async-dts-wrapped-tail-sync-output", &[]);
     let async_output = write_temp_file("mux-async-dts-wrapped-tail-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(dts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&dts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15494,7 +15488,7 @@ async fn mux_to_path_async_matches_sync_14bit_little_endian_raw_dts_output() {
     let dts_input = write_test_dts_14bit_little_endian_file("mux-async-dts-14le-input", 2);
     let sync_output = write_temp_file("mux-async-dts-14le-sync-output", &[]);
     let async_output = write_temp_file("mux-async-dts-14le-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(dts_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&dts_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15508,7 +15502,7 @@ async fn mux_to_path_async_matches_sync_raw_ac4_output() {
     let ac4_input = write_test_ac4_file("mux-async-ac4-input", 2);
     let sync_output = write_temp_file("mux-async-ac4-sync-output", &[]);
     let async_output = write_temp_file("mux-async-ac4-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(ac4_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&ac4_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15522,7 +15516,7 @@ async fn mux_to_path_async_matches_sync_raw_amr_output() {
     let amr_input = write_test_amr_file("mux-async-amr-input", &[b"one", b"two"]);
     let sync_output = write_temp_file("mux-async-amr-sync-output", &[]);
     let async_output = write_temp_file("mux-async-amr-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(amr_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&amr_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15536,7 +15530,7 @@ async fn mux_to_path_async_matches_sync_raw_amr_wb_output() {
     let amr_input = write_test_amr_wb_file("mux-async-amr-wb-input", &[b"wide", b"band"]);
     let sync_output = write_temp_file("mux-async-amr-wb-sync-output", &[]);
     let async_output = write_temp_file("mux-async-amr-wb-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(amr_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&amr_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15550,7 +15544,7 @@ async fn mux_to_path_async_matches_sync_raw_latm_output() {
     let latm_input = write_test_latm_file("mux-async-latm-input", &[b"abc", b"defg"]);
     let sync_output = write_temp_file("mux-async-latm-sync-output", &[]);
     let async_output = write_temp_file("mux-async-latm-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(latm_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&latm_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15565,7 +15559,7 @@ async fn mux_to_path_async_matches_sync_raw_usac_latm_output() {
         write_test_usac_latm_file("mux-async-usac-latm-input", &[b"\x80abc", b"\x00defg"]);
     let sync_output = write_temp_file("mux-async-usac-latm-sync-output", &[]);
     let async_output = write_temp_file("mux-async-usac-latm-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(latm_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&latm_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15580,7 +15574,7 @@ async fn mux_to_path_async_matches_sync_raw_truehd_output() {
         write_test_truehd_file("mux-async-truehd-input", &[b"abcdefgh", b"ijklmnop"]);
     let sync_output = write_temp_file("mux-async-truehd-sync-output", &[]);
     let async_output = write_temp_file("mux-async-truehd-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(truehd_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&truehd_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15594,7 +15588,7 @@ async fn mux_to_path_async_matches_sync_raw_flac_output() {
     let flac_input = write_test_flac_file("mux-async-flac-input", b"flac-frame");
     let sync_output = write_temp_file("mux-async-flac-sync-output", &[]);
     let async_output = write_temp_file("mux-async-flac-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(flac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15608,7 +15602,7 @@ async fn mux_to_path_async_matches_sync_ogg_flac_output() {
     let flac_input = write_test_ogg_flac_file("mux-async-ogg-flac-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-ogg-flac-sync-output", &[]);
     let async_output = write_temp_file("mux-async-ogg-flac-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(flac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15623,7 +15617,7 @@ async fn mux_to_path_async_matches_sync_ogg_flac_mapping_output() {
         write_test_ogg_flac_mapping_file("mux-async-ogg-flac-mapping-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-ogg-flac-mapping-sync-output", &[]);
     let async_output = write_temp_file("mux-async-ogg-flac-mapping-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(flac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15638,7 +15632,7 @@ async fn mux_to_path_async_matches_sync_ogg_flac_split_header_output() {
         write_test_ogg_flac_split_header_file("mux-async-ogg-flac-split-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-ogg-flac-split-sync-output", &[]);
     let async_output = write_temp_file("mux-async-ogg-flac-split-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(flac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&flac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15652,7 +15646,7 @@ async fn mux_to_path_async_matches_sync_mhas_output() {
     let mhas_input = write_test_mhas_file("mux-async-mhas-input", &[b"frame-one", b"frame-two"]);
     let sync_output = write_temp_file("mux-async-mhas-sync-output", &[]);
     let async_output = write_temp_file("mux-async-mhas-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(mhas_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&mhas_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15666,7 +15660,7 @@ async fn mux_to_path_async_matches_sync_iamf_output() {
     let iamf_input = write_test_iamf_file("mux-async-iamf-input", &[b"frame-one", b"frame-two"]);
     let sync_output = write_temp_file("mux-async-iamf-sync-output", &[]);
     let async_output = write_temp_file("mux-async-iamf-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(iamf_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&iamf_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -15680,7 +15674,7 @@ async fn mux_to_path_async_matches_sync_ogg_opus_output() {
     let opus_input = write_test_ogg_opus_file("mux-async-opus-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-opus-sync-output", &[]);
     let async_output = write_temp_file("mux-async-opus-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(opus_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&opus_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16319,7 +16313,7 @@ async fn mux_to_path_async_matches_sync_wave_pcm_output() {
     );
     let sync_output = write_temp_file("mux-async-wave-pcm-sync-output", &[]);
     let async_output = write_temp_file("mux-async-wave-pcm-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(pcm_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&pcm_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16336,7 +16330,7 @@ async fn mux_to_path_async_matches_sync_aiff_pcm_output() {
     );
     let sync_output = write_temp_file("mux-async-aiff-pcm-sync-output", &[]);
     let async_output = write_temp_file("mux-async-aiff-pcm-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(pcm_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&pcm_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16350,7 +16344,7 @@ async fn mux_to_path_async_matches_sync_ogg_vorbis_output() {
     let vorbis_input = write_test_ogg_vorbis_file("mux-async-vorbis-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-vorbis-sync-output", &[]);
     let async_output = write_temp_file("mux-async-vorbis-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(vorbis_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&vorbis_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16364,7 +16358,7 @@ async fn mux_to_path_async_matches_sync_ogg_speex_output() {
     let speex_input = write_test_ogg_speex_file("mux-async-speex-input", &[b"abc", b"def"]);
     let sync_output = write_temp_file("mux-async-speex-sync-output", &[]);
     let async_output = write_temp_file("mux-async-speex-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(speex_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&speex_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16399,7 +16393,7 @@ async fn mux_to_path_async_matches_sync_ogg_theora_output() {
         write_test_ogg_theora_file("mux-async-theora-input", &[b"frame-a", b"frame-b"]);
     let sync_output = write_temp_file("mux-async-theora-sync-output", &[]);
     let async_output = write_temp_file("mux-async-theora-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(theora_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&theora_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16413,7 +16407,7 @@ async fn mux_to_path_async_matches_sync_caf_alac_output() {
     let alac_input = write_test_caf_alac_file("mux-async-alac-input", &[b"ABCD", b"EFGH"]);
     let sync_output = write_temp_file("mux-async-alac-sync-output", &[]);
     let async_output = write_temp_file("mux-async-alac-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(alac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&alac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16432,7 +16426,7 @@ async fn mux_to_path_async_matches_sync_variable_packet_caf_alac_output() {
     );
     let sync_output = write_temp_file("mux-async-alac-variable-sync-output", &[]);
     let async_output = write_temp_file("mux-async-alac-variable-async-output", &[]);
-    let request = MuxRequest::new(vec![MuxTrackSpec::path(alac_input)]);
+    let request = MuxRequest::new(vec![MuxTrackSpec::path(&alac_input)]);
 
     mux_to_path(&request, &sync_output).unwrap();
     mux_to_path_async(&request, &async_output).await.unwrap();
@@ -16451,7 +16445,7 @@ async fn mux_to_path_async_matches_sync_fragmented_output() {
     let sync_output = write_temp_file("mux-async-fragmented-sync-output", &[]);
     let async_output = write_temp_file("mux-async-fragmented-async-output", &[]);
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -16478,7 +16472,7 @@ async fn mux_fragmented_to_paths_async_matches_sync_split_output() {
     let async_init = async_dir.join("init.mp4");
     let async_media = async_dir.join("media.mp4");
     let request = MuxRequest::new(vec![MuxTrackSpec::mp4(
-        audio_input,
+        &audio_input,
         MuxMp4TrackSelector::Audio { occurrence: 1 },
     )])
     .with_output_layout(MuxOutputLayout::Fragmented)
@@ -16523,13 +16517,10 @@ async fn mux_to_path_async_matches_sync_mixed_subtitle_output() {
     let sync_output = write_temp_file("mux-async-mixed-sync-output", &[]);
     let async_output = write_temp_file("mux-async-mixed-async-output", &[]);
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(
-            text_input.clone(),
-            MuxMp4TrackSelector::Text { occurrence: 1 },
-        ),
-        MuxTrackSpec::mp4(text_input, MuxMp4TrackSelector::Text { occurrence: 2 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 1 }),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 2 }),
     ]);
 
     mux_to_path(&request, &sync_output).unwrap();
@@ -16596,7 +16587,7 @@ fn build_audio_input_file(
     prefix: &str,
     major_brand: mp4forge::FourCc,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     build_audio_input_file_with_type(prefix, major_brand, "mp4a", payloads)
 }
 
@@ -16607,7 +16598,7 @@ fn build_audio_input_file_with_metadata(
     language: [u8; 3],
     handler_name: &str,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let samples = payloads
         .iter()
         .copied()
@@ -16634,7 +16625,7 @@ fn build_audio_input_file_with_metadata(
     )
 }
 
-fn build_dtsx_dash_segment_input_file(prefix: &str) -> std::path::PathBuf {
+fn build_dtsx_dash_segment_input_file(prefix: &str) -> TestTempPath {
     let sample_entry_box = audio_sample_entry_box_with_children(
         "dtsx",
         &encode_supported_box(
@@ -17369,7 +17360,7 @@ fn build_imported_track_input_file(
     track_config: &MuxTrackConfig,
     movie_duration: u32,
     samples: &[TestMuxSample<'_>],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     build_imported_track_input_file_with_edit_media_time(
         prefix,
         file_config,
@@ -17387,7 +17378,7 @@ fn build_imported_track_input_file_with_edit_media_time(
     movie_duration: u32,
     edit_media_time: u32,
     samples: &[TestMuxSample<'_>],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let edit_entries = (edit_media_time != 0).then(|| {
         vec![ElstEntry {
             segment_duration_v0: 0,
@@ -17413,7 +17404,7 @@ fn build_imported_track_input_file_with_edit_entries(
     movie_duration: u32,
     edit_entries: Option<&[ElstEntry]>,
     samples: &[TestMuxSample<'_>],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let ftyp = Ftyp {
         major_brand: file_config.major_brand(),
         minor_version: file_config.minor_version(),
@@ -17453,7 +17444,7 @@ fn build_imported_track_input_file_with_edit_entries(
     write_temp_file(prefix, &bytes)
 }
 
-fn build_multi_description_audio_input_file(prefix: &str) -> std::path::PathBuf {
+fn build_multi_description_audio_input_file(prefix: &str) -> TestTempPath {
     let file_config = MuxFileConfig::new(1_000)
         .with_major_brand(fourcc("isom"))
         .with_compatible_brand(fourcc("mp42"));
@@ -17608,7 +17599,7 @@ fn build_audio_input_file_with_type(
     major_brand: mp4forge::FourCc,
     sample_entry_type: &str,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let samples = payloads
         .iter()
         .copied()
@@ -17637,7 +17628,7 @@ fn build_video_input_file(
     prefix: &str,
     major_brand: mp4forge::FourCc,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     build_video_input_file_with_type(prefix, major_brand, "avc1", payloads)
 }
 
@@ -17648,7 +17639,7 @@ fn build_video_input_file_with_metadata(
     language: [u8; 3],
     handler_name: &str,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let samples = payloads
         .iter()
         .copied()
@@ -17682,7 +17673,7 @@ fn build_video_input_file_with_type(
     major_brand: mp4forge::FourCc,
     sample_entry_type: &str,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let samples = payloads
         .iter()
         .copied()
@@ -17884,7 +17875,7 @@ fn build_external_reference_audio_input_file(
     prefix: &str,
     referenced_media: &[u8],
     sample_sizes: &[u32],
-) -> (PathBuf, PathBuf) {
+) -> (TestTempPath, TestTempPath) {
     let reference_path =
         write_temp_file_with_extension(&format!("{prefix}-media"), "bin", referenced_media);
     let reference_name = reference_path
@@ -18042,7 +18033,7 @@ fn build_wvtt_input_file(
     prefix: &str,
     major_brand: mp4forge::FourCc,
     payloads: &[&[u8]],
-) -> std::path::PathBuf {
+) -> TestTempPath {
     let samples = payloads
         .iter()
         .copied()
@@ -18063,7 +18054,7 @@ fn build_wvtt_input_file(
     )
 }
 
-fn build_mixed_text_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> std::path::PathBuf {
+fn build_mixed_text_input_file(prefix: &str, major_brand: mp4forge::FourCc) -> TestTempPath {
     let first_source = write_temp_file(&format!("{prefix}-source-text"), b"wvtt");
     let second_source = write_temp_file(&format!("{prefix}-source-subtitle"), b"stpp");
     let output_path = write_temp_file(prefix, &[]);

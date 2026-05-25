@@ -31,13 +31,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_path = mux_example_support::write_temp_file("example-subtitle-output", "mp4", &[]);
 
     let request = MuxRequest::new(vec![
-        MuxTrackSpec::mp4(video_input, MuxMp4TrackSelector::Video),
-        MuxTrackSpec::mp4(audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
-        MuxTrackSpec::mp4(
-            text_input.clone(),
-            MuxMp4TrackSelector::Text { occurrence: 1 },
-        ),
-        MuxTrackSpec::mp4(text_input, MuxMp4TrackSelector::Text { occurrence: 2 }),
+        MuxTrackSpec::mp4(&video_input, MuxMp4TrackSelector::Video),
+        MuxTrackSpec::mp4(&audio_input, MuxMp4TrackSelector::Audio { occurrence: 1 }),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 1 }),
+        MuxTrackSpec::mp4(&text_input, MuxMp4TrackSelector::Text { occurrence: 2 }),
     ]);
 
     mux_to_path(&request, &output_path)?;

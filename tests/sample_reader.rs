@@ -59,6 +59,49 @@ fn planned_sample_reader_reads_seekable_samples_in_output_order() {
 }
 
 #[test]
+fn planned_sample_reader_reads_into_reused_buffer() {
+    let mut sources = [
+        Cursor::new(b"AAAAhelloBBBBxy".to_vec()),
+        Cursor::new(b"zzzzSYNCtail".to_vec()),
+    ];
+    let plan = plan_staged_media_items(
+        vec![
+            MuxStagedMediaItem::new(0, 2, 10, 4, 13, 2),
+            MuxStagedMediaItem::new(1, 1, 0, 5, 4, 4).with_sync_sample(true),
+            MuxStagedMediaItem::new(0, 2, 0, 4, 4, 5).with_composition_time_offset(2),
+        ],
+        MuxInterleavePolicy::DecodeTime,
+    )
+    .unwrap();
+
+    let mut reader = PlannedSampleReader::new(&mut sources, &plan);
+    let mut sample_bytes = Vec::with_capacity(16);
+    let original_capacity = sample_bytes.capacity();
+
+    let first = reader.next_sample_into(&mut sample_bytes).unwrap().unwrap();
+    assert_eq!(sample_bytes, b"hello");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(first.track_id(), 2);
+
+    let second = reader.next_sample_into(&mut sample_bytes).unwrap().unwrap();
+    assert_eq!(sample_bytes, b"SYNC");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(second.track_id(), 1);
+
+    let third = reader.next_sample_into(&mut sample_bytes).unwrap().unwrap();
+    assert_eq!(sample_bytes, b"xy");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(third.track_id(), 2);
+
+    assert!(
+        reader
+            .next_sample_into(&mut sample_bytes)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn progressive_sample_reader_reads_non_seekable_samples_in_output_order() {
     let mut first_source: &[u8] = b"AAAAhelloBBBBxy";
     let mut second_source: &[u8] = b"zzzzSYNCtail";
@@ -89,6 +132,48 @@ fn progressive_sample_reader_reads_non_seekable_samples_in_output_order() {
     assert_eq!(third.metadata().source_index(), 0);
 
     assert!(reader.next_sample().unwrap().is_none());
+}
+
+#[test]
+fn progressive_sample_reader_reads_into_reused_buffer() {
+    let mut first_source: &[u8] = b"AAAAhelloBBBBxy";
+    let mut second_source: &[u8] = b"zzzzSYNCtail";
+    let mut sources = [&mut first_source, &mut second_source];
+    let plan = plan_staged_media_items(
+        vec![
+            MuxStagedMediaItem::new(0, 1, 0, 4, 4, 5),
+            MuxStagedMediaItem::new(1, 2, 5, 4, 4, 4).with_sync_sample(true),
+            MuxStagedMediaItem::new(0, 1, 10, 4, 13, 2),
+        ],
+        MuxInterleavePolicy::DecodeTime,
+    )
+    .unwrap();
+
+    let mut reader = ProgressiveSampleReader::new(&mut sources, &plan);
+    let mut sample_bytes = Vec::with_capacity(16);
+    let original_capacity = sample_bytes.capacity();
+
+    let first = reader.next_sample_into(&mut sample_bytes).unwrap().unwrap();
+    assert_eq!(sample_bytes, b"hello");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(first.source_index(), 0);
+
+    let second = reader.next_sample_into(&mut sample_bytes).unwrap().unwrap();
+    assert_eq!(sample_bytes, b"SYNC");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(second.source_index(), 1);
+
+    let third = reader.next_sample_into(&mut sample_bytes).unwrap().unwrap();
+    assert_eq!(sample_bytes, b"xy");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(third.source_index(), 0);
+
+    assert!(
+        reader
+            .next_sample_into(&mut sample_bytes)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -260,6 +345,63 @@ async fn async_planned_sample_reader_reads_seekable_samples_in_output_order() {
 
 #[cfg(feature = "async")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_planned_sample_reader_reads_into_reused_buffer() {
+    let mut sources = [
+        Cursor::new(b"AAAAhelloBBBBxy".to_vec()),
+        Cursor::new(b"zzzzSYNCtail".to_vec()),
+    ];
+    let plan = plan_staged_media_items(
+        vec![
+            MuxStagedMediaItem::new(0, 2, 10, 4, 13, 2),
+            MuxStagedMediaItem::new(1, 1, 0, 5, 4, 4).with_sync_sample(true),
+            MuxStagedMediaItem::new(0, 2, 0, 4, 4, 5).with_composition_time_offset(2),
+        ],
+        MuxInterleavePolicy::DecodeTime,
+    )
+    .unwrap();
+
+    let mut reader = AsyncPlannedSampleReader::new(&mut sources, &plan);
+    let mut sample_bytes = Vec::with_capacity(16);
+    let original_capacity = sample_bytes.capacity();
+
+    let first = reader
+        .next_sample_into(&mut sample_bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample_bytes, b"hello");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(first.track_id(), 2);
+
+    let second = reader
+        .next_sample_into(&mut sample_bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample_bytes, b"SYNC");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(second.track_id(), 1);
+
+    let third = reader
+        .next_sample_into(&mut sample_bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample_bytes, b"xy");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(third.track_id(), 2);
+
+    assert!(
+        reader
+            .next_sample_into(&mut sample_bytes)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_progressive_sample_reader_reads_non_seekable_samples_in_output_order() {
     let (mut first_writer, first_source) = tokio::io::duplex(64);
     let (mut second_writer, second_source) = tokio::io::duplex(64);
@@ -291,4 +433,65 @@ async fn async_progressive_sample_reader_reads_non_seekable_samples_in_output_or
     );
     assert_eq!(reader.next_sample().await.unwrap().unwrap().bytes(), b"xy");
     assert!(reader.next_sample().await.unwrap().is_none());
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_progressive_sample_reader_reads_into_reused_buffer() {
+    let (mut first_writer, first_source) = tokio::io::duplex(64);
+    let (mut second_writer, second_source) = tokio::io::duplex(64);
+    first_writer.write_all(b"AAAAhelloBBBBxy").await.unwrap();
+    first_writer.shutdown().await.unwrap();
+    second_writer.write_all(b"zzzzSYNCtail").await.unwrap();
+    second_writer.shutdown().await.unwrap();
+
+    let plan = plan_staged_media_items(
+        vec![
+            MuxStagedMediaItem::new(0, 1, 0, 4, 4, 5),
+            MuxStagedMediaItem::new(1, 2, 5, 4, 4, 4).with_sync_sample(true),
+            MuxStagedMediaItem::new(0, 1, 10, 4, 13, 2),
+        ],
+        MuxInterleavePolicy::DecodeTime,
+    )
+    .unwrap();
+
+    let mut sources = [first_source, second_source];
+    let mut reader = AsyncProgressiveSampleReader::new(&mut sources, &plan);
+    let mut sample_bytes = Vec::with_capacity(16);
+    let original_capacity = sample_bytes.capacity();
+
+    let first = reader
+        .next_sample_into(&mut sample_bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample_bytes, b"hello");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(first.source_index(), 0);
+
+    let second = reader
+        .next_sample_into(&mut sample_bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample_bytes, b"SYNC");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(second.source_index(), 1);
+
+    let third = reader
+        .next_sample_into(&mut sample_bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample_bytes, b"xy");
+    assert_eq!(sample_bytes.capacity(), original_capacity);
+    assert_eq!(third.source_index(), 0);
+
+    assert!(
+        reader
+            .next_sample_into(&mut sample_bytes)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
