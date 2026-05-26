@@ -614,9 +614,6 @@ fn fragmented_and_encrypted_cli_surfaces_match_shared_fixture_expectations() {
             .all(|segment| segment.base_media_decode_time == 123_456)
     );
     assert!(mfra.is_empty());
-
-    let _ = fs::remove_file(&edit_output);
-    let _ = fs::remove_dir_all(&divide_output_dir);
 }
 
 #[test]

@@ -2,13 +2,13 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::write_error_line;
 use crate::decrypt::{
     DecryptError, DecryptOptions, DecryptProgress, DecryptProgressPhase, ParseDecryptionKeyError,
-    decrypt_file, decrypt_file_with_progress,
+    decrypt_file_with_optional_progress_and_fragments_info_path,
 };
 
 /// Runs the decrypt subcommand with `args`, writing progress and failures to `stderr`.
@@ -23,7 +23,7 @@ where
             1
         }
         Err(error) => {
-            let _ = writeln!(stderr, "Error: {error}");
+            let _ = write_error_line(stderr, &error, error.diagnostic_context());
             1
         }
     }
@@ -116,6 +116,17 @@ impl From<ParseDecryptionKeyError> for DecryptCliError {
     }
 }
 
+impl DecryptCliError {
+    fn diagnostic_context(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Io(..) => Some(("io", "io")),
+            Self::Decrypt(error) => Some((error.stage(), error.category())),
+            Self::ParseKey(..) | Self::InvalidArgument(..) => Some(("request", "input")),
+            Self::UsageRequested => None,
+        }
+    }
+}
+
 struct ParsedArgs {
     show_progress: bool,
     key_specs: Vec<String>,
@@ -134,14 +145,23 @@ where
         options.add_key_spec(key_spec)?;
     }
 
-    if let Some(path) = &parsed.fragments_info {
-        options.set_fragments_info_bytes(fs::read(path)?);
-    }
-
     if parsed.show_progress {
-        decrypt_file_with_cli_progress(&parsed.input, &parsed.output, &options, stderr)
+        decrypt_file_with_cli_progress(
+            &parsed.input,
+            &parsed.output,
+            parsed.fragments_info.as_deref(),
+            &options,
+            stderr,
+        )
     } else {
-        decrypt_file(&parsed.input, &parsed.output, &options).map_err(Into::into)
+        decrypt_file_with_optional_progress_and_fragments_info_path(
+            &parsed.input,
+            &parsed.output,
+            parsed.fragments_info.as_deref(),
+            &options,
+            None::<fn(DecryptProgress)>,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -215,6 +235,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, DecryptCliError> {
 fn decrypt_file_with_cli_progress<E>(
     input: &Path,
     output: &Path,
+    fragments_info: Option<&Path>,
     options: &DecryptOptions,
     stderr: &mut E,
 ) -> Result<(), DecryptCliError>
@@ -222,13 +243,19 @@ where
     E: Write,
 {
     let mut progress_write_error = None;
-    decrypt_file_with_progress(input, output, options, |snapshot| {
-        if progress_write_error.is_none()
-            && let Err(error) = write_progress_snapshot(stderr, snapshot)
-        {
-            progress_write_error = Some(error);
-        }
-    })?;
+    decrypt_file_with_optional_progress_and_fragments_info_path(
+        input,
+        output,
+        fragments_info,
+        options,
+        Some(|snapshot| {
+            if progress_write_error.is_none()
+                && let Err(error) = write_progress_snapshot(stderr, snapshot)
+            {
+                progress_write_error = Some(error);
+            }
+        }),
+    )?;
 
     if let Some(error) = progress_write_error {
         return Err(DecryptCliError::Io(error));

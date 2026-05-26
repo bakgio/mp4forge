@@ -55,9 +55,6 @@ fn decrypt_command_writes_clear_output_via_dispatch() {
         .map(|track| (track.summary.track_id, track))
         .collect::<BTreeMap<_, _>>();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -97,10 +94,6 @@ fn decrypt_command_supports_fragments_info_files() {
     )
     .unwrap();
 
-    let _ = fs::remove_file(&init_path);
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(mdat_payloads.len(), 1);
@@ -132,8 +125,44 @@ fn decrypt_command_writes_stable_progress_lines() {
     let mut stderr = Vec::new();
     let exit_code = decrypt::run(&args, &mut stderr);
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
+    assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        concat!(
+            "OpenInput 0/1\n",
+            "OpenInput 1/1\n",
+            "InspectStructure 0/1\n",
+            "InspectStructure 1/1\n",
+            "ProcessSamples 0/1\n",
+            "ProcessSamples 1/1\n",
+            "OpenOutput 0/1\n",
+            "OpenOutput 1/1\n",
+            "FinalizeOutput 0/1\n",
+            "FinalizeOutput 1/1\n",
+        )
+    );
+}
+
+#[test]
+fn decrypt_command_writes_stable_progress_lines_for_media_segments() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let init_path = write_temp_file("cli-decrypt-progress-init", &fixture.init_segment);
+    let input_path = write_temp_file("cli-decrypt-progress-media", &fixture.media_segment);
+    let output_path = write_temp_file("cli-decrypt-progress-media-output", &[]);
+    let args = vec![
+        "--show-progress".to_string(),
+        "--key".to_string(),
+        fixture.all_keys[0].to_spec(),
+        "--key".to_string(),
+        fixture.all_keys[1].to_spec(),
+        "--fragments-info".to_string(),
+        init_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+        output_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
 
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(
@@ -142,6 +171,8 @@ fn decrypt_command_writes_stable_progress_lines() {
             "OpenInput 0/1\n",
             "OpenInput 1/1\n",
             "InspectStructure 0/1\n",
+            "OpenFragmentsInfo 0/1\n",
+            "OpenFragmentsInfo 1/1\n",
             "InspectStructure 1/1\n",
             "ProcessSamples 0/1\n",
             "ProcessSamples 1/1\n",
@@ -185,7 +216,7 @@ fn decrypt_command_rejects_invalid_arguments() {
     );
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: at least one --key <ID:KEY> is required\n"
+        "Error [stage=request category=input]: at least one --key <ID:KEY> is required\n"
     );
 
     let mut stderr = Vec::new();
@@ -203,7 +234,85 @@ fn decrypt_command_rejects_invalid_arguments() {
     );
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error: invalid decryption key spec \"bad\": expected <id>:<key>\n"
+        "Error [stage=request category=input]: invalid decryption key spec \"bad\": expected <id>:<key>\n"
+    );
+}
+
+#[test]
+fn decrypt_command_rejects_same_input_and_output_path() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let input_path = write_temp_file("cli-decrypt-same-path-input", &fixture.single_file);
+    let args = vec![
+        "--key".to_string(),
+        fixture.all_keys[0].to_spec(),
+        input_path.to_string_lossy().into_owned(),
+        input_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let message = String::from_utf8(stderr).unwrap();
+    assert_eq!(exit_code, 1);
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("conflicts with input"), "{message}");
+}
+
+#[test]
+fn decrypt_command_rejects_output_path_conflicting_with_fragments_info_path() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let init_path = write_temp_file("cli-decrypt-fragments-conflict-init", &fixture.init_segment);
+    let media_path = write_temp_file(
+        "cli-decrypt-fragments-conflict-media",
+        &fixture.media_segment,
+    );
+    let args = vec![
+        "--key".to_string(),
+        fixture.all_keys[0].to_spec(),
+        "--key".to_string(),
+        fixture.all_keys[1].to_spec(),
+        "--fragments-info".to_string(),
+        init_path.to_string_lossy().into_owned(),
+        media_path.to_string_lossy().into_owned(),
+        init_path.to_string_lossy().into_owned(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let message = String::from_utf8(stderr).unwrap();
+    assert_eq!(exit_code, 1);
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("fragments-info path"), "{message}");
+}
+
+#[test]
+fn decrypt_command_reports_missing_input_path_with_context() {
+    let args = vec![
+        "--key".to_string(),
+        "1:00112233445566778899aabbccddeeff".to_string(),
+        "this-file-does-not-exist.mp4".to_string(),
+        "cli-decrypt-missing-output.mp4".to_string(),
+    ];
+
+    let mut stderr = Vec::new();
+    let exit_code = decrypt::run(&args, &mut stderr);
+
+    let message = String::from_utf8(stderr).unwrap();
+    assert_eq!(exit_code, 1);
+    assert!(
+        message.contains("failed to open decrypt input"),
+        "{message}"
+    );
+    assert!(
+        message.contains("this-file-does-not-exist.mp4"),
+        "{message}"
     );
 }
 
@@ -225,8 +334,6 @@ fn assert_retained_file_fixture_cli_decrypts(
     let mut stderr = Vec::new();
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let output = fs::read(&output_path).unwrap();
-
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
@@ -260,8 +367,6 @@ fn assert_retained_fragmented_fixture_cli_decrypts(
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let output = fs::read(&output_path).unwrap();
 
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -287,9 +392,6 @@ fn assert_generated_topology_fixture_cli_decrypts(
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let output = fs::read(&output_path).unwrap();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -314,9 +416,6 @@ fn assert_generated_topology_fixture_cli_rejects_first_sample_description_limit(
     let mut stderr = Vec::new();
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let stderr_text = String::from_utf8(stderr).unwrap();
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 1, "stderr={stderr_text}");
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
@@ -502,8 +601,6 @@ fn decrypt_command_supports_multi_sample_entry_fragmented_tracks() {
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
 
     let output = fs::read(&output_path).unwrap();
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
     assert_eq!(output, fixture.decrypted_single_file);
 }
 
@@ -531,8 +628,6 @@ fn decrypt_command_supports_zero_kid_multi_sample_entry_fragmented_tracks() {
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
 
     let output = fs::read(&output_path).unwrap();
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
     assert_eq!(output, fixture.decrypted_single_file);
 }
 

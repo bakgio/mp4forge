@@ -2,13 +2,21 @@
 
 use std::io::{SeekFrom, Write};
 
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::BoxRegistry;
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
+#[cfg(feature = "async")]
+use crate::codec::read_exact_array_untrusted_async;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_vec_untrusted,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, read_exact_array_untrusted,
     untrusted_prealloc_hint,
 };
 use crate::{FourCc, codec_field};
+#[cfg(feature = "async")]
+use tokio::io::AsyncReadExt;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FullBoxState {
@@ -202,6 +210,78 @@ pub(crate) fn decode_senc_payload(payload: &[u8]) -> Result<Senc, CodecError> {
     Ok(senc)
 }
 
+pub(crate) fn decode_senc_payload_from_reader(
+    reader: &mut dyn ReadSeek,
+    payload_size: u64,
+) -> Result<Senc, CodecError> {
+    if payload_size < 8 {
+        return Err(invalid_value("Payload", "payload is too short").into());
+    }
+
+    let header = read_exact_array_untrusted::<8, _>(reader)?;
+    let version = header[0];
+    let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+    let mut senc = Senc::default();
+    if !senc.is_supported_version(version) {
+        return Err(CodecError::UnsupportedVersion {
+            box_type: senc.box_type(),
+            version,
+        });
+    }
+    validate_senc_flags(flags)?;
+
+    let sample_count = read_u32(&header, 4);
+    let samples = read_senc_samples_from_reader(
+        reader,
+        payload_size - 8,
+        sample_count,
+        flags & SENC_USE_SUBSAMPLE_ENCRYPTION != 0,
+    )?;
+
+    senc.set_version(version);
+    senc.set_flags(flags);
+    senc.sample_count = sample_count;
+    senc.samples = samples;
+    Ok(senc)
+}
+
+#[cfg(feature = "async")]
+pub(crate) async fn decode_senc_payload_from_reader_async(
+    reader: &mut dyn AsyncReadSeek,
+    payload_size: u64,
+) -> Result<Senc, CodecError> {
+    if payload_size < 8 {
+        return Err(invalid_value("Payload", "payload is too short").into());
+    }
+
+    let header = read_exact_array_untrusted_async::<8, _>(reader).await?;
+    let version = header[0];
+    let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+    let mut senc = Senc::default();
+    if !senc.is_supported_version(version) {
+        return Err(CodecError::UnsupportedVersion {
+            box_type: senc.box_type(),
+            version,
+        });
+    }
+    validate_senc_flags(flags)?;
+
+    let sample_count = read_u32(&header, 4);
+    let samples = read_senc_samples_from_reader_async(
+        reader,
+        payload_size - 8,
+        sample_count,
+        flags & SENC_USE_SUBSAMPLE_ENCRYPTION != 0,
+    )
+    .await?;
+
+    senc.set_version(version);
+    senc.set_flags(flags);
+    senc.sample_count = sample_count;
+    senc.samples = samples;
+    Ok(senc)
+}
+
 #[cfg(feature = "decrypt")]
 pub(crate) fn decode_senc_payload_with_iv_size(
     payload: &[u8],
@@ -364,6 +444,144 @@ fn try_parse_senc_samples_with_iv_size(
     (cursor == bytes.len()).then_some(samples)
 }
 
+fn try_read_senc_samples_with_iv_size_from_reader(
+    reader: &mut dyn ReadSeek,
+    payload_start: u64,
+    payload_len: u64,
+    sample_count: usize,
+    iv_size: usize,
+    use_subsample_encryption: bool,
+) -> Result<Option<Vec<SencSample>>, CodecError> {
+    reader.seek(SeekFrom::Start(payload_start))?;
+    let iv_len = u64::try_from(iv_size)
+        .map_err(|_| invalid_value("Samples", "IV size does not fit in u64"))?;
+    let mut remaining = payload_len;
+    let mut samples = Vec::with_capacity(untrusted_prealloc_hint(sample_count));
+
+    for _ in 0..sample_count {
+        if remaining < iv_len {
+            return Ok(None);
+        }
+
+        let initialization_vector = if iv_size == 0 {
+            Vec::new()
+        } else {
+            let mut bytes = vec![0_u8; iv_size];
+            reader.read_exact(&mut bytes)?;
+            remaining -= iv_len;
+            bytes
+        };
+
+        let mut subsamples = Vec::new();
+        if use_subsample_encryption {
+            if remaining < 2 {
+                return Ok(None);
+            }
+
+            let subsample_count = u16::from_be_bytes(read_exact_array_untrusted::<2, _>(reader)?);
+            remaining -= 2;
+            let subsample_bytes = u64::from(subsample_count) * 6;
+            if remaining < subsample_bytes {
+                return Ok(None);
+            }
+
+            subsamples = Vec::with_capacity(untrusted_prealloc_hint(usize::from(subsample_count)));
+            for _ in 0..subsample_count {
+                let entry = read_exact_array_untrusted::<6, _>(reader)?;
+                subsamples.push(SencSubsample {
+                    bytes_of_clear_data: u16::from_be_bytes([entry[0], entry[1]]),
+                    bytes_of_protected_data: u32::from_be_bytes([
+                        entry[2], entry[3], entry[4], entry[5],
+                    ]),
+                });
+            }
+            remaining -= subsample_bytes;
+        }
+
+        samples.push(SencSample {
+            initialization_vector,
+            subsamples,
+        });
+    }
+
+    if remaining != 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(samples))
+}
+
+#[cfg(feature = "async")]
+async fn try_read_senc_samples_with_iv_size_from_reader_async(
+    reader: &mut dyn AsyncReadSeek,
+    payload_start: u64,
+    payload_len: u64,
+    sample_count: usize,
+    iv_size: usize,
+    use_subsample_encryption: bool,
+) -> Result<Option<Vec<SencSample>>, CodecError> {
+    use tokio::io::AsyncSeekExt;
+
+    reader.seek(SeekFrom::Start(payload_start)).await?;
+    let iv_len = u64::try_from(iv_size)
+        .map_err(|_| invalid_value("Samples", "IV size does not fit in u64"))?;
+    let mut remaining = payload_len;
+    let mut samples = Vec::with_capacity(untrusted_prealloc_hint(sample_count));
+
+    for _ in 0..sample_count {
+        if remaining < iv_len {
+            return Ok(None);
+        }
+
+        let initialization_vector = if iv_size == 0 {
+            Vec::new()
+        } else {
+            let mut bytes = vec![0_u8; iv_size];
+            reader.read_exact(&mut bytes).await?;
+            remaining -= iv_len;
+            bytes
+        };
+
+        let mut subsamples = Vec::new();
+        if use_subsample_encryption {
+            if remaining < 2 {
+                return Ok(None);
+            }
+
+            let subsample_count =
+                u16::from_be_bytes(read_exact_array_untrusted_async::<2, _>(reader).await?);
+            remaining -= 2;
+            let subsample_bytes = u64::from(subsample_count) * 6;
+            if remaining < subsample_bytes {
+                return Ok(None);
+            }
+
+            subsamples = Vec::with_capacity(untrusted_prealloc_hint(usize::from(subsample_count)));
+            for _ in 0..subsample_count {
+                let entry = read_exact_array_untrusted_async::<6, _>(reader).await?;
+                subsamples.push(SencSubsample {
+                    bytes_of_clear_data: u16::from_be_bytes([entry[0], entry[1]]),
+                    bytes_of_protected_data: u32::from_be_bytes([
+                        entry[2], entry[3], entry[4], entry[5],
+                    ]),
+                });
+            }
+            remaining -= subsample_bytes;
+        }
+
+        samples.push(SencSample {
+            initialization_vector,
+            subsamples,
+        });
+    }
+
+    if remaining != 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(samples))
+}
+
 fn parse_senc_samples(
     field_name: &'static str,
     bytes: &[u8],
@@ -408,6 +626,124 @@ fn parse_senc_samples(
             field_name,
             "sample IV size cannot be inferred from the payload",
         )
+    })
+}
+
+fn read_senc_samples_from_reader(
+    reader: &mut dyn ReadSeek,
+    payload_len: u64,
+    sample_count: u32,
+    use_subsample_encryption: bool,
+) -> Result<Vec<SencSample>, CodecError> {
+    let sample_count = usize::try_from(sample_count)
+        .map_err(|_| invalid_value("SampleCount", "sample count does not fit in usize"))?;
+    if sample_count == 0 {
+        if payload_len != 0 {
+            return Err(invalid_value(
+                "Samples",
+                "sample payload must be empty when sample count is zero",
+            )
+            .into());
+        }
+        return Ok(Vec::new());
+    }
+
+    let payload_start = reader.stream_position()?;
+    let max_iv_size = usize::try_from(payload_len.min(u64::from(u8::MAX)))
+        .map_err(|_| invalid_value("Samples", "sample payload is too large to decode"))?;
+    let mut matched = None;
+    for iv_size in 0..=max_iv_size {
+        let Some(samples) = try_read_senc_samples_with_iv_size_from_reader(
+            reader,
+            payload_start,
+            payload_len,
+            sample_count,
+            iv_size,
+            use_subsample_encryption,
+        )?
+        else {
+            continue;
+        };
+
+        if matched.is_some() {
+            return Err(invalid_value(
+                "Samples",
+                "sample IV size is ambiguous without external encryption parameters",
+            )
+            .into());
+        }
+        matched = Some(samples);
+    }
+
+    reader.seek(SeekFrom::Start(payload_start + payload_len))?;
+    matched.ok_or_else(|| {
+        invalid_value(
+            "Samples",
+            "sample IV size cannot be inferred from the payload",
+        )
+        .into()
+    })
+}
+
+#[cfg(feature = "async")]
+async fn read_senc_samples_from_reader_async(
+    reader: &mut dyn AsyncReadSeek,
+    payload_len: u64,
+    sample_count: u32,
+    use_subsample_encryption: bool,
+) -> Result<Vec<SencSample>, CodecError> {
+    use tokio::io::AsyncSeekExt;
+
+    let sample_count = usize::try_from(sample_count)
+        .map_err(|_| invalid_value("SampleCount", "sample count does not fit in usize"))?;
+    if sample_count == 0 {
+        if payload_len != 0 {
+            return Err(invalid_value(
+                "Samples",
+                "sample payload must be empty when sample count is zero",
+            )
+            .into());
+        }
+        return Ok(Vec::new());
+    }
+
+    let payload_start = reader.stream_position().await?;
+    let max_iv_size = usize::try_from(payload_len.min(u64::from(u8::MAX)))
+        .map_err(|_| invalid_value("Samples", "sample payload is too large to decode"))?;
+    let mut matched = None;
+    for iv_size in 0..=max_iv_size {
+        let Some(samples) = try_read_senc_samples_with_iv_size_from_reader_async(
+            reader,
+            payload_start,
+            payload_len,
+            sample_count,
+            iv_size,
+            use_subsample_encryption,
+        )
+        .await?
+        else {
+            continue;
+        };
+
+        if matched.is_some() {
+            return Err(invalid_value(
+                "Samples",
+                "sample IV size is ambiguous without external encryption parameters",
+            )
+            .into());
+        }
+        matched = Some(samples);
+    }
+
+    reader
+        .seek(SeekFrom::Start(payload_start + payload_len))
+        .await?;
+    matched.ok_or_else(|| {
+        invalid_value(
+            "Samples",
+            "sample IV size cannot be inferred from the payload",
+        )
+        .into()
     })
 }
 
@@ -867,27 +1203,39 @@ impl CodecBox for Senc {
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
         let start = reader.stream_position()?;
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = match read_exact_vec_untrusted(reader, payload_len) {
-            Ok(payload) => payload,
+        match decode_senc_payload_from_reader(reader, payload_size) {
+            Ok(decoded) => {
+                *self = decoded;
+                Ok(Some(payload_size))
+            }
             Err(error) => {
                 reader.seek(SeekFrom::Start(start))?;
-                return Err(error.into());
+                Err(error)
             }
-        };
-
-        let parse_result = (|| -> Result<(), CodecError> {
-            *self = decode_senc_payload(&payload)?;
-            Ok(())
-        })();
-
-        if let Err(error) = parse_result {
-            reader.seek(SeekFrom::Start(start))?;
-            return Err(error);
         }
+    }
 
-        Ok(Some(payload_size))
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            use tokio::io::AsyncSeekExt;
+
+            let start = reader.stream_position().await?;
+            match decode_senc_payload_from_reader_async(reader, payload_size).await {
+                Ok(decoded) => {
+                    *self = decoded;
+                    Ok(Some(payload_size))
+                }
+                Err(error) => {
+                    reader.seek(SeekFrom::Start(start)).await?;
+                    Err(error)
+                }
+            }
+        })
     }
 }
 

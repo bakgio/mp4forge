@@ -18,6 +18,8 @@ use crate::boxes::iso14496_12::{
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
 use crate::codec::{CodecBox, CodecError, marshal_dyn, unmarshal, unmarshal_any_with_context};
+#[cfg(feature = "async")]
+use crate::codec::{marshal_dyn_async, unmarshal_any_with_context_async};
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
 use crate::walk::{BoxPath, PathMatch};
 use crate::writer::{Writer, WriterError};
@@ -562,60 +564,49 @@ where
         .seek(SeekFrom::Start(info.offset() + info.header_size()))
         .await?;
     let payload_size = info.payload_size()?;
-    let mut payload_bytes = Vec::with_capacity(payload_size.try_into().unwrap_or(0));
-    let mut payload_reader = (&mut *reader).take(payload_size);
-    let payload_read = payload_reader.read_to_end(&mut payload_bytes).await? as u64;
-    if payload_read != payload_size {
-        return Err(RewriteError::UnexpectedEof);
-    }
-    let (encoded_payload, payload_read, is_visual_sample_entry) = {
-        let (mut payload, payload_read) = unmarshal_any_with_context(
-            &mut Cursor::new(payload_bytes.as_slice()),
-            payload_size,
-            info.box_type(),
-            registry,
-            info.lookup_context(),
-            None,
-        )
-        .map_err(|source| RewriteError::PayloadDecode {
-            path: current_path.clone(),
-            box_type: info.box_type(),
-            offset: info.offset(),
-            source,
-        })?;
+    let (mut payload, payload_read) = unmarshal_any_with_context_async(
+        reader,
+        payload_size,
+        info.box_type(),
+        registry,
+        info.lookup_context(),
+        None,
+    )
+    .await
+    .map_err(|source| RewriteError::PayloadDecode {
+        path: current_path.clone(),
+        box_type: info.box_type(),
+        offset: info.offset(),
+        source,
+    })?;
 
-        if path_match.exact_match {
-            let typed = payload.as_any_mut().downcast_mut::<T>().ok_or_else(|| {
-                RewriteError::UnexpectedPayloadType {
-                    path: current_path.clone(),
-                    box_type: info.box_type(),
-                    offset: info.offset(),
-                    expected_type: type_name::<T>(),
-                }
-            })?;
-            (plan.edit)(typed);
-            *plan.rewritten_count += 1;
-        }
-
-        let is_visual_sample_entry = payload.as_any().is::<VisualSampleEntry>();
-        let mut encoded_payload = Vec::new();
-        marshal_dyn(&mut encoded_payload, payload.as_ref(), None).map_err(|source| {
-            RewriteError::PayloadEncode {
+    if path_match.exact_match {
+        let typed = payload.as_any_mut().downcast_mut::<T>().ok_or_else(|| {
+            RewriteError::UnexpectedPayloadType {
                 path: current_path.clone(),
                 box_type: info.box_type(),
                 offset: info.offset(),
-                source,
+                expected_type: type_name::<T>(),
             }
         })?;
-        (encoded_payload, payload_read, is_visual_sample_entry)
-    };
+        (plan.edit)(typed);
+        *plan.rewritten_count += 1;
+    }
 
+    let is_visual_sample_entry = payload.as_any().is::<VisualSampleEntry>();
     let placeholder = BoxInfo::new(info.box_type(), info.header_size())
         .with_header_size(info.header_size())
         .with_lookup_context(info.lookup_context())
         .with_extend_to_eof(info.extend_to_eof());
     writer.start_box_async(placeholder).await?;
-    writer.write_all(&encoded_payload).await?;
+    marshal_dyn_async(&mut *writer, payload.as_ref(), None)
+        .await
+        .map_err(|source| RewriteError::PayloadEncode {
+            path: current_path.clone(),
+            box_type: info.box_type(),
+            offset: info.offset(),
+            source,
+        })?;
 
     let children_offset = info.offset() + info.header_size() + payload_read;
     let (children_size, trailing_bytes) = if is_visual_sample_entry {

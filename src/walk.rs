@@ -14,10 +14,12 @@ use crate::FourCc;
 #[cfg(feature = "async")]
 use crate::async_io::{AsyncReadSeek, AsyncWrite};
 use crate::boxes::iso14496_12::{
-    Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
+    AudioSampleEntry, Ftyp, VisualSampleEntry, split_box_children_with_optional_trailing_bytes,
 };
 use crate::boxes::metadata::Keys;
 use crate::boxes::{BoxLookupContext, BoxRegistry, default_registry};
+#[cfg(feature = "async")]
+use crate::codec::unmarshal_any_with_context_async;
 use crate::codec::{CodecError, DynCodecBox, unmarshal, unmarshal_any_with_context};
 use crate::fourcc::ParseFourCcError;
 use crate::header::{BoxInfo, HeaderError, SMALL_HEADER_SIZE};
@@ -358,6 +360,7 @@ where
 
     /// Decodes the current payload into a descriptor-backed runtime box value.
     pub fn read_payload(&mut self) -> Result<(Box<dyn DynCodecBox>, u64), WalkError> {
+        validate_box_fits_stream(self.reader, &self.info)?;
         self.info.seek_to_payload(self.reader)?;
         let payload_size = self.info.payload_size()?;
         let (boxed, read) = unmarshal_any_with_context(
@@ -383,6 +386,7 @@ where
     where
         W: Write,
     {
+        validate_box_fits_stream(self.reader, &self.info)?;
         self.info.seek_to_payload(self.reader)?;
         let payload_size = self.info.payload_size()?;
         let mut limited = (&mut *self.reader).take(payload_size);
@@ -431,32 +435,28 @@ where
 
     /// Decodes the current payload into a descriptor-backed runtime box value.
     pub async fn read_payload_async(&mut self) -> Result<(Box<dyn DynCodecBox>, u64), WalkError> {
+        validate_box_fits_stream_async(self.reader, &self.info).await?;
         self.info.seek_to_payload_async(self.reader).await?;
         let payload_size = self.info.payload_size()?;
-        let payload = crate::codec::read_exact_vec_untrusted_async(
+        let (boxed, read) = unmarshal_any_with_context_async(
             self.reader,
-            usize::try_from(payload_size)
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-        )
-        .await?;
-        self.info.seek_to_payload_async(self.reader).await?;
-
-        let mut payload_reader = std::io::Cursor::new(payload.as_slice());
-        let (boxed, read) = crate::codec::unmarshal_any_with_context(
-            &mut payload_reader,
             payload_size,
             self.info.box_type(),
             self.registry,
             self.info.lookup_context(),
             None,
-        )?;
-        self.children_layout = Some(children_layout_for_buffered_payload(
-            &self.info,
-            payload_size,
-            read,
-            boxed.as_any().is::<VisualSampleEntry>(),
-            &payload,
-        )?);
+        )
+        .await?;
+        self.children_layout = Some(
+            children_layout_for_payload_async(
+                self.reader,
+                &self.info,
+                payload_size,
+                read,
+                boxed.as_ref(),
+            )
+            .await?,
+        );
         Ok((boxed, read))
     }
 
@@ -465,6 +465,7 @@ where
     where
         W: AsyncWrite + Unpin,
     {
+        validate_box_fits_stream_async(self.reader, &self.info).await?;
         self.info.seek_to_payload_async(self.reader).await?;
         let payload_size = self.info.payload_size()?;
         let mut limited = (&mut *self.reader).take(payload_size);
@@ -551,6 +552,7 @@ where
         &mut visitor,
         &mut parent,
         &BoxPath::default(),
+        false,
     )
 }
 
@@ -631,6 +633,7 @@ where
         &mut visitor,
         &mut parent,
         &BoxPath::default(),
+        false,
     )
     .await
 }
@@ -674,7 +677,7 @@ where
         }
 
         info.set_lookup_context(sibling_lookup_context);
-        walk_box(reader, registry, visitor, &mut info, path)?;
+        walk_box(reader, registry, visitor, &mut info, path, is_root)?;
 
         if info.lookup_context().is_quicktime_compatible() {
             sibling_lookup_context = sibling_lookup_context.with_quicktime_compatible(true);
@@ -698,6 +701,7 @@ fn walk_box<R, F>(
     visitor: &mut F,
     info: &mut BoxInfo,
     path: &BoxPath,
+    is_root: bool,
 ) -> Result<(), WalkError>
 where
     R: Read + Seek,
@@ -733,7 +737,7 @@ where
         )?;
     }
 
-    handle.info.seek_to_end(handle.reader)?;
+    seek_to_box_end(handle.reader, &handle.info, is_root)?;
     Ok(())
 }
 
@@ -779,7 +783,7 @@ where
         }
 
         info.set_lookup_context(sibling_lookup_context);
-        walk_box_async(reader, registry, visitor, &mut info, path).await?;
+        walk_box_async(reader, registry, visitor, &mut info, path, is_root).await?;
 
         if info.lookup_context().is_quicktime_compatible() {
             sibling_lookup_context = sibling_lookup_context.with_quicktime_compatible(true);
@@ -804,6 +808,7 @@ async fn walk_box_async<R, V>(
     visitor: &mut V,
     info: &mut BoxInfo,
     path: &BoxPath,
+    is_root: bool,
 ) -> Result<(), WalkError>
 where
     R: AsyncReadSeek,
@@ -847,7 +852,7 @@ where
     }
 
     let info = handle.info;
-    info.seek_to_end_async(handle.reader).await?;
+    seek_to_box_end_async(handle.reader, &info, is_root).await?;
     Ok(())
 }
 
@@ -862,7 +867,7 @@ where
     R: Read + Seek,
 {
     let offset = info.offset() + info.header_size() + payload_read;
-    let size = if payload.as_any().is::<VisualSampleEntry>() {
+    let size = if payload_uses_optional_trailing_bytes(payload) {
         visual_sample_entry_child_payload_size(
             reader,
             offset,
@@ -876,26 +881,33 @@ where
 }
 
 #[cfg(feature = "async")]
-fn children_layout_for_buffered_payload(
+async fn children_layout_for_payload_async<R>(
+    reader: &mut R,
     info: &BoxInfo,
     payload_size: u64,
     payload_read: u64,
-    is_visual_sample_entry: bool,
-    payload: &[u8],
-) -> Result<ChildrenLayout, WalkError> {
+    payload: &dyn DynCodecBox,
+) -> Result<ChildrenLayout, WalkError>
+where
+    R: AsyncReadSeek,
+{
     let offset = info.offset() + info.header_size() + payload_read;
-    let size = if is_visual_sample_entry {
-        let payload_read = usize::try_from(payload_read)
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-        let remaining = payload
-            .get(payload_read..)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-        split_box_children_with_optional_trailing_bytes(remaining) as u64
+    let size = if payload_uses_optional_trailing_bytes(payload) {
+        visual_sample_entry_child_payload_size_async(
+            reader,
+            offset,
+            payload_size.saturating_sub(payload_read),
+        )
+        .await?
     } else {
         payload_size.saturating_sub(payload_read)
     };
 
     Ok(ChildrenLayout { offset, size })
+}
+
+fn payload_uses_optional_trailing_bytes(payload: &dyn DynCodecBox) -> bool {
+    payload.as_any().is::<VisualSampleEntry>() || payload.as_any().is::<AudioSampleEntry>()
 }
 
 fn visual_sample_entry_child_payload_size<R>(
@@ -922,6 +934,38 @@ where
     })?;
     let mut bytes = vec![0; extension_len];
     reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "async")]
+async fn visual_sample_entry_child_payload_size_async<R>(
+    reader: &mut R,
+    extension_offset: u64,
+    extension_size: u64,
+) -> Result<u64, WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let checkpoint = reader.stream_position().await?;
+    reader.seek(SeekFrom::Start(extension_offset)).await?;
+    let bytes = read_extension_bytes_async(reader, extension_size).await?;
+    reader.seek(SeekFrom::Start(checkpoint)).await?;
+    Ok(split_box_children_with_optional_trailing_bytes(&bytes) as u64)
+}
+
+#[cfg(feature = "async")]
+async fn read_extension_bytes_async<R>(
+    reader: &mut R,
+    extension_size: u64,
+) -> Result<Vec<u8>, WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let extension_len = usize::try_from(extension_size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload extension is too large")
+    })?;
+    let mut bytes = vec![0; extension_len];
+    reader.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
 
@@ -1012,7 +1056,51 @@ where
     }
 
     let end = reader.seek(SeekFrom::End(0))?;
-    Ok(start == end)
+    Ok(start >= end)
+}
+
+fn validate_box_fits_stream<R>(reader: &mut R, info: &BoxInfo) -> Result<(), WalkError>
+where
+    R: Seek,
+{
+    let position = reader.stream_position()?;
+    let stream_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(position))?;
+    validate_box_end_within_stream(info, stream_len)
+}
+
+fn validate_box_end_within_stream(info: &BoxInfo, stream_len: u64) -> Result<(), WalkError> {
+    let end = checked_box_end(info)?;
+    if end > stream_len {
+        return Err(WalkError::UnexpectedEof);
+    }
+    Ok(())
+}
+
+fn checked_box_end(info: &BoxInfo) -> Result<u64, WalkError> {
+    info.offset()
+        .checked_add(info.size())
+        .ok_or(WalkError::UnexpectedEof)
+}
+
+fn seek_to_box_end<R>(
+    reader: &mut R,
+    info: &BoxInfo,
+    clamp_to_stream_end: bool,
+) -> Result<u64, WalkError>
+where
+    R: Seek,
+{
+    let end = checked_box_end(info)?;
+    let target = if clamp_to_stream_end {
+        let position = reader.stream_position()?;
+        let stream_len = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(position))?;
+        end.min(stream_len)
+    } else {
+        end
+    };
+    reader.seek(SeekFrom::Start(target)).map_err(WalkError::Io)
 }
 
 #[cfg(feature = "async")]
@@ -1029,7 +1117,42 @@ where
     }
 
     let end = reader.seek(SeekFrom::End(0)).await?;
-    Ok(start == end)
+    Ok(start >= end)
+}
+
+#[cfg(feature = "async")]
+async fn validate_box_fits_stream_async<R>(reader: &mut R, info: &BoxInfo) -> Result<(), WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let position = reader.stream_position().await?;
+    let stream_len = reader.seek(SeekFrom::End(0)).await?;
+    reader.seek(SeekFrom::Start(position)).await?;
+    validate_box_end_within_stream(info, stream_len)
+}
+
+#[cfg(feature = "async")]
+async fn seek_to_box_end_async<R>(
+    reader: &mut R,
+    info: &BoxInfo,
+    clamp_to_stream_end: bool,
+) -> Result<u64, WalkError>
+where
+    R: AsyncReadSeek,
+{
+    let end = checked_box_end(info)?;
+    let target = if clamp_to_stream_end {
+        let position = reader.stream_position().await?;
+        let stream_len = reader.seek(SeekFrom::End(0)).await?;
+        reader.seek(SeekFrom::Start(position)).await?;
+        end.min(stream_len)
+    } else {
+        end
+    };
+    reader
+        .seek(SeekFrom::Start(target))
+        .await
+        .map_err(WalkError::Io)
 }
 
 /// Errors raised while walking a box tree.

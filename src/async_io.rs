@@ -2,7 +2,9 @@
 //!
 //! The existing sync APIs remain the default path in `mp4forge`. The first async rollout is
 //! intentionally limited to seekable library readers and writers such as Tokio file handles or
-//! in-memory buffers. The CLI continues to use the sync surface.
+//! in-memory buffers. Later queue-backed follow-ons can also use the forward-only async reader
+//! and writer aliases in this module when a surface can operate progressively without seeks. The
+//! CLI continues to use the sync surface.
 
 /// Tokio async read trait used by the library-side async surface.
 pub use tokio::io::AsyncRead;
@@ -10,6 +12,23 @@ pub use tokio::io::AsyncRead;
 pub use tokio::io::AsyncSeek;
 /// Tokio async write trait used by the library-side async surface.
 pub use tokio::io::AsyncWrite;
+
+/// Async reader alias for forward-only library inputs.
+///
+/// Queue-backed progressive flows can use this bound when they only need incremental reads and do
+/// not require random-access seeks. The alias still requires `Send` so callers can move
+/// independent I/O jobs onto Tokio worker threads safely.
+pub trait AsyncReadForward: AsyncRead + Unpin + Send {}
+
+impl<T> AsyncReadForward for T where T: AsyncRead + Unpin + Send {}
+
+/// Async writer alias for forward-only library outputs.
+///
+/// This alias covers additive async write surfaces that can emit bytes progressively without
+/// later header backfill seeks, while still requiring `Send` for multithreaded Tokio tasks.
+pub trait AsyncWriteForward: AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncWriteForward for T where T: AsyncWrite + Unpin + Send {}
 
 /// Async reader alias for seekable library inputs.
 ///

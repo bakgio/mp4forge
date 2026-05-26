@@ -6,31 +6,32 @@ use std::time::{Duration, UNIX_EPOCH};
 use mp4forge::FourCc;
 use mp4forge::boxes::iso14496_12::{
     AVCDecoderConfiguration, AVCParameterSet, AlbumLoudnessInfo, AlternativeStartupEntry,
-    AlternativeStartupEntryL, AlternativeStartupEntryOpt, AudioSampleEntry, Btrt, Cdat, Cdsc, Clap,
-    Co64, CoLL, Colr, Cslg, Ctts, CttsEntry, Dinf, Dpnd, Dref, Edts, Elng, Elst, ElstEntry, Emeb,
-    Emib, Emsg, EventMessageSampleEntry, Fiel, Font, Free, Frma, Ftyp, HEVCDecoderConfiguration,
-    HEVCNalu, HEVCNaluArray, Hdlr, Hind, Hint, Ipir, Kind, Leva, LevaLevel, LoudnessEntry,
-    LoudnessMeasurement, Ludt, Mdat, Mdhd, Mdia, Mehd, Meta, Mfhd, Mfra, Mfro, Mime, Minf, Moof,
-    Moov, Mpod, Mvex, Mvhd, Nmhd, PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS,
-    PRFT_TIME_ARBITRARY_CONSISTENT, PRFT_TIME_CAPTURED, PRFT_TIME_ENCODER_INPUT,
-    PRFT_TIME_ENCODER_OUTPUT, PRFT_TIME_MOOF_FINALIZED, PRFT_TIME_MOOF_WRITTEN, Pasp, Prft, Saio,
-    Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm, Sdtp, SdtpSampleElem, SeigEntry, SeigEntryL,
-    Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf, Skip, SmDm, Smhd, SphericalVideoV1Metadata,
-    Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd, Stsc, StscEntry, Stsd, Stss, Stsz, Stts,
-    SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt, Sync, TFHD_BASE_DATA_OFFSET_PRESENT,
-    TFHD_DEFAULT_SAMPLE_DURATION_PRESENT, TRUN_DATA_OFFSET_PRESENT,
-    TRUN_FIRST_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT,
-    TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry,
-    TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra, TfraEntry, Tkhd, TrackLoudnessInfo, Traf, Trak,
-    Tref, Trep, Trex, Trun, TrunEntry, UUID_FRAGMENT_ABSOLUTE_TIMING, UUID_FRAGMENT_RUN_TABLE,
-    UUID_SAMPLE_ENCRYPTION, UUID_SPHERICAL_VIDEO_V1, Udta, Uuid, UuidFragmentAbsoluteTiming,
-    UuidFragmentRunEntry, UuidFragmentRunTable, UuidPayload, Vdep, VisualRandomAccessEntry,
-    VisualSampleEntry, Vmhd, Vplx, Wave, XMLSubtitleSampleEntry,
+    AlternativeStartupEntryL, AlternativeStartupEntryOpt, AudioSampleEntry, Btrt, Cdat, Cdsc, Chnl,
+    Clap, Co64, CoLL, Colr, Cslg, Ctts, CttsEntry, Dinf, Dpnd, Dref, DvsC, Edts, Elng, Elst,
+    ElstEntry, Emeb, Emib, Emsg, EventMessageSampleEntry, Fiel, Font, Free, Frma, Ftyp,
+    GenericMediaSampleEntry, HEVCDecoderConfiguration, HEVCNalu, HEVCNaluArray, Hdlr, Hind, Hint,
+    Ipir, Kind, Leva, LevaLevel, LoudnessEntry, LoudnessMeasurement, Ludt, Mdat, Mdhd, Mdia, Mehd,
+    Meta, Mfhd, Mfra, Mfro, Mime, Minf, Moof, Moov, Mpod, Mvex, Mvhd, Nmhd,
+    PRFT_NTP_UNIX_EPOCH_OFFSET_SECONDS, PRFT_TIME_ARBITRARY_CONSISTENT, PRFT_TIME_CAPTURED,
+    PRFT_TIME_ENCODER_INPUT, PRFT_TIME_ENCODER_OUTPUT, PRFT_TIME_MOOF_FINALIZED,
+    PRFT_TIME_MOOF_WRITTEN, Padb, Pasp, Prft, Saio, Saiz, SampleEntry, Sbgp, SbgpEntry, Schi, Schm,
+    Sdtp, SdtpSampleElem, SeigEntry, SeigEntryL, Sgpd, Sidx, SidxReference, Silb, SilbEntry, Sinf,
+    Skip, SmDm, Smhd, SphericalVideoV1Metadata, Ssix, SsixRange, SsixSubsegment, Stbl, Stco, Sthd,
+    Stsc, StscEntry, Stsd, Stss, Stsz, Stts, SttsEntry, Styp, Subs, SubsEntry, SubsSample, Subt,
+    Sync, TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
+    TRUN_DATA_OFFSET_PRESENT, TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
+    TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
+    TRUN_SAMPLE_SIZE_PRESENT, TemporalLevelEntry, TextSubtitleSampleEntry, Tfdt, Tfhd, Tfra,
+    TfraEntry, Tkhd, TrackLoudnessInfo, Traf, Trak, Tref, Trep, Trex, Trun, TrunEntry,
+    UUID_FRAGMENT_ABSOLUTE_TIMING, UUID_FRAGMENT_RUN_TABLE, UUID_SAMPLE_ENCRYPTION,
+    UUID_SPHERICAL_VIDEO_V1, Udta, Uuid, UuidFragmentAbsoluteTiming, UuidFragmentRunEntry,
+    UuidFragmentRunTable, UuidPayload, Vdep, VisualRandomAccessEntry, VisualSampleEntry, Vmhd,
+    Vplx, Wave, XMLSubtitleSampleEntry,
 };
 use mp4forge::boxes::iso23001_7::{SENC_USE_SUBSAMPLE_ENCRYPTION, Senc, SencSample, SencSubsample};
 use mp4forge::boxes::{AnyTypeBox, default_registry};
 use mp4forge::codec::{
-    CodecBox, CodecError, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any,
+    CodecBox, CodecError, FieldValue, ImmutableBox, MutableBox, marshal, unmarshal, unmarshal_any,
 };
 #[cfg(feature = "async")]
 use mp4forge::codec::{marshal_async, unmarshal_any_async, unmarshal_async};
@@ -347,6 +348,11 @@ fn core_iso14496_12_catalog_roundtrips() {
             sample_delta: 0x6789abcd,
         },
     ];
+
+    let mut padb = Padb::default();
+    padb.set_version(0);
+    padb.sample_count = 3;
+    padb.padding_bits = b"AB".to_vec();
 
     let mut tfdt_v0 = Tfdt::default();
     tfdt_v0.set_version(0);
@@ -772,6 +778,11 @@ fn core_iso14496_12_catalog_roundtrips() {
             0x67, 0x89, 0x45, 0x67, 0x89, 0xab, 0x67, 0x89, 0xab, 0xcd,
         ],
         "Version=0 Flags=0x000000 EntryCount=2 Entries=[{SampleCount=19088743 SampleDelta=591751049}, {SampleCount=1164413355 SampleDelta=1737075661}]",
+    );
+    assert_box_roundtrip(
+        padb,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'A', b'B'],
+        "Version=0 Flags=0x000000 SampleCount=3 PaddingBits=\"AB\"",
     );
     assert_box_roundtrip(
         tfdt_v0,
@@ -1697,7 +1708,8 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         general_level_idc: 0x78,
         min_spatial_segmentation_idc: 0x0000,
         chroma_format_idc: 0x01,
-        temporal_id_nested: 0x03,
+        num_temporal_layers: 0x01,
+        temporal_id_nested: 0x01,
         length_size_minus_one: 0x03,
         num_of_nalu_arrays: 4,
         nalu_arrays: vec![
@@ -1775,6 +1787,33 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
             box_type: FourCc::from_bytes(*b"evte"),
             data_reference_index: 0x1234,
         },
+    };
+
+    let dvbs = GenericMediaSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"dvbs"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let dvbt = GenericMediaSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"dvbt"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let mp4s = GenericMediaSampleEntry {
+        sample_entry: SampleEntry {
+            box_type: FourCc::from_bytes(*b"mp4s"),
+            data_reference_index: 0x1234,
+        },
+    };
+
+    let dvsc = DvsC {
+        composition_page_id: 0x0123,
+        ancillary_page_id: 0x0456,
+        subtitle_type: 0x10,
     };
 
     let mut silb = Silb::default();
@@ -1982,7 +2021,7 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
     assert_box_roundtrip(
         hvcc,
         &[
-            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xe0,
+            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xf0,
             0x00, 0xfc, 0xfd, 0xf8, 0xf8, 0x00, 0x00, 0x0f, 0x04, 0x20, 0x00, 0x01, 0x00, 0x18,
             0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00,
             0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0x99, 0x98, 0x09, 0x21, 0x00, 0x01, 0x00,
@@ -1999,7 +2038,7 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
             "GeneralConstraintIndicator=[0x90, 0x0, 0x0, 0x0, 0x0, 0x0] GeneralLevelIdc=0x78 ",
             "MinSpatialSegmentationIdc=0 ParallelismType=0x0 ChromaFormatIdc=0x1 ",
             "BitDepthLumaMinus8=0x0 BitDepthChromaMinus8=0x0 AvgFrameRate=0 ConstantFrameRate=0x0 ",
-            "NumTemporalLayers=0x0 TemporalIdNested=0x3 LengthSizeMinusOne=0x3 NumOfNaluArrays=0x4 ",
+            "NumTemporalLayers=0x1 TemporalIdNested=0x1 LengthSizeMinusOne=0x3 NumOfNaluArrays=0x4 ",
             "NaluArrays=[{Completeness=false Reserved=false NaluType=0x20 NumNalus=1 Nalus=[{Length=24 NALUnit=[0x40, 0x1, 0xc, 0x1, 0xff, 0xff, 0x1, 0x60, 0x0, 0x0, 0x3, 0x0, 0x90, 0x0, 0x0, 0x3, 0x0, 0x0, 0x3, 0x0, 0x78, 0x99, 0x98, 0x9]}]}, ",
             "{Completeness=false Reserved=false NaluType=0x21 NumNalus=1 Nalus=[{Length=42 NALUnit=[0x6, 0x1, 0x1, 0x1, 0x60, 0x0, 0x0, 0x3, 0x0, 0x90, 0x0, 0x0, 0x3, 0x0, 0x0, 0x3, 0x0, 0x78, 0xa0, 0x3, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x66, 0x69, 0x24, 0xca, 0xe0, 0x10, 0x0, 0x0, 0x3, 0x0, 0x10, 0x0, 0x0, 0x3, 0x1, 0xe0, 0x80]}]}, ",
             "{Completeness=false Reserved=false NaluType=0x22 NumNalus=1 Nalus=[{Length=7 NALUnit=[0x44, 0x1, 0xc1, 0x72, 0xb4, 0x62, 0x40]}]}, ",
@@ -2030,6 +2069,26 @@ fn sample_entry_and_leaf_iso14496_12_catalog_roundtrips() {
         evte,
         &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
         "DataReferenceIndex=4660",
+    );
+    assert_any_box_roundtrip(
+        dvbs,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_any_box_roundtrip(
+        dvbt,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_any_box_roundtrip(
+        mp4s,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34],
+        "DataReferenceIndex=4660",
+    );
+    assert_box_roundtrip(
+        dvsc,
+        &[0x01, 0x23, 0x04, 0x56, 0x10],
+        "CompositionPageID=291 AncillaryPageID=1110 SubtitleType=16",
     );
     assert_box_roundtrip(
         silb,
@@ -2249,6 +2308,13 @@ fn compact_track_payload_metadata_iso14496_12_catalog_roundtrips() {
         &[0xde, 0xad, 0xbe, 0xef],
         "Data=[0xde, 0xad, 0xbe, 0xef]",
     );
+    assert_box_roundtrip(
+        Chnl {
+            data: vec![0x01, 0x02, 0x03, 0x04],
+        },
+        &[0x01, 0x02, 0x03, 0x04],
+        "Data=[0x1, 0x2, 0x3, 0x4]",
+    );
 }
 
 #[test]
@@ -2322,6 +2388,28 @@ fn elng_preserves_payloads_without_full_box_header_bytes() {
 
 #[cfg(feature = "async")]
 #[tokio::test]
+async fn async_elng_preserves_payloads_without_full_box_header_bytes() {
+    let payload = [b'd', b'k', 0x00];
+    let mut decoded = Elng::default();
+    let mut reader = Cursor::new(payload.to_vec());
+    let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+        .await
+        .unwrap();
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded.extended_language, "dk");
+    assert_eq!(
+        stringify(&decoded, None).unwrap(),
+        "Version=0 Flags=0x000000 ExtendedLanguage=\"dk\""
+    );
+
+    let mut encoded = Cursor::new(Vec::new());
+    let written = marshal_async(&mut encoded, &decoded, None).await.unwrap();
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(encoded.into_inner(), payload);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
 async fn async_meta_and_prft_roundtrips_preserve_typed_behavior() {
     let meta_payload = [
         0x00, 0x00, 0x01, 0x00, b'h', b'd', b'l', b'r', 0x00, 0x00, 0x00, 0x00,
@@ -2375,6 +2463,207 @@ async fn async_meta_and_prft_roundtrips_preserve_typed_behavior() {
     .unwrap();
     assert_eq!(any_read, 24);
     assert_eq!(any_box.as_any().downcast_ref::<Prft>().unwrap(), &prft);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_uuid_and_decoder_configs_roundtrip_reader_first_paths() {
+    let avcc = AVCDecoderConfiguration {
+        configuration_version: 1,
+        profile: 100,
+        profile_compatibility: 0,
+        level: 31,
+        length_size_minus_one: 3,
+        num_of_sequence_parameter_sets: 1,
+        sequence_parameter_sets: vec![AVCParameterSet {
+            length: 3,
+            nal_unit: vec![0x67, 0x64, 0x00],
+        }],
+        num_of_picture_parameter_sets: 1,
+        picture_parameter_sets: vec![AVCParameterSet {
+            length: 2,
+            nal_unit: vec![0x68, 0xee],
+        }],
+        high_profile_fields_enabled: false,
+        chroma_format: 0,
+        bit_depth_luma_minus8: 0,
+        bit_depth_chroma_minus8: 0,
+        num_of_sequence_parameter_set_ext: 0,
+        sequence_parameter_sets_ext: Vec::new(),
+    };
+
+    let hvcc = HEVCDecoderConfiguration {
+        configuration_version: 1,
+        general_profile_space: 0,
+        general_tier_flag: false,
+        general_profile_idc: 1,
+        general_profile_compatibility: [false; 32],
+        general_constraint_indicator: [0; 6],
+        general_level_idc: 120,
+        min_spatial_segmentation_idc: 0,
+        parallelism_type: 0,
+        chroma_format_idc: 1,
+        bit_depth_luma_minus8: 0,
+        bit_depth_chroma_minus8: 0,
+        avg_frame_rate: 0,
+        constant_frame_rate: 0,
+        num_temporal_layers: 1,
+        temporal_id_nested: 1,
+        length_size_minus_one: 3,
+        num_of_nalu_arrays: 1,
+        nalu_arrays: vec![HEVCNaluArray {
+            completeness: true,
+            reserved: false,
+            nalu_type: 32,
+            num_nalus: 1,
+            nalus: vec![HEVCNalu {
+                length: 2,
+                nal_unit: vec![0xaa, 0xbb],
+            }],
+        }],
+    };
+
+    let mut legacy_sample_encryption = Senc::default();
+    legacy_sample_encryption.set_version(0);
+    legacy_sample_encryption.set_flags(SENC_USE_SUBSAMPLE_ENCRYPTION);
+    legacy_sample_encryption.sample_count = 1;
+    legacy_sample_encryption.samples = vec![SencSample {
+        initialization_vector: vec![0x10, 0x20, 0x30, 0x40],
+        subsamples: vec![SencSubsample {
+            bytes_of_clear_data: 2,
+            bytes_of_protected_data: 4,
+        }],
+    }];
+
+    let uuid = Uuid {
+        user_type: UUID_SAMPLE_ENCRYPTION,
+        payload: UuidPayload::SampleEncryption(legacy_sample_encryption),
+    };
+
+    async fn assert_async_roundtrip<T>(src: T)
+    where
+        T: CodecBox + Default + PartialEq + std::fmt::Debug + 'static,
+    {
+        let mut encoded = Cursor::new(Vec::new());
+        let written = marshal_async(&mut encoded, &src, None).await.unwrap();
+        let payload = encoded.into_inner();
+        assert_eq!(written, payload.len() as u64);
+
+        let mut decoded = T::default();
+        let mut reader = Cursor::new(payload.clone());
+        let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+            .await
+            .unwrap();
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(decoded, src);
+
+        let registry = default_registry();
+        let mut any_reader = Cursor::new(payload);
+        let payload_len = any_reader.get_ref().len() as u64;
+        let (any_box, any_read) = unmarshal_any_async(
+            &mut any_reader,
+            payload_len,
+            src.box_type(),
+            &registry,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(any_read, payload_len);
+        assert_eq!(any_box.as_any().downcast_ref::<T>().unwrap(), &src);
+    }
+
+    assert_async_roundtrip(avcc).await;
+    assert_async_roundtrip(hvcc).await;
+    assert_async_roundtrip(uuid).await;
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_loudness_and_elng_roundtrips_reader_first_paths() {
+    let mut elng = Elng::default();
+    elng.extended_language = "en-US".into();
+
+    let mut tlou = TrackLoudnessInfo::default();
+    tlou.set_version(1);
+    tlou.entries = vec![LoudnessEntry {
+        eq_set_id: 7,
+        downmix_id: 12,
+        drc_set_id: 18,
+        bs_sample_peak_level: 528,
+        bs_true_peak_level: 801,
+        measurement_system_for_tp: 4,
+        reliability_for_tp: 6,
+        measurements: vec![
+            LoudnessMeasurement {
+                method_definition: 7,
+                method_value: 8,
+                measurement_system: 9,
+                reliability: 10,
+            },
+            LoudnessMeasurement {
+                method_definition: 11,
+                method_value: 12,
+                measurement_system: 13,
+                reliability: 14,
+            },
+        ],
+    }];
+
+    let mut alou = AlbumLoudnessInfo::default();
+    alou.set_version(0);
+    alou.entries = vec![LoudnessEntry {
+        downmix_id: 9,
+        drc_set_id: 17,
+        bs_sample_peak_level: 274,
+        bs_true_peak_level: 291,
+        measurement_system_for_tp: 2,
+        reliability_for_tp: 3,
+        measurements: vec![LoudnessMeasurement {
+            method_definition: 1,
+            method_value: 2,
+            measurement_system: 4,
+            reliability: 5,
+        }],
+        ..LoudnessEntry::default()
+    }];
+
+    async fn assert_async_roundtrip<T>(src: T)
+    where
+        T: CodecBox + Default + PartialEq + std::fmt::Debug + 'static,
+    {
+        let mut encoded = Cursor::new(Vec::new());
+        let written = marshal_async(&mut encoded, &src, None).await.unwrap();
+        let payload = encoded.into_inner();
+        assert_eq!(written, payload.len() as u64);
+
+        let mut decoded = T::default();
+        let mut reader = Cursor::new(payload.clone());
+        let read = unmarshal_async(&mut reader, payload.len() as u64, &mut decoded, None)
+            .await
+            .unwrap();
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(decoded, src);
+
+        let registry = default_registry();
+        let mut any_reader = Cursor::new(payload);
+        let payload_len = any_reader.get_ref().len() as u64;
+        let (any_box, any_read) = unmarshal_any_async(
+            &mut any_reader,
+            payload_len,
+            src.box_type(),
+            &registry,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(any_read, payload_len);
+        assert_eq!(any_box.as_any().downcast_ref::<T>().unwrap(), &src);
+    }
+
+    assert_async_roundtrip(elng).await;
+    assert_async_roundtrip(tlou).await;
+    assert_async_roundtrip(alou).await;
 }
 
 #[test]
@@ -3007,6 +3296,10 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
         Some(&[][..])
     );
     assert_eq!(
+        registry.supported_versions(FourCc::from_bytes(*b"chnl")),
+        Some(&[][..])
+    );
+    assert_eq!(
         registry.supported_versions(FourCc::from_bytes(*b"leva")),
         Some(&[0][..])
     );
@@ -3091,6 +3384,7 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"avcC")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"btrt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"cdat")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"chnl")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"clap")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"colr")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"CoLL")));
@@ -3104,10 +3398,30 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"leva")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ludt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"avc1")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"avc2")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"avc3")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"avc4")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mime")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mp4a")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dvbs")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dvbt")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"text")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"tx3g")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"mp4s")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dvsC")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"divx")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"jpeg")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"png ")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"SVQ1")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"pasp")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"prft")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"samr")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sawb")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sqcp")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"sevc")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"ssmv")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"dts-")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"QDM2")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"schm")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sbtt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"sidx")));
@@ -3119,6 +3433,7 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"sync")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"subt")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"subs")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"s263")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"nmhd")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"tref")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"tlou")));
@@ -3134,6 +3449,25 @@ fn built_in_registry_reports_supported_versions_for_landed_types() {
     assert!(registry.is_registered(FourCc::from_bytes(*b"hint")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"ipir")));
     assert!(registry.is_registered(FourCc::from_bytes(*b"mpod")));
+    assert!(registry.is_registered(FourCc::from_bytes(*b"swre")));
+}
+
+#[test]
+fn swre_boxes_roundtrip_as_registered_opaque_payloads() {
+    let registry = default_registry();
+    let box_type = FourCc::from_bytes(*b"swre");
+    let payload = b"\x00\x00\x00\x00mp4forge apple fps retained metadata\x00".to_vec();
+
+    let mut reader = Cursor::new(payload.clone());
+    let (decoded, read) =
+        unmarshal_any(&mut reader, payload.len() as u64, box_type, &registry, None).unwrap();
+
+    assert_eq!(read, payload.len() as u64);
+    assert_eq!(decoded.box_type(), box_type);
+    assert_eq!(
+        decoded.field_value("Data").unwrap(),
+        FieldValue::Bytes(payload)
+    );
 }
 
 #[test]
@@ -3303,7 +3637,7 @@ fn avcc_rejects_inconsistent_high_profile_state() {
 #[test]
 fn hvcc_rejects_truncated_nalu_array_payloads() {
     let payload = [
-        0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xe0, 0x00,
+        0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xf0, 0x00,
         0xfc, 0xfd, 0xf8, 0xf8, 0x00, 0x00, 0x0f, 0x04, 0x20, 0x00, 0x01, 0x00, 0x18, 0x40, 0x01,
         0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
         0x00, 0x03, 0x00, 0x78, 0x99, 0x98, 0x09, 0x21, 0x00, 0x01, 0x00, 0x2a, 0x06, 0x01, 0x01,

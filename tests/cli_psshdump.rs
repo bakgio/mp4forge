@@ -2,7 +2,6 @@
 
 mod support;
 
-use std::fs;
 use std::io::Cursor;
 
 use mp4forge::boxes::iso14496_12::{Ftyp, Moof, Moov};
@@ -190,8 +189,6 @@ fn psshdump_command_renders_offsets_flags_and_base64() {
     let mut stderr = Vec::new();
     let exit_code = pssh::run(&args, &mut stdout, &mut stderr);
 
-    let _ = fs::remove_file(&path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(
@@ -223,8 +220,6 @@ fn psshdump_command_filters_text_output_by_path() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit_code = pssh::run(&args, &mut stdout, &mut stderr);
-
-    let _ = fs::remove_file(&path);
 
     let stdout = String::from_utf8(stdout).unwrap();
     assert_eq!(exit_code, 0);
@@ -286,8 +281,6 @@ fn psshdump_command_filters_structured_output_with_stable_goldens() {
             "golden mismatch for {golden}"
         );
     }
-
-    let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -324,8 +317,6 @@ fn psshdump_command_rejects_invalid_filter_values() {
         assert_eq!(String::from_utf8(stdout).unwrap(), "");
         assert_eq!(String::from_utf8(stderr).unwrap(), *expected_stderr);
     }
-
-    let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -367,8 +358,6 @@ fn psshdump_command_returns_empty_reports_for_empty_matches() {
         String::from_utf8(json_stdout).unwrap(),
         "{\n  \"Entries\": [\n  ]\n}\n"
     );
-
-    let _ = fs::remove_file(&path);
 }
 
 #[test]

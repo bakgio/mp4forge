@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">mp4forge</h1>
   <p align="center">
-    Rust library and CLI for inspecting, extracting, probing, and rewriting MP4 box structures.
+    Rust library and CLI for inspecting, extracting, probing, muxing, and rewriting MP4 structures.
   </p>
   <p align="center">
     <a href="https://crates.io/crates/mp4forge"><img src="https://img.shields.io/crates/v/mp4forge.svg" alt="Crates.io"></a>
@@ -21,20 +21,22 @@
 - Thin typed path-based helpers and byte-slice convenience wrappers for common extraction, rewrite, and probe flows
 - Fragmented top-level `sidx` analysis, planning, and rewrite APIs for supported layouts
 - Feature-gated decryption APIs and a sync-only `decrypt` CLI for the supported protected MP4 families
-- Built-in CLI for `decrypt`, `dump`, `extract`, `probe`, `psshdump`, `edit`, and `divide`
+- Built-in CLI for `decrypt`, `divide`, `dump`, `edit`, `extract`, `mux`, `probe`, and `psshdump`
 - Shared-fixture coverage for regular MP4, fragmented MP4, encrypted init segments, QuickTime-style metadata cases, and derived real codec fixtures for additional codec-family coverage
 
 ## Installation
 
 ```toml
 [dependencies]
-mp4forge = "0.7.0"
+mp4forge = "0.8.0"
 
 # With optional features:
-# mp4forge = { version = "0.7.0", features = ["async"] }
-# mp4forge = { version = "0.7.0", features = ["decrypt"] }
-# mp4forge = { version = "0.7.0", features = ["decrypt", "async"] }
-# mp4forge = { version = "0.7.0", features = ["serde"] }
+# mp4forge = { version = "0.8.0", features = ["async"] }
+# mp4forge = { version = "0.8.0", features = ["decrypt"] }
+# mp4forge = { version = "0.8.0", features = ["decrypt", "async"] }
+# mp4forge = { version = "0.8.0", features = ["mux"] }
+# mp4forge = { version = "0.8.0", features = ["mux", "async"] }
+# mp4forge = { version = "0.8.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:
@@ -68,6 +70,14 @@ feature flags:
   IPMP ACBC and ACGK OD-track movies, and the retained IAEC protected-movie path. When combined
   with `async`, it also enables the additive file-backed Tokio async decrypt companions, while the
   CLI remains on the synchronous path.
+- `mux`: enables the additive mux task surface and the retained low-level helpers underneath it.
+  The library path covers the narrow public `MuxRequest` model with repeated track specs plus
+  optional `segment_duration` or `fragment_duration`, real `ftyp`/`moov`/`mdat` writing for sync
+  callers, additive async real-container writing when combined with `async`, internal chunk and
+  duration coordination on one mux event graph, the retained low-level seekable and progressive
+  payload assembly helpers, and one-sample-at-a-time seekable or progressive readers. It also 
+  enables the sync-only `mux` CLI route for one output MP4 built from repeated 
+  path-first `--track` inputs.
 - `serde`: derives `Serialize` and `Deserialize` for the reusable public report structs under
   `mp4forge::cli::probe` and `mp4forge::cli::dump`, along with their nested public codec-detail,
   media-characteristics, `FieldValue`, and `FourCc` data. This is intended for library-side report
@@ -85,6 +95,7 @@ COMMAND:
   dump         display the MP4 box tree
   edit         rewrite selected boxes
   extract      extract raw boxes by type or path
+  mux          merge one video track plus audio, text, and subtitle tracks into one MP4
   psshdump     summarize pssh boxes
   probe        summarize an MP4 file
 ```
@@ -94,9 +105,37 @@ sync-only, accepts repeated `--key ID:KEY`, optional `--fragments-info FILE`, an
 `--show-progress`, and reuses the same library decryption surface that backs the feature-gated
 sync and async APIs.
 
-`divide` currently targets fragmented inputs with up to one AVC video track and one MP4A audio
-track, including encrypted wrappers that preserve those original sample-entry formats. Pass
-`-validate` when you want the same probe-driven layout checks without creating any output files.
+`mux` is available when the crate is built with `--features mux`. The CLI route stays sync-only
+and accepts repeated `--track` inputs, one required positional output path, and at most one of
+`--segment_duration` or `--fragment_duration`. The current public `--track` grammar is path-first:
+`PATH` imports one raw source or every supported track from one MP4 source, while
+`PATH#video`, `PATH#audio`, `PATH#audio:N`, `PATH#text`, `PATH#text:N`, and `PATH#track:ID`
+select one specific track from a containerized source. The landed path-only auto-detection
+currently covers MP4, supported AVI audio streams plus H.263/JPEG/PNG/MPEG-4 Part 2/H.264/AVC1 video streams, supported
+MPEG-PS MPEG audio streams plus LPCM audio plus MPEG-4 Part 2/H.264/H.265/VVC video streams, supported MPEG-TS
+MPEG audio streams plus AAC LATM/MHAS plus AC-3/E-AC-3/AC-4/DTS/TrueHD audio plus MPEG-2/AV1/AVS3/MPEG-4 Part 2/H.264/H.265/VVC video streams, AAC
+ADTS, MP3, AC-3, E-AC-3, AC-4, AMR, AMR-WB, QCP voice audio, DTS core audio, AAC LATM, Dolby
+TrueHD, leading-sync MHAS MPEG-H, IAMF, H.263 elementary video, MPEG-2 elementary video, MPEG-4 Part 2 elementary video,
+H.264 Annex B, H.265 Annex B, VVC Annex B, raw AV1 OBU, raw AV1 Annex B, IVF-backed AV1, IVF-backed VP8, IVF-backed VP9,
+JPEG still images, PNG still images, WAVE/AIFF/AIFC PCM, native FLAC, Ogg-backed FLAC,
+Ogg-backed Opus, Ogg-backed Vorbis, Ogg-backed Speex, Ogg-backed Theora, and CAF-backed ALAC.
+Broader DTS-family
+sample-entry variants remain supported through MP4 track import, and the broader demux-backed
+path-only families continue to move over behind the same public shape.
+MP4-track merges continue to cover the broader registered sample-entry families because they
+preserve encoded sample-entry bytes from the source file, and mixed video/audio/text/subtitle jobs
+retain imported handler names and languages on the real MP4 path. The matching sync and async
+library entry points use the same `MuxRequest` surface, while the retained lower-level mux helpers
+remain available separately when you need staged planning or payload-copy behavior without the
+task-level request layer. The public `mp4forge::mux::sample_reader` helpers can also expose stable
+text or subtitle track identity when you construct them with companion `MuxTrackConfig` values.
+
+`divide` currently targets fragmented inputs with up to one video track from AVC, HEVC, Dolby
+Vision on HEVC, AV1, VP8, or VP9 and one audio track from MP4A-based audio, Opus, AC-3,
+E-AC-3, AC-4, ALAC, DTS-family entries, FLAC, IAMF, MPEG-H, or PCM, including encrypted wrappers
+that preserve those original sample-entry formats. Subtitle and text tracks remain unsupported in
+the current divide output model. Pass `-validate` when you want the same probe-driven layout
+checks without creating any output files.
 
 `dump` defaults to the existing human-readable tree view. Pass `-format json` or `-format yaml` for
 deterministic structured tree export with stable `payload_fields` for supported boxes; `-full` and
@@ -124,8 +163,9 @@ per-chunk, bitrate, and IDR aggregation, or use `mp4forge::probe::ProbeOptions` 
 when you need the same control programmatically.
 
 > See the [`examples/`](./examples) directory for the crate's low-level and high-level API usage
-> patterns, including the feature-gated decrypt example and the Tokio-based async library example
-> behind the optional `async` feature.
+> patterns, including the feature-gated decrypt example, the feature-gated real-mux and
+> mux/sample-reader examples, and the Tokio-based async library example behind the optional
+> `async` feature.
 
 ## License
 

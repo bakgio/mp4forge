@@ -2,10 +2,14 @@
 
 use std::io::Write;
 
+#[cfg(feature = "async")]
+use crate::async_io::AsyncReadSeek;
 use crate::boxes::BoxRegistry;
+#[cfg(feature = "async")]
+use crate::codec::CodecFuture;
 use crate::codec::{
     CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError, FieldValueRead,
-    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode, read_exact_vec_untrusted,
+    FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode,
 };
 use crate::{FourCc, codec_field};
 
@@ -190,44 +194,102 @@ impl CodecBox for Ikms {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload = read_exact_vec_untrusted(
-            reader,
-            usize::try_from(payload_size)
-                .map_err(|_| invalid_value("iKMS payload", "payload size does not fit in usize"))?,
-        )?;
-        if payload.len() < 4 {
+        if payload_size < 4 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
+        let mut fixed = [0_u8; 4];
+        reader.read_exact(&mut fixed)?;
 
-        self.set_version(payload[0]);
+        self.set_version(fixed[0]);
         if self.version() > 1 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
                 version: self.version(),
             });
         }
-        self.set_flags(u32::from_be_bytes([0, payload[1], payload[2], payload[3]]));
+        self.set_flags(u32::from_be_bytes([0, fixed[1], fixed[2], fixed[3]]));
 
-        let mut cursor = 4usize;
-        if self.version() == 1 && payload.len().saturating_sub(cursor) >= 8 {
-            self.kms_id = u32::from_be_bytes(payload[cursor..cursor + 4].try_into().unwrap());
-            self.kms_version =
-                u32::from_be_bytes(payload[cursor + 4..cursor + 8].try_into().unwrap());
-            cursor += 8;
+        let mut remaining = payload_size - 4;
+        if self.version() == 1 && remaining >= 8 {
+            let mut version_fields = [0_u8; 8];
+            reader.read_exact(&mut version_fields)?;
+            self.kms_id = u32::from_be_bytes(version_fields[..4].try_into().unwrap());
+            self.kms_version = u32::from_be_bytes(version_fields[4..].try_into().unwrap());
+            remaining -= 8;
         } else {
             self.kms_id = 0;
             self.kms_version = 0;
         }
 
-        if cursor < payload.len() {
-            let uri_bytes = &payload[cursor..];
-            let uri_bytes = uri_bytes.strip_suffix(&[0]).unwrap_or(uri_bytes);
+        if remaining != 0 {
+            let mut uri_bytes = vec![
+                0_u8;
+                usize::try_from(remaining).map_err(|_| invalid_value(
+                    "KmsUri",
+                    "payload size does not fit in usize",
+                ))?
+            ];
+            reader.read_exact(&mut uri_bytes)?;
+            let uri_bytes = uri_bytes.strip_suffix(&[0]).unwrap_or(&uri_bytes);
             self.kms_uri = decode_utf8_string("KmsUri", uri_bytes)?;
         } else {
             self.kms_uri.clear();
         }
 
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 4 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let mut fixed = [0_u8; 4];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut fixed).await?;
+
+            self.set_version(fixed[0]);
+            if self.version() > 1 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version: self.version(),
+                });
+            }
+            self.set_flags(u32::from_be_bytes([0, fixed[1], fixed[2], fixed[3]]));
+
+            let mut remaining = payload_size - 4;
+            if self.version() == 1 && remaining >= 8 {
+                let mut version_fields = [0_u8; 8];
+                tokio::io::AsyncReadExt::read_exact(reader, &mut version_fields).await?;
+                self.kms_id = u32::from_be_bytes(version_fields[..4].try_into().unwrap());
+                self.kms_version = u32::from_be_bytes(version_fields[4..].try_into().unwrap());
+                remaining -= 8;
+            } else {
+                self.kms_id = 0;
+                self.kms_version = 0;
+            }
+
+            if remaining != 0 {
+                let mut uri_bytes = vec![
+                    0_u8;
+                    usize::try_from(remaining).map_err(|_| invalid_value(
+                        "KmsUri",
+                        "payload size does not fit in usize",
+                    ))?
+                ];
+                tokio::io::AsyncReadExt::read_exact(reader, &mut uri_bytes).await?;
+                let uri_bytes = uri_bytes.strip_suffix(&[0]).unwrap_or(&uri_bytes);
+                self.kms_uri = decode_utf8_string("KmsUri", uri_bytes)?;
+            } else {
+                self.kms_uri.clear();
+            }
+
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -331,14 +393,11 @@ impl CodecBox for Isfm {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload = read_exact_vec_untrusted(
-            reader,
-            usize::try_from(payload_size)
-                .map_err(|_| invalid_value("iSFM payload", "payload size does not fit in usize"))?,
-        )?;
-        if payload.len() != 7 {
+        if payload_size != 7 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
+        let mut payload = [0_u8; 7];
+        reader.read_exact(&mut payload)?;
 
         self.set_version(payload[0]);
         if self.version() != 0 {
@@ -352,6 +411,34 @@ impl CodecBox for Isfm {
         self.key_indicator_length = payload[5];
         self.iv_length = payload[6];
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size != 7 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let mut payload = [0_u8; 7];
+            tokio::io::AsyncReadExt::read_exact(reader, &mut payload).await?;
+
+            self.set_version(payload[0]);
+            if self.version() != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version: self.version(),
+                });
+            }
+            self.set_flags(u32::from_be_bytes([0, payload[1], payload[2], payload[3]]));
+            self.selective_encryption = (payload[4] & 0x80) != 0;
+            self.key_indicator_length = payload[5];
+            self.iv_length = payload[6];
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -410,9 +497,23 @@ impl CodecBox for Islt {
         if payload_size != 8 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
-        let payload = read_exact_vec_untrusted(reader, 8)?;
-        self.salt.copy_from_slice(&payload);
+        reader.read_exact(&mut self.salt)?;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size != 8 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            tokio::io::AsyncReadExt::read_exact(reader, &mut self.salt).await?;
+            Ok(Some(payload_size))
+        })
     }
 }
 

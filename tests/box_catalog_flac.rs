@@ -189,17 +189,16 @@ fn dfla_rejects_block_length_mismatch_during_marshal() {
 }
 
 #[test]
-fn dfla_rejects_missing_final_metadata_flag_during_unmarshal() {
+fn dfla_normalizes_missing_final_metadata_flag_during_unmarshal() {
     let mut decoded = DfLa::default();
-    let error = unmarshal(
+    let read = unmarshal(
         &mut Cursor::new(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
         8,
         &mut decoded,
         None,
     )
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "invalid field value for MetadataBlocks: final metadata block flag must be set"
-    );
+    .unwrap();
+    assert_eq!(read, 8);
+    assert_eq!(decoded.metadata_blocks.len(), 1);
+    assert!(decoded.metadata_blocks[0].last_metadata_block_flag);
 }

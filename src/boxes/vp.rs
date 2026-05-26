@@ -1,4 +1,4 @@
-//! VP8/VP9 sample-entry and codec-configuration box definitions.
+//! VP8/VP9/VP10 sample-entry and codec-configuration box definitions.
 
 use super::iso14496_12::VisualSampleEntry;
 use crate::boxes::BoxRegistry;
@@ -191,5 +191,6 @@ impl CodecBox for VpCodecConfiguration {
 pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"vp08"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"vp09"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"vp10"));
     registry.register::<VpCodecConfiguration>(FourCc::from_bytes(*b"vpcC"));
 }

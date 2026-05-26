@@ -2,7 +2,6 @@
 
 mod support;
 
-use std::fs;
 use std::io::Cursor;
 
 use mp4forge::BoxInfo;
@@ -20,8 +19,6 @@ fn extract_command_writes_matching_raw_boxes() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit_code = extract::run(&args, &mut stdout, &mut stderr);
-
-    let _ = fs::remove_file(&path);
 
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -42,8 +39,6 @@ fn extract_command_writes_matching_raw_boxes_by_path() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit_code = extract::run(&args, &mut stdout, &mut stderr);
-
-    let _ = fs::remove_file(&path);
 
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");

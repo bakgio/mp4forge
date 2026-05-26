@@ -43,34 +43,32 @@ fn dispatch_keeps_decrypt_unavailable_without_feature() {
     assert_eq!(String::from_utf8(stderr).unwrap(), top_level_usage());
 }
 
-fn top_level_usage() -> &'static str {
+#[cfg(not(feature = "mux"))]
+#[test]
+fn dispatch_keeps_mux_unavailable_without_feature() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    assert_eq!(
+        cli::dispatch(&["mux".to_string()], &mut stdout, &mut stderr),
+        1
+    );
+    assert_eq!(String::from_utf8(stdout).unwrap(), "");
+    assert_eq!(String::from_utf8(stderr).unwrap(), top_level_usage());
+}
+
+fn top_level_usage() -> String {
+    let mut usage = String::from("USAGE: mp4forge COMMAND [ARGS]\n\nCOMMAND:\n");
+    usage.push_str("  divide       split a fragmented MP4 into track playlists\n");
     #[cfg(feature = "decrypt")]
-    {
-        concat!(
-            "USAGE: mp4forge COMMAND [ARGS]\n",
-            "\n",
-            "COMMAND:\n",
-            "  divide       split a fragmented MP4 into track playlists\n",
-            "  decrypt      decrypt protected MP4-family content\n",
-            "  dump         display the MP4 box tree\n",
-            "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type or path\n",
-            "  psshdump     summarize pssh boxes\n",
-            "  probe        summarize an MP4 file\n"
-        )
-    }
-    #[cfg(not(feature = "decrypt"))]
-    {
-        concat!(
-            "USAGE: mp4forge COMMAND [ARGS]\n",
-            "\n",
-            "COMMAND:\n",
-            "  divide       split a fragmented MP4 into track playlists\n",
-            "  dump         display the MP4 box tree\n",
-            "  edit         rewrite selected boxes\n",
-            "  extract      extract raw boxes by type or path\n",
-            "  psshdump     summarize pssh boxes\n",
-            "  probe        summarize an MP4 file\n"
-        )
-    }
+    usage.push_str("  decrypt      decrypt protected MP4-family content\n");
+    usage.push_str("  dump         display the MP4 box tree\n");
+    usage.push_str("  edit         rewrite selected boxes\n");
+    usage.push_str("  extract      extract raw boxes by type or path\n");
+    #[cfg(feature = "mux")]
+    usage.push_str("  inspect      inspect one direct-ingest input without writing an MP4\n");
+    #[cfg(feature = "mux")]
+    usage.push_str("  mux          merge one video track plus audio tracks into one MP4\n");
+    usage.push_str("  psshdump     summarize pssh boxes\n");
+    usage.push_str("  probe        summarize an MP4 file\n");
+    usage
 }

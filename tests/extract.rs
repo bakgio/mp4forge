@@ -17,14 +17,15 @@ use mp4forge::boxes::oma_dcf::{
 };
 use mp4forge::codec::{CodecBox, marshal};
 use mp4forge::extract::{
-    ExtractError, extract_box, extract_box_as, extract_box_as_bytes, extract_box_bytes,
-    extract_box_payload_bytes, extract_box_with_payload, extract_boxes, extract_boxes_as_bytes,
-    extract_boxes_bytes, extract_boxes_payload_bytes,
+    ExtractError, copy_box_bytes_to, copy_box_payload_bytes_to, extract_box, extract_box_as,
+    extract_box_as_bytes, extract_box_bytes, extract_box_payload_bytes, extract_box_with_payload,
+    extract_boxes, extract_boxes_as_bytes, extract_boxes_bytes, extract_boxes_payload_bytes,
 };
 #[cfg(feature = "async")]
 use mp4forge::extract::{
-    extract_box_as_async, extract_box_async, extract_box_bytes_async,
-    extract_box_payload_bytes_async, extract_box_with_payload_async, extract_boxes_async,
+    copy_box_bytes_to_async, copy_box_payload_bytes_to_async, extract_box_as_async,
+    extract_box_async, extract_box_bytes_async, extract_box_payload_bytes_async,
+    extract_box_with_payload_async, extract_boxes_async,
 };
 use mp4forge::stringify::stringify;
 use mp4forge::walk::BoxPath;
@@ -35,9 +36,40 @@ mod support;
 #[cfg(feature = "decrypt")]
 use mp4forge::boxes::isma_cryp::{Ikms, Isfm, Islt};
 #[cfg(feature = "async")]
+use std::pin::Pin;
+#[cfg(feature = "async")]
+use std::task::{Context, Poll};
+#[cfg(feature = "async")]
 use support::build_visual_sample_entry_box_with_trailing_bytes;
 #[cfg(feature = "async")]
 use support::write_temp_file;
+#[cfg(feature = "async")]
+use tokio::io::AsyncWrite;
+
+#[cfg(feature = "async")]
+struct VecAsyncWriter {
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "async")]
+impl AsyncWrite for VecAsyncWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
 use support::{
     build_encrypted_fragmented_video_file, build_event_message_movie_file, fixture_path,
 };
@@ -1141,6 +1173,35 @@ fn extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
     assert_eq!(extracted, vec![leaf]);
 }
 
+#[test]
+fn copy_box_byte_surfaces_stream_exact_leaf_and_payload_bytes() {
+    let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
+    let udta = encode_supported_box(&Udta, &leaf);
+    let moov = encode_supported_box(&Moov, &udta);
+
+    let mut full_bytes = Vec::new();
+    let full_lengths = copy_box_bytes_to(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("udta"), fourcc("zzzz")]),
+        &mut full_bytes,
+    )
+    .unwrap();
+    assert_eq!(full_lengths, vec![leaf.len() as u64]);
+    assert_eq!(full_bytes, leaf);
+
+    let mut payload_bytes = Vec::new();
+    let payload_lengths = copy_box_payload_bytes_to(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("udta")]),
+        &mut payload_bytes,
+    )
+    .unwrap();
+    assert_eq!(payload_lengths, vec![leaf.len() as u64]);
+    assert_eq!(payload_bytes, leaf);
+}
+
 #[cfg(feature = "async")]
 #[tokio::test]
 async fn async_extract_box_payload_bytes_preserve_exact_container_payload_bytes() {
@@ -1157,6 +1218,38 @@ async fn async_extract_box_payload_bytes_preserve_exact_container_payload_bytes(
     .unwrap();
 
     assert_eq!(extracted, vec![leaf]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_copy_box_byte_surfaces_stream_exact_leaf_and_payload_bytes() {
+    let leaf = encode_raw_box(fourcc("zzzz"), &[0xde, 0xad, 0xbe, 0xef]);
+    let udta = encode_supported_box(&Udta, &leaf);
+    let moov = encode_supported_box(&Moov, &udta);
+
+    let mut full_writer = VecAsyncWriter { bytes: Vec::new() };
+    let full_lengths = copy_box_bytes_to_async(
+        &mut Cursor::new(moov.clone()),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("udta"), fourcc("zzzz")]),
+        &mut full_writer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(full_lengths, vec![leaf.len() as u64]);
+    assert_eq!(full_writer.bytes, leaf);
+
+    let mut payload_writer = VecAsyncWriter { bytes: Vec::new() };
+    let payload_lengths = copy_box_payload_bytes_to_async(
+        &mut Cursor::new(moov),
+        None,
+        BoxPath::from([fourcc("moov"), fourcc("udta")]),
+        &mut payload_writer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload_lengths, vec![leaf.len() as u64]);
+    assert_eq!(payload_writer.bytes, leaf);
 }
 
 #[cfg(feature = "async")]

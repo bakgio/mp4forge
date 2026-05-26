@@ -9,7 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 #[cfg(feature = "async")]
 use crate::async_io::AsyncReadSeek;
 use crate::boxes::iso23001_7::{
-    Senc, decode_senc_payload, encode_senc_payload, render_senc_samples_display,
+    Senc, decode_senc_payload, decode_senc_payload_from_reader, encode_senc_payload,
+    render_senc_samples_display,
 };
 use crate::boxes::{AnyTypeBox, BoxLookupContext, BoxRegistry};
 #[cfg(feature = "async")]
@@ -17,8 +18,10 @@ use crate::codec::CodecFuture;
 use crate::codec::{
     ANY_VERSION, CodecBox, CodecError, FieldHooks, FieldTable, FieldValue, FieldValueError,
     FieldValueRead, FieldValueWrite, ImmutableBox, MutableBox, ReadSeek, StringFieldMode,
-    read_exact_vec_untrusted, untrusted_prealloc_hint,
+    read_exact_array_untrusted, read_exact_vec_untrusted, untrusted_prealloc_hint,
 };
+#[cfg(feature = "async")]
+use crate::codec::{read_exact_array_untrusted_async, read_exact_vec_untrusted_async};
 use crate::header::{BoxInfo, SMALL_HEADER_SIZE};
 use crate::{FourCc, codec_field};
 
@@ -511,6 +514,358 @@ fn decode_uuid_fragment_run_table(
     })
 }
 
+fn read_uuid_fragment_run_entries_from_reader(
+    field_name: &'static str,
+    reader: &mut dyn ReadSeek,
+    version: u8,
+    fragment_count: u8,
+) -> Result<Vec<UuidFragmentRunEntry>, FieldValueError> {
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(usize::from(fragment_count)));
+    for _ in 0..fragment_count {
+        let (fragment_absolute_time, fragment_absolute_duration) = match version {
+            0 => {
+                let entry = read_exact_array_untrusted::<8, _>(reader).map_err(|_| {
+                    invalid_value(
+                        field_name,
+                        "fragment run table payload length does not match the fragment count",
+                    )
+                })?;
+                (
+                    u64::from(read_u32(&entry, 0)),
+                    u64::from(read_u32(&entry, 4)),
+                )
+            }
+            1 => {
+                let entry = read_exact_array_untrusted::<16, _>(reader).map_err(|_| {
+                    invalid_value(
+                        field_name,
+                        "fragment run table payload length does not match the fragment count",
+                    )
+                })?;
+                (read_u64(&entry, 0), read_u64(&entry, 8))
+            }
+            _ => {
+                return Err(invalid_value(
+                    field_name,
+                    "fragment run table payload version is not supported",
+                ));
+            }
+        };
+        entries.push(UuidFragmentRunEntry {
+            fragment_absolute_time,
+            fragment_absolute_duration,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(feature = "async")]
+async fn read_uuid_fragment_run_entries_from_reader_async(
+    field_name: &'static str,
+    reader: &mut dyn AsyncReadSeek,
+    version: u8,
+    fragment_count: u8,
+) -> Result<Vec<UuidFragmentRunEntry>, FieldValueError> {
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(usize::from(fragment_count)));
+    for _ in 0..fragment_count {
+        let (fragment_absolute_time, fragment_absolute_duration) = match version {
+            0 => {
+                let entry = read_exact_array_untrusted_async::<8, _>(reader)
+                    .await
+                    .map_err(|_| {
+                        invalid_value(
+                            field_name,
+                            "fragment run table payload length does not match the fragment count",
+                        )
+                    })?;
+                (
+                    u64::from(read_u32(&entry, 0)),
+                    u64::from(read_u32(&entry, 4)),
+                )
+            }
+            1 => {
+                let entry = read_exact_array_untrusted_async::<16, _>(reader)
+                    .await
+                    .map_err(|_| {
+                        invalid_value(
+                            field_name,
+                            "fragment run table payload length does not match the fragment count",
+                        )
+                    })?;
+                (read_u64(&entry, 0), read_u64(&entry, 8))
+            }
+            _ => {
+                return Err(invalid_value(
+                    field_name,
+                    "fragment run table payload version is not supported",
+                ));
+            }
+        };
+        entries.push(UuidFragmentRunEntry {
+            fragment_absolute_time,
+            fragment_absolute_duration,
+        });
+    }
+    Ok(entries)
+}
+
+fn decode_uuid_payload_from_reader(
+    user_type: [u8; 16],
+    reader: &mut dyn ReadSeek,
+    payload_size: u64,
+) -> Result<UuidPayload, FieldValueError> {
+    if user_type == UUID_SPHERICAL_VIDEO_V1 {
+        let bytes = if payload_size == 0 {
+            Vec::new()
+        } else {
+            read_exact_vec_untrusted(
+                reader,
+                usize::try_from(payload_size)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+            )
+            .map_err(|_| invalid_value("Payload", "payload is truncated"))?
+        };
+        return Ok(UuidPayload::SphericalVideoV1(SphericalVideoV1Metadata {
+            xml_data: bytes,
+        }));
+    }
+    if user_type == UUID_FRAGMENT_ABSOLUTE_TIMING {
+        return Ok(UuidPayload::FragmentAbsoluteTiming(match payload_size {
+            12 => {
+                let payload = read_exact_array_untrusted::<12, _>(reader).map_err(|_| {
+                    invalid_value("Payload", "fragment timing payload is truncated")
+                })?;
+                UuidFragmentAbsoluteTiming {
+                    version: payload[0],
+                    flags: u32::from_be_bytes([0, payload[1], payload[2], payload[3]]),
+                    fragment_absolute_time: u64::from(read_u32(&payload, 4)),
+                    fragment_absolute_duration: u64::from(read_u32(&payload, 8)),
+                }
+            }
+            20 => {
+                let payload = read_exact_array_untrusted::<20, _>(reader).map_err(|_| {
+                    invalid_value("Payload", "fragment timing payload is truncated")
+                })?;
+                UuidFragmentAbsoluteTiming {
+                    version: payload[0],
+                    flags: u32::from_be_bytes([0, payload[1], payload[2], payload[3]]),
+                    fragment_absolute_time: read_u64(&payload, 4),
+                    fragment_absolute_duration: read_u64(&payload, 12),
+                }
+            }
+            _ => {
+                if payload_size < 4 {
+                    return Err(invalid_value(
+                        "Payload",
+                        "fragment timing payload is truncated",
+                    ));
+                }
+                let header = read_exact_array_untrusted::<4, _>(reader).map_err(|_| {
+                    invalid_value("Payload", "fragment timing payload is truncated")
+                })?;
+                return Err(match header[0] {
+                    0 => invalid_value(
+                        "Payload",
+                        "fragment timing payload length does not match version 0",
+                    ),
+                    1 => invalid_value(
+                        "Payload",
+                        "fragment timing payload length does not match version 1",
+                    ),
+                    _ => invalid_value(
+                        "Payload",
+                        "fragment timing payload version is not supported",
+                    ),
+                });
+            }
+        }));
+    }
+    if user_type == UUID_FRAGMENT_RUN_TABLE {
+        if payload_size < 5 {
+            return Err(invalid_value(
+                "Payload",
+                "fragment run table payload is truncated",
+            ));
+        }
+        let header = read_exact_array_untrusted::<5, _>(reader)
+            .map_err(|_| invalid_value("Payload", "fragment run table payload is truncated"))?;
+        let version = header[0];
+        let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+        let fragment_count = header[4];
+        let entries =
+            read_uuid_fragment_run_entries_from_reader("Payload", reader, version, fragment_count)?;
+        return Ok(UuidPayload::FragmentRunTable(UuidFragmentRunTable {
+            version,
+            flags,
+            fragment_count,
+            entries,
+        }));
+    }
+    if user_type == UUID_SAMPLE_ENCRYPTION {
+        return Ok(UuidPayload::SampleEncryption(
+            decode_senc_payload_from_reader(reader, payload_size).map_err(|error| match error {
+                CodecError::FieldValue(field_error) => field_error,
+                CodecError::UnsupportedVersion { .. } => invalid_value(
+                    "Payload",
+                    "sample encryption payload version is not supported",
+                ),
+                CodecError::InvalidLength { .. } => invalid_value(
+                    "Payload",
+                    "sample count does not match the number of sample records",
+                ),
+                _ => invalid_value("Payload", "sample encryption payload is invalid"),
+            })?,
+        ));
+    }
+    Ok(UuidPayload::Raw(if payload_size == 0 {
+        Vec::new()
+    } else {
+        read_exact_vec_untrusted(
+            reader,
+            usize::try_from(payload_size)
+                .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+        )
+        .map_err(|_| invalid_value("Payload", "payload is truncated"))?
+    }))
+}
+
+#[cfg(feature = "async")]
+async fn decode_uuid_payload_from_reader_async(
+    user_type: [u8; 16],
+    reader: &mut dyn AsyncReadSeek,
+    payload_size: u64,
+) -> Result<UuidPayload, FieldValueError> {
+    if user_type == UUID_SPHERICAL_VIDEO_V1 {
+        let bytes = if payload_size == 0 {
+            Vec::new()
+        } else {
+            read_exact_vec_untrusted_async(
+                reader,
+                usize::try_from(payload_size)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+            )
+            .await
+            .map_err(|_| invalid_value("Payload", "payload is truncated"))?
+        };
+        return Ok(UuidPayload::SphericalVideoV1(SphericalVideoV1Metadata {
+            xml_data: bytes,
+        }));
+    }
+    if user_type == UUID_FRAGMENT_ABSOLUTE_TIMING {
+        return Ok(UuidPayload::FragmentAbsoluteTiming(match payload_size {
+            12 => {
+                let payload = read_exact_array_untrusted_async::<12, _>(reader)
+                    .await
+                    .map_err(|_| {
+                        invalid_value("Payload", "fragment timing payload is truncated")
+                    })?;
+                UuidFragmentAbsoluteTiming {
+                    version: payload[0],
+                    flags: u32::from_be_bytes([0, payload[1], payload[2], payload[3]]),
+                    fragment_absolute_time: u64::from(read_u32(&payload, 4)),
+                    fragment_absolute_duration: u64::from(read_u32(&payload, 8)),
+                }
+            }
+            20 => {
+                let payload = read_exact_array_untrusted_async::<20, _>(reader)
+                    .await
+                    .map_err(|_| {
+                        invalid_value("Payload", "fragment timing payload is truncated")
+                    })?;
+                UuidFragmentAbsoluteTiming {
+                    version: payload[0],
+                    flags: u32::from_be_bytes([0, payload[1], payload[2], payload[3]]),
+                    fragment_absolute_time: read_u64(&payload, 4),
+                    fragment_absolute_duration: read_u64(&payload, 12),
+                }
+            }
+            _ => {
+                if payload_size < 4 {
+                    return Err(invalid_value(
+                        "Payload",
+                        "fragment timing payload is truncated",
+                    ));
+                }
+                let header = read_exact_array_untrusted_async::<4, _>(reader)
+                    .await
+                    .map_err(|_| {
+                        invalid_value("Payload", "fragment timing payload is truncated")
+                    })?;
+                return Err(match header[0] {
+                    0 => invalid_value(
+                        "Payload",
+                        "fragment timing payload length does not match version 0",
+                    ),
+                    1 => invalid_value(
+                        "Payload",
+                        "fragment timing payload length does not match version 1",
+                    ),
+                    _ => invalid_value(
+                        "Payload",
+                        "fragment timing payload version is not supported",
+                    ),
+                });
+            }
+        }));
+    }
+    if user_type == UUID_FRAGMENT_RUN_TABLE {
+        if payload_size < 5 {
+            return Err(invalid_value(
+                "Payload",
+                "fragment run table payload is truncated",
+            ));
+        }
+        let header = read_exact_array_untrusted_async::<5, _>(reader)
+            .await
+            .map_err(|_| invalid_value("Payload", "fragment run table payload is truncated"))?;
+        let version = header[0];
+        let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+        let fragment_count = header[4];
+        let entries = read_uuid_fragment_run_entries_from_reader_async(
+            "Payload",
+            reader,
+            version,
+            fragment_count,
+        )
+        .await?;
+        return Ok(UuidPayload::FragmentRunTable(UuidFragmentRunTable {
+            version,
+            flags,
+            fragment_count,
+            entries,
+        }));
+    }
+    if user_type == UUID_SAMPLE_ENCRYPTION {
+        return Ok(UuidPayload::SampleEncryption(
+            crate::boxes::iso23001_7::decode_senc_payload_from_reader_async(reader, payload_size)
+                .await
+                .map_err(|error| match error {
+                    CodecError::FieldValue(field_error) => field_error,
+                    CodecError::UnsupportedVersion { .. } => invalid_value(
+                        "Payload",
+                        "sample encryption payload version is not supported",
+                    ),
+                    CodecError::InvalidLength { .. } => invalid_value(
+                        "Payload",
+                        "sample count does not match the number of sample records",
+                    ),
+                    _ => invalid_value("Payload", "sample encryption payload is invalid"),
+                })?,
+        ));
+    }
+    Ok(UuidPayload::Raw(if payload_size == 0 {
+        Vec::new()
+    } else {
+        read_exact_vec_untrusted_async(
+            reader,
+            usize::try_from(payload_size)
+                .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+        )
+        .await
+        .map_err(|_| invalid_value("Payload", "payload is truncated"))?
+    }))
+}
+
 fn encode_uuid_payload(
     user_type: [u8; 16],
     payload: &UuidPayload,
@@ -809,6 +1164,191 @@ fn decode_loudness_entries(
     Ok(entries)
 }
 
+fn decode_loudness_entries_from_reader(
+    field_name: &'static str,
+    version: u8,
+    reader: &mut dyn ReadSeek,
+    payload_size: u64,
+) -> Result<Vec<LoudnessEntry>, CodecError> {
+    if version > 1 {
+        return Err(invalid_value(field_name, "unsupported loudness box version").into());
+    }
+
+    let mut remaining = payload_size;
+    let entry_count = if version >= 1 {
+        if remaining == 0 {
+            return Err(invalid_value(field_name, "payload is truncated").into());
+        }
+        let header = read_exact_array_untrusted::<1, _>(reader).map_err(CodecError::Io)?[0];
+        remaining -= 1;
+        let info_type = header >> 6;
+        if info_type != 0 {
+            return Err(invalid_value(field_name, "loudness info type is not supported").into());
+        }
+        usize::from(header & 0x3f)
+    } else {
+        1
+    };
+
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(entry_count));
+    for _ in 0..entry_count {
+        let eq_set_id = if version >= 1 {
+            if remaining == 0 {
+                return Err(invalid_value(field_name, "payload is truncated").into());
+            }
+            let value = read_exact_array_untrusted::<1, _>(reader).map_err(CodecError::Io)?[0];
+            remaining -= 1;
+            value & 0x3f
+        } else {
+            0
+        };
+
+        if remaining < 7 {
+            return Err(invalid_value(field_name, "payload is truncated").into());
+        }
+        let prefix = read_exact_array_untrusted::<7, _>(reader).map_err(CodecError::Io)?;
+        remaining -= 7;
+
+        let downmix_and_drc = u16::from_be_bytes([prefix[0], prefix[1]]);
+        let peak_levels =
+            (u32::from(prefix[2]) << 16) | (u32::from(prefix[3]) << 8) | u32::from(prefix[4]);
+        let measurement_system_and_reliability_for_tp = prefix[5];
+        let measurement_count = usize::from(prefix[6]);
+        let required_measurement_bytes = measurement_count
+            .checked_mul(3)
+            .ok_or_else(|| invalid_value(field_name, "payload is too large to decode"))?;
+        if remaining < required_measurement_bytes as u64 {
+            return Err(invalid_value(field_name, "payload is truncated").into());
+        }
+
+        let mut measurements = Vec::with_capacity(untrusted_prealloc_hint(measurement_count));
+        for _ in 0..measurement_count {
+            let chunk = read_exact_array_untrusted::<3, _>(reader).map_err(CodecError::Io)?;
+            remaining -= 3;
+            measurements.push(LoudnessMeasurement {
+                method_definition: chunk[0],
+                method_value: chunk[1],
+                measurement_system: chunk[2] >> 4,
+                reliability: chunk[2] & 0x0f,
+            });
+        }
+
+        entries.push(LoudnessEntry {
+            eq_set_id,
+            downmix_id: downmix_and_drc >> 6,
+            drc_set_id: (downmix_and_drc & 0x3f) as u8,
+            bs_sample_peak_level: ((peak_levels >> 12) & 0x0fff) as u16,
+            bs_true_peak_level: (peak_levels & 0x0fff) as u16,
+            measurement_system_for_tp: measurement_system_and_reliability_for_tp >> 4,
+            reliability_for_tp: measurement_system_and_reliability_for_tp & 0x0f,
+            measurements,
+        });
+    }
+
+    if remaining != 0 {
+        return Err(invalid_value(field_name, "payload has trailing bytes").into());
+    }
+
+    Ok(entries)
+}
+
+#[cfg(feature = "async")]
+async fn decode_loudness_entries_from_reader_async(
+    field_name: &'static str,
+    version: u8,
+    reader: &mut dyn AsyncReadSeek,
+    payload_size: u64,
+) -> Result<Vec<LoudnessEntry>, CodecError> {
+    if version > 1 {
+        return Err(invalid_value(field_name, "unsupported loudness box version").into());
+    }
+
+    let mut remaining = payload_size;
+    let entry_count = if version >= 1 {
+        if remaining == 0 {
+            return Err(invalid_value(field_name, "payload is truncated").into());
+        }
+        let header = read_exact_array_untrusted_async::<1, _>(reader)
+            .await
+            .map_err(CodecError::Io)?[0];
+        remaining -= 1;
+        let info_type = header >> 6;
+        if info_type != 0 {
+            return Err(invalid_value(field_name, "loudness info type is not supported").into());
+        }
+        usize::from(header & 0x3f)
+    } else {
+        1
+    };
+
+    let mut entries = Vec::with_capacity(untrusted_prealloc_hint(entry_count));
+    for _ in 0..entry_count {
+        let eq_set_id = if version >= 1 {
+            if remaining == 0 {
+                return Err(invalid_value(field_name, "payload is truncated").into());
+            }
+            let value = read_exact_array_untrusted_async::<1, _>(reader)
+                .await
+                .map_err(CodecError::Io)?[0];
+            remaining -= 1;
+            value & 0x3f
+        } else {
+            0
+        };
+
+        if remaining < 7 {
+            return Err(invalid_value(field_name, "payload is truncated").into());
+        }
+        let prefix = read_exact_array_untrusted_async::<7, _>(reader)
+            .await
+            .map_err(CodecError::Io)?;
+        remaining -= 7;
+
+        let downmix_and_drc = u16::from_be_bytes([prefix[0], prefix[1]]);
+        let peak_levels =
+            (u32::from(prefix[2]) << 16) | (u32::from(prefix[3]) << 8) | u32::from(prefix[4]);
+        let measurement_system_and_reliability_for_tp = prefix[5];
+        let measurement_count = usize::from(prefix[6]);
+        let required_measurement_bytes = measurement_count
+            .checked_mul(3)
+            .ok_or_else(|| invalid_value(field_name, "payload is too large to decode"))?;
+        if remaining < required_measurement_bytes as u64 {
+            return Err(invalid_value(field_name, "payload is truncated").into());
+        }
+
+        let mut measurements = Vec::with_capacity(untrusted_prealloc_hint(measurement_count));
+        for _ in 0..measurement_count {
+            let chunk = read_exact_array_untrusted_async::<3, _>(reader)
+                .await
+                .map_err(CodecError::Io)?;
+            remaining -= 3;
+            measurements.push(LoudnessMeasurement {
+                method_definition: chunk[0],
+                method_value: chunk[1],
+                measurement_system: chunk[2] >> 4,
+                reliability: chunk[2] & 0x0f,
+            });
+        }
+
+        entries.push(LoudnessEntry {
+            eq_set_id,
+            downmix_id: downmix_and_drc >> 6,
+            drc_set_id: (downmix_and_drc & 0x3f) as u8,
+            bs_sample_peak_level: ((peak_levels >> 12) & 0x0fff) as u16,
+            bs_true_peak_level: (peak_levels & 0x0fff) as u16,
+            measurement_system_for_tp: measurement_system_and_reliability_for_tp >> 4,
+            reliability_for_tp: measurement_system_and_reliability_for_tp & 0x0f,
+            measurements,
+        });
+    }
+
+    if remaining != 0 {
+        return Err(invalid_value(field_name, "payload has trailing bytes").into());
+    }
+
+    Ok(entries)
+}
+
 fn render_loudness_measurements(measurements: &[LoudnessMeasurement]) -> String {
     render_array(measurements.iter().map(|measurement| {
         format!(
@@ -1026,6 +1566,51 @@ fn parse_avc_parameter_sets(
     Ok(parameter_sets)
 }
 
+fn read_avc_parameter_sets_from_reader(
+    field_name: &'static str,
+    reader: &mut dyn ReadSeek,
+    expected_count: u8,
+) -> Result<Vec<AVCParameterSet>, CodecError> {
+    let mut parameter_sets =
+        Vec::with_capacity(untrusted_prealloc_hint(usize::from(expected_count)));
+    for _ in 0..expected_count {
+        let length = u16::from_be_bytes(
+            read_exact_array_untrusted::<2, _>(reader)
+                .map_err(|_| invalid_value(field_name, "parameter-set payload is truncated"))?,
+        );
+        let mut nal_unit = vec![0_u8; usize::from(length)];
+        reader
+            .read_exact(&mut nal_unit)
+            .map_err(|_| invalid_value(field_name, "parameter-set payload is truncated"))?;
+        parameter_sets.push(AVCParameterSet { length, nal_unit });
+    }
+    Ok(parameter_sets)
+}
+
+#[cfg(feature = "async")]
+async fn read_avc_parameter_sets_from_reader_async(
+    field_name: &'static str,
+    reader: &mut dyn AsyncReadSeek,
+    expected_count: u8,
+) -> Result<Vec<AVCParameterSet>, CodecError> {
+    let mut parameter_sets =
+        Vec::with_capacity(untrusted_prealloc_hint(usize::from(expected_count)));
+    for _ in 0..expected_count {
+        let length = u16::from_be_bytes(
+            read_exact_array_untrusted_async::<2, _>(reader)
+                .await
+                .map_err(|_| invalid_value(field_name, "parameter-set payload is truncated"))?,
+        );
+        let mut nal_unit = vec![0_u8; usize::from(length)];
+        reader
+            .read_exact(&mut nal_unit)
+            .await
+            .map_err(|_| invalid_value(field_name, "parameter-set payload is truncated"))?;
+        parameter_sets.push(AVCParameterSet { length, nal_unit });
+    }
+    Ok(parameter_sets)
+}
+
 fn render_avc_parameter_sets(parameter_sets: &[AVCParameterSet]) -> String {
     render_array(parameter_sets.iter().map(|parameter_set| {
         format!(
@@ -1182,6 +1767,104 @@ fn parse_hevc_nalu_arrays(
         ));
     }
 
+    Ok(arrays)
+}
+
+fn read_hevc_nalu_arrays_from_reader(
+    field_name: &'static str,
+    reader: &mut dyn ReadSeek,
+    expected_count: u8,
+) -> Result<Vec<HEVCNaluArray>, CodecError> {
+    let mut arrays = Vec::with_capacity(untrusted_prealloc_hint(usize::from(expected_count)));
+    for _ in 0..expected_count {
+        let header = read_exact_array_untrusted::<3, _>(reader).map_err(|_| {
+            invalid_value(
+                field_name,
+                "NAL-array payload length does not match the entry count",
+            )
+        })?;
+        let completeness = header[0] & 0x80 != 0;
+        let reserved = header[0] & 0x40 != 0;
+        let nalu_type = header[0] & 0x3f;
+        let num_nalus = u16::from_be_bytes([header[1], header[2]]);
+        let mut nalus = Vec::with_capacity(untrusted_prealloc_hint(usize::from(num_nalus)));
+        for _ in 0..num_nalus {
+            let length =
+                u16::from_be_bytes(read_exact_array_untrusted::<2, _>(reader).map_err(|_| {
+                    invalid_value(
+                        field_name,
+                        "NAL-array payload length does not match the entry count",
+                    )
+                })?);
+            let mut nal_unit = vec![0_u8; usize::from(length)];
+            reader.read_exact(&mut nal_unit).map_err(|_| {
+                invalid_value(
+                    field_name,
+                    "NAL-array payload length does not match the entry count",
+                )
+            })?;
+            nalus.push(HEVCNalu { length, nal_unit });
+        }
+        arrays.push(HEVCNaluArray {
+            completeness,
+            reserved,
+            nalu_type,
+            num_nalus,
+            nalus,
+        });
+    }
+    Ok(arrays)
+}
+
+#[cfg(feature = "async")]
+async fn read_hevc_nalu_arrays_from_reader_async(
+    field_name: &'static str,
+    reader: &mut dyn AsyncReadSeek,
+    expected_count: u8,
+) -> Result<Vec<HEVCNaluArray>, CodecError> {
+    let mut arrays = Vec::with_capacity(untrusted_prealloc_hint(usize::from(expected_count)));
+    for _ in 0..expected_count {
+        let header = read_exact_array_untrusted_async::<3, _>(reader)
+            .await
+            .map_err(|_| {
+                invalid_value(
+                    field_name,
+                    "NAL-array payload length does not match the entry count",
+                )
+            })?;
+        let completeness = header[0] & 0x80 != 0;
+        let reserved = header[0] & 0x40 != 0;
+        let nalu_type = header[0] & 0x3f;
+        let num_nalus = u16::from_be_bytes([header[1], header[2]]);
+        let mut nalus = Vec::with_capacity(untrusted_prealloc_hint(usize::from(num_nalus)));
+        for _ in 0..num_nalus {
+            let length = u16::from_be_bytes(
+                read_exact_array_untrusted_async::<2, _>(reader)
+                    .await
+                    .map_err(|_| {
+                        invalid_value(
+                            field_name,
+                            "NAL-array payload length does not match the entry count",
+                        )
+                    })?,
+            );
+            let mut nal_unit = vec![0_u8; usize::from(length)];
+            reader.read_exact(&mut nal_unit).await.map_err(|_| {
+                invalid_value(
+                    field_name,
+                    "NAL-array payload length does not match the entry count",
+                )
+            })?;
+            nalus.push(HEVCNalu { length, nal_unit });
+        }
+        arrays.push(HEVCNaluArray {
+            completeness,
+            reserved,
+            nalu_type,
+            num_nalus,
+            nalus,
+        });
+    }
     Ok(arrays)
 }
 
@@ -1453,6 +2136,7 @@ simple_container_box!(Tref, *b"tref");
 raw_data_box!(Free, *b"free");
 raw_data_box!(Skip, *b"skip");
 raw_data_box!(Mdat, *b"mdat");
+raw_data_box!(Chnl, *b"chnl");
 
 /// Closed-caption sample-data box that preserves its payload bytes verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1642,28 +2326,71 @@ macro_rules! define_loudness_info_box {
                 reader: &mut dyn ReadSeek,
                 payload_size: u64,
             ) -> Result<Option<u64>, CodecError> {
-                let payload_len = usize::try_from(payload_size)
-                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-                if payload_len < 4 {
+                if payload_size < 4 {
                     return Err(invalid_value("Payload", "payload is too short").into());
                 }
 
-                let payload = read_exact_vec_untrusted(reader, payload_len)?;
-                let version = payload[0];
+                let header = read_exact_array_untrusted::<4, _>(reader).map_err(CodecError::Io)?;
+                let version = header[0];
                 if version > 1 {
                     return Err(CodecError::UnsupportedVersion {
                         box_type: self.box_type(),
                         version,
                     });
                 }
-                let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+                let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
                 if flags != 0 {
                     return Err(invalid_value("Flags", "non-zero flags are not supported").into());
                 }
 
                 self.full_box = FullBoxState { version, flags };
-                self.entries = decode_loudness_entries("Entries", version, &payload[4..])?;
+                self.entries = decode_loudness_entries_from_reader(
+                    "Entries",
+                    version,
+                    reader,
+                    payload_size - 4,
+                )?;
                 Ok(Some(payload_size))
+            }
+
+            #[cfg(feature = "async")]
+            fn custom_unmarshal_async<'a>(
+                &'a mut self,
+                reader: &'a mut dyn AsyncReadSeek,
+                payload_size: u64,
+            ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+                Box::pin(async move {
+                    if payload_size < 4 {
+                        return Err(invalid_value("Payload", "payload is too short").into());
+                    }
+
+                    let header = read_exact_array_untrusted_async::<4, _>(reader)
+                        .await
+                        .map_err(CodecError::Io)?;
+                    let version = header[0];
+                    if version > 1 {
+                        return Err(CodecError::UnsupportedVersion {
+                            box_type: self.box_type(),
+                            version,
+                        });
+                    }
+                    let flags = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+                    if flags != 0 {
+                        return Err(
+                            invalid_value("Flags", "non-zero flags are not supported").into()
+                        );
+                    }
+
+                    self.full_box = FullBoxState { version, flags };
+                    self.entries = decode_loudness_entries_from_reader_async(
+                        "Entries",
+                        version,
+                        reader,
+                        payload_size - 4,
+                    )
+                    .await?;
+                    Ok(Some(payload_size))
+                })
             }
         }
     };
@@ -2078,16 +2805,34 @@ impl CodecBox for Uuid {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        if payload_len < 16 {
+        if payload_size < 16 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let payload = read_exact_vec_untrusted(reader, payload_len)?;
-        self.user_type = payload[..16].try_into().unwrap();
-        self.payload = decode_uuid_payload(self.user_type, &payload[16..])?;
+        let user_type = read_exact_array_untrusted::<16, _>(reader)?;
+        self.user_type = user_type;
+        self.payload = decode_uuid_payload_from_reader(self.user_type, reader, payload_size - 16)?;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 16 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let user_type = read_exact_array_untrusted_async::<16, _>(reader).await?;
+            self.user_type = user_type;
+            self.payload =
+                decode_uuid_payload_from_reader_async(self.user_type, reader, payload_size - 16)
+                    .await?;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -2898,12 +3643,8 @@ fn validate_c_string_value(field_name: &'static str, value: &str) -> Result<(), 
     Ok(())
 }
 
-fn decode_c_string(field_name: &'static str, bytes: &[u8]) -> Result<String, CodecError> {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    String::from_utf8(bytes[..end].to_vec()).map_err(|_| CodecError::InvalidUtf8 { field_name })
+fn decode_utf8_owned(field_name: &'static str, bytes: Vec<u8>) -> Result<String, CodecError> {
+    String::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8 { field_name })
 }
 
 fn parse_required_c_string(
@@ -2919,29 +3660,186 @@ fn parse_required_c_string(
     Ok((value, end + 1))
 }
 
-fn decode_required_c_string(
+fn read_required_c_string_from_reader(
+    reader: &mut dyn ReadSeek,
+    remaining: &mut u64,
     field_name: &'static str,
-    bytes: &[u8],
 ) -> Result<(String, usize), CodecError> {
-    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
-        return Err(invalid_value(field_name, "string is not NUL-terminated").into());
-    };
+    let mut bytes = Vec::new();
+    let mut consumed = 0usize;
 
-    let value = String::from_utf8(bytes[..end].to_vec())
-        .map_err(|_| CodecError::InvalidUtf8 { field_name })?;
-    Ok((value, end + 1))
+    while *remaining != 0 {
+        let byte = read_exact_array_untrusted::<1, _>(reader).map_err(CodecError::Io)?[0];
+        *remaining -= 1;
+        consumed += 1;
+        if byte == 0 {
+            return Ok((decode_utf8_owned(field_name, bytes)?, consumed));
+        }
+        bytes.push(byte);
+    }
+
+    Err(invalid_value(field_name, "string is not NUL-terminated").into())
 }
 
-fn looks_like_missing_elng_full_box_header(bytes: &[u8]) -> bool {
-    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
-        return false;
-    };
+#[cfg(feature = "async")]
+async fn read_required_c_string_from_reader_async(
+    reader: &mut dyn AsyncReadSeek,
+    remaining: &mut u64,
+    field_name: &'static str,
+) -> Result<(String, usize), CodecError> {
+    let mut bytes = Vec::new();
+    let mut consumed = 0usize;
 
-    end > 0
-        && bytes[end..].iter().all(|byte| *byte == 0)
-        && bytes[..end]
+    while *remaining != 0 {
+        let byte = read_exact_array_untrusted_async::<1, _>(reader)
+            .await
+            .map_err(CodecError::Io)?[0];
+        *remaining -= 1;
+        consumed += 1;
+        if byte == 0 {
+            return Ok((decode_utf8_owned(field_name, bytes)?, consumed));
+        }
+        bytes.push(byte);
+    }
+
+    Err(invalid_value(field_name, "string is not NUL-terminated").into())
+}
+
+fn try_decode_legacy_elng_from_reader(
+    reader: &mut dyn ReadSeek,
+    start: u64,
+    payload_size: u64,
+) -> Result<Option<String>, CodecError> {
+    reader
+        .seek(SeekFrom::Start(start))
+        .map_err(CodecError::Io)?;
+    let mut remaining = payload_size;
+    let mut bytes = Vec::new();
+    let mut seen_zero = false;
+    let mut trailing_all_zero = true;
+
+    while remaining != 0 {
+        let byte = read_exact_array_untrusted::<1, _>(reader).map_err(CodecError::Io)?[0];
+        remaining -= 1;
+        if seen_zero {
+            trailing_all_zero &= byte == 0;
+            continue;
+        }
+        if byte == 0 {
+            seen_zero = true;
+            continue;
+        }
+        bytes.push(byte);
+    }
+
+    if seen_zero
+        && !bytes.is_empty()
+        && trailing_all_zero
+        && bytes
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        return Ok(Some(decode_utf8_owned("ExtendedLanguage", bytes)?));
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "async")]
+async fn try_decode_legacy_elng_from_reader_async(
+    reader: &mut dyn AsyncReadSeek,
+    start: u64,
+    payload_size: u64,
+) -> Result<Option<String>, CodecError> {
+    reader
+        .seek(SeekFrom::Start(start))
+        .await
+        .map_err(CodecError::Io)?;
+    let mut remaining = payload_size;
+    let mut bytes = Vec::new();
+    let mut seen_zero = false;
+    let mut trailing_all_zero = true;
+
+    while remaining != 0 {
+        let byte = read_exact_array_untrusted_async::<1, _>(reader)
+            .await
+            .map_err(CodecError::Io)?[0];
+        remaining -= 1;
+        if seen_zero {
+            trailing_all_zero &= byte == 0;
+            continue;
+        }
+        if byte == 0 {
+            seen_zero = true;
+            continue;
+        }
+        bytes.push(byte);
+    }
+
+    if seen_zero
+        && !bytes.is_empty()
+        && trailing_all_zero
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        return Ok(Some(decode_utf8_owned("ExtendedLanguage", bytes)?));
+    }
+
+    Ok(None)
+}
+
+fn read_optional_c_string_tail_from_reader(
+    reader: &mut dyn ReadSeek,
+    remaining: u64,
+    field_name: &'static str,
+) -> Result<String, CodecError> {
+    let mut bytes = Vec::new();
+    let mut trailing = remaining;
+    let mut seen_zero = false;
+
+    while trailing != 0 {
+        let byte = read_exact_array_untrusted::<1, _>(reader).map_err(CodecError::Io)?[0];
+        trailing -= 1;
+        if seen_zero {
+            continue;
+        }
+        if byte == 0 {
+            seen_zero = true;
+            continue;
+        }
+        bytes.push(byte);
+    }
+
+    decode_utf8_owned(field_name, bytes)
+}
+
+#[cfg(feature = "async")]
+async fn read_optional_c_string_tail_from_reader_async(
+    reader: &mut dyn AsyncReadSeek,
+    remaining: u64,
+    field_name: &'static str,
+) -> Result<String, CodecError> {
+    let mut bytes = Vec::new();
+    let mut trailing = remaining;
+    let mut seen_zero = false;
+
+    while trailing != 0 {
+        let byte = read_exact_array_untrusted_async::<1, _>(reader)
+            .await
+            .map_err(CodecError::Io)?[0];
+        trailing -= 1;
+        if seen_zero {
+            continue;
+        }
+        if byte == 0 {
+            seen_zero = true;
+            continue;
+        }
+        bytes.push(byte);
+    }
+
+    decode_utf8_owned(field_name, bytes)
 }
 
 /// Extended-language box carried alongside `mdhd` when a track uses a language tag that does not
@@ -3048,23 +3946,21 @@ impl CodecBox for Elng {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if (payload.len() < 4 || !payload.starts_with(&[0, 0, 0, 0]))
-            && looks_like_missing_elng_full_box_header(&payload)
-        {
+        let start = reader.stream_position().map_err(CodecError::Io)?;
+        if let Some(language) = try_decode_legacy_elng_from_reader(reader, start, payload_size)? {
             self.full_box = FullBoxState::default();
-            self.extended_language = decode_c_string("ExtendedLanguage", &payload)?;
+            self.extended_language = language;
             self.missing_full_box_header = true;
             return Ok(Some(payload_size));
         }
-
-        if payload.len() < 4 {
+        if payload_size < 4 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(CodecError::Io)?;
+        let payload = read_exact_array_untrusted::<4, _>(reader).map_err(CodecError::Io)?;
         let version = payload[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
@@ -3078,9 +3974,62 @@ impl CodecBox for Elng {
         }
 
         self.full_box = FullBoxState { version, flags };
-        self.extended_language = decode_c_string("ExtendedLanguage", &payload[4..])?;
+        self.extended_language =
+            read_optional_c_string_tail_from_reader(reader, payload_size - 4, "ExtendedLanguage")?;
         self.missing_full_box_header = false;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            let start = reader.stream_position().await.map_err(CodecError::Io)?;
+            if let Some(language) =
+                try_decode_legacy_elng_from_reader_async(reader, start, payload_size).await?
+            {
+                self.full_box = FullBoxState::default();
+                self.extended_language = language;
+                self.missing_full_box_header = true;
+                return Ok(Some(payload_size));
+            }
+
+            if payload_size < 4 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            reader
+                .seek(SeekFrom::Start(start))
+                .await
+                .map_err(CodecError::Io)?;
+            let payload = read_exact_array_untrusted_async::<4, _>(reader)
+                .await
+                .map_err(CodecError::Io)?;
+            let version = payload[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+            let flags = read_uint(&payload, 1, 3) as u32;
+            if flags != 0 {
+                return Err(invalid_value("Flags", "non-zero flags are not supported").into());
+            }
+
+            self.full_box = FullBoxState { version, flags };
+            self.extended_language = read_optional_c_string_tail_from_reader_async(
+                reader,
+                payload_size - 4,
+                "ExtendedLanguage",
+            )
+            .await?;
+            self.missing_full_box_header = false;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -5865,15 +6814,12 @@ impl CodecBox for Kind {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 6 {
+        if payload_size < 6 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let version = payload[0];
+        let header = read_exact_array_untrusted::<4, _>(reader).map_err(CodecError::Io)?;
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -5881,20 +6827,63 @@ impl CodecBox for Kind {
             });
         }
 
-        let (scheme_uri, scheme_len) = decode_required_c_string("SchemeURI", &payload[4..])?;
-        let value_offset = 4 + scheme_len;
-        let (value, value_len) = decode_required_c_string("Value", &payload[value_offset..])?;
-        if value_offset + value_len != payload.len() {
+        let mut remaining = payload_size - 4;
+        let (scheme_uri, _) =
+            read_required_c_string_from_reader(reader, &mut remaining, "SchemeURI")?;
+        let (value, _) = read_required_c_string_from_reader(reader, &mut remaining, "Value")?;
+        if remaining != 0 {
             return Err(invalid_value("Payload", "payload has trailing bytes").into());
         }
 
         self.full_box = FullBoxState {
             version,
-            flags: read_uint(&payload, 1, 3) as u32,
+            flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
         };
         self.scheme_uri = scheme_uri;
         self.value = value;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 6 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let header = read_exact_array_untrusted_async::<4, _>(reader)
+                .await
+                .map_err(CodecError::Io)?;
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let mut remaining = payload_size - 4;
+            let (scheme_uri, _) =
+                read_required_c_string_from_reader_async(reader, &mut remaining, "SchemeURI")
+                    .await?;
+            let (value, _) =
+                read_required_c_string_from_reader_async(reader, &mut remaining, "Value").await?;
+            if remaining != 0 {
+                return Err(invalid_value("Payload", "payload has trailing bytes").into());
+            }
+
+            self.full_box = FullBoxState {
+                version,
+                flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+            };
+            self.scheme_uri = scheme_uri;
+            self.value = value;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -6000,15 +6989,12 @@ impl CodecBox for Mime {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 5 {
+        if payload_size < 5 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let version = payload[0];
+        let header = read_exact_array_untrusted::<4, _>(reader).map_err(CodecError::Io)?;
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -6016,27 +7002,86 @@ impl CodecBox for Mime {
             });
         }
 
-        let content_bytes = if payload.last() == Some(&0) {
-            self.lacks_zero_termination = false;
-            &payload[4..payload.len() - 1]
+        let mut content_bytes = if payload_size == 4 {
+            Vec::new()
         } else {
-            self.lacks_zero_termination = true;
-            &payload[4..]
+            read_exact_vec_untrusted(
+                reader,
+                usize::try_from(payload_size - 4)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+            )
+            .map_err(CodecError::Io)?
         };
 
+        let has_terminator = content_bytes.last() == Some(&0);
+        self.lacks_zero_termination = !has_terminator;
+        if has_terminator {
+            content_bytes.pop();
+        }
         if content_bytes.contains(&0) {
             return Err(invalid_value("ContentType", "value must not contain NUL bytes").into());
         }
 
         self.full_box = FullBoxState {
             version,
-            flags: read_uint(&payload, 1, 3) as u32,
+            flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
         };
-        self.content_type =
-            String::from_utf8(content_bytes.to_vec()).map_err(|_| CodecError::InvalidUtf8 {
-                field_name: "ContentType",
-            })?;
+        self.content_type = decode_utf8_owned("ContentType", content_bytes)?;
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 5 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let header = read_exact_array_untrusted_async::<4, _>(reader)
+                .await
+                .map_err(CodecError::Io)?;
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let mut content_bytes = if payload_size == 4 {
+                Vec::new()
+            } else {
+                read_exact_vec_untrusted_async(
+                    reader,
+                    usize::try_from(payload_size - 4)
+                        .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+                )
+                .await
+                .map_err(CodecError::Io)?
+            };
+
+            let has_terminator = content_bytes.last() == Some(&0);
+            self.lacks_zero_termination = !has_terminator;
+            if has_terminator {
+                content_bytes.pop();
+            }
+            if content_bytes.contains(&0) {
+                return Err(
+                    invalid_value("ContentType", "value must not contain NUL bytes").into(),
+                );
+            }
+
+            self.full_box = FullBoxState {
+                version,
+                flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+            };
+            self.content_type = decode_utf8_owned("ContentType", content_bytes)?;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -6870,6 +7915,82 @@ impl CodecBox for Sdtp {
         codec_field!("Version", 0, with_bit_width(8), as_version_field()),
         codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
         codec_field!("Samples", 2, with_bit_width(8), as_bytes()),
+    ]);
+    const SUPPORTED_VERSIONS: &'static [u8] = &[0];
+}
+
+/// Sample padding bits box.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Padb {
+    full_box: FullBoxState,
+    pub sample_count: u32,
+    pub padding_bits: Vec<u8>,
+}
+
+impl FieldHooks for Padb {
+    fn field_length(&self, name: &'static str) -> Option<u32> {
+        match name {
+            "PaddingBits" => usize::try_from(self.sample_count)
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .map(|count| count / 2)
+                .and_then(|count| field_len_bytes(count, 1)),
+            _ => None,
+        }
+    }
+
+    fn display_field(&self, name: &'static str) -> Option<String> {
+        match name {
+            "PaddingBits" => Some(quote_bytes(&self.padding_bits)),
+            _ => None,
+        }
+    }
+}
+
+impl_full_box!(Padb, *b"padb");
+
+impl FieldValueRead for Padb {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "SampleCount" => Ok(FieldValue::Unsigned(u64::from(self.sample_count))),
+            "PaddingBits" => Ok(FieldValue::Bytes(self.padding_bits.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for Padb {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("SampleCount", FieldValue::Unsigned(value)) => {
+                self.sample_count = u32_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("PaddingBits", FieldValue::Bytes(bytes)) => {
+                self.padding_bits = bytes;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for Padb {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Version", 0, with_bit_width(8), as_version_field()),
+        codec_field!("Flags", 1, with_bit_width(24), as_flags_field()),
+        codec_field!("SampleCount", 2, with_bit_width(32)),
+        codec_field!(
+            "PaddingBits",
+            3,
+            with_bit_width(8),
+            with_dynamic_length(),
+            as_bytes()
+        ),
     ]);
     const SUPPORTED_VERSIONS: &'static [u8] = &[0];
 }
@@ -9241,6 +10362,92 @@ fn parse_silb_schemes(
     Ok(schemes)
 }
 
+fn read_silb_schemes_from_reader(
+    field_name: &'static str,
+    reader: &mut dyn ReadSeek,
+    payload_len: u64,
+    scheme_count: u32,
+) -> Result<Vec<SilbEntry>, CodecError> {
+    let mut remaining = payload_len;
+    let mut schemes = Vec::with_capacity(untrusted_prealloc_hint(
+        usize::try_from(scheme_count).unwrap_or(0),
+    ));
+
+    for _ in 0..scheme_count {
+        let (scheme_id_uri, _) =
+            read_required_c_string_from_reader(reader, &mut remaining, field_name)?;
+        let (value, _) = read_required_c_string_from_reader(reader, &mut remaining, field_name)?;
+        if remaining == 0 {
+            return Err(invalid_value(field_name, "scheme flag payload is truncated").into());
+        }
+        let at_least_one_flag = match read_exact_array_untrusted::<1, _>(reader)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid_value(field_name, "scheme flag byte must be 0 or 1").into()),
+        };
+        remaining -= 1;
+        schemes.push(SilbEntry {
+            scheme_id_uri,
+            value,
+            at_least_one_flag,
+        });
+    }
+
+    if remaining != 0 {
+        return Err(invalid_value(
+            field_name,
+            "scheme payload length does not match the scheme count",
+        )
+        .into());
+    }
+
+    Ok(schemes)
+}
+
+#[cfg(feature = "async")]
+async fn read_silb_schemes_from_reader_async(
+    field_name: &'static str,
+    reader: &mut dyn AsyncReadSeek,
+    payload_len: u64,
+    scheme_count: u32,
+) -> Result<Vec<SilbEntry>, CodecError> {
+    let mut remaining = payload_len;
+    let mut schemes = Vec::with_capacity(untrusted_prealloc_hint(
+        usize::try_from(scheme_count).unwrap_or(0),
+    ));
+
+    for _ in 0..scheme_count {
+        let (scheme_id_uri, _) =
+            read_required_c_string_from_reader_async(reader, &mut remaining, field_name).await?;
+        let (value, _) =
+            read_required_c_string_from_reader_async(reader, &mut remaining, field_name).await?;
+        if remaining == 0 {
+            return Err(invalid_value(field_name, "scheme flag payload is truncated").into());
+        }
+        let at_least_one_flag = match read_exact_array_untrusted_async::<1, _>(reader).await?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid_value(field_name, "scheme flag byte must be 0 or 1").into()),
+        };
+        remaining -= 1;
+        schemes.push(SilbEntry {
+            scheme_id_uri,
+            value,
+            at_least_one_flag,
+        });
+    }
+
+    if remaining != 0 {
+        return Err(invalid_value(
+            field_name,
+            "scheme payload length does not match the scheme count",
+        )
+        .into());
+    }
+
+    Ok(schemes)
+}
+
 impl FieldHooks for Silb {
     fn display_field(&self, name: &'static str) -> Option<String> {
         match name {
@@ -9328,15 +10535,12 @@ impl CodecBox for Silb {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 9 {
+        if payload_size < 9 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let version = payload[0];
+        let header = read_exact_array_untrusted::<8, _>(reader).map_err(CodecError::Io)?;
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -9344,24 +10548,82 @@ impl CodecBox for Silb {
             });
         }
 
-        let other_schemes_flag = match payload[payload.len() - 1] {
+        let scheme_payload_len = payload_size - 9;
+        self.full_box = FullBoxState {
+            version,
+            flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+        };
+        self.scheme_count = read_u32(&header, 4);
+        self.schemes = read_silb_schemes_from_reader(
+            "Schemes",
+            reader,
+            scheme_payload_len,
+            self.scheme_count,
+        )?;
+        let other_schemes_flag = match read_exact_array_untrusted::<1, _>(reader)
+            .map_err(CodecError::Io)?[0]
+        {
             0 => false,
             1 => true,
             _ => {
                 return Err(invalid_value("OtherSchemesFlag", "flag byte must be 0 or 1").into());
             }
         };
-
-        self.full_box = FullBoxState {
-            version,
-            flags: read_uint(&payload, 1, 3) as u32,
-        };
-        self.scheme_count = read_u32(&payload, 4);
-        self.schemes =
-            parse_silb_schemes("Schemes", self.scheme_count, &payload[8..payload.len() - 1])?;
         self.other_schemes_flag = other_schemes_flag;
 
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 9 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let header = read_exact_array_untrusted_async::<8, _>(reader)
+                .await
+                .map_err(CodecError::Io)?;
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            let scheme_payload_len = payload_size - 9;
+            self.full_box = FullBoxState {
+                version,
+                flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+            };
+            self.scheme_count = read_u32(&header, 4);
+            self.schemes = read_silb_schemes_from_reader_async(
+                "Schemes",
+                reader,
+                scheme_payload_len,
+                self.scheme_count,
+            )
+            .await?;
+            let other_schemes_flag = match read_exact_array_untrusted_async::<1, _>(reader)
+                .await
+                .map_err(CodecError::Io)?[0]
+            {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(
+                        invalid_value("OtherSchemesFlag", "flag byte must be 0 or 1").into(),
+                    );
+                }
+            };
+            self.other_schemes_flag = other_schemes_flag;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -9496,15 +10758,12 @@ impl CodecBox for Emib {
         reader: &mut dyn ReadSeek,
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-
-        if payload.len() < 24 {
+        if payload_size < 24 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
 
-        let version = payload[0];
+        let header = read_exact_array_untrusted::<24, _>(reader).map_err(CodecError::Io)?;
+        let version = header[0];
         if version != 0 {
             return Err(CodecError::UnsupportedVersion {
                 box_type: self.box_type(),
@@ -9512,27 +10771,95 @@ impl CodecBox for Emib {
             });
         }
 
-        if read_u32(&payload, 4) != 0 {
+        if read_u32(&header, 4) != 0 {
             return Err(invalid_value("Reserved", "reserved field must be zero").into());
         }
 
-        let (scheme_id_uri, scheme_len) = decode_required_c_string("SchemeIdUri", &payload[24..])?;
-        let value_offset = 24 + scheme_len;
-        let (value, value_len) = decode_required_c_string("Value", &payload[value_offset..])?;
-        let message_offset = value_offset + value_len;
+        let mut remaining = payload_size - 24;
+        let (scheme_id_uri, _) =
+            read_required_c_string_from_reader(reader, &mut remaining, "SchemeIdUri")?;
+        let (value, _) = read_required_c_string_from_reader(reader, &mut remaining, "Value")?;
+        let message_data = if remaining == 0 {
+            Vec::new()
+        } else {
+            read_exact_vec_untrusted(
+                reader,
+                usize::try_from(remaining)
+                    .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+            )
+            .map_err(CodecError::Io)?
+        };
 
         self.full_box = FullBoxState {
             version,
-            flags: read_uint(&payload, 1, 3) as u32,
+            flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
         };
-        self.presentation_time_delta = read_i64(&payload, 8);
-        self.event_duration = read_u32(&payload, 16);
-        self.id = read_u32(&payload, 20);
+        self.presentation_time_delta = read_i64(&header, 8);
+        self.event_duration = read_u32(&header, 16);
+        self.id = read_u32(&header, 20);
         self.scheme_id_uri = scheme_id_uri;
         self.value = value;
-        self.message_data = payload[message_offset..].to_vec();
+        self.message_data = message_data;
 
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            if payload_size < 24 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+
+            let header = read_exact_array_untrusted_async::<24, _>(reader)
+                .await
+                .map_err(CodecError::Io)?;
+            let version = header[0];
+            if version != 0 {
+                return Err(CodecError::UnsupportedVersion {
+                    box_type: self.box_type(),
+                    version,
+                });
+            }
+
+            if read_u32(&header, 4) != 0 {
+                return Err(invalid_value("Reserved", "reserved field must be zero").into());
+            }
+
+            let mut remaining = payload_size - 24;
+            let (scheme_id_uri, _) =
+                read_required_c_string_from_reader_async(reader, &mut remaining, "SchemeIdUri")
+                    .await?;
+            let (value, _) =
+                read_required_c_string_from_reader_async(reader, &mut remaining, "Value").await?;
+            let message_data = if remaining == 0 {
+                Vec::new()
+            } else {
+                read_exact_vec_untrusted_async(
+                    reader,
+                    usize::try_from(remaining)
+                        .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?,
+                )
+                .await
+                .map_err(CodecError::Io)?
+            };
+
+            self.full_box = FullBoxState {
+                version,
+                flags: u32::from_be_bytes([0, header[1], header[2], header[3]]),
+            };
+            self.presentation_time_delta = read_i64(&header, 8);
+            self.event_duration = read_u32(&header, 16);
+            self.id = read_u32(&header, 20);
+            self.scheme_id_uri = scheme_id_uri;
+            self.value = value;
+            self.message_data = message_data;
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -9584,6 +10911,22 @@ impl CodecBox for Emeb {
             return Err(invalid_value("Payload", "payload must be empty").into());
         }
         Ok(Some(0))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            let start = reader.stream_position().await?;
+            if payload_size != 0 {
+                reader.seek(SeekFrom::Start(start)).await?;
+                return Err(invalid_value("Payload", "payload must be empty").into());
+            }
+            Ok(Some(0))
+        })
     }
 }
 
@@ -10162,12 +11505,11 @@ impl CodecBox for VisualSampleEntry {
         const VISUAL_SAMPLE_ENTRY_HEADER_SIZE: usize = 78;
 
         let start = reader.stream_position()?;
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = read_exact_vec_untrusted(reader, payload_len).map_err(CodecError::Io)?;
-        if payload.len() < VISUAL_SAMPLE_ENTRY_HEADER_SIZE {
+        if payload_size < VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64 {
             return Err(invalid_value("Payload", "payload is too short").into());
         }
+        let payload = read_exact_array_untrusted::<VISUAL_SAMPLE_ENTRY_HEADER_SIZE, _>(reader)
+            .map_err(CodecError::Io)?;
 
         if read_u16(&payload, 0) != 0 {
             return Err(CodecError::ConstantMismatch {
@@ -10215,6 +11557,75 @@ impl CodecBox for VisualSampleEntry {
             start + VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64,
         ))?;
         Ok(Some(VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            const VISUAL_SAMPLE_ENTRY_HEADER_SIZE: usize = 78;
+
+            let start = reader.stream_position().await?;
+            if payload_size < VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let payload =
+                read_exact_array_untrusted_async::<VISUAL_SAMPLE_ENTRY_HEADER_SIZE, _>(reader)
+                    .await
+                    .map_err(CodecError::Io)?;
+
+            if read_u16(&payload, 0) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved0A",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 2) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved0B",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 4) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved0C",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 10) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1",
+                    constant: "0",
+                });
+            }
+
+            self.sample_entry.data_reference_index = read_u16(&payload, 6);
+            self.pre_defined = read_u16(&payload, 8);
+            self.pre_defined2 = [
+                read_u32(&payload, 12),
+                read_u32(&payload, 16),
+                read_u32(&payload, 20),
+            ];
+            self.width = read_u16(&payload, 24);
+            self.height = read_u16(&payload, 26);
+            self.horizresolution = read_u32(&payload, 28);
+            self.vertresolution = read_u32(&payload, 32);
+            self.reserved2 = read_u32(&payload, 36);
+            self.frame_count = read_u16(&payload, 40);
+            self.compressorname = payload[42..74].try_into().unwrap();
+            self.depth = read_u16(&payload, 74);
+            self.pre_defined3 = read_i16(&payload, 76);
+
+            reader
+                .seek(SeekFrom::Start(
+                    start + VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64,
+                ))
+                .await?;
+            Ok(Some(VISUAL_SAMPLE_ENTRY_HEADER_SIZE as u64))
+        })
     }
 }
 
@@ -10390,6 +11801,201 @@ impl CodecBox for AudioSampleEntry {
             with_dynamic_presence()
         ),
     ]);
+
+    fn custom_unmarshal(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        payload_size: u64,
+    ) -> Result<Option<u64>, CodecError> {
+        const AUDIO_SAMPLE_ENTRY_HEADER_SIZE: usize = 28;
+        const QUICKTIME_VENDOR_ENTRY_TYPES: [FourCc; 3] = [
+            FourCc::from_bytes(*b"ipcm"),
+            FourCc::from_bytes(*b"fpcm"),
+            FourCc::from_bytes(*b"spex"),
+        ];
+
+        let start = reader.stream_position()?;
+        if payload_size < AUDIO_SAMPLE_ENTRY_HEADER_SIZE as u64 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+        let payload = read_exact_array_untrusted::<AUDIO_SAMPLE_ENTRY_HEADER_SIZE, _>(reader)
+            .map_err(CodecError::Io)?;
+
+        if read_u16(&payload, 0) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0A",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 2) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0B",
+                constant: "0",
+            });
+        }
+        if read_u16(&payload, 4) != 0 {
+            return Err(CodecError::ConstantMismatch {
+                field_name: "Reserved0C",
+                constant: "0",
+            });
+        }
+
+        self.sample_entry.data_reference_index = read_u16(&payload, 6);
+        self.entry_version = read_u16(&payload, 8);
+        let allow_quicktime_vendor_words = self.entry_version == 0
+            && QUICKTIME_VENDOR_ENTRY_TYPES.contains(&self.sample_entry.box_type);
+        if !allow_quicktime_vendor_words {
+            if read_u16(&payload, 10) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1A",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 12) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1B",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 14) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved1C",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 22) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved2",
+                    constant: "0",
+                });
+            }
+        }
+
+        self.channel_count = read_u16(&payload, 16);
+        self.sample_size = read_u16(&payload, 18);
+        self.pre_defined = read_u16(&payload, 20);
+        self.sample_rate = read_u32(&payload, 24);
+        self.quicktime_data = match self.entry_version {
+            1 => read_exact_array_untrusted::<16, _>(reader)
+                .map_err(CodecError::Io)?
+                .to_vec(),
+            2 => read_exact_array_untrusted::<36, _>(reader)
+                .map_err(CodecError::Io)?
+                .to_vec(),
+            _ => Vec::new(),
+        };
+
+        let consumed = AUDIO_SAMPLE_ENTRY_HEADER_SIZE
+            + match self.entry_version {
+                1 => 16,
+                2 => 36,
+                _ => 0,
+            };
+        reader.seek(SeekFrom::Start(start + consumed as u64))?;
+        Ok(Some(consumed as u64))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            const AUDIO_SAMPLE_ENTRY_HEADER_SIZE: usize = 28;
+            const QUICKTIME_VENDOR_ENTRY_TYPES: [FourCc; 3] = [
+                FourCc::from_bytes(*b"ipcm"),
+                FourCc::from_bytes(*b"fpcm"),
+                FourCc::from_bytes(*b"spex"),
+            ];
+
+            let start = reader.stream_position().await?;
+            if payload_size < AUDIO_SAMPLE_ENTRY_HEADER_SIZE as u64 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let payload =
+                read_exact_array_untrusted_async::<AUDIO_SAMPLE_ENTRY_HEADER_SIZE, _>(reader)
+                    .await
+                    .map_err(CodecError::Io)?;
+
+            if read_u16(&payload, 0) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved0A",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 2) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved0B",
+                    constant: "0",
+                });
+            }
+            if read_u16(&payload, 4) != 0 {
+                return Err(CodecError::ConstantMismatch {
+                    field_name: "Reserved0C",
+                    constant: "0",
+                });
+            }
+
+            self.sample_entry.data_reference_index = read_u16(&payload, 6);
+            self.entry_version = read_u16(&payload, 8);
+            let allow_quicktime_vendor_words = self.entry_version == 0
+                && QUICKTIME_VENDOR_ENTRY_TYPES.contains(&self.sample_entry.box_type);
+            if !allow_quicktime_vendor_words {
+                if read_u16(&payload, 10) != 0 {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved1A",
+                        constant: "0",
+                    });
+                }
+                if read_u16(&payload, 12) != 0 {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved1B",
+                        constant: "0",
+                    });
+                }
+                if read_u16(&payload, 14) != 0 {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved1C",
+                        constant: "0",
+                    });
+                }
+                if read_u16(&payload, 22) != 0 {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved2",
+                        constant: "0",
+                    });
+                }
+            }
+
+            self.channel_count = read_u16(&payload, 16);
+            self.sample_size = read_u16(&payload, 18);
+            self.pre_defined = read_u16(&payload, 20);
+            self.sample_rate = read_u32(&payload, 24);
+            self.quicktime_data = match self.entry_version {
+                1 => read_exact_array_untrusted_async::<16, _>(reader)
+                    .await
+                    .map_err(CodecError::Io)?
+                    .to_vec(),
+                2 => read_exact_array_untrusted_async::<36, _>(reader)
+                    .await
+                    .map_err(CodecError::Io)?
+                    .to_vec(),
+                _ => Vec::new(),
+            };
+
+            let consumed = AUDIO_SAMPLE_ENTRY_HEADER_SIZE
+                + match self.entry_version {
+                    1 => 16,
+                    2 => 36,
+                    _ => 0,
+                };
+            reader
+                .seek(SeekFrom::Start(start + consumed as u64))
+                .await?;
+            Ok(Some(consumed as u64))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10455,6 +12061,67 @@ impl CodecBox for WaveAudioData {
         with_bit_width(8),
         as_bytes()
     )]);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpaqueCodecSpecificData {
+    box_type: FourCc,
+    data: Vec<u8>,
+}
+
+impl Default for OpaqueCodecSpecificData {
+    fn default() -> Self {
+        Self {
+            box_type: FourCc::ANY,
+            data: Vec::new(),
+        }
+    }
+}
+
+impl FieldHooks for OpaqueCodecSpecificData {}
+
+impl ImmutableBox for OpaqueCodecSpecificData {
+    fn box_type(&self) -> FourCc {
+        self.box_type
+    }
+}
+
+impl MutableBox for OpaqueCodecSpecificData {}
+
+impl AnyTypeBox for OpaqueCodecSpecificData {
+    fn set_box_type(&mut self, box_type: FourCc) {
+        self.box_type = box_type;
+    }
+}
+
+impl FieldValueRead for OpaqueCodecSpecificData {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "Data" => Ok(FieldValue::Bytes(self.data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for OpaqueCodecSpecificData {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("Data", FieldValue::Bytes(value)) => {
+                self.data = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for OpaqueCodecSpecificData {
+    const FIELD_TABLE: FieldTable =
+        FieldTable::new(&[codec_field!("Data", 0, with_bit_width(8), as_bytes())]);
 }
 
 /// One length-prefixed AVC parameter-set record carried by `avcC`.
@@ -10805,10 +12472,11 @@ impl CodecBox for AVCDecoderConfiguration {
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
         let start = reader.stream_position()?;
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = match read_exact_vec_untrusted(reader, payload_len) {
-            Ok(payload) => payload,
+        if payload_size < 6 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+        let header = match read_exact_array_untrusted::<6, _>(reader) {
+            Ok(header) => header,
             Err(error) => {
                 reader.seek(SeekFrom::Start(start))?;
                 return Err(error.into());
@@ -10816,21 +12484,12 @@ impl CodecBox for AVCDecoderConfiguration {
         };
 
         let parse_result = (|| -> Result<(), CodecError> {
-            if payload.len() < 6 {
-                return Err(invalid_value("Payload", "payload is too short").into());
-            }
+            self.configuration_version = header[0];
+            self.profile = header[1];
+            self.profile_compatibility = header[2];
+            self.level = header[3];
 
-            let mut offset = 0_usize;
-            self.configuration_version = payload[offset];
-            offset += 1;
-            self.profile = payload[offset];
-            offset += 1;
-            self.profile_compatibility = payload[offset];
-            offset += 1;
-            self.level = payload[offset];
-            offset += 1;
-
-            let length_size = payload[offset];
+            let length_size = header[4];
             if length_size >> 2 != 0x3f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved",
@@ -10838,9 +12497,8 @@ impl CodecBox for AVCDecoderConfiguration {
                 });
             }
             self.length_size_minus_one = length_size & 0x03;
-            offset += 1;
 
-            let sequence_count = payload[offset];
+            let sequence_count = header[5];
             if sequence_count >> 5 != 0x07 {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved2",
@@ -10848,71 +12506,18 @@ impl CodecBox for AVCDecoderConfiguration {
                 });
             }
             self.num_of_sequence_parameter_sets = sequence_count & 0x1f;
-            offset += 1;
+            self.sequence_parameter_sets = read_avc_parameter_sets_from_reader(
+                "SequenceParameterSets",
+                reader,
+                self.num_of_sequence_parameter_sets,
+            )?;
 
-            let sequence_start = offset;
-            self.sequence_parameter_sets = Vec::with_capacity(untrusted_prealloc_hint(
-                usize::from(self.num_of_sequence_parameter_sets),
-            ));
-            for _ in 0..self.num_of_sequence_parameter_sets {
-                if payload.len().saturating_sub(offset) < 2 {
-                    return Err(invalid_value(
-                        "SequenceParameterSets",
-                        "parameter-set payload length does not match the entry count",
-                    )
-                    .into());
-                }
-                let length = read_u16(&payload, offset);
-                offset += 2;
-                let end = offset + usize::from(length);
-                if end > payload.len() {
-                    return Err(invalid_value(
-                        "SequenceParameterSets",
-                        "parameter-set payload length does not match the entry count",
-                    )
-                    .into());
-                }
-                self.sequence_parameter_sets.push(AVCParameterSet {
-                    length,
-                    nal_unit: payload[offset..end].to_vec(),
-                });
-                offset = end;
-            }
-            let _ = sequence_start;
-
-            if offset >= payload.len() {
-                return Err(invalid_value("Payload", "payload is too short").into());
-            }
-            self.num_of_picture_parameter_sets = payload[offset];
-            offset += 1;
-
-            self.picture_parameter_sets = Vec::with_capacity(untrusted_prealloc_hint(usize::from(
+            self.num_of_picture_parameter_sets = read_exact_array_untrusted::<1, _>(reader)?[0];
+            self.picture_parameter_sets = read_avc_parameter_sets_from_reader(
+                "PictureParameterSets",
+                reader,
                 self.num_of_picture_parameter_sets,
-            )));
-            for _ in 0..self.num_of_picture_parameter_sets {
-                if payload.len().saturating_sub(offset) < 2 {
-                    return Err(invalid_value(
-                        "PictureParameterSets",
-                        "parameter-set payload length does not match the entry count",
-                    )
-                    .into());
-                }
-                let length = read_u16(&payload, offset);
-                offset += 2;
-                let end = offset + usize::from(length);
-                if end > payload.len() {
-                    return Err(invalid_value(
-                        "PictureParameterSets",
-                        "parameter-set payload length does not match the entry count",
-                    )
-                    .into());
-                }
-                self.picture_parameter_sets.push(AVCParameterSet {
-                    length,
-                    nal_unit: payload[offset..end].to_vec(),
-                });
-                offset = end;
-            }
+            )?;
 
             self.high_profile_fields_enabled = false;
             self.chroma_format = 0;
@@ -10921,7 +12526,7 @@ impl CodecBox for AVCDecoderConfiguration {
             self.num_of_sequence_parameter_set_ext = 0;
             self.sequence_parameter_sets_ext.clear();
 
-            let remaining = payload.len().saturating_sub(offset);
+            let remaining = payload_size - (reader.stream_position()? - start);
             if avc_profile_supports_extensions(self.profile) && remaining != 0 {
                 if remaining < 4 {
                     return Err(invalid_value("Payload", "payload is truncated").into());
@@ -10929,7 +12534,7 @@ impl CodecBox for AVCDecoderConfiguration {
 
                 self.high_profile_fields_enabled = true;
 
-                let chroma_format = payload[offset];
+                let chroma_format = read_exact_array_untrusted::<1, _>(reader)?[0];
                 if chroma_format >> 2 != 0x3f {
                     return Err(CodecError::ConstantMismatch {
                         field_name: "Reserved3",
@@ -10937,9 +12542,8 @@ impl CodecBox for AVCDecoderConfiguration {
                     });
                 }
                 self.chroma_format = chroma_format & 0x03;
-                offset += 1;
 
-                let bit_depth_luma = payload[offset];
+                let bit_depth_luma = read_exact_array_untrusted::<1, _>(reader)?[0];
                 if bit_depth_luma >> 3 != 0x1f {
                     return Err(CodecError::ConstantMismatch {
                         field_name: "Reserved4",
@@ -10947,9 +12551,8 @@ impl CodecBox for AVCDecoderConfiguration {
                     });
                 }
                 self.bit_depth_luma_minus8 = bit_depth_luma & 0x07;
-                offset += 1;
 
-                let bit_depth_chroma = payload[offset];
+                let bit_depth_chroma = read_exact_array_untrusted::<1, _>(reader)?[0];
                 if bit_depth_chroma >> 3 != 0x1f {
                     return Err(CodecError::ConstantMismatch {
                         field_name: "Reserved5",
@@ -10957,41 +12560,17 @@ impl CodecBox for AVCDecoderConfiguration {
                     });
                 }
                 self.bit_depth_chroma_minus8 = bit_depth_chroma & 0x07;
-                offset += 1;
 
-                self.num_of_sequence_parameter_set_ext = payload[offset];
-                offset += 1;
-
-                self.sequence_parameter_sets_ext = Vec::with_capacity(untrusted_prealloc_hint(
-                    usize::from(self.num_of_sequence_parameter_set_ext),
-                ));
-                for _ in 0..self.num_of_sequence_parameter_set_ext {
-                    if payload.len().saturating_sub(offset) < 2 {
-                        return Err(invalid_value(
-                            "SequenceParameterSetsExt",
-                            "parameter-set payload length does not match the entry count",
-                        )
-                        .into());
-                    }
-                    let length = read_u16(&payload, offset);
-                    offset += 2;
-                    let end = offset + usize::from(length);
-                    if end > payload.len() {
-                        return Err(invalid_value(
-                            "SequenceParameterSetsExt",
-                            "parameter-set payload length does not match the entry count",
-                        )
-                        .into());
-                    }
-                    self.sequence_parameter_sets_ext.push(AVCParameterSet {
-                        length,
-                        nal_unit: payload[offset..end].to_vec(),
-                    });
-                    offset = end;
-                }
+                self.num_of_sequence_parameter_set_ext =
+                    read_exact_array_untrusted::<1, _>(reader)?[0];
+                self.sequence_parameter_sets_ext = read_avc_parameter_sets_from_reader(
+                    "SequenceParameterSetsExt",
+                    reader,
+                    self.num_of_sequence_parameter_set_ext,
+                )?;
             }
 
-            if offset != payload.len() {
+            if reader.stream_position()? - start != payload_size {
                 return Err(invalid_value("Payload", "payload has trailing bytes").into());
             }
 
@@ -11004,6 +12583,133 @@ impl CodecBox for AVCDecoderConfiguration {
         }
 
         Ok(Some(payload_size))
+    }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            let start = reader.stream_position().await?;
+            if payload_size < 6 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let header = match read_exact_array_untrusted_async::<6, _>(reader).await {
+                Ok(header) => header,
+                Err(error) => {
+                    reader.seek(SeekFrom::Start(start)).await?;
+                    return Err(error.into());
+                }
+            };
+            let parse_result = async {
+                self.configuration_version = header[0];
+                self.profile = header[1];
+                self.profile_compatibility = header[2];
+                self.level = header[3];
+
+                let length_size = header[4];
+                if length_size >> 2 != 0x3f {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved",
+                        constant: "63",
+                    });
+                }
+                self.length_size_minus_one = length_size & 0x03;
+
+                let sequence_count = header[5];
+                if sequence_count >> 5 != 0x07 {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved2",
+                        constant: "7",
+                    });
+                }
+                self.num_of_sequence_parameter_sets = sequence_count & 0x1f;
+                self.sequence_parameter_sets = read_avc_parameter_sets_from_reader_async(
+                    "SequenceParameterSets",
+                    reader,
+                    self.num_of_sequence_parameter_sets,
+                )
+                .await?;
+
+                self.num_of_picture_parameter_sets =
+                    read_exact_array_untrusted_async::<1, _>(reader).await?[0];
+                self.picture_parameter_sets = read_avc_parameter_sets_from_reader_async(
+                    "PictureParameterSets",
+                    reader,
+                    self.num_of_picture_parameter_sets,
+                )
+                .await?;
+
+                self.high_profile_fields_enabled = false;
+                self.chroma_format = 0;
+                self.bit_depth_luma_minus8 = 0;
+                self.bit_depth_chroma_minus8 = 0;
+                self.num_of_sequence_parameter_set_ext = 0;
+                self.sequence_parameter_sets_ext.clear();
+
+                let remaining = payload_size - (reader.stream_position().await? - start);
+                if avc_profile_supports_extensions(self.profile) && remaining != 0 {
+                    if remaining < 4 {
+                        return Err(invalid_value("Payload", "payload is truncated").into());
+                    }
+
+                    self.high_profile_fields_enabled = true;
+
+                    let chroma_format = read_exact_array_untrusted_async::<1, _>(reader).await?[0];
+                    if chroma_format >> 2 != 0x3f {
+                        return Err(CodecError::ConstantMismatch {
+                            field_name: "Reserved3",
+                            constant: "63",
+                        });
+                    }
+                    self.chroma_format = chroma_format & 0x03;
+
+                    let bit_depth_luma = read_exact_array_untrusted_async::<1, _>(reader).await?[0];
+                    if bit_depth_luma >> 3 != 0x1f {
+                        return Err(CodecError::ConstantMismatch {
+                            field_name: "Reserved4",
+                            constant: "31",
+                        });
+                    }
+                    self.bit_depth_luma_minus8 = bit_depth_luma & 0x07;
+
+                    let bit_depth_chroma =
+                        read_exact_array_untrusted_async::<1, _>(reader).await?[0];
+                    if bit_depth_chroma >> 3 != 0x1f {
+                        return Err(CodecError::ConstantMismatch {
+                            field_name: "Reserved5",
+                            constant: "31",
+                        });
+                    }
+                    self.bit_depth_chroma_minus8 = bit_depth_chroma & 0x07;
+
+                    self.num_of_sequence_parameter_set_ext =
+                        read_exact_array_untrusted_async::<1, _>(reader).await?[0];
+                    self.sequence_parameter_sets_ext = read_avc_parameter_sets_from_reader_async(
+                        "SequenceParameterSetsExt",
+                        reader,
+                        self.num_of_sequence_parameter_set_ext,
+                    )
+                    .await?;
+                }
+
+                if reader.stream_position().await? - start != payload_size {
+                    return Err(invalid_value("Payload", "payload has trailing bytes").into());
+                }
+
+                Ok(())
+            }
+            .await;
+
+            if let Err(error) = parse_result {
+                reader.seek(SeekFrom::Start(start)).await?;
+                return Err(error);
+            }
+
+            Ok(Some(payload_size))
+        })
     }
 }
 
@@ -11252,8 +12958,8 @@ impl CodecBox for HEVCDecoderConfiguration {
         codec_field!("BitDepthChromaMinus8", 11, with_bit_width(3), as_hex()),
         codec_field!("AvgFrameRate", 12, with_bit_width(16)),
         codec_field!("ConstantFrameRate", 13, with_bit_width(2), as_hex()),
-        codec_field!("NumTemporalLayers", 14, with_bit_width(2), as_hex()),
-        codec_field!("TemporalIdNested", 15, with_bit_width(2), as_hex()),
+        codec_field!("NumTemporalLayers", 14, with_bit_width(3), as_hex()),
+        codec_field!("TemporalIdNested", 15, with_bit_width(1), as_hex()),
         codec_field!("LengthSizeMinusOne", 16, with_bit_width(2), as_hex()),
         codec_field!("NumOfNaluArrays", 17, with_bit_width(8), as_hex()),
         codec_field!(
@@ -11298,11 +13004,11 @@ impl CodecBox for HEVCDecoderConfiguration {
         if self.constant_frame_rate > 0x03 {
             return Err(invalid_value("ConstantFrameRate", "value does not fit in 2 bits").into());
         }
-        if self.num_temporal_layers > 0x03 {
-            return Err(invalid_value("NumTemporalLayers", "value does not fit in 2 bits").into());
+        if self.num_temporal_layers > 0x07 {
+            return Err(invalid_value("NumTemporalLayers", "value does not fit in 3 bits").into());
         }
-        if self.temporal_id_nested > 0x03 {
-            return Err(invalid_value("TemporalIdNested", "value does not fit in 2 bits").into());
+        if self.temporal_id_nested > 0x01 {
+            return Err(invalid_value("TemporalIdNested", "value does not fit in 1 bit").into());
         }
         if self.length_size_minus_one > 0x03 {
             return Err(invalid_value("LengthSizeMinusOne", "value does not fit in 2 bits").into());
@@ -11327,7 +13033,7 @@ impl CodecBox for HEVCDecoderConfiguration {
         ));
         payload.extend_from_slice(&self.general_constraint_indicator);
         payload.push(self.general_level_idc);
-        payload.extend_from_slice(&(0xe000 | self.min_spatial_segmentation_idc).to_be_bytes());
+        payload.extend_from_slice(&(0xf000 | self.min_spatial_segmentation_idc).to_be_bytes());
         payload.push(0xfc | self.parallelism_type);
         payload.push(0xfc | self.chroma_format_idc);
         payload.push(0xf8 | self.bit_depth_luma_minus8);
@@ -11335,7 +13041,7 @@ impl CodecBox for HEVCDecoderConfiguration {
         payload.extend_from_slice(&self.avg_frame_rate.to_be_bytes());
         payload.push(
             (self.constant_frame_rate << 6)
-                | (self.num_temporal_layers << 4)
+                | (self.num_temporal_layers << 3)
                 | (self.temporal_id_nested << 2)
                 | self.length_size_minus_one,
         );
@@ -11352,53 +13058,42 @@ impl CodecBox for HEVCDecoderConfiguration {
         payload_size: u64,
     ) -> Result<Option<u64>, CodecError> {
         let start = reader.stream_position()?;
-        let payload_len = usize::try_from(payload_size)
-            .map_err(|_| invalid_value("Payload", "payload is too large to decode"))?;
-        let payload = match read_exact_vec_untrusted(reader, payload_len) {
-            Ok(payload) => payload,
+        if payload_size < 23 {
+            return Err(invalid_value("Payload", "payload is too short").into());
+        }
+        let header = match read_exact_array_untrusted::<23, _>(reader) {
+            Ok(header) => header,
             Err(error) => {
                 reader.seek(SeekFrom::Start(start))?;
                 return Err(error.into());
             }
         };
-
         let parse_result = (|| -> Result<(), CodecError> {
-            if payload.len() < 23 {
-                return Err(invalid_value("Payload", "payload is too short").into());
-            }
+            self.configuration_version = header[0];
 
-            let mut offset = 0_usize;
-            self.configuration_version = payload[offset];
-            offset += 1;
-
-            let profile_header = payload[offset];
+            let profile_header = header[1];
             self.general_profile_space = profile_header >> 6;
             self.general_tier_flag = profile_header & 0x20 != 0;
             self.general_profile_idc = profile_header & 0x1f;
-            offset += 1;
 
-            let profile_compatibility: [u8; 4] = payload[offset..offset + 4].try_into().unwrap();
+            let profile_compatibility: [u8; 4] = header[2..6].try_into().unwrap();
             self.general_profile_compatibility =
                 unpack_hevc_profile_compatibility(&profile_compatibility);
-            offset += 4;
 
-            self.general_constraint_indicator = payload[offset..offset + 6].try_into().unwrap();
-            offset += 6;
+            self.general_constraint_indicator = header[6..12].try_into().unwrap();
 
-            self.general_level_idc = payload[offset];
-            offset += 1;
+            self.general_level_idc = header[12];
 
-            let segmentation = read_u16(&payload, offset);
-            if segmentation >> 12 != 0x0e {
+            let segmentation = read_u16(&header, 13);
+            if segmentation >> 12 != 0x0f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved1",
-                    constant: "14",
+                    constant: "15",
                 });
             }
             self.min_spatial_segmentation_idc = segmentation & 0x0fff;
-            offset += 2;
 
-            let parallelism = payload[offset];
+            let parallelism = header[15];
             if parallelism >> 2 != 0x3f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved2",
@@ -11406,9 +13101,8 @@ impl CodecBox for HEVCDecoderConfiguration {
                 });
             }
             self.parallelism_type = parallelism & 0x03;
-            offset += 1;
 
-            let chroma_format = payload[offset];
+            let chroma_format = header[16];
             if chroma_format >> 2 != 0x3f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved3",
@@ -11416,9 +13110,8 @@ impl CodecBox for HEVCDecoderConfiguration {
                 });
             }
             self.chroma_format_idc = chroma_format & 0x03;
-            offset += 1;
 
-            let bit_depth_luma = payload[offset];
+            let bit_depth_luma = header[17];
             if bit_depth_luma >> 3 != 0x1f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved4",
@@ -11426,9 +13119,8 @@ impl CodecBox for HEVCDecoderConfiguration {
                 });
             }
             self.bit_depth_luma_minus8 = bit_depth_luma & 0x07;
-            offset += 1;
 
-            let bit_depth_chroma = payload[offset];
+            let bit_depth_chroma = header[18];
             if bit_depth_chroma >> 3 != 0x1f {
                 return Err(CodecError::ConstantMismatch {
                     field_name: "Reserved5",
@@ -11436,23 +13128,22 @@ impl CodecBox for HEVCDecoderConfiguration {
                 });
             }
             self.bit_depth_chroma_minus8 = bit_depth_chroma & 0x07;
-            offset += 1;
 
-            self.avg_frame_rate = read_u16(&payload, offset);
-            offset += 2;
+            self.avg_frame_rate = read_u16(&header, 19);
 
-            let layer_header = payload[offset];
+            let layer_header = header[21];
             self.constant_frame_rate = layer_header >> 6;
-            self.num_temporal_layers = (layer_header >> 4) & 0x03;
-            self.temporal_id_nested = (layer_header >> 2) & 0x03;
+            self.num_temporal_layers = (layer_header >> 3) & 0x07;
+            self.temporal_id_nested = (layer_header >> 2) & 0x01;
             self.length_size_minus_one = layer_header & 0x03;
-            offset += 1;
 
-            self.num_of_nalu_arrays = payload[offset];
-            offset += 1;
-
+            self.num_of_nalu_arrays = header[22];
             self.nalu_arrays =
-                parse_hevc_nalu_arrays("NaluArrays", &payload[offset..], self.num_of_nalu_arrays)?;
+                read_hevc_nalu_arrays_from_reader("NaluArrays", reader, self.num_of_nalu_arrays)?;
+
+            if reader.stream_position()? - start != payload_size {
+                return Err(invalid_value("Payload", "payload has trailing bytes").into());
+            }
 
             Ok(())
         })();
@@ -11464,6 +13155,323 @@ impl CodecBox for HEVCDecoderConfiguration {
 
         Ok(Some(payload_size))
     }
+
+    #[cfg(feature = "async")]
+    fn custom_unmarshal_async<'a>(
+        &'a mut self,
+        reader: &'a mut dyn AsyncReadSeek,
+        payload_size: u64,
+    ) -> CodecFuture<'a, Result<Option<u64>, CodecError>> {
+        Box::pin(async move {
+            let start = reader.stream_position().await?;
+            if payload_size < 23 {
+                return Err(invalid_value("Payload", "payload is too short").into());
+            }
+            let header = match read_exact_array_untrusted_async::<23, _>(reader).await {
+                Ok(header) => header,
+                Err(error) => {
+                    reader.seek(SeekFrom::Start(start)).await?;
+                    return Err(error.into());
+                }
+            };
+            let parse_result = async {
+                self.configuration_version = header[0];
+
+                let profile_header = header[1];
+                self.general_profile_space = profile_header >> 6;
+                self.general_tier_flag = profile_header & 0x20 != 0;
+                self.general_profile_idc = profile_header & 0x1f;
+
+                let profile_compatibility: [u8; 4] = header[2..6].try_into().unwrap();
+                self.general_profile_compatibility =
+                    unpack_hevc_profile_compatibility(&profile_compatibility);
+
+                self.general_constraint_indicator = header[6..12].try_into().unwrap();
+
+                self.general_level_idc = header[12];
+
+                let segmentation = read_u16(&header, 13);
+                if segmentation >> 12 != 0x0f {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved1",
+                        constant: "15",
+                    });
+                }
+                self.min_spatial_segmentation_idc = segmentation & 0x0fff;
+
+                let parallelism = header[15];
+                if parallelism >> 2 != 0x3f {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved2",
+                        constant: "63",
+                    });
+                }
+                self.parallelism_type = parallelism & 0x03;
+
+                let chroma_format = header[16];
+                if chroma_format >> 2 != 0x3f {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved3",
+                        constant: "63",
+                    });
+                }
+                self.chroma_format_idc = chroma_format & 0x03;
+
+                let bit_depth_luma = header[17];
+                if bit_depth_luma >> 3 != 0x1f {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved4",
+                        constant: "31",
+                    });
+                }
+                self.bit_depth_luma_minus8 = bit_depth_luma & 0x07;
+
+                let bit_depth_chroma = header[18];
+                if bit_depth_chroma >> 3 != 0x1f {
+                    return Err(CodecError::ConstantMismatch {
+                        field_name: "Reserved5",
+                        constant: "31",
+                    });
+                }
+                self.bit_depth_chroma_minus8 = bit_depth_chroma & 0x07;
+
+                self.avg_frame_rate = read_u16(&header, 19);
+
+                let layer_header = header[21];
+                self.constant_frame_rate = layer_header >> 6;
+                self.num_temporal_layers = (layer_header >> 3) & 0x07;
+                self.temporal_id_nested = (layer_header >> 2) & 0x01;
+                self.length_size_minus_one = layer_header & 0x03;
+
+                self.num_of_nalu_arrays = header[22];
+                self.nalu_arrays = read_hevc_nalu_arrays_from_reader_async(
+                    "NaluArrays",
+                    reader,
+                    self.num_of_nalu_arrays,
+                )
+                .await?;
+
+                if reader.stream_position().await? - start != payload_size {
+                    return Err(invalid_value("Payload", "payload has trailing bytes").into());
+                }
+
+                Ok(())
+            }
+            .await;
+
+            if let Err(error) = parse_result {
+                reader.seek(SeekFrom::Start(start)).await?;
+                return Err(error);
+            }
+
+            Ok(Some(payload_size))
+        })
+    }
+}
+
+/// Generic media sample entry used by subtitle-style or other non-audio or non-visual handlers.
+///
+/// The typed header only carries the shared sample-entry fields. Any codec-specific payload or
+/// child boxes remain outside this struct and are encoded through the normal child-box path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenericMediaSampleEntry {
+    pub sample_entry: SampleEntry,
+}
+
+impl FieldHooks for GenericMediaSampleEntry {}
+
+impl ImmutableBox for GenericMediaSampleEntry {
+    fn box_type(&self) -> FourCc {
+        self.sample_entry.box_type
+    }
+}
+
+impl MutableBox for GenericMediaSampleEntry {}
+
+impl AnyTypeBox for GenericMediaSampleEntry {
+    fn set_box_type(&mut self, box_type: FourCc) {
+        self.sample_entry.box_type = box_type;
+    }
+}
+
+impl FieldValueRead for GenericMediaSampleEntry {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "DataReferenceIndex" => Ok(FieldValue::Unsigned(u64::from(
+                self.sample_entry.data_reference_index,
+            ))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for GenericMediaSampleEntry {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("DataReferenceIndex", FieldValue::Unsigned(value)) => {
+                self.sample_entry.data_reference_index = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for GenericMediaSampleEntry {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Reserved0A", 0, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0B", 1, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0C", 2, with_bit_width(16), with_constant("0")),
+        codec_field!("DataReferenceIndex", 3, with_bit_width(16)),
+    ]);
+}
+
+/// Opaque timed-text sample entry used for legacy `text` and `tx3g` carriage.
+///
+/// The fixed sample-entry header is preserved, and the remaining payload bytes are carried
+/// opaquely because these legacy text entries store non-box inline data after the shared header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpaqueTextSampleEntry {
+    sample_entry: SampleEntry,
+    data: Vec<u8>,
+}
+
+impl Default for OpaqueTextSampleEntry {
+    fn default() -> Self {
+        Self {
+            sample_entry: SampleEntry {
+                box_type: FourCc::ANY,
+                data_reference_index: 0,
+            },
+            data: Vec::new(),
+        }
+    }
+}
+
+impl FieldHooks for OpaqueTextSampleEntry {}
+
+impl ImmutableBox for OpaqueTextSampleEntry {
+    fn box_type(&self) -> FourCc {
+        self.sample_entry.box_type
+    }
+}
+
+impl MutableBox for OpaqueTextSampleEntry {}
+
+impl AnyTypeBox for OpaqueTextSampleEntry {
+    fn set_box_type(&mut self, box_type: FourCc) {
+        self.sample_entry.box_type = box_type;
+    }
+}
+
+impl FieldValueRead for OpaqueTextSampleEntry {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "DataReferenceIndex" => Ok(FieldValue::Unsigned(u64::from(
+                self.sample_entry.data_reference_index,
+            ))),
+            "Data" => Ok(FieldValue::Bytes(self.data.clone())),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for OpaqueTextSampleEntry {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("DataReferenceIndex", FieldValue::Unsigned(value)) => {
+                self.sample_entry.data_reference_index = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("Data", FieldValue::Bytes(value)) => {
+                self.data = value;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for OpaqueTextSampleEntry {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("Reserved0A", 0, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0B", 1, with_bit_width(16), with_constant("0")),
+        codec_field!("Reserved0C", 2, with_bit_width(16), with_constant("0")),
+        codec_field!("DataReferenceIndex", 3, with_bit_width(16)),
+        codec_field!("Data", 4, with_bit_width(8), as_bytes()),
+    ]);
+}
+
+/// DVB subtitle decoder configuration carried by `dvsC` child boxes under `dvbs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DvsC {
+    /// DVB subtitle composition page identifier.
+    pub composition_page_id: u16,
+    /// DVB subtitle ancillary page identifier.
+    pub ancillary_page_id: u16,
+    /// DVB subtitle service type.
+    pub subtitle_type: u8,
+}
+
+impl FieldHooks for DvsC {}
+
+impl ImmutableBox for DvsC {
+    fn box_type(&self) -> FourCc {
+        FourCc::from_bytes(*b"dvsC")
+    }
+}
+
+impl MutableBox for DvsC {}
+
+impl FieldValueRead for DvsC {
+    fn field_value(&self, field_name: &'static str) -> Result<FieldValue, FieldValueError> {
+        match field_name {
+            "CompositionPageID" => Ok(FieldValue::Unsigned(u64::from(self.composition_page_id))),
+            "AncillaryPageID" => Ok(FieldValue::Unsigned(u64::from(self.ancillary_page_id))),
+            "SubtitleType" => Ok(FieldValue::Unsigned(u64::from(self.subtitle_type))),
+            _ => Err(missing_field(field_name)),
+        }
+    }
+}
+
+impl FieldValueWrite for DvsC {
+    fn set_field_value(
+        &mut self,
+        field_name: &'static str,
+        value: FieldValue,
+    ) -> Result<(), FieldValueError> {
+        match (field_name, value) {
+            ("CompositionPageID", FieldValue::Unsigned(value)) => {
+                self.composition_page_id = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("AncillaryPageID", FieldValue::Unsigned(value)) => {
+                self.ancillary_page_id = u16_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            ("SubtitleType", FieldValue::Unsigned(value)) => {
+                self.subtitle_type = u8_from_unsigned(field_name, value)?;
+                Ok(())
+            }
+            (field_name, value) => Err(unexpected_field(field_name, value)),
+        }
+    }
+}
+
+impl CodecBox for DvsC {
+    const FIELD_TABLE: FieldTable = FieldTable::new(&[
+        codec_field!("CompositionPageID", 0, with_bit_width(16)),
+        codec_field!("AncillaryPageID", 1, with_bit_width(16)),
+        codec_field!("SubtitleType", 2, with_bit_width(8)),
+    ]);
 }
 
 /// XML subtitle sample entry that stores namespace and schema strings.
@@ -11678,6 +13686,14 @@ fn is_quicktime_wave_audio_context(context: BoxLookupContext) -> bool {
     context.is_quicktime_compatible() && context.under_wave()
 }
 
+fn is_audio_sample_entry_child_context(context: BoxLookupContext) -> bool {
+    context.under_audio_sample_entry()
+}
+
+fn is_audio_sample_entry_root_context(context: BoxLookupContext) -> bool {
+    !context.under_audio_sample_entry()
+}
+
 fn matches_audio_sample_entry_context(box_type: FourCc, context: BoxLookupContext) -> bool {
     (box_type == FourCc::from_bytes(*b"enca") || box_type == FourCc::from_bytes(*b"mp4a"))
         && !is_quicktime_wave_audio_context(context)
@@ -11705,6 +13721,9 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<EventMessageSampleEntry>(FourCc::from_bytes(*b"evte"));
     registry.register::<AlbumLoudnessInfo>(FourCc::from_bytes(*b"alou"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc1"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc2"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc3"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"avc4"));
     registry.register_contextual_any::<WaveAudioData>(
         FourCc::from_bytes(*b"enca"),
         is_quicktime_wave_audio_context,
@@ -11716,6 +13735,8 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Ftyp>(FourCc::from_bytes(*b"ftyp"));
     registry.register::<Hdlr>(FourCc::from_bytes(*b"hdlr"));
     registry.register::<HEVCDecoderConfiguration>(FourCc::from_bytes(*b"hvcC"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"dvhe"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"dvh1"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"hev1"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"hvc1"));
     registry.register::<Kind>(FourCc::from_bytes(*b"kind"));
@@ -11732,6 +13753,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Mime>(FourCc::from_bytes(*b"mime"));
     registry.register::<Nmhd>(FourCc::from_bytes(*b"nmhd"));
     registry.register::<Prft>(FourCc::from_bytes(*b"prft"));
+    registry.register::<Chnl>(FourCc::from_bytes(*b"chnl"));
     registry.register::<Minf>(FourCc::from_bytes(*b"minf"));
     registry.register::<Moof>(FourCc::from_bytes(*b"moof"));
     registry.register::<Moov>(FourCc::from_bytes(*b"moov"));
@@ -11741,8 +13763,91 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
         FourCc::from_bytes(*b"mp4a"),
         is_quicktime_wave_audio_context,
     );
+    registry.register_contextual_any::<AudioSampleEntry>(
+        FourCc::from_bytes(*b"alac"),
+        is_audio_sample_entry_root_context,
+    );
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"samr"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sawb"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sqcp"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"sevc"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ssmv"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"alaw"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"MLAW"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b".mp3"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"ulaw"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes([0x6D, 0x73, 0x00, 0x02]));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes([0x6D, 0x73, 0x00, 0x11]));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"CSVD"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"OPCM"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"DSTD"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"YPCM"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"TSPE"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"G610"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"IPCM"));
+    registry.register_contextual_any::<OpaqueCodecSpecificData>(
+        FourCc::from_bytes(*b"alac"),
+        is_audio_sample_entry_child_context,
+    );
+    registry.register_contextual_any::<OpaqueCodecSpecificData>(
+        FourCc::from_u32(0),
+        is_audio_sample_entry_child_context,
+    );
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"spex"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsc"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtse"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsh"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsl"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsm"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dts-"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsx"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"dtsy"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"iamf"));
+    registry.register::<crate::boxes::dts::Ddts>(FourCc::from_bytes(*b"ddts"));
+    registry.register::<crate::boxes::dts::Udts>(FourCc::from_bytes(*b"udts"));
+    registry.register::<crate::boxes::iamf::Iacb>(FourCc::from_bytes(*b"iacb"));
     registry.register_dynamic_any::<AudioSampleEntry>(matches_audio_sample_entry_context);
+    registry.register_any::<OpaqueTextSampleEntry>(FourCc::from_bytes(*b"text"));
+    registry.register_any::<OpaqueTextSampleEntry>(FourCc::from_bytes(*b"tx3g"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbs"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"dvbt"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"mp4s"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"H263"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"DIV3"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"DIV4"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"divx"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"BGR3"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MJPG"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"MPEG"));
+    registry.register_any::<GenericMediaSampleEntry>(FourCc::from_bytes(*b"SVQ1"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mjp2"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"PNG "));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apco"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apcn"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apch"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"apcs"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"ap4x"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"ap4h"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"jpeg"));
     registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"mp4v"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"s263"));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"png "));
+    registry.register_any::<VisualSampleEntry>(FourCc::from_bytes(*b"uncv"));
+    registry.register_any::<AudioSampleEntry>(FourCc::from_bytes(*b"QDM2"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"auxi"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"jp2h"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"ramf"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"cmpd"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"uncC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"dvcC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"dvvC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"lhvC"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"chrm"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"vexu"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"hfov"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"clli"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"mdcv"));
+    registry.register::<DvsC>(FourCc::from_bytes(*b"dvsC"));
     registry.register::<Pasp>(FourCc::from_bytes(*b"pasp"));
     registry.register::<Saio>(FourCc::from_bytes(*b"saio"));
     registry.register::<Saiz>(FourCc::from_bytes(*b"saiz"));
@@ -11769,6 +13874,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Stts>(FourCc::from_bytes(*b"stts"));
     registry.register::<Styp>(FourCc::from_bytes(*b"styp"));
     registry.register::<Subs>(FourCc::from_bytes(*b"subs"));
+    registry.register::<Padb>(FourCc::from_bytes(*b"padb"));
     registry.register::<Tfdt>(FourCc::from_bytes(*b"tfdt"));
     registry.register::<Tfhd>(FourCc::from_bytes(*b"tfhd"));
     registry.register::<Tfra>(FourCc::from_bytes(*b"tfra"));
@@ -11789,6 +13895,7 @@ pub fn register_boxes(registry: &mut BoxRegistry) {
     registry.register::<Mpod>(FourCc::from_bytes(*b"mpod"));
     registry.register::<Subt>(FourCc::from_bytes(*b"subt"));
     registry.register::<Udta>(FourCc::from_bytes(*b"udta"));
+    registry.register_any::<OpaqueCodecSpecificData>(FourCc::from_bytes(*b"swre"));
     registry.register::<Uuid>(FourCc::from_bytes(*b"uuid"));
     registry.register::<Url>(FourCc::from_bytes(*b"url "));
     registry.register::<Urn>(FourCc::from_bytes(*b"urn "));

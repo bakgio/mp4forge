@@ -1,6 +1,6 @@
 //! ETSI TS 102 366 AC-3 and E-AC-3 sample-entry and decoder-configuration box definitions.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use super::iso14496_12::AudioSampleEntry;
 use crate::bitio::{BitReader, BitWriter};
@@ -276,9 +276,21 @@ fn parse_ec3_substreams(
         });
     }
 
-    let mut reserved = Vec::new();
+    let checkpoint = reader
+        .stream_position()
+        .map_err(|_| invalid_value(field_name, "substream payload alignment is invalid"))?;
+    let end = reader
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(|_| invalid_value(field_name, "substream payload is truncated"))?;
     reader
-        .read_to_end(&mut reserved)
+        .seek(std::io::SeekFrom::Start(checkpoint))
+        .map_err(|_| invalid_value(field_name, "substream payload is truncated"))?;
+    let remaining = end.saturating_sub(checkpoint);
+    let reserved_len = usize::try_from(remaining)
+        .map_err(|_| invalid_value(field_name, "substream payload is too large"))?;
+    let mut reserved = vec![0_u8; reserved_len];
+    reader
+        .read_exact(&mut reserved)
         .map_err(|_| invalid_value(field_name, "substream payload is truncated"))?;
 
     Ok((substreams, reserved))

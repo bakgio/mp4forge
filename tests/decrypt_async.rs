@@ -59,6 +59,40 @@ async fn async_decrypt_file_with_progress_matches_sync_output() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_with_progress_matches_sync_output_for_retained_media_segments() {
+    let fixture = common_encryption_fragment_fixture("cenc-single", "video");
+    let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+    let options = options_with_keys(&fixture.keys).with_fragments_info_bytes(fragments_info);
+    let sync_output_path = write_temp_file("decrypt-async-retained-fragment-sync-output", &[]);
+    let async_output_path = write_temp_file("decrypt-async-retained-fragment-async-output", &[]);
+
+    let mut sync_progress = Vec::new();
+    decrypt_file_with_progress(
+        &fixture.encrypted_segment_path,
+        &sync_output_path,
+        &options,
+        |snapshot| sync_progress.push(snapshot),
+    )
+    .unwrap();
+
+    let mut async_progress = Vec::new();
+    decrypt_file_with_progress_async(
+        &fixture.encrypted_segment_path,
+        &async_output_path,
+        &options,
+        |snapshot| async_progress.push(snapshot),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fs::read(sync_output_path).unwrap(),
+        fs::read(async_output_path).unwrap()
+    );
+    assert_eq!(phases(&async_progress), phases(&sync_progress));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_decrypt_helpers_can_run_on_tokio_worker_threads() {
     let fixture = build_decrypt_rewrite_fixture();
     let input_path = write_temp_file("decrypt-async-worker-input", &fixture.single_file);
@@ -86,6 +120,48 @@ async fn async_decrypt_helpers_can_run_on_tokio_worker_threads() {
         assert!(!track.summary.encrypted);
         assert_eq!(track.sample_entry_type, Some(fourcc("avc1")));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_rejects_same_input_and_output_path_with_context() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let input_path = write_temp_file("decrypt-async-same-path-input", &fixture.single_file);
+
+    let error = decrypt_file_async(
+        &input_path,
+        &input_path,
+        &options_with_keys(&fixture.all_keys),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+
+    assert!(
+        message.contains("invalid decrypt file arguments"),
+        "{message}"
+    );
+    assert!(message.contains("conflicts with input"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_reports_truncated_progressive_ranges_with_context() {
+    let fixture = build_decrypt_rewrite_fixture();
+    let mut truncated = fixture.single_file.clone();
+    truncated.truncate(truncated.len().saturating_sub(1));
+    let input_path = write_temp_file("decrypt-async-truncated-progressive-input", &truncated);
+    let output_path = write_temp_file("decrypt-async-truncated-progressive-output", &[]);
+
+    let error = decrypt_file_async(
+        &input_path,
+        &output_path,
+        &options_with_keys(&fixture.all_keys),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("progressive"), "{message}");
+    assert!(message.contains("buffered tail is"), "{message}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -217,6 +293,30 @@ async fn assert_retained_fragmented_fixture_decrypts_async(
 
     let output = fs::read(output_path).unwrap();
     assert_eq!(output, expected);
+}
+
+async fn assert_retained_fragmented_fixture_decrypts_async_with_progress(
+    fixture: &RetainedFragmentedDecryptFixture,
+    temp_prefix: &str,
+) {
+    let output_path = write_temp_file(temp_prefix, &[]);
+    let expected = fs::read(&fixture.clear_segment_path).unwrap();
+    let fragments_info = fs::read(&fixture.fragments_info_path).unwrap();
+    let options = options_with_keys(&fixture.keys).with_fragments_info_bytes(fragments_info);
+    let mut progress = Vec::new();
+
+    decrypt_file_with_progress_async(
+        &fixture.encrypted_segment_path,
+        &output_path,
+        &options,
+        |snapshot| progress.push(snapshot),
+    )
+    .await
+    .unwrap();
+
+    let output = fs::read(output_path).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(phases(&progress), expected_file_fragment_progress_phases());
 }
 
 async fn assert_generated_topology_fixture_decrypts_async(
@@ -440,6 +540,15 @@ async fn async_decrypt_file_supports_retained_common_encryption_multi_track_file
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_decrypt_file_with_progress_supports_retained_cenc_single_video_media_segments() {
+    assert_retained_fragmented_fixture_decrypts_async_with_progress(
+        &common_encryption_fragment_fixture("cenc-single", "video"),
+        "decrypt-async-cenc-single-video-segment-progress-output",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_decrypt_file_supports_multi_sample_entry_fragmented_tracks() {
     let fixture = build_multi_sample_entry_decrypt_fixture();
     let input_path = write_temp_file("decrypt-async-multi-entry-input", &fixture.single_file);
@@ -585,4 +694,21 @@ fn options_with_keys(keys: &[DecryptionKey]) -> DecryptOptions {
 
 fn phases(progress: &[DecryptProgress]) -> Vec<DecryptProgressPhase> {
     progress.iter().map(|snapshot| snapshot.phase).collect()
+}
+
+fn expected_file_fragment_progress_phases() -> Vec<DecryptProgressPhase> {
+    vec![
+        DecryptProgressPhase::OpenInput,
+        DecryptProgressPhase::OpenInput,
+        DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::OpenFragmentsInfo,
+        DecryptProgressPhase::OpenFragmentsInfo,
+        DecryptProgressPhase::InspectStructure,
+        DecryptProgressPhase::ProcessSamples,
+        DecryptProgressPhase::ProcessSamples,
+        DecryptProgressPhase::OpenOutput,
+        DecryptProgressPhase::OpenOutput,
+        DecryptProgressPhase::FinalizeOutput,
+        DecryptProgressPhase::FinalizeOutput,
+    ]
 }

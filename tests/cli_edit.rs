@@ -38,9 +38,6 @@ fn edit_command_updates_tfdt_and_can_drop_boxes() {
     let mut reader = Cursor::new(output.clone());
     let summary = probe(&mut reader).unwrap();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(summary.segments.len(), 1);
@@ -86,9 +83,6 @@ fn edit_command_accepts_double_dash_long_options() {
     let mut reader = Cursor::new(output.clone());
     let summary = probe(&mut reader).unwrap();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(summary.segments.len(), 1);
@@ -125,8 +119,6 @@ fn edit_command_matches_shared_fragmented_fixture_behavior() {
         BoxPath::from([fourcc("mfra")]),
     )
     .unwrap();
-
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -197,9 +189,6 @@ fn edit_command_scopes_tfdt_rewrites_to_matching_paths() {
     )
     .unwrap();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(scoped_tfdt.len(), 1);
@@ -225,9 +214,6 @@ fn edit_command_rejects_path_scoped_type_mismatches() {
     let mut stderr = Vec::new();
     let exit_code = edit::run(&args, &mut stderr);
     let stderr = String::from_utf8(stderr).unwrap();
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 1);
     assert!(
@@ -277,9 +263,6 @@ fn edit_command_rejects_unsupported_path_only_rewrites() {
     let mut stderr = Vec::new();
     let exit_code = edit::run(&args, &mut stderr);
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
@@ -304,9 +287,6 @@ fn edit_command_preserves_bytes_when_scoped_path_matches_nothing() {
     let mut stderr = Vec::new();
     let exit_code = edit::run(&args, &mut stderr);
     let output = fs::read(&output_path).unwrap();
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");

@@ -5,7 +5,7 @@ use mp4forge::FourCc;
 use mp4forge::cli::edit::{EditError, EditOptions, edit_reader};
 use mp4forge::codec::CodecError;
 use mp4forge::extract::{ExtractError, extract_box_with_payload};
-use mp4forge::header::{BoxInfo, HeaderError};
+use mp4forge::header::BoxInfo;
 use mp4forge::walk::{BoxPath, WalkControl, WalkError, walk_structure};
 
 #[test]
@@ -22,11 +22,7 @@ fn walk_structure_rejects_truncated_child_headers() {
     })
     .unwrap_err();
 
-    assert!(matches!(
-        error,
-        WalkError::Header(HeaderError::Io(ref io_error))
-            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
-    ));
+    assert!(matches!(error, WalkError::UnexpectedEof));
 }
 
 #[test]
@@ -45,11 +41,7 @@ fn walk_structure_rejects_huge_declared_supported_payloads_without_preallocating
     })
     .unwrap_err();
 
-    assert!(matches!(
-        error,
-        WalkError::Codec(CodecError::Io(ref io_error))
-            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
-    ));
+    assert!(matches!(error, WalkError::UnexpectedEof));
 }
 
 #[test]
