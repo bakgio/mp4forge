@@ -17055,6 +17055,8 @@ fn path_to_file_uri_string(path: &Path) -> String {
     };
     if normalized.starts_with("//") {
         format!("file:{normalized}")
+    } else if normalized.starts_with('/') {
+        format!("file://{normalized}")
     } else {
         format!("file:///{normalized}")
     }

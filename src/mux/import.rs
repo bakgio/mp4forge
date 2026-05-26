@@ -8269,23 +8269,33 @@ fn resolve_local_data_reference_path(
             message: format!("track {track_id} uses an empty or invalid data-reference location"),
         });
     }
-    let local_path_text = if let Some(rest) = location.strip_prefix("file://") {
-        rest
+    let mut reference_path = if location.starts_with("file:") {
+        if location.contains('%') {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: movie_path.display().to_string(),
+                message: format!("track {track_id} uses an encoded data-reference location"),
+            });
+        }
+        resolve_local_data_reference_file_uri_path(location).ok_or_else(|| {
+            MuxError::UnsupportedTrackImport {
+                spec: movie_path.display().to_string(),
+                message: format!("track {track_id} uses a non-local data-reference location"),
+            }
+        })?
     } else if location.contains("://") {
         return Err(MuxError::UnsupportedTrackImport {
             spec: movie_path.display().to_string(),
             message: format!("track {track_id} uses a non-local data-reference location"),
         });
     } else {
-        location
+        if location.contains('%') {
+            return Err(MuxError::UnsupportedTrackImport {
+                spec: movie_path.display().to_string(),
+                message: format!("track {track_id} uses an encoded data-reference location"),
+            });
+        }
+        PathBuf::from(location)
     };
-    if local_path_text.contains('%') {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: movie_path.display().to_string(),
-            message: format!("track {track_id} uses an encoded data-reference location"),
-        });
-    }
-    let mut reference_path = PathBuf::from(local_path_text);
     if reference_path.as_os_str().is_empty() {
         return Err(MuxError::UnsupportedTrackImport {
             spec: movie_path.display().to_string(),
@@ -8308,6 +8318,92 @@ fn resolve_local_data_reference_path(
             .join(reference_path);
     }
     absolute_path(&reference_path)
+}
+
+fn resolve_local_data_reference_file_uri_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file:")?;
+    if let Some(path) = rest.strip_prefix("///") {
+        return resolve_local_data_reference_absolute_file_uri_path(path);
+    }
+    if let Some(authority_path) = rest.strip_prefix("//") {
+        let (authority, path) = authority_path.split_once('/')?;
+        if authority.eq_ignore_ascii_case("localhost") {
+            return resolve_local_data_reference_absolute_file_uri_path(path);
+        }
+        return resolve_local_data_reference_authority_file_uri_path(authority, path);
+    }
+    if let Some(path) = rest.strip_prefix('/') {
+        return resolve_local_data_reference_single_slash_file_uri_path(path);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn resolve_local_data_reference_single_slash_file_uri_path(path: &str) -> Option<PathBuf> {
+    if path.len() >= 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic() {
+        Some(PathBuf::from(path))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_local_data_reference_single_slash_file_uri_path(path: &str) -> Option<PathBuf> {
+    resolve_local_data_reference_absolute_file_uri_path(path)
+}
+
+#[cfg(windows)]
+fn resolve_local_data_reference_absolute_file_uri_path(path: &str) -> Option<PathBuf> {
+    if path.len() >= 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic() {
+        Some(PathBuf::from(path))
+    } else if path.starts_with('/') {
+        Some(PathBuf::from(format!(
+            r"\\{}",
+            path.trim_start_matches('/').replace('/', "\\")
+        )))
+    } else if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(windows)]
+fn resolve_local_data_reference_authority_file_uri_path(
+    authority: &str,
+    path: &str,
+) -> Option<PathBuf> {
+    if authority.is_empty() || path.is_empty() {
+        None
+    } else if authority.len() == 2
+        && authority.as_bytes()[1] == b':'
+        && authority.as_bytes()[0].is_ascii_alphabetic()
+    {
+        Some(PathBuf::from(format!("{authority}/{path}")))
+    } else {
+        Some(PathBuf::from(format!(
+            r"\\{}\{}",
+            authority,
+            path.replace('/', "\\")
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_local_data_reference_absolute_file_uri_path(path: &str) -> Option<PathBuf> {
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(format!("/{}", path.trim_start_matches('/'))))
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_local_data_reference_authority_file_uri_path(
+    _authority: &str,
+    _path: &str,
+) -> Option<PathBuf> {
+    None
 }
 
 fn sample_entry_data_reference_index(
@@ -8430,6 +8526,139 @@ mod tests {
             .join("fixtures")
             .join("mux")
             .join(name)
+    }
+
+    #[test]
+    fn resolve_local_data_reference_path_keeps_plain_relative_paths_relative_to_movie() {
+        let movie_path = std::env::current_dir().unwrap().join("movie.mp4");
+        let resolved =
+            super::resolve_local_data_reference_path(&movie_path, 1, "sidecar.bin").unwrap();
+
+        assert_eq!(resolved, movie_path.parent().unwrap().join("sidecar.bin"));
+        assert!(
+            super::resolve_local_data_reference_path(&movie_path, 1, "file:sidecar.bin").is_err()
+        );
+        assert!(
+            super::resolve_local_data_reference_path(&movie_path, 1, "https://example.invalid/a")
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_data_reference_path_keeps_unix_file_uri_paths() {
+        let movie_path = PathBuf::from("/tmp/movie.mp4");
+
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file:///tmp/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file:////tmp/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file://localhost/private/var/tmp/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("/private/var/tmp/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file://LOCALHOST/tmp/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file:/tmp/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/media/segment.mdat")
+        );
+        assert!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file://media/assets/segment.mdat"
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_local_data_reference_path_keeps_windows_file_uri_paths() {
+        let movie_path = PathBuf::from("C:/movie.mp4");
+
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file:///C:/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("C:/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file://C:/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("C:/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file://LOCALHOST/C:/media/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from("C:/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(&movie_path, 1, "file:/C:/media/segment.mdat")
+                .unwrap(),
+            PathBuf::from("C:/media/segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file:////media/assets/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from(r"\\media\assets\segment.mdat")
+        );
+        assert_eq!(
+            super::resolve_local_data_reference_path(
+                &movie_path,
+                1,
+                "file://media/assets/segment.mdat"
+            )
+            .unwrap(),
+            PathBuf::from(r"\\media\assets\segment.mdat")
+        );
     }
 
     fn imported_track(

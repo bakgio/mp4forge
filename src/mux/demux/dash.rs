@@ -1208,7 +1208,7 @@ fn resolve_dash_path(
             };
             continue;
         }
-        if base_url.contains("://") {
+        if is_unsupported_dash_url(base_url) {
             return Err(invalid_dash_manifest(
                 manifest_path,
                 "remote MPD URLs are not supported on the current path-only ingest surface; only local paths and file:// URIs are supported",
@@ -1223,7 +1223,7 @@ fn resolve_dash_path(
             joined.join(local_path)
         });
     }
-    if url.contains("://") {
+    if is_unsupported_dash_url(url) {
         return Err(invalid_dash_manifest(
             manifest_path,
             "remote MPD URLs are not supported on the current path-only ingest surface; only local paths and file:// URIs are supported",
@@ -1238,23 +1238,87 @@ fn resolve_dash_path(
 }
 
 fn resolve_dash_local_file_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    if rest.starts_with("//") {
+    let rest = uri.strip_prefix("file:")?;
+    if let Some(path) = rest.strip_prefix("///") {
+        return resolve_dash_local_absolute_file_uri_path(path);
+    }
+    if let Some(authority_path) = rest.strip_prefix("//") {
+        let (authority, path) = authority_path.split_once('/')?;
+        if authority.eq_ignore_ascii_case("localhost") {
+            return resolve_dash_local_absolute_file_uri_path(path);
+        }
+        return resolve_dash_local_authority_file_uri_path(authority, path);
+    }
+    if let Some(path) = rest.strip_prefix('/') {
+        return resolve_dash_local_single_slash_file_uri_path(path);
+    }
+    None
+}
+
+fn is_unsupported_dash_url(value: &str) -> bool {
+    value.starts_with("file:") || value.contains("://")
+}
+
+#[cfg(windows)]
+fn resolve_dash_local_single_slash_file_uri_path(path: &str) -> Option<PathBuf> {
+    if path.len() >= 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic() {
+        Some(PathBuf::from(path))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_dash_local_single_slash_file_uri_path(path: &str) -> Option<PathBuf> {
+    resolve_dash_local_absolute_file_uri_path(path)
+}
+
+#[cfg(windows)]
+fn resolve_dash_local_absolute_file_uri_path(path: &str) -> Option<PathBuf> {
+    if path.len() >= 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic() {
+        Some(PathBuf::from(path))
+    } else if path.starts_with('/') {
         Some(PathBuf::from(format!(
             r"\\{}",
-            rest.trim_start_matches('/').replace('/', "\\")
+            path.trim_start_matches('/').replace('/', "\\")
         )))
-    } else if rest.starts_with('/')
-        && rest.len() >= 3
-        && rest.as_bytes()[2] == b':'
-        && rest.as_bytes()[1].is_ascii_alphabetic()
-    {
-        Some(PathBuf::from(&rest[1..]))
-    } else if rest.is_empty() {
+    } else if path.is_empty() {
         None
     } else {
-        Some(PathBuf::from(rest))
+        Some(PathBuf::from(path))
     }
+}
+
+#[cfg(windows)]
+fn resolve_dash_local_authority_file_uri_path(authority: &str, path: &str) -> Option<PathBuf> {
+    if authority.is_empty() || path.is_empty() {
+        None
+    } else if authority.len() == 2
+        && authority.as_bytes()[1] == b':'
+        && authority.as_bytes()[0].is_ascii_alphabetic()
+    {
+        Some(PathBuf::from(format!("{authority}/{path}")))
+    } else {
+        Some(PathBuf::from(format!(
+            r"\\{}\{}",
+            authority,
+            path.replace('/', "\\")
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_dash_local_absolute_file_uri_path(path: &str) -> Option<PathBuf> {
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(format!("/{}", path.trim_start_matches('/'))))
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_dash_local_authority_file_uri_path(_authority: &str, _path: &str) -> Option<PathBuf> {
+    None
 }
 
 fn poll_next_xml_event(
@@ -1491,5 +1555,67 @@ fn invalid_dash_manifest(path: &Path, message: &str) -> MuxError {
     MuxError::UnsupportedTrackImport {
         spec: path.display().to_string(),
         message: format!("invalid DASH manifest: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_dash_file_uri_paths_keep_unix_absolute_paths() {
+        assert_eq!(
+            resolve_dash_local_file_uri("file:///tmp/media/segment.mp4").unwrap(),
+            PathBuf::from("/tmp/media/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file:////tmp/media/segment.mp4").unwrap(),
+            PathBuf::from("/tmp/media/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file://localhost/tmp/media/segment.mp4").unwrap(),
+            PathBuf::from("/tmp/media/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file://LOCALHOST/private/var/tmp/segment.mp4").unwrap(),
+            PathBuf::from("/private/var/tmp/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file:/tmp/media/segment.mp4").unwrap(),
+            PathBuf::from("/tmp/media/segment.mp4")
+        );
+        assert!(resolve_dash_local_file_uri("file://media/assets/segment.mp4").is_none());
+        assert!(is_unsupported_dash_url("file:relative/segment.mp4"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_dash_file_uri_paths_keep_windows_absolute_paths() {
+        assert_eq!(
+            resolve_dash_local_file_uri("file:///C:/media/segment.mp4").unwrap(),
+            PathBuf::from("C:/media/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file://C:/media/segment.mp4").unwrap(),
+            PathBuf::from("C:/media/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file:////media/assets/segment.mp4").unwrap(),
+            PathBuf::from(r"\\media\assets\segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file://media/assets/segment.mp4").unwrap(),
+            PathBuf::from(r"\\media\assets\segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file://LOCALHOST/C:/media/segment.mp4").unwrap(),
+            PathBuf::from("C:/media/segment.mp4")
+        );
+        assert_eq!(
+            resolve_dash_local_file_uri("file:/C:/media/segment.mp4").unwrap(),
+            PathBuf::from("C:/media/segment.mp4")
+        );
+        assert!(is_unsupported_dash_url("file:relative/segment.mp4"));
     }
 }
