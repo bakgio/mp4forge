@@ -626,14 +626,11 @@ fn aac_profile_esds(
     let total_duration = samples
         .iter()
         .fold(0_u64, |total, sample| total + u64::from(sample.duration));
-    let avg_bitrate = if total_duration == 0 {
-        0
-    } else {
-        total_payload_bytes
-            .saturating_mul(8)
-            .saturating_mul(u64::from(sample_rate))
-            / total_duration
-    };
+    let avg_bitrate = total_payload_bytes
+        .saturating_mul(8)
+        .saturating_mul(u64::from(sample_rate))
+        .checked_div(total_duration)
+        .unwrap_or(0);
     let max_bitrate = total_payload_bits.max(avg_bitrate);
     let mut esds = Esds::default();
     esds.descriptors = vec![

@@ -1447,24 +1447,14 @@ fn parse_ac4_frame_rate_multiply_info(
     frame_rate_index: usize,
 ) -> Result<u8, MuxError> {
     let value = match frame_rate_index {
-        2..=4 => {
-            if reader.read_bool(spec, "b_multiplier")? {
-                if reader.read_bool(spec, "multiplier_bit")? {
-                    2
-                } else {
-                    1
-                }
+        2..=4 if reader.read_bool(spec, "b_multiplier")? => {
+            if reader.read_bool(spec, "multiplier_bit")? {
+                2
             } else {
-                0
-            }
-        }
-        0 | 1 | 7 | 8 | 9 => {
-            if reader.read_bool(spec, "b_multiplier")? {
                 1
-            } else {
-                0
             }
         }
+        0 | 1 | 7 | 8 | 9 if reader.read_bool(spec, "b_multiplier")? => 1,
         _ => 0,
     };
     Ok(value)
@@ -1476,22 +1466,12 @@ fn parse_ac4_frame_rate_fraction_info(
     frame_rate_index: usize,
 ) -> Result<u8, MuxError> {
     let value = match frame_rate_index {
-        5..=9 => {
-            if reader.read_bool(spec, "b_frame_rate_fraction")? {
+        5..=9 if reader.read_bool(spec, "b_frame_rate_fraction")? => 1,
+        10..=12 if reader.read_bool(spec, "b_frame_rate_fraction")? => {
+            if reader.read_bool(spec, "b_frame_rate_fraction_is_4")? {
+                2
+            } else {
                 1
-            } else {
-                0
-            }
-        }
-        10..=12 => {
-            if reader.read_bool(spec, "b_frame_rate_fraction")? {
-                if reader.read_bool(spec, "b_frame_rate_fraction_is_4")? {
-                    2
-                } else {
-                    1
-                }
-            } else {
-                0
             }
         }
         _ => 0,

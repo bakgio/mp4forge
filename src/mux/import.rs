@@ -1399,7 +1399,7 @@ fn prepare_request_sync(
     let mut authority_file_config = None::<MuxFileConfig>;
     let mut selected_mp4_track_carries = SelectedImportedMp4CarryMap::new();
 
-    for (track, path_kind) in request.tracks().iter().zip(path_kinds.into_iter()) {
+    for (track, path_kind) in request.tracks().iter().zip(path_kinds) {
         let spec = display_track_spec(track);
         match track {
             MuxTrackSpec::RawVideo { path, params } => {
@@ -1586,7 +1586,7 @@ async fn prepare_request_async(
     let mut authority_file_config = None::<MuxFileConfig>;
     let mut selected_mp4_track_carries = SelectedImportedMp4CarryMap::new();
 
-    for (track, path_kind) in request.tracks().iter().zip(path_kinds.into_iter()) {
+    for (track, path_kind) in request.tracks().iter().zip(path_kinds) {
         let spec = display_track_spec(track);
         match track {
             MuxTrackSpec::RawVideo { path, params } => {
@@ -3045,10 +3045,8 @@ fn merge_dash_period_tracks(
             ),
         });
     }
-    for (track_index, (merged_track, period_track)) in merged_tracks
-        .iter_mut()
-        .zip(period_tracks.into_iter())
-        .enumerate()
+    for (track_index, (merged_track, period_track)) in
+        merged_tracks.iter_mut().zip(period_tracks).enumerate()
     {
         ensure_dash_period_track_compatible(
             manifest_path,
@@ -13715,10 +13713,7 @@ fn build_preserved_authority_flat_audio_chunk_sample_counts(
             .ok_or(MuxError::LayoutOverflow("authority video drift window"))?;
         let mut current_chunk_sample_count = 0_u32;
 
-        loop {
-            let Some(sample) = imported_track.samples.get(audio_sample_index) else {
-                break;
-            };
+        while let Some(sample) = imported_track.samples.get(audio_sample_index) {
             let dts_delta = audio_decode_time
                 .checked_sub(audio_previous_dts)
                 .ok_or(MuxError::LayoutOverflow("authority audio dts delta"))?;
@@ -18315,11 +18310,7 @@ fn average_bitrate_bits_per_second(
 
 fn average_size(total_payload_size: u64, count: usize) -> Option<u64> {
     let count = u64::try_from(count).ok()?;
-    if count == 0 {
-        None
-    } else {
-        Some(total_payload_size / count)
-    }
+    total_payload_size.checked_div(count)
 }
 
 fn average_non_sync_sample_size(samples: &[DirectIngestSampleReport]) -> Option<u64> {
@@ -18332,11 +18323,7 @@ fn average_non_sync_sample_size(samples: &[DirectIngestSampleReport]) -> Option<
         total = total.saturating_add(u64::from(sample.data_size));
         count = count.saturating_add(1);
     }
-    if count == 0 {
-        None
-    } else {
-        Some(total / count)
-    }
+    total.checked_div(count)
 }
 
 fn sync_sample_distance_summary(
@@ -18360,11 +18347,7 @@ fn sync_sample_distance_summary(
         }
         previous_sync_index = Some(index);
     }
-    let average = if count == 0 {
-        None
-    } else {
-        Some(total / count)
-    };
+    let average = total.checked_div(count);
     (minimum, maximum, average)
 }
 
@@ -18382,11 +18365,7 @@ fn sync_sample_size_summary(
         total = total.saturating_add(u64::from(size));
         count = count.saturating_add(1);
     }
-    let average = if count == 0 {
-        None
-    } else {
-        Some(total / count)
-    };
+    let average = total.checked_div(count);
     (minimum, maximum, average)
 }
 
@@ -18411,11 +18390,7 @@ fn sync_sample_decode_delta_summary(
         }
         previous_sync_decode_time = Some(sample.decode_time);
     }
-    let average = if count == 0 {
-        None
-    } else {
-        Some(total / count)
-    };
+    let average = total.checked_div(count);
     (minimum, maximum, average)
 }
 
@@ -19413,11 +19388,7 @@ fn direct_ingest_packet_report_sync(
             total = total.saturating_add(u64::from(packet.data_size));
             count = count.saturating_add(1);
         }
-        if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        }
+        total.checked_div(count)
     };
     let (minimum_sync_packet_size, maximum_sync_packet_size, average_sync_packet_size) = {
         let sync_sizes = packets
@@ -19431,11 +19402,7 @@ fn direct_ingest_packet_report_sync(
             total = total.saturating_add(u64::from(size));
             count = count.saturating_add(1);
         }
-        let average = if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        };
+        let average = total.checked_div(count);
         (minimum, maximum, average)
     };
     let (minimum_packet_duration, maximum_packet_duration) =
@@ -19505,11 +19472,7 @@ fn direct_ingest_packet_report_sync(
             }
             previous_sync_decode_time = Some(packet.decode_time);
         }
-        let average = if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        };
+        let average = total.checked_div(count);
         (minimum, maximum, average)
     };
     let average_sync_packet_distance = {
@@ -19528,11 +19491,7 @@ fn direct_ingest_packet_report_sync(
             }
             previous_sync_index = Some(index);
         }
-        if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        }
+        total.checked_div(count)
     };
     let (
         first_sync_packet_track_id,
@@ -19682,11 +19641,7 @@ async fn direct_ingest_packet_report_async(
             total = total.saturating_add(u64::from(packet.data_size));
             count = count.saturating_add(1);
         }
-        if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        }
+        total.checked_div(count)
     };
     let (minimum_sync_packet_size, maximum_sync_packet_size, average_sync_packet_size) = {
         let sync_sizes = packets
@@ -19700,11 +19655,7 @@ async fn direct_ingest_packet_report_async(
             total = total.saturating_add(u64::from(size));
             count = count.saturating_add(1);
         }
-        let average = if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        };
+        let average = total.checked_div(count);
         (minimum, maximum, average)
     };
     let (minimum_packet_duration, maximum_packet_duration) =
@@ -19774,11 +19725,7 @@ async fn direct_ingest_packet_report_async(
             }
             previous_sync_decode_time = Some(packet.decode_time);
         }
-        let average = if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        };
+        let average = total.checked_div(count);
         (minimum, maximum, average)
     };
     let average_sync_packet_distance = {
@@ -19797,11 +19744,7 @@ async fn direct_ingest_packet_report_async(
             }
             previous_sync_index = Some(index);
         }
-        if count == 0 {
-            None
-        } else {
-            Some(total / count)
-        }
+        total.checked_div(count)
     };
     let (
         first_sync_packet_track_id,

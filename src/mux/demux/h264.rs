@@ -770,7 +770,7 @@ fn finalize_h264_staged_track(
         for (sample, composition_time_offset) in state
             .samples
             .iter_mut()
-            .zip(sample_timing.composition_offsets.into_iter())
+            .zip(sample_timing.composition_offsets)
         {
             sample.composition_time_offset = composition_time_offset;
         }

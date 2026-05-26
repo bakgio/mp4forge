@@ -517,21 +517,17 @@ fn validate_y4m_dimensions(
     layout: UncvPixelLayout,
 ) -> Result<(), MuxError> {
     match layout {
-        UncvPixelLayout::Yuv420p8 => {
-            if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-                return Err(invalid_y4m(
-                    spec,
-                    "Y4M 4:2:0 carriage requires even width and even height",
-                ));
-            }
+        UncvPixelLayout::Yuv420p8 if !width.is_multiple_of(2) || !height.is_multiple_of(2) => {
+            return Err(invalid_y4m(
+                spec,
+                "Y4M 4:2:0 carriage requires even width and even height",
+            ));
         }
-        UncvPixelLayout::Yuv422p8 => {
-            if !width.is_multiple_of(2) {
-                return Err(invalid_y4m(
-                    spec,
-                    "Y4M 4:2:2 carriage requires an even width",
-                ));
-            }
+        UncvPixelLayout::Yuv422p8 if !width.is_multiple_of(2) => {
+            return Err(invalid_y4m(
+                spec,
+                "Y4M 4:2:2 carriage requires an even width",
+            ));
         }
         _ => {}
     }

@@ -1750,7 +1750,7 @@ fn append_common_encryption_sample_edits(
         context.resolved_samples,
     )?;
     let mut sample_cursor = 0usize;
-    for (trun, auxiliary_info_span) in context.truns.iter().zip(auxiliary_info_spans.into_iter()) {
+    for (trun, auxiliary_info_span) in context.truns.iter().zip(auxiliary_info_spans) {
         let run_sample_count =
             usize::try_from(trun.sample_count).map_err(|_| DecryptRewriteError::InvalidLayout {
                 reason: "fragment run sample count does not fit in usize".to_owned(),
@@ -12207,7 +12207,7 @@ fn compute_ctr_counter_block(iv: &[u8; 16], stream_offset: u64) -> Block<Aes128>
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[path = "../../../tests/support/mod.rs"]
+    #[path = "test_support.rs"]
     mod test_support;
 
     use crate::boxes::iso14496_12::StscEntry;

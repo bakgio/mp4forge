@@ -1708,7 +1708,7 @@ fn build_native_avi_mp4v_candidate_samples(
     let mut logical_chunk_offset = 0_u64;
     let mut samples = Vec::with_capacity(parsed_samples.len());
     let mut sample_sizes = Vec::with_capacity(parsed_samples.len());
-    for (chunk, sample) in chunks.iter().zip(parsed_samples.into_iter()) {
+    for (chunk, sample) in chunks.iter().zip(parsed_samples) {
         let sample_start = sample
             .data_offset
             .checked_sub(logical_chunk_offset)

@@ -971,31 +971,29 @@ fn parse_transport_av1_video_descriptor(
         }
         let descriptor_payload = &es_info[descriptor_offset + 2..descriptor_end];
         match descriptor_tag {
-            PMT_DESCRIPTOR_REGISTRATION => {
-                if descriptor_payload == REGISTRATION_AV01 {
-                    if saw_registration {
-                        return Err(MuxError::UnsupportedTrackImport {
-                            spec: spec.to_string(),
-                            message:
-                                "multiple transport-stream AV1 registration descriptors are not supported on the native direct-ingest path yet"
-                                    .to_string(),
-                        });
-                    }
-                    saw_registration = true;
+            PMT_DESCRIPTOR_REGISTRATION if descriptor_payload == REGISTRATION_AV01 => {
+                if saw_registration {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: spec.to_string(),
+                        message:
+                            "multiple transport-stream AV1 registration descriptors are not supported on the native direct-ingest path yet"
+                                .to_string(),
+                    });
                 }
+                saw_registration = true;
             }
-            PMT_DESCRIPTOR_PRIVATE_DATA_SPECIFIER => {
-                if descriptor_payload == PRIVATE_DATA_SPECIFIER_AOMS {
-                    if saw_private_data_specifier {
-                        return Err(MuxError::UnsupportedTrackImport {
-                            spec: spec.to_string(),
-                            message:
-                                "multiple transport-stream AV1 private-data specifier descriptors are not supported on the native direct-ingest path yet"
-                                    .to_string(),
-                        });
-                    }
-                    saw_private_data_specifier = true;
+            PMT_DESCRIPTOR_PRIVATE_DATA_SPECIFIER
+                if descriptor_payload == PRIVATE_DATA_SPECIFIER_AOMS =>
+            {
+                if saw_private_data_specifier {
+                    return Err(MuxError::UnsupportedTrackImport {
+                        spec: spec.to_string(),
+                        message:
+                            "multiple transport-stream AV1 private-data specifier descriptors are not supported on the native direct-ingest path yet"
+                                .to_string(),
+                    });
                 }
+                saw_private_data_specifier = true;
             }
             PMT_DESCRIPTOR_AV1_VIDEO => {
                 if descriptor_length != 4 {
