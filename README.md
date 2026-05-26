@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">mp4forge</h1>
   <p align="center">
-    Rust library and CLI for inspecting, extracting, probing, and rewriting MP4 box structures.
+    Rust library and CLI for inspecting, extracting, probing, muxing, and rewriting MP4 structures.
   </p>
   <p align="center">
     <a href="https://crates.io/crates/mp4forge"><img src="https://img.shields.io/crates/v/mp4forge.svg" alt="Crates.io"></a>
@@ -28,15 +28,15 @@
 
 ```toml
 [dependencies]
-mp4forge = "0.7.0"
+mp4forge = "0.8.0"
 
 # With optional features:
-# mp4forge = { version = "0.7.0", features = ["async"] }
-# mp4forge = { version = "0.7.0", features = ["decrypt"] }
-# mp4forge = { version = "0.7.0", features = ["decrypt", "async"] }
-# mp4forge = { version = "0.7.0", features = ["mux"] }
-# mp4forge = { version = "0.7.0", features = ["mux", "async"] }
-# mp4forge = { version = "0.7.0", features = ["serde"] }
+# mp4forge = { version = "0.8.0", features = ["async"] }
+# mp4forge = { version = "0.8.0", features = ["decrypt"] }
+# mp4forge = { version = "0.8.0", features = ["decrypt", "async"] }
+# mp4forge = { version = "0.8.0", features = ["mux"] }
+# mp4forge = { version = "0.8.0", features = ["mux", "async"] }
+# mp4forge = { version = "0.8.0", features = ["serde"] }
 ```
 
 Install the CLI from crates.io:

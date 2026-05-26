@@ -1,3 +1,39 @@
+# 0.8.0 (May 26, 2026)
+
+- Added the feature-gated mux release surface, including `MuxRequest`, path-first
+  `MuxTrackSpec` parsing with selector suffixes, flat and fragmented output layout selection,
+  segment or fragment duration modes, sync `mux_to_path`, `mux_into_path`, and
+  `mux_fragmented_to_paths` helpers, Tokio async companions behind `mux` plus `async`, and the
+  sync-only `mux` CLI route
+- Added real MP4 mux writing for both flat and fragmented layouts on one shared mux event graph,
+  with deterministic payload planning, chunk interleaving, duration-based chunking, sync-aligned
+  fragment or segment boundaries, split init/media fragmented outputs, destination update or
+  create-new behavior, preserved flat destination metadata where supported, and explicit
+  validation for unsupported duration-mode or fragmented multi-video requests
+- Added broad mux import coverage for MP4 track import with retained sample-entry bytes, selected
+  AVI, MPEG-PS, MPEG-TS, DASH, NHML, NHNT, SAF, and VobSub-style inputs, plus demux-backed
+  elementary or containerized audio, video, text, subtitle, image, raw-video, and PCM families
+  across the public path-first request shape
+- Added `mp4forge::mux::inspect`, `mp4forge::mux::sample_reader`, and
+  `mp4forge::mux::rewrite` helpers for direct-ingest reporting, packet-focused exports,
+  one-sample-at-a-time seekable or progressive reading, and elementary sample rewrite/export
+  flows for AVC, HEVC, VVC, AV1, AAC ADTS, and MHAS data
+- Expanded typed box and sample-entry coverage needed by the mux, probe, divide, and rewrite
+  paths, including additional DTS, Dolby, IAMF, FLAC, MPEG-H, PCM, uncompressed-visual,
+  codec-configuration, timing, and metadata structures
+- Broadened `divide` and probe behavior for more video and audio sample-entry families while
+  keeping the existing validation-first workflow for unsupported fragmented output shapes
+- Reworked file-backed decrypt rewrite execution to use streaming root rewrite plans for the
+  supported sync and async surfaces, refreshed affected top-level `sidx` data after clear-output
+  rewrites, and kept progress-enabled decrypt surfaces byte-aligned with their non-progress
+  companions
+- Added mux-focused examples, expanded retained fixture coverage, moved test output helpers onto
+  auto-cleaned temporary paths, and added fuzz targets for mux demuxing, sample rewrites, async
+  API parity, decrypt byte-surface parity, extra box roundtrips, bit I/O boundaries, and `sidx`
+  plan application
+- Removed the deprecated `dump` command `-mdat` and `-free` shorthand options; use
+  `-full mdat` or `-full free,skip` explicitly instead
+
 # 0.7.0 (April 28, 2026)
 
 - Added the feature-gated decryption release surface across sync library helpers, Tokio async
