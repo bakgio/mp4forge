@@ -91,7 +91,7 @@ where
     writeln!(writer)?;
     writeln!(
         writer,
-        "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. `--init_out PATH --media_out PATH` writes a fragmented job as separate outputs. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH` or separate fragmented outputs. Path-only MP4 inputs import all supported tracks unless you add one selector suffix."
+        "Flat mux jobs may carry multiple video tracks as separate tracks plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. `--init_out PATH --media_out PATH` writes a fragmented job as separate outputs. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and supports at most one video track per mux output. Path-only MP4 inputs import all supported tracks unless you add one selector suffix."
     )
 }
 
@@ -474,7 +474,7 @@ fn validate_mux_cli_request_shape(
             )
         })
         .count();
-    if video_count > 1 {
+    if matches!(request.output_layout(), MuxOutputLayout::Fragmented) && video_count > 1 {
         return Err(MuxError::MultipleVideoTracks { count: video_count }.into());
     }
 

@@ -55,9 +55,6 @@ fn decrypt_command_writes_clear_output_via_dispatch() {
         .map(|track| (track.summary.track_id, track))
         .collect::<BTreeMap<_, _>>();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -97,10 +94,6 @@ fn decrypt_command_supports_fragments_info_files() {
     )
     .unwrap();
 
-    let _ = fs::remove_file(&init_path);
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(mdat_payloads.len(), 1);
@@ -131,9 +124,6 @@ fn decrypt_command_writes_stable_progress_lines() {
 
     let mut stderr = Vec::new();
     let exit_code = decrypt::run(&args, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(
@@ -173,10 +163,6 @@ fn decrypt_command_writes_stable_progress_lines_for_media_segments() {
 
     let mut stderr = Vec::new();
     let exit_code = decrypt::run(&args, &mut stderr);
-
-    let _ = fs::remove_file(&init_path);
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(
@@ -349,8 +335,6 @@ fn assert_retained_file_fixture_cli_decrypts(
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let output = fs::read(&output_path).unwrap();
 
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -383,8 +367,6 @@ fn assert_retained_fragmented_fixture_cli_decrypts(
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let output = fs::read(&output_path).unwrap();
 
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -410,9 +392,6 @@ fn assert_generated_topology_fixture_cli_decrypts(
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let output = fs::read(&output_path).unwrap();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-
     assert_eq!(exit_code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -437,9 +416,6 @@ fn assert_generated_topology_fixture_cli_rejects_first_sample_description_limit(
     let mut stderr = Vec::new();
     let exit_code = cli::dispatch(&args, &mut stdout, &mut stderr);
     let stderr_text = String::from_utf8(stderr).unwrap();
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
 
     assert_eq!(exit_code, 1, "stderr={stderr_text}");
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
@@ -625,8 +601,6 @@ fn decrypt_command_supports_multi_sample_entry_fragmented_tracks() {
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
 
     let output = fs::read(&output_path).unwrap();
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
     assert_eq!(output, fixture.decrypted_single_file);
 }
 
@@ -654,8 +628,6 @@ fn decrypt_command_supports_zero_kid_multi_sample_entry_fragmented_tracks() {
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
 
     let output = fs::read(&output_path).unwrap();
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
     assert_eq!(output, fixture.decrypted_single_file);
 }
 

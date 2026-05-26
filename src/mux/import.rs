@@ -236,8 +236,10 @@ fn mux_to_path_inner(request: &MuxRequest, output_path: &Path) -> Result<(), Mux
         .iter()
         .map(SyncMuxSource::open)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut writer = File::create(output_path)
-        .map_err(|error| mux_io_at_path("create mux output", output_path, error))?;
+    let mut writer = std::io::BufWriter::new(
+        File::create(output_path)
+            .map_err(|error| mux_io_at_path("create mux output", output_path, error))?,
+    );
     match prepared.output_layout {
         MuxOutputLayout::Flat => write_mp4_mux(
             &mut sources,
@@ -276,10 +278,14 @@ fn mux_fragmented_to_paths_inner(
     let init_temp_path = create_update_temp_path(init_path, MuxDestinationMode::CreateNew)?;
     let media_temp_path = create_update_temp_path(media_path, MuxDestinationMode::CreateNew)?;
     let write_result = (|| {
-        let mut init_writer = File::create(&init_temp_path)
-            .map_err(|error| mux_io_at_path("create mux init output", &init_temp_path, error))?;
-        let mut media_writer = File::create(&media_temp_path)
-            .map_err(|error| mux_io_at_path("create mux media output", &media_temp_path, error))?;
+        let mut init_writer =
+            std::io::BufWriter::new(File::create(&init_temp_path).map_err(|error| {
+                mux_io_at_path("create mux init output", &init_temp_path, error)
+            })?);
+        let mut media_writer =
+            std::io::BufWriter::new(File::create(&media_temp_path).map_err(|error| {
+                mux_io_at_path("create mux media output", &media_temp_path, error)
+            })?);
         write_fragmented_mp4_mux_split(
             &mut sources,
             &mut init_writer,
@@ -1172,6 +1178,7 @@ enum ImportedDataReference {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlatChunkingMode {
     Auto,
+    AutoWithoutTerminalVideoSplit,
     OneSamplePerChunk,
 }
 
@@ -1281,6 +1288,16 @@ impl ImportedTrackMuxPolicy {
 
     pub(crate) const fn with_strip_single_sample_dts_btrt(mut self, enabled: bool) -> Self {
         self.strip_single_sample_dts_btrt = enabled;
+        self
+    }
+
+    pub(in crate::mux) const fn without_terminal_flat_video_chunk_split(mut self) -> Self {
+        self.flat_chunking_mode = FlatChunkingMode::AutoWithoutTerminalVideoSplit;
+        self
+    }
+
+    const fn with_terminal_flat_video_chunk_split(mut self) -> Self {
+        self.flat_chunking_mode = FlatChunkingMode::Auto;
         self
     }
 }
@@ -1749,7 +1766,7 @@ fn finish_prepared_request(
         .iter()
         .filter(|track| track.kind == MuxTrackKind::Video)
         .count();
-    if video_count > 1 {
+    if request.output_layout() == MuxOutputLayout::Fragmented && video_count > 1 {
         return Err(MuxError::MultipleVideoTracks { count: video_count });
     }
 
@@ -2366,8 +2383,10 @@ fn finish_prepared_request(
                         auto_flat_interleave_target_ticks(imported_track.timescale),
                     )?
                 };
-                if sample_entry_box_type(&imported_track.sample_entry_box)
-                    != Some(FourCc::from_bytes(*b"vp08"))
+                if imported_track.mux_policy.flat_chunking_mode
+                    != FlatChunkingMode::AutoWithoutTerminalVideoSplit
+                    && sample_entry_box_type(&imported_track.sample_entry_box)
+                        != Some(FourCc::from_bytes(*b"vp08"))
                 {
                     split_terminal_short_video_chunk_sample_counts(
                         &sample_durations,
@@ -2672,12 +2691,15 @@ fn finish_prepared_request(
         track_configs.push(config);
     }
 
-    let interleave_policy = if request.preserve_flat_authority_layout()
+    let use_chunk_ordinal_interleave = (request.preserve_flat_authority_layout()
         && request.output_layout() == MuxOutputLayout::Flat
         && video_count == 1
         && audio_track_count == 1
-        && preserved_authority_video_alignment.is_some()
-    {
+        && preserved_authority_video_alignment.is_some())
+        || (request.output_layout() == MuxOutputLayout::Flat
+            && auto_flat_interleave_target.is_some()
+            && video_count > 1);
+    let interleave_policy = if use_chunk_ordinal_interleave {
         MuxInterleavePolicy::ChunkOrdinalThenSource
     } else {
         MuxInterleavePolicy::DecodeTime
@@ -3334,6 +3356,9 @@ fn flat_destination_append_mode(
     destination: &ImportedTrack,
     incoming: &ImportedTrack,
 ) -> Option<FlatDestinationAppendMode> {
+    if incoming.kind.is_video() {
+        return None;
+    }
     if !(destination.kind == incoming.kind
         && destination.timescale == incoming.timescale
         && destination.language == incoming.language
@@ -5178,15 +5203,28 @@ fn select_mp4_track(
     }
     .ok_or_else(|| MuxError::MissingTrackSelection { spec: spec.clone() })?;
 
+    let is_selected_container_mpeg_video =
+        preserve_track_id && sample_entry_is_mpeg_video(&selected.sample_entry_box);
+    let mux_policy = if is_selected_container_mpeg_video {
+        selected.mux_policy.with_terminal_flat_video_chunk_split()
+    } else {
+        selected.mux_policy
+    };
+    let sample_entry_box = if preserve_track_id {
+        normalize_selected_container_sample_entry_box(&selected.sample_entry_box)?
+    } else {
+        selected.sample_entry_box.clone()
+    };
+
     Ok(ImportedTrack {
         kind: selected.kind,
         timescale: selected.timescale,
         language: selected.language,
         handler_name: selected.handler_name.clone(),
-        mux_policy: selected.mux_policy,
+        mux_policy,
         width: selected.width,
         height: selected.height,
-        sample_entry_box: selected.sample_entry_box.clone(),
+        sample_entry_box,
         source_edit_media_time: selected.source_edit_media_time,
         sample_roll_distance: selected.mux_policy.sample_roll_distance(),
         samples: selected
@@ -5203,6 +5241,44 @@ fn select_mp4_track(
             .collect(),
     }
     .with_source_index_from_candidate(selected, preserve_track_id))
+}
+
+fn normalize_selected_container_sample_entry_box(
+    sample_entry_box: &[u8],
+) -> Result<Vec<u8>, MuxError> {
+    if !sample_entry_is_mpeg_video(sample_entry_box) {
+        return Ok(sample_entry_box.to_vec());
+    }
+
+    let child_boxes = super::mp4::visual_sample_entry_immediate_children(sample_entry_box)?;
+    let mut retained_children = Vec::with_capacity(child_boxes.len());
+    let mut stripped_square_pasp = false;
+    for child_box in child_boxes {
+        if sample_entry_box_type(&child_box) == Some(FourCc::from_bytes(*b"pasp")) {
+            let pasp = super::mp4::decode_typed_box::<Pasp>(&child_box)?;
+            if pasp.h_spacing == 1 && pasp.v_spacing == 1 {
+                stripped_square_pasp = true;
+                continue;
+            }
+        }
+        retained_children.push(child_box);
+    }
+
+    if stripped_square_pasp {
+        super::mp4::replace_visual_sample_entry_immediate_children(
+            sample_entry_box,
+            &retained_children,
+        )
+    } else {
+        Ok(sample_entry_box.to_vec())
+    }
+}
+
+fn sample_entry_is_mpeg_video(sample_entry_box: &[u8]) -> bool {
+    sample_entry_box_type(sample_entry_box) == Some(FourCc::from_bytes(*b"mp4v"))
+        && [0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x6A]
+            .iter()
+            .any(|object_type| sample_entry_carries_oti(sample_entry_box, *object_type))
 }
 
 fn select_container_tracks(
@@ -17501,7 +17577,7 @@ fn validate_request_shape(request: &MuxRequest, output_path: &Path) -> Result<()
             )
         })
         .count();
-    if video_count > 1 {
+    if matches!(request.output_layout(), MuxOutputLayout::Fragmented) && video_count > 1 {
         return Err(MuxError::MultipleVideoTracks { count: video_count });
     }
 

@@ -80,7 +80,7 @@ fn mux_command_validates_argument_shape() {
             "  --media_out <PATH>           Write fragmented index and media fragments to PATH\n",
             "  -warnings                    Emit warning-grade diagnostics to stderr after a successful run\n",
             "\n",
-            "The current mux command supports at most one video track plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. `--init_out PATH --media_out PATH` writes a fragmented job as separate outputs. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and should be paired with `--out PATH` or separate fragmented outputs. Path-only MP4 inputs import all supported tracks unless you add one selector suffix.\n",
+            "Flat mux jobs may carry multiple video tracks as separate tracks plus one or more audio and text/subtitle tracks. One positional DEST path follows the update-or-create destination flow: if DEST is an existing MP4, its current tracks are preserved and the requested tracks are imported into it; otherwise DEST is treated as the newly created output file. `--out PATH` is the explicit force-new path. `--init_out PATH --media_out PATH` writes a fragmented job as separate outputs. Flat output rejects duration modes. Fragmented output currently requires exactly one duration mode and supports at most one video track per mux output. Path-only MP4 inputs import all supported tracks unless you add one selector suffix.\n",
         )
     );
 }
@@ -2111,13 +2111,18 @@ fn mux_command_rejects_fragmented_layout_without_duration() {
 }
 
 #[test]
-fn mux_command_rejects_multiple_video_tracks() {
+fn mux_command_rejects_fragmented_multiple_video_tracks() {
     let output = write_temp_file("mux-cli-multi-video-output", &[]);
     let args = vec![
         "--track".to_string(),
         "first.mp4#video".to_string(),
         "--track".to_string(),
         "second.mp4#video".to_string(),
+        "--layout".to_string(),
+        "fragmented".to_string(),
+        "--fragment_duration".to_string(),
+        "1.0".to_string(),
+        "--out".to_string(),
         output.to_string_lossy().into_owned(),
     ];
 
@@ -2127,7 +2132,7 @@ fn mux_command_rejects_multiple_video_tracks() {
     assert_eq!(exit_code, 1);
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
-        "Error [stage=request category=input]: the current mux surface supports at most one video track per job, but 2 were requested\n"
+        "Error [stage=request category=input]: fragmented output supports at most one video track per mux output, but 2 were requested\n"
     );
 }
 

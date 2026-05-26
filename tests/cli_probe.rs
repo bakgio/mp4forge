@@ -615,8 +615,6 @@ fn probe_command_reads_a_file_and_honors_the_yaml_flag() {
     let mut stderr = Vec::new();
     let exit_code = probe::run(&args, &mut stdout, &mut stderr);
 
-    let _ = fs::remove_file(&path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(

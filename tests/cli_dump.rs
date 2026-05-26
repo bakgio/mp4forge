@@ -282,8 +282,6 @@ fn dump_command_renders_supported_and_unsupported_boxes() {
     let mut stderr = Vec::new();
     let exit_code = dump::run(&args, &mut stdout, &mut stderr);
 
-    let _ = fs::remove_file(&path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(
@@ -540,8 +538,6 @@ fn dump_command_scopes_text_output_to_selected_subtrees() {
     let mut stderr = Vec::new();
     let exit_code = dump::run(&args, &mut stdout, &mut stderr);
 
-    let _ = fs::remove_file(&path);
-
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert_eq!(
@@ -567,8 +563,6 @@ fn dump_command_scopes_structured_output_to_selected_subtrees() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit_code = dump::run(&args, &mut stdout, &mut stderr);
-
-    let _ = fs::remove_file(&path);
 
     assert_eq!(exit_code, 0);
     assert_eq!(String::from_utf8(stderr).unwrap(), "");

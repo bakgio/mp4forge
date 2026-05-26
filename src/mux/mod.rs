@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -2309,7 +2309,7 @@ impl MuxTrackConfig {
 pub enum MuxError {
     /// One public mux track spec did not match the fixed supported grammar.
     InvalidTrackSpec { spec: String, message: String },
-    /// The current mux request selected more than one video track.
+    /// The current fragmented mux request selected more than one video track for one output.
     MultipleVideoTracks { count: usize },
     /// The current mux request did not carry any tracks.
     MissingTrackSpecs,
@@ -2406,7 +2406,7 @@ impl fmt::Display for MuxError {
             }
             Self::MultipleVideoTracks { count } => write!(
                 f,
-                "the current mux surface supports at most one video track per job, but {count} were requested"
+                "fragmented output supports at most one video track per mux output, but {count} were requested"
             ),
             Self::MissingTrackSpecs => {
                 write!(
@@ -2853,7 +2853,7 @@ where
         .iter()
         .map(File::open)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut writer = File::create(output_path)?;
+    let mut writer = BufWriter::new(File::create(output_path)?);
     write_fragmented_mp4_mux(
         &mut sources,
         &mut writer,
@@ -2893,6 +2893,33 @@ where
     )
 }
 
+/// Writes fragmented initialization bytes and standalone media-segment bytes to separate writers.
+///
+/// The media writer receives concatenated standalone media-segment units. Each unit starts with a
+/// segment type box, then a local segment index, then the media fragment bytes.
+pub fn write_fragmented_mp4_mux_segmented<R, I, M>(
+    sources: &mut [R],
+    init_writer: &mut I,
+    media_writer: &mut M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: Read + Seek,
+    I: Write,
+    M: Write,
+{
+    mp4::write_fragmented_mp4_mux_segmented(
+        sources,
+        init_writer,
+        media_writer,
+        file_config,
+        track_configs,
+        plan,
+    )
+}
+
 /// Opens staged source files and writes fragmented init/media outputs to separate paths.
 pub fn write_fragmented_mp4_mux_split_to_paths<P, I, M>(
     source_paths: &[P],
@@ -2912,8 +2939,8 @@ where
         .iter()
         .map(File::open)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut init_writer = File::create(init_path)?;
-    let mut media_writer = File::create(media_path)?;
+    let mut init_writer = BufWriter::new(File::create(init_path)?);
+    let mut media_writer = BufWriter::new(File::create(media_path)?);
     write_fragmented_mp4_mux_split(
         &mut sources,
         &mut init_writer,
@@ -3074,6 +3101,34 @@ where
     .await
 }
 
+/// Writes fragmented initialization bytes and standalone media-segment bytes to separate async
+/// writers.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
+pub async fn write_fragmented_mp4_mux_segmented_async<R, I, M>(
+    sources: &mut [R],
+    init_writer: &mut I,
+    media_writer: &mut M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+    I: AsyncWrite + Unpin,
+    M: AsyncWrite + Unpin,
+{
+    mp4::write_fragmented_mp4_mux_segmented_async(
+        sources,
+        init_writer,
+        media_writer,
+        file_config,
+        track_configs,
+        plan,
+    )
+    .await
+}
+
 /// Writes one fragmented MP4 asynchronously and flushes after the top-level index and each media
 /// fragment.
 #[cfg(feature = "async")]
@@ -3195,7 +3250,7 @@ where
         .iter()
         .map(File::open)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut writer = File::create(output_path)?;
+    let mut writer = BufWriter::new(File::create(output_path)?);
     copy_planned_payloads(&mut sources, &mut writer, plan)
 }
 

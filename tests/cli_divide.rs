@@ -58,9 +58,6 @@ fn divide_command_writes_playlists_and_segments() {
     let segment0 = fs::read(output_dir.join("video").join("0.mp4")).unwrap();
     let segment1 = fs::read(output_dir.join("video").join("1.mp4")).unwrap();
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
-
     assert_eq!(
         master_playlist,
         concat!(
@@ -113,9 +110,6 @@ fn divide_command_writes_hls_only_when_requested() {
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
     assert!(output_dir.join("playlist.m3u8").is_file());
     assert!(!output_dir.join("manifest.mpd").exists());
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -164,9 +158,6 @@ fn divide_command_writes_hls_with_base_url_event_type_and_start_offset() {
         )
     );
     assert!(!output_dir.join("manifest.mpd").exists());
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -192,9 +183,6 @@ fn divide_command_writes_hls_program_date_time_when_requested() {
     assert!(lines[5].starts_with("#EXT-X-PROGRAM-DATE-TIME:"));
     assert_eq!(lines[6], "#EXTINF:1.000000,");
     assert!(lines[5].ends_with('Z'));
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -235,9 +223,6 @@ fn divide_command_writes_manifest_name_overrides() {
     );
     let manifest = read_text(&output_dir.join("stream.mpd"));
     assert!(manifest.contains("initialization=\"video/init.mp4\""));
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -269,9 +254,6 @@ fn divide_command_writes_dynamic_dash_only_manifest_when_requested() {
     assert!(!manifest.contains("suggestedPresentationDelay="));
     assert!(!manifest.contains("mediaPresentationDuration="));
     assert!(!output_dir.join("playlist.m3u8").exists());
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -314,9 +296,6 @@ fn divide_command_writes_dynamic_dash_manifest_with_defaults_and_repeated_base_u
     assert!(!manifest.contains("timeShiftBufferDepth="));
     assert!(!manifest.contains("availabilityStartTime=\"1970-01-01T00:00:00Z\""));
     assert!(!manifest.contains("publishTime=\"1970-01-01T00:00:00Z\""));
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -399,10 +378,6 @@ fn divide_command_saves_and_reloads_dash_session_state() {
             .join("playlist.m3u8")
             .exists()
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&first_output_dir);
-    let _ = fs::remove_dir_all(&second_output_dir);
 }
 
 #[test]
@@ -467,10 +442,6 @@ fn divide_command_session_reload_still_allows_manifest_override_with_continuity(
     assert!(video_playlist.contains("\n2.mp4\n"));
     assert!(video_playlist.contains("\n3.mp4\n"));
     assert!(second_output_dir.join("playlist.m3u8").is_file());
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&first_output_dir);
-    let _ = fs::remove_dir_all(&second_output_dir);
 }
 
 #[test]
@@ -497,9 +468,6 @@ fn divide_command_writes_dash_segment_list_when_requested() {
     assert!(manifest.contains("<SegmentURL media=\"video/0.mp4\" />"));
     assert!(!manifest.contains("<SegmentTemplate"));
     assert!(!output_dir.join("playlist.m3u8").exists());
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -563,9 +531,6 @@ fn divide_command_rejects_removed_dash_override_options() {
         String::from_utf8(stderr).unwrap(),
         "Error [stage=request category=input]: divide option `-dash-minimum-update-period` was removed; mp4forge now uses built-in DASH minimumUpdatePeriod defaults\n"
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -590,9 +555,6 @@ fn divide_command_rejects_dash_only_options_when_manifest_selection_is_hls() {
         String::from_utf8(stderr).unwrap(),
         "Error [stage=request category=input]: divide manifest selection `hls` does not support `-dash-mode`; use `-manifest dash` or `-manifest both`\n"
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -617,9 +579,6 @@ fn divide_command_rejects_hls_only_options_when_manifest_selection_is_dash() {
         String::from_utf8(stderr).unwrap(),
         "Error [stage=request category=input]: divide manifest selection `dash` does not support `-hls-base-url`; use `-manifest hls` or `-manifest both`\n"
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -644,9 +603,6 @@ fn divide_command_rejects_dynamic_only_dash_options_in_static_mode() {
         String::from_utf8(stderr).unwrap(),
         "Error [stage=request category=input]: divide DASH profile `live` requires `-dash-mode dynamic`\n"
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -670,9 +626,6 @@ fn divide_command_rejects_session_state_options_in_validate_mode() {
         String::from_utf8(stderr).unwrap(),
         "Error [stage=request category=input]: divide validation mode does not support `-dash-session-save`\n"
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&session_dir);
 }
 
 #[test]
@@ -703,9 +656,6 @@ fn divide_command_rejects_reusing_the_same_session_state_path() {
             session_path.display()
         )
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -740,9 +690,6 @@ fn divide_command_derives_master_playlist_signaling_from_probe_metadata() {
     assert!(manifest.contains("audioSamplingRate=\"48000\""));
     assert!(manifest.contains("initialization=\"video/init.mp4\""));
     assert!(manifest.contains("initialization=\"audio/init.mp4\""));
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -803,9 +750,6 @@ fn divide_command_writes_multi_audio_group_outputs() {
     assert!(manifest.contains("codecs=\"ac-3\""));
     assert!(manifest.contains("initialization=\"audio_2/init.mp4\""));
     assert!(manifest.contains("initialization=\"audio_3/init.mp4\""));
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -844,9 +788,6 @@ fn divide_command_prefers_default_language_for_hls_and_dash() {
         "<AdaptationSet id=\"3\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"fra\">\n",
         "      <Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"main\" />\n"
     )));
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -869,9 +810,6 @@ fn divide_command_rejects_multiple_video_tracks_with_clear_message() {
             "Error [stage=request category=input]: {DIVIDE_SCOPE_MESSAGE}; found multiple fragmented video tracks (1 and 2).\n"
         )
     );
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -964,8 +902,6 @@ fn divide_command_matches_shared_fragmented_fixture_outputs() {
             &output_dir.join("audio").join(format!("{index}.mp4")),
         );
     }
-
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -999,10 +935,6 @@ fn divide_dash_list_manifest_round_trips_through_mux_input() {
     assert_eq!(remuxed.tracks.len(), 2);
     assert_eq!(remuxed.tracks[0].codec, TrackCodec::Avc1);
     assert_eq!(remuxed.tracks[1].codec, TrackCodec::Mp4a);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -1036,10 +968,6 @@ fn divide_dash_template_manifest_round_trips_through_mux_input() {
     assert_eq!(remuxed.tracks.len(), 2);
     assert_eq!(remuxed.tracks[0].codec, TrackCodec::Avc1);
     assert_eq!(remuxed.tracks[1].codec, TrackCodec::Mp4a);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_file(&output_path);
-    let _ = fs::remove_dir_all(&output_dir);
 }
 
 #[test]
@@ -1054,8 +982,6 @@ fn divide_validate_reports_supported_layout_without_writing_files() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit_code = divide::run_with_output(&args, &mut stdout, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
 
     assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -1245,9 +1171,6 @@ fn divide_command_derives_master_playlist_signaling_from_broader_codec_metadata(
             ),
             "case={name}"
         );
-
-        let _ = fs::remove_file(&input_path);
-        let _ = fs::remove_dir_all(&output_dir);
     }
 }
 
@@ -1317,9 +1240,6 @@ fn divide_command_writes_supported_broader_video_family_outputs() {
             &input_summary.segments[0],
             &output_dir.join("video").join("0.mp4"),
         );
-
-        let _ = fs::remove_file(&input_path);
-        let _ = fs::remove_dir_all(&output_dir);
     }
 }
 
@@ -1395,9 +1315,6 @@ fn divide_command_writes_supported_broader_audio_family_outputs() {
             &input_summary.segments[0],
             &output_dir.join("audio").join("0.mp4"),
         );
-
-        let _ = fs::remove_file(&input_path);
-        let _ = fs::remove_dir_all(&output_dir);
     }
 }
 
@@ -1413,8 +1330,6 @@ fn divide_validate_rejects_duplicate_video_layouts_before_writing_output() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit_code = divide::run_with_output(&args, &mut stdout, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
 
     assert_eq!(exit_code, 1);
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
@@ -1439,8 +1354,6 @@ fn divide_validate_rejects_subtitle_layout_with_clear_message() {
     let mut stderr = Vec::new();
     let exit_code = divide::run_with_output(&args, &mut stdout, &mut stderr);
 
-    let _ = fs::remove_file(&input_path);
-
     assert_eq!(exit_code, 1);
     assert_eq!(String::from_utf8(stdout).unwrap(), "");
     assert_eq!(
@@ -1464,9 +1377,6 @@ fn divide_command_can_emit_warning_mode_for_audio_only_outputs() {
 
     let mut stderr = Vec::new();
     let exit_code = divide::run(&args, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 
     assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
@@ -1494,9 +1404,6 @@ fn divide_command_warning_mode_reports_fragmented_decode_gap_and_duration_shift(
 
     let mut stderr = Vec::new();
     let exit_code = divide::run(&args, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 
     assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
@@ -1533,9 +1440,6 @@ fn divide_command_warning_mode_reports_fragmented_decode_regression_and_zero_dur
 
     let mut stderr = Vec::new();
     let exit_code = divide::run(&args, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 
     assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
@@ -1576,9 +1480,6 @@ fn divide_command_warning_mode_reports_zero_duration_samples_inside_nonzero_dura
     let mut stderr = Vec::new();
     let exit_code = divide::run(&args, &mut stderr);
 
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
-
     assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
         String::from_utf8(stderr).unwrap(),
@@ -1607,9 +1508,6 @@ fn divide_command_warning_mode_reports_authored_fragmented_sample_duration_jitte
 
     let mut stderr = Vec::new();
     let exit_code = divide::run(&args, &mut stderr);
-
-    let _ = fs::remove_file(&input_path);
-    let _ = fs::remove_dir_all(&output_dir);
 
     assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(

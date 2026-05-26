@@ -35,9 +35,9 @@ const VVC_NAL_TYPE_SPS: u8 = 15;
 const VVC_NAL_TYPE_PPS: u8 = 16;
 const VVC_NAL_TYPE_PREFIX_APS: u8 = 17;
 const VVC_NAL_TYPE_AUD: u8 = 20;
-const DEFAULT_SINGLE_SAMPLE_VVC_TIMESCALE: u32 = 25;
-const DEFAULT_SINGLE_SAMPLE_VVC_COMPOSITION_OFFSET: i32 = 1;
-const DEFAULT_SINGLE_SAMPLE_VVC_EDIT_MEDIA_TIME: u64 = 1;
+const DEFAULT_VVC_TIMESCALE: u32 = 25;
+const DEFAULT_VVC_COMPOSITION_OFFSET: i32 = 1;
+const DEFAULT_VVC_EDIT_MEDIA_TIME: u64 = 1;
 const VVC_GENERAL_CONSTRAINT_INFO_BYTES: usize = 12;
 
 pub(in crate::mux) fn stage_annex_b_vvc_sync(
@@ -371,18 +371,11 @@ fn finalize_vvc_staged_track(
             message: "VVC input contained parameter sets but no media samples".to_string(),
         });
     }
-    if state.samples.len() > 1 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message:
-                "multi-sample VVC inputs are not supported on the native direct-ingest path yet"
-                    .to_string(),
-        });
-    }
-
     let sps_info = parse_vvc_sps_configuration(&state.sps_list[0], spec)?;
-    state.samples[0].duration = 1;
-    state.samples[0].composition_time_offset = DEFAULT_SINGLE_SAMPLE_VVC_COMPOSITION_OFFSET;
+    for sample in &mut state.samples {
+        sample.duration = 1;
+        sample.composition_time_offset = DEFAULT_VVC_COMPOSITION_OFFSET;
+    }
     let sample_entry_box = build_vvc_sample_entry_box(
         sps_info.width,
         sps_info.height,
@@ -402,9 +395,9 @@ fn finalize_vvc_staged_track(
         },
         track_width: sps_info.width,
         track_height: sps_info.height,
-        timescale: DEFAULT_SINGLE_SAMPLE_VVC_TIMESCALE,
+        timescale: DEFAULT_VVC_TIMESCALE,
         sample_entry_box,
-        source_edit_media_time: Some(DEFAULT_SINGLE_SAMPLE_VVC_EDIT_MEDIA_TIME),
+        source_edit_media_time: Some(DEFAULT_VVC_EDIT_MEDIA_TIME),
         samples: state.samples,
     })
 }

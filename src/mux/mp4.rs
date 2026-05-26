@@ -98,7 +98,7 @@ where
         .iter()
         .map(File::open)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut writer = File::create(output_path)?;
+    let mut writer = std::io::BufWriter::new(File::create(output_path)?);
     write_mp4_mux(&mut sources, &mut writer, file_config, track_configs, plan)
 }
 
@@ -191,6 +191,27 @@ where
     Ok(())
 }
 
+pub(super) fn write_fragmented_mp4_mux_segmented<R, I, M>(
+    sources: &mut [R],
+    init_writer: &mut I,
+    media_writer: &mut M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: Read + Seek,
+    I: Write,
+    M: Write,
+{
+    let layout = build_fragmented_segmented_layout(file_config, track_configs, plan)?;
+    write_fragmented_init(&layout, init_writer)?;
+    init_writer.flush()?;
+    write_fragmented_media(sources, media_writer, &layout, false)?;
+    media_writer.flush()?;
+    Ok(())
+}
+
 pub(super) fn write_fragmented_mp4_mux_chunked<R, W>(
     sources: &mut [R],
     writer: &mut W,
@@ -232,8 +253,16 @@ where
     if flush_each_fragment {
         writer.flush()?;
     }
-    for fragment in &layout.fragments {
-        write_fragmented_media_fragment(sources, writer, fragment)?;
+    for (fragment_index, fragment) in layout.fragments.iter().enumerate() {
+        write_fragmented_media_fragment(
+            sources,
+            writer,
+            fragment,
+            layout
+                .segment_index_bytes
+                .get(fragment_index)
+                .map(Vec::as_slice),
+        )?;
         if flush_each_fragment {
             writer.flush()?;
         }
@@ -245,12 +274,16 @@ fn write_fragmented_media_fragment<R, W>(
     sources: &mut [R],
     writer: &mut W,
     fragment: &FragmentLayout,
+    segment_index_bytes: Option<&[u8]>,
 ) -> Result<(), MuxError>
 where
     R: Read + Seek,
     W: Write,
 {
     writer.write_all(&fragment.segment_type_bytes)?;
+    if let Some(segment_index_bytes) = segment_index_bytes {
+        writer.write_all(segment_index_bytes)?;
+    }
     for metadata_bytes in &fragment.metadata_bytes {
         writer.write_all(metadata_bytes)?;
     }
@@ -296,6 +329,28 @@ where
     M: AsyncWrite + Unpin,
 {
     let layout = build_fragmented_layout(file_config, track_configs, single_sidx_reference, plan)?;
+    write_fragmented_init_async(&layout, init_writer).await?;
+    init_writer.flush().await?;
+    write_fragmented_media_async(sources, media_writer, &layout, false).await?;
+    media_writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+pub(super) async fn write_fragmented_mp4_mux_segmented_async<R, I, M>(
+    sources: &mut [R],
+    init_writer: &mut I,
+    media_writer: &mut M,
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    plan: &MuxPlan,
+) -> Result<(), MuxError>
+where
+    R: AsyncReadSeek,
+    I: AsyncWrite + Unpin,
+    M: AsyncWrite + Unpin,
+{
+    let layout = build_fragmented_segmented_layout(file_config, track_configs, plan)?;
     write_fragmented_init_async(&layout, init_writer).await?;
     init_writer.flush().await?;
     write_fragmented_media_async(sources, media_writer, &layout, false).await?;
@@ -350,8 +405,17 @@ where
     if flush_each_fragment {
         writer.flush().await?;
     }
-    for fragment in &layout.fragments {
-        write_fragmented_media_fragment_async(sources, writer, fragment).await?;
+    for (fragment_index, fragment) in layout.fragments.iter().enumerate() {
+        write_fragmented_media_fragment_async(
+            sources,
+            writer,
+            fragment,
+            layout
+                .segment_index_bytes
+                .get(fragment_index)
+                .map(Vec::as_slice),
+        )
+        .await?;
         if flush_each_fragment {
             writer.flush().await?;
         }
@@ -364,12 +428,16 @@ async fn write_fragmented_media_fragment_async<R, W>(
     sources: &mut [R],
     writer: &mut W,
     fragment: &FragmentLayout,
+    segment_index_bytes: Option<&[u8]>,
 ) -> Result<(), MuxError>
 where
     R: AsyncReadSeek,
     W: AsyncWrite + Unpin,
 {
     writer.write_all(&fragment.segment_type_bytes).await?;
+    if let Some(segment_index_bytes) = segment_index_bytes {
+        writer.write_all(segment_index_bytes).await?;
+    }
     for metadata_bytes in &fragment.metadata_bytes {
         writer.write_all(metadata_bytes).await?;
     }
@@ -391,6 +459,7 @@ struct FragmentedLayout {
     ftyp_bytes: Vec<u8>,
     moov_bytes: Vec<u8>,
     sidx_bytes: Vec<u8>,
+    segment_index_bytes: Vec<Vec<u8>>,
     fragments: Vec<FragmentLayout>,
 }
 
@@ -519,31 +588,84 @@ fn build_fragmented_layout(
     single_sidx_reference: bool,
     plan: &MuxPlan,
 ) -> Result<FragmentedLayout, MuxError> {
+    build_fragmented_layout_with_media_mode(
+        file_config,
+        track_configs,
+        single_sidx_reference,
+        FragmentedMediaMode::SingleFile,
+        plan,
+    )
+}
+
+fn build_fragmented_segmented_layout(
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    plan: &MuxPlan,
+) -> Result<FragmentedLayout, MuxError> {
+    build_fragmented_layout_with_media_mode(
+        file_config,
+        track_configs,
+        false,
+        FragmentedMediaMode::StandaloneSegments,
+        plan,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FragmentedMediaMode {
+    SingleFile,
+    StandaloneSegments,
+}
+
+fn build_fragmented_layout_with_media_mode(
+    file_config: &MuxFileConfig,
+    track_configs: &[MuxTrackConfig],
+    single_sidx_reference: bool,
+    media_mode: FragmentedMediaMode,
+    plan: &MuxPlan,
+) -> Result<FragmentedLayout, MuxError> {
     if file_config.movie_timescale() == 0 {
         return Err(MuxError::InvalidMovieTimescale);
     }
 
     let prepared_tracks = prepare_tracks(file_config, track_configs, plan, false)?;
-    let fragment_layouts = build_fragment_layouts(file_config, &prepared_tracks)?;
-    let ftyp_bytes = build_fragmented_ftyp_bytes(&prepared_tracks)?;
+    let mut fragment_layouts = build_fragment_layouts(file_config, &prepared_tracks)?;
+    let ftyp = build_fragmented_ftyp(&prepared_tracks)?;
+    let ftyp_bytes = encode_typed_box(&ftyp, &[])?;
+    if media_mode == FragmentedMediaMode::StandaloneSegments {
+        let segment_type_bytes = build_fragmented_segment_type_bytes(&ftyp)?;
+        for fragment in &mut fragment_layouts {
+            fragment.segment_type_bytes = segment_type_bytes.clone();
+        }
+    }
     let moov_bytes = build_fragmented_moov_bytes(file_config, &prepared_tracks)?;
     let sidx_track = select_fragmented_sidx_track(&prepared_tracks)?;
-    let sidx_bytes = build_sidx_bytes(
-        file_config,
-        sidx_track,
-        &fragment_layouts,
-        single_sidx_reference,
-    )?;
+    let (sidx_bytes, segment_index_bytes) = match media_mode {
+        FragmentedMediaMode::SingleFile => (
+            build_sidx_bytes(
+                file_config,
+                sidx_track,
+                &fragment_layouts,
+                single_sidx_reference,
+            )?,
+            Vec::new(),
+        ),
+        FragmentedMediaMode::StandaloneSegments => (
+            Vec::new(),
+            build_fragment_segment_index_bytes(file_config, sidx_track, &fragment_layouts)?,
+        ),
+    };
 
     Ok(FragmentedLayout {
         ftyp_bytes,
         moov_bytes,
         sidx_bytes,
+        segment_index_bytes,
         fragments: fragment_layouts,
     })
 }
 
-fn build_fragmented_ftyp_bytes(tracks: &[PreparedTrack<'_>]) -> Result<Vec<u8>, MuxError> {
+fn build_fragmented_ftyp(tracks: &[PreparedTrack<'_>]) -> Result<Ftyp, MuxError> {
     let mut compatible_brands = vec![
         FourCc::from_bytes(*b"iso8"),
         FourCc::from_bytes(*b"isom"),
@@ -556,14 +678,21 @@ fn build_fragmented_ftyp_bytes(tracks: &[PreparedTrack<'_>]) -> Result<Vec<u8>, 
         }
     }
 
-    encode_typed_box(
-        &Ftyp {
-            major_brand: FourCc::from_bytes(*b"mp41"),
-            minor_version: 0,
-            compatible_brands,
-        },
-        &[],
-    )
+    Ok(Ftyp {
+        major_brand: FourCc::from_bytes(*b"mp41"),
+        minor_version: 0,
+        compatible_brands,
+    })
+}
+
+fn build_fragmented_segment_type_bytes(ftyp: &Ftyp) -> Result<Vec<u8>, MuxError> {
+    let mut segment_type = ftyp.clone();
+    for brand in &mut segment_type.compatible_brands {
+        if *brand == FourCc::from_bytes(*b"cmfc") {
+            *brand = FourCc::from_bytes(*b"cmfs");
+        }
+    }
+    encode_typed_box_as(FourCc::from_bytes(*b"styp"), &segment_type, &[])
 }
 
 fn push_unique_brand(compatible_brands: &mut Vec<FourCc>, brand: FourCc) {
@@ -1445,9 +1574,14 @@ fn build_sidx_bytes(
             fragments,
             reference_group_fragment_counts,
             presentation_trim,
+            true,
         )?
     } else if single_sidx_reference {
-        vec![build_sidx_reference(fragments.iter(), presentation_trim)?]
+        vec![build_sidx_reference(
+            fragments.iter(),
+            presentation_trim,
+            true,
+        )?]
     } else {
         fragments
             .iter()
@@ -1456,6 +1590,7 @@ fn build_sidx_bytes(
                 build_sidx_reference(
                     std::iter::once(fragment),
                     if index == 0 { presentation_trim } else { 0 },
+                    true,
                 )
             })
             .collect::<Result<Vec<_>, MuxError>>()?
@@ -1481,6 +1616,51 @@ fn build_sidx_bytes(
     sidx.reference_count = u16::try_from(sidx.references.len())
         .map_err(|_| MuxError::LayoutOverflow("sidx reference count"))?;
     encode_typed_box(&sidx, &[])
+}
+
+fn build_fragment_segment_index_bytes(
+    file_config: &MuxFileConfig,
+    track: &PreparedTrack<'_>,
+    fragments: &[FragmentLayout],
+) -> Result<Vec<Vec<u8>>, MuxError> {
+    if track_uses_direct_iamf_flat_timing(track)
+        || (sample_entry_matches(track.sample_entry_box, &[b"iamf"])
+            && track
+                .samples
+                .iter()
+                .any(|sample| sample.duration_movie == u32::MAX))
+    {
+        return Ok(vec![Vec::new(); fragments.len()]);
+    }
+
+    let presentation_trim = sidx_presentation_trim(track, file_config)?;
+    fragments
+        .iter()
+        .enumerate()
+        .map(|(index, fragment)| {
+            let built_reference = build_sidx_reference(
+                std::iter::once(fragment),
+                if index == 0 { presentation_trim } else { 0 },
+                false,
+            )?;
+            let mut sidx = Sidx::default();
+            sidx.reference_id = track.config.track_id();
+            sidx.timescale = file_config.movie_timescale();
+            if built_reference.earliest_presentation_time > u64::from(u32::MAX) {
+                sidx.set_version(1);
+                sidx.earliest_presentation_time_v1 = built_reference.earliest_presentation_time;
+                sidx.first_offset_v1 = 0;
+            } else {
+                sidx.earliest_presentation_time_v0 =
+                    u32::try_from(built_reference.earliest_presentation_time)
+                        .map_err(|_| MuxError::LayoutOverflow("sidx earliest presentation time"))?;
+                sidx.first_offset_v0 = 0;
+            }
+            sidx.references = vec![built_reference.reference];
+            sidx.reference_count = 1;
+            encode_typed_box(&sidx, &[])
+        })
+        .collect()
 }
 
 fn limit_sidx_references(mut references: Vec<BuiltSidxReference>) -> Vec<BuiltSidxReference> {
@@ -1517,6 +1697,7 @@ fn build_grouped_sidx_references(
     fragments: &[FragmentLayout],
     reference_group_fragment_counts: &[u32],
     presentation_trim: u64,
+    include_segment_type: bool,
 ) -> Result<Vec<BuiltSidxReference>, MuxError> {
     let mut references = Vec::with_capacity(reference_group_fragment_counts.len());
     let mut fragment_index = 0_usize;
@@ -1540,6 +1721,7 @@ fn build_grouped_sidx_references(
             } else {
                 0
             },
+            include_segment_type,
         )?);
         fragment_index = next_fragment_index;
     }
@@ -1555,6 +1737,7 @@ fn build_grouped_sidx_references(
 fn build_sidx_reference<'a, I>(
     fragments: I,
     presentation_trim: u64,
+    include_segment_type: bool,
 ) -> Result<BuiltSidxReference, MuxError>
 where
     I: IntoIterator<Item = &'a FragmentLayout>,
@@ -1576,13 +1759,16 @@ where
                 .unwrap_or(false);
             saw_any_sample = true;
         }
-        referenced_size = referenced_size
-            .checked_add(fragment.segment_type_bytes.len())
-            .and_then(|size| {
-                fragment
-                    .metadata_bytes
-                    .iter()
-                    .try_fold(size, |total, bytes| total.checked_add(bytes.len()))
+        if include_segment_type {
+            referenced_size = referenced_size
+                .checked_add(fragment.segment_type_bytes.len())
+                .ok_or(MuxError::LayoutOverflow("sidx referenced size"))?;
+        }
+        referenced_size = fragment
+            .metadata_bytes
+            .iter()
+            .try_fold(referenced_size, |total, bytes| {
+                total.checked_add(bytes.len())
             })
             .and_then(|size| size.checked_add(fragment.moof_bytes.len()))
             .and_then(|size| size.checked_add(fragment.mdat_header.len()))
@@ -1757,32 +1943,38 @@ fn infer_auto_flat_ftyp_profile(tracks: &[PreparedTrack<'_>]) -> (FourCc, u32, V
         );
     }
     if has_av1 {
-        return (
-            FourCc::from_bytes(*b"iso4"),
-            1,
-            vec![FourCc::from_bytes(*b"iso4"), FourCc::from_bytes(*b"av01")],
-        );
+        let mut brands = Vec::new();
+        if has_avc {
+            brands.push(FourCc::from_bytes(*b"avc1"));
+        }
+        brands.push(FourCc::from_bytes(*b"iso4"));
+        brands.push(FourCc::from_bytes(*b"av01"));
+        return (FourCc::from_bytes(*b"iso4"), 1, brands);
     }
     if has_hevc {
-        return (
-            FourCc::from_bytes(*b"iso4"),
-            1,
-            vec![FourCc::from_bytes(*b"iso4")],
-        );
+        let mut brands = Vec::new();
+        if has_avc {
+            brands.push(FourCc::from_bytes(*b"avc1"));
+        }
+        brands.push(FourCc::from_bytes(*b"iso4"));
+        return (FourCc::from_bytes(*b"iso4"), 1, brands);
     }
     if has_avs3 {
-        return (
-            FourCc::from_bytes(*b"iso4"),
-            1,
-            vec![FourCc::from_bytes(*b"iso4"), FourCc::from_bytes(*b"cav3")],
-        );
+        let mut brands = Vec::new();
+        if has_avc {
+            brands.push(FourCc::from_bytes(*b"avc1"));
+        }
+        brands.push(FourCc::from_bytes(*b"iso4"));
+        brands.push(FourCc::from_bytes(*b"cav3"));
+        return (FourCc::from_bytes(*b"iso4"), 1, brands);
     }
     if has_vvc {
-        return (
-            FourCc::from_bytes(*b"iso4"),
-            1,
-            vec![FourCc::from_bytes(*b"iso4")],
-        );
+        let mut brands = Vec::new();
+        if has_avc {
+            brands.push(FourCc::from_bytes(*b"avc1"));
+        }
+        brands.push(FourCc::from_bytes(*b"iso4"));
+        return (FourCc::from_bytes(*b"iso4"), 1, brands);
     }
     if has_h263 {
         return (
@@ -2556,19 +2748,7 @@ fn build_flat_iods_bytes(
         } else {
             0xff
         },
-        visual_profile_level_indication: if has_vvc
-            || (has_avc && !has_audio && imported_authority_tracks)
-        {
-            0xfe
-        } else if has_avc && has_mp4a && imported_authority_tracks {
-            0xff
-        } else if has_avc && has_mp4a {
-            0x7f
-        } else if has_avc && (has_non_mp4a_audio || has_timed_text_sample_entry) {
-            0x15
-        } else if has_avc {
-            0x7f
-        } else if has_mpeg2_mp4v {
+        visual_profile_level_indication: if has_mpeg2_mp4v {
             if imported_authority_tracks {
                 0xfe
             } else {
@@ -2582,6 +2762,18 @@ fn build_flat_iods_bytes(
             0xfe
         } else if has_mp4v {
             0x01
+        } else if has_vvc && !has_avc && has_mp4a {
+            0xff
+        } else if (has_vvc && !has_avc) || (has_avc && !has_audio && imported_authority_tracks) {
+            0xfe
+        } else if has_avc && has_mp4a && imported_authority_tracks {
+            0xff
+        } else if has_avc && has_mp4a {
+            0x7f
+        } else if has_avc && (has_non_mp4a_audio || has_timed_text_sample_entry) {
+            0x15
+        } else if has_avc {
+            0x7f
         } else {
             0xff
         },
@@ -3660,10 +3852,21 @@ pub(super) fn encode_typed_box<B>(box_value: &B, children: &[u8]) -> Result<Vec<
 where
     B: CodecBox,
 {
+    encode_typed_box_as(box_value.box_type(), box_value, children)
+}
+
+fn encode_typed_box_as<B>(
+    box_type: FourCc,
+    box_value: &B,
+    children: &[u8],
+) -> Result<Vec<u8>, MuxError>
+where
+    B: CodecBox,
+{
     let mut payload = Vec::new();
     marshal(&mut payload, box_value, None)?;
     payload.extend_from_slice(children);
-    encode_raw_box(box_value.box_type(), &payload)
+    encode_raw_box(box_type, &payload)
 }
 
 pub(super) fn encode_raw_box(box_type: FourCc, payload: &[u8]) -> Result<Vec<u8>, MuxError> {
@@ -4822,7 +5025,7 @@ mod tests {
         };
 
         let built =
-            build_sidx_reference(std::iter::once(&fragment), 3_072).expect("sidx reference");
+            build_sidx_reference(std::iter::once(&fragment), 3_072, true).expect("sidx reference");
 
         assert!(!built.reference.starts_with_sap);
         assert_eq!(built.reference.sap_type, 1);
@@ -4916,6 +5119,50 @@ mod tests {
             edit_media_time: None,
             flat_timing_override: None,
         }
+    }
+
+    #[test]
+    fn infer_auto_flat_ftyp_profile_keeps_avc_brand_with_hevc_video() {
+        let avc_entry = test_visual_sample_entry_box(FourCc::from_bytes(*b"avc1"));
+        let avc_config = MuxTrackConfig::new_video(1, 1_000, 640, 360, avc_entry.clone());
+        let avc_track = test_prepared_track(&avc_config, &avc_entry, 1_000);
+        let hevc_entry = test_visual_sample_entry_box(FourCc::from_bytes(*b"hvc1"));
+        let hevc_config = MuxTrackConfig::new_video(2, 1_000, 640, 360, hevc_entry.clone());
+        let hevc_track = test_prepared_track(&hevc_config, &hevc_entry, 1_000);
+
+        let (major_brand, minor_version, compatible_brands) =
+            infer_auto_flat_ftyp_profile(&[avc_track, hevc_track]);
+
+        assert_eq!(major_brand, FourCc::from_bytes(*b"iso4"));
+        assert_eq!(minor_version, 1);
+        assert_eq!(
+            compatible_brands,
+            vec![FourCc::from_bytes(*b"avc1"), FourCc::from_bytes(*b"iso4")]
+        );
+    }
+
+    #[test]
+    fn infer_auto_flat_ftyp_profile_keeps_avc_brand_with_avs3_video() {
+        let avc_entry = test_visual_sample_entry_box(FourCc::from_bytes(*b"avc1"));
+        let avc_config = MuxTrackConfig::new_video(1, 1_000, 640, 360, avc_entry.clone());
+        let avc_track = test_prepared_track(&avc_config, &avc_entry, 1_000);
+        let avs3_entry = test_visual_sample_entry_box(FourCc::from_bytes(*b"avs3"));
+        let avs3_config = MuxTrackConfig::new_video(2, 1_000, 640, 360, avs3_entry.clone());
+        let avs3_track = test_prepared_track(&avs3_config, &avs3_entry, 1_000);
+
+        let (major_brand, minor_version, compatible_brands) =
+            infer_auto_flat_ftyp_profile(&[avc_track, avs3_track]);
+
+        assert_eq!(major_brand, FourCc::from_bytes(*b"iso4"));
+        assert_eq!(minor_version, 1);
+        assert_eq!(
+            compatible_brands,
+            vec![
+                FourCc::from_bytes(*b"avc1"),
+                FourCc::from_bytes(*b"iso4"),
+                FourCc::from_bytes(*b"cav3"),
+            ]
+        );
     }
 
     #[test]
@@ -5074,6 +5321,41 @@ mod tests {
                 .expect("flat iods")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn build_flat_iods_bytes_uses_no_visual_profile_for_vvc_mp4a_tracks() {
+        let video_sample_entry_box = test_visual_sample_entry_box(FourCc::from_bytes(*b"vvc1"));
+        let video_config =
+            MuxTrackConfig::new_video(1, 90_000, 640, 360, video_sample_entry_box.clone());
+        let video_track = test_prepared_track(&video_config, &video_sample_entry_box, 0);
+        let audio_sample_entry_box = encode_typed_box(
+            &AudioSampleEntry {
+                sample_entry: SampleEntry {
+                    box_type: FourCc::from_bytes(*b"mp4a"),
+                    data_reference_index: 1,
+                },
+                channel_count: 2,
+                sample_size: 16,
+                sample_rate: 48_000 << 16,
+                ..AudioSampleEntry::default()
+            },
+            &[],
+        )
+        .expect("mp4a sample entry");
+        let audio_config = MuxTrackConfig::new_audio(2, 48_000, audio_sample_entry_box.clone());
+        let audio_track = test_prepared_track(&audio_config, &audio_sample_entry_box, 1_024);
+        let file_config = MuxFileConfig::new(1_000).with_auto_flat_profile(true);
+
+        let iods_bytes = build_flat_iods_bytes(&file_config, &[video_track, audio_track])
+            .expect("flat iods")
+            .expect("present iods");
+        let iods = decode_typed_box::<Iods>(&iods_bytes).expect("decode iods");
+        let descriptor = iods
+            .initial_object_descriptor()
+            .expect("initial descriptor");
+
+        assert_eq!(descriptor.visual_profile_level_indication, 0xff);
     }
 
     #[test]
@@ -5810,7 +6092,8 @@ mod tests {
             flat_timing_override: None,
         };
 
-        let ftyp_bytes = build_fragmented_ftyp_bytes(&[track]).expect("fragmented ftyp");
+        let ftyp = build_fragmented_ftyp(&[track]).expect("fragmented ftyp");
+        let ftyp_bytes = encode_typed_box(&ftyp, &[]).expect("fragmented ftyp bytes");
         let ftyp = decode_typed_box::<Ftyp>(&ftyp_bytes).expect("decode ftyp");
 
         assert_eq!(ftyp.major_brand, FourCc::from_bytes(*b"mp41"));

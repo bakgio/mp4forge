@@ -63,7 +63,7 @@ use super::mp4v::{
 };
 #[cfg(feature = "async")]
 use super::mpeg2v::scan_mpeg2v_segmented_async;
-use super::mpeg2v::{build_mpeg2v_sample_entry_box, scan_mpeg2v_segmented_sync};
+use super::mpeg2v::{build_transport_mpeg2v_sample_entry_box, scan_mpeg2v_segmented_sync};
 #[cfg(feature = "async")]
 use super::truehd::scan_truehd_segmented_async;
 use super::truehd::{build_truehd_sample_entry_box_with_btrt, scan_truehd_segmented_sync};
@@ -684,11 +684,8 @@ fn parse_pat_section(spec: &str, payload: &[u8]) -> Result<Option<u16>, MuxError
         let program_number = u16::from_be_bytes([payload[entry_offset], payload[entry_offset + 1]]);
         let pid = (u16::from(payload[entry_offset + 2] & 0x1F) << 8)
             | u16::from(payload[entry_offset + 3]);
-        if program_number != 0 && found.replace(pid).is_some() {
-            return Err(MuxError::UnsupportedTrackImport {
-                spec: spec.to_string(),
-                message: "multiple PAT program mappings are not supported on the native direct-ingest transport-stream path yet".to_string(),
-            });
+        if program_number != 0 && found.is_none() {
+            found = Some(pid);
         }
         entry_offset += 4;
     }
@@ -2336,7 +2333,7 @@ fn finalize_transport_mpeg2v_track_sync(
         parsed.timescale,
         &builder.pts_anchors,
     )?;
-    let sample_entry_box = build_mpeg2v_sample_entry_box(
+    let sample_entry_box = build_transport_mpeg2v_sample_entry_box(
         parsed.width,
         parsed.height,
         &parsed.decoder_specific_info,
@@ -2708,12 +2705,20 @@ fn finalize_transport_h264_track_sync(
         spec,
         "H.264",
     )?;
-    align_transport_h264_presentation_time(
-        &mut samples,
-        &mut source_edit_media_time,
-        &builder.pts_anchors,
-    )?;
-    normalize_transport_h264_wraparound_samples(&mut samples, &mut source_edit_media_time)?;
+    if source_edit_media_time.unwrap_or(0) != 0
+        || samples
+            .iter()
+            .any(|sample| sample.composition_time_offset != 0)
+    {
+        align_transport_h264_presentation_time(
+            &mut samples,
+            &mut source_edit_media_time,
+            &builder.pts_anchors,
+        )?;
+        normalize_transport_h264_wraparound_samples(&mut samples, &mut source_edit_media_time)?;
+    } else {
+        source_edit_media_time = None;
+    }
     let sample_entry_box = retune_carried_h264_sample_entry_box(
         &parsed.sample_entry_box,
         TRANSPORT_VIDEO_TIMESCALE,
@@ -3126,7 +3131,7 @@ async fn finalize_transport_mpeg2v_track_async(
         parsed.timescale,
         &builder.pts_anchors,
     )?;
-    let sample_entry_box = build_mpeg2v_sample_entry_box(
+    let sample_entry_box = build_transport_mpeg2v_sample_entry_box(
         parsed.width,
         parsed.height,
         &parsed.decoder_specific_info,
@@ -4392,12 +4397,20 @@ async fn finalize_transport_h264_track_async(
         spec,
         "H.264",
     )?;
-    align_transport_h264_presentation_time(
-        &mut samples,
-        &mut source_edit_media_time,
-        &builder.pts_anchors,
-    )?;
-    normalize_transport_h264_wraparound_samples(&mut samples, &mut source_edit_media_time)?;
+    if source_edit_media_time.unwrap_or(0) != 0
+        || samples
+            .iter()
+            .any(|sample| sample.composition_time_offset != 0)
+    {
+        align_transport_h264_presentation_time(
+            &mut samples,
+            &mut source_edit_media_time,
+            &builder.pts_anchors,
+        )?;
+        normalize_transport_h264_wraparound_samples(&mut samples, &mut source_edit_media_time)?;
+    } else {
+        source_edit_media_time = None;
+    }
     let sample_entry_box = retune_carried_h264_sample_entry_box(
         &parsed.sample_entry_box,
         TRANSPORT_VIDEO_TIMESCALE,

@@ -1993,6 +1993,30 @@ pub fn write_test_transport_stream_mp3_file(prefix: &str, payloads: &[&[u8]]) ->
 }
 
 #[cfg(feature = "mux")]
+pub fn write_test_transport_stream_multi_program_mp3_file(
+    prefix: &str,
+    payloads: &[&[u8]],
+) -> PathBuf {
+    let mut bytes = Vec::new();
+    let mut continuity_counter = 0_u8;
+    bytes.extend_from_slice(&build_test_transport_stream_multi_program_pat_packet(
+        continuity_counter,
+    ));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    bytes.extend_from_slice(&build_test_transport_stream_pmt_packet(continuity_counter));
+    continuity_counter = (continuity_counter + 1) & 0x0F;
+    for payload in payloads {
+        let pes_packet = build_test_transport_stream_mp3_pes_packet(payload);
+        bytes.extend_from_slice(&packetize_test_transport_stream_pes(
+            0x0101,
+            &mut continuity_counter,
+            &pes_packet,
+        ));
+    }
+    write_temp_file(prefix, &bytes)
+}
+
+#[cfg(feature = "mux")]
 pub fn write_test_transport_stream_latm_file(prefix: &str, payloads: &[&[u8]]) -> PathBuf {
     let mut bytes = Vec::new();
     let mut continuity_counter = 0_u8;
@@ -8525,6 +8549,21 @@ fn build_test_transport_stream_pat_packet(continuity_counter: u8) -> Vec<u8> {
     section.extend_from_slice(&[0xC1, 0x00, 0x00]);
     section.extend_from_slice(&1_u16.to_be_bytes());
     section.extend_from_slice(&0xE100_u16.to_be_bytes());
+    section.extend_from_slice(&mpeg2ts_crc32_for_test(&section).to_be_bytes());
+    build_test_transport_stream_section_packet(0x0000, continuity_counter, &section)
+}
+
+#[cfg(feature = "mux")]
+fn build_test_transport_stream_multi_program_pat_packet(continuity_counter: u8) -> Vec<u8> {
+    let mut section = Vec::new();
+    section.push(0x00);
+    section.extend_from_slice(&0xB011_u16.to_be_bytes());
+    section.extend_from_slice(&1_u16.to_be_bytes());
+    section.extend_from_slice(&[0xC1, 0x00, 0x00]);
+    section.extend_from_slice(&1_u16.to_be_bytes());
+    section.extend_from_slice(&0xE100_u16.to_be_bytes());
+    section.extend_from_slice(&2_u16.to_be_bytes());
+    section.extend_from_slice(&0xE110_u16.to_be_bytes());
     section.extend_from_slice(&mpeg2ts_crc32_for_test(&section).to_be_bytes());
     build_test_transport_stream_section_packet(0x0000, continuity_counter, &section)
 }

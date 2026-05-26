@@ -832,6 +832,31 @@ where
         object_type_indication,
         decoder_bitrates,
         pixel_aspect_ratio,
+        false,
+    )
+}
+
+pub(in crate::mux) fn build_transport_mpeg2v_sample_entry_box<I>(
+    width: u16,
+    height: u16,
+    decoder_specific_info: &[u8],
+    object_type_indication: u8,
+    timescale: u32,
+    samples: I,
+    pixel_aspect_ratio: Option<(u32, u32)>,
+) -> Result<Vec<u8>, MuxError>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+{
+    let decoder_bitrates = build_btrt_from_sample_sizes(samples, timescale)?;
+    encode_mpeg2v_sample_entry_box(
+        width,
+        height,
+        decoder_specific_info,
+        object_type_indication,
+        decoder_bitrates,
+        pixel_aspect_ratio,
+        true,
     )
 }
 
@@ -851,6 +876,7 @@ where
         config.object_type_indication,
         decoder_bitrates,
         config.pixel_aspect_ratio,
+        true,
     )
 }
 
@@ -861,6 +887,7 @@ fn encode_mpeg2v_sample_entry_box(
     object_type_indication: u8,
     decoder_bitrates: Btrt,
     pixel_aspect_ratio: Option<(u32, u32)>,
+    force_pixel_aspect_ratio_box: bool,
 ) -> Result<Vec<u8>, MuxError> {
     let mut esds = Esds::default();
     esds.descriptors = vec![
@@ -900,7 +927,7 @@ fn encode_mpeg2v_sample_entry_box(
         .map_err(|_| MuxError::LayoutOverflow("MPEG-2 video esds"))?;
     let mut child_boxes = vec![super::super::mp4::encode_typed_box(&esds, &[])?];
     if let Some((h_spacing, v_spacing)) = pixel_aspect_ratio
-        && !(h_spacing == 1 && v_spacing == 1)
+        && (force_pixel_aspect_ratio_box || !(h_spacing == 1 && v_spacing == 1))
     {
         child_boxes.push(super::super::mp4::encode_typed_box(
             &Pasp {

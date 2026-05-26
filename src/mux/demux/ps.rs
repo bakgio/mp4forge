@@ -705,7 +705,8 @@ fn finalize_program_stream_video_track_sync(
                     timescale,
                     language: *b"und",
                     handler_name: direct_ingest_handler_name("mpeg2v"),
-                    mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video),
+                    mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video)
+                        .without_terminal_flat_video_chunk_split(),
                     width: parsed.width,
                     height: parsed.height,
                     sample_entry_box,
@@ -1903,7 +1904,8 @@ async fn finalize_program_stream_video_track_async(
                     timescale,
                     language: *b"und",
                     handler_name: direct_ingest_handler_name("mpeg2v"),
-                    mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video),
+                    mux_policy: direct_ingest_mux_policy("mpeg2v", MuxTrackKind::Video)
+                        .without_terminal_flat_video_chunk_split(),
                     width: parsed.width,
                     height: parsed.height,
                     sample_entry_box,
